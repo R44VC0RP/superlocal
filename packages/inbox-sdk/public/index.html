@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Inbox SDK</title>
+    <link rel="stylesheet" href="/pilot.css">
+    <script type="module" src="/pilot.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Inbox SDK</h1>
+        <p id="mode">Connecting to the local server...</p>
+        <div class="actions">
+          <button id="google" type="button" disabled>Connect Gmail</button>
+          <button id="refresh" type="button">Refresh</button>
+        </div>
+      </header>
+      <p id="status" role="status" aria-live="polite"></p>
+      <section aria-labelledby="connections-heading">
+        <h2 id="connections-heading">Connections</h2>
+        <ul id="connections"><li>Loading...</li></ul>
+        <details id="inbound">
+          <summary>Connect Inbound</summary>
+          <form id="inbound-form" class="actions">
+            <label for="inbound-key">API key</label>
+            <input id="inbound-key" type="password" autocomplete="off" required>
+            <button type="submit">Connect Inbound</button>
+          </form>
+        </details>
+      </section>
+      <section aria-labelledby="mailboxes-heading">
+        <h2 id="mailboxes-heading">Mailbox views</h2>
+        <div id="mailboxes" role="group" aria-label="Mailbox views"></div>
+      </section>
+      <section aria-labelledby="messages-heading">
+        <h2 id="messages-heading">Messages</h2>
+        <form id="search-form" class="actions">
+          <label for="search">Search</label>
+          <input id="search" type="search" placeholder="Search cached messages">
+          <button type="submit">Search</button>
+          <button id="sync" type="button" disabled>Sync selected</button>
+          <button id="backfill" type="button" disabled>Import older mail</button>
+        </form>
+        <p id="message-count">Choose a mailbox view to read its messages.</p>
+        <div class="reader-layout">
+          <div>
+            <ul id="messages"></ul>
+            <button id="more" type="button" hidden>Load more cached messages</button>
+          </div>
+          <section id="reader" aria-label="Message" tabindex="-1" hidden>
+            <button id="close-message" type="button">Close message</button>
+            <h3 id="subject"></h3>
+            <p id="message-meta"></p>
+            <div id="memberships"></div>
+            <pre id="message-body" dir="auto"></pre>
+            <ul id="attachments"></ul>
+            <details>
+              <summary>API response</summary>
+              <pre id="message-json"></pre>
+            </details>
+          </section>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

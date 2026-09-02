@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 680" role="img" aria-labelledby="title description">
+  <title id="title">The case for quieter software</title>
+  <desc id="description">An editorial composition of calm lilac interface windows, a warm paper background, and an oversized lavender sun.</desc>
+  <defs>
+    <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#faf7f0" />
+      <stop offset="1" stop-color="#ece6f4" />
+    </linearGradient>
+    <linearGradient id="lavender" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c4b5e8" />
+      <stop offset="1" stop-color="#8877bd" />
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="680" fill="url(#paper)" />
+  <circle cx="948" cy="174" r="192" fill="#ded5ed" />
+  <circle cx="1064" cy="500" r="258" fill="#e8cdbd" opacity=".52" />
+  <rect x="117" y="107" width="714" height="452" rx="20" fill="#fffdf9" stroke="#d9d2e1" stroke-width="2" />
+  <path d="M117 167h714" stroke="#e9e4ed" stroke-width="2" />
+  <circle cx="149" cy="136" r="7" fill="#d6a9a5" />
+  <circle cx="173" cy="136" r="7" fill="#dac496" />
+  <circle cx="197" cy="136" r="7" fill="#abc7ae" />
+  <rect x="150" y="204" width="154" height="316" rx="10" fill="#f6f3f8" />
+  <rect x="174" y="232" width="107" height="11" rx="5" fill="#aaa0bd" />
+  <rect x="174" y="273" width="81" height="8" rx="4" fill="#d7d0df" />
+  <rect x="174" y="305" width="92" height="8" rx="4" fill="#d7d0df" />
+  <rect x="174" y="337" width="68" height="8" rx="4" fill="#d7d0df" />
+  <rect x="344" y="221" width="293" height="17" rx="8" fill="#544b63" />
+  <rect x="344" y="264" width="386" height="10" rx="5" fill="#ddd7e3" />
+  <rect x="344" y="289" width="340" height="10" rx="5" fill="#e7e2eb" />
+  <rect x="344" y="338" width="135" height="39" rx="19" fill="url(#lavender)" />
+  <rect x="344" y="423" width="431" height="2" fill="#eeeaf0" />
+  <rect x="344" y="454" width="212" height="10" rx="5" fill="#d7d0df" />
+  <rect x="900" y="392" width="112" height="142" rx="55" fill="#8d79bf" />
+  <path d="M956 531v65" stroke="#7561aa" stroke-width="8" stroke-linecap="round" />
+  <path d="M907 596h98" stroke="#7561aa" stroke-width="8" stroke-linecap="round" />
+</svg>

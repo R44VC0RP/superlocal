@@ -1,0 +1,13 @@
+cohort_week,provider,signups,accounts_connected,connection_rate,median_minutes_to_first_send,invited_by_teammate
+2026-07-06,gmail,84,51,0.607,11.4,19
+2026-07-06,custom_domain,37,22,0.595,12.1,8
+2026-07-13,gmail,91,56,0.615,10.9,23
+2026-07-13,custom_domain,42,26,0.619,11.7,11
+2026-07-20,gmail,102,72,0.706,8.1,31
+2026-07-20,custom_domain,48,35,0.729,8.8,14
+2026-07-27,gmail,118,86,0.729,7.2,39
+2026-07-27,custom_domain,53,40,0.755,7.6,17
+2026-08-03,gmail,126,93,0.738,6.8,42
+2026-08-03,custom_domain,61,47,0.770,7.1,21
+2026-08-10,gmail,139,105,0.755,6.4,46
+2026-08-10,custom_domain,67,52,0.776,6.7,24

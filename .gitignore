@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.tsbuildinfo
+data/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
+/superlocal.local.json
+/apps/web/reference/
+/packages/inbox-sdk/OVERNIGHT_NOTES.md

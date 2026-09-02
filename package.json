@@ -1,0 +1,29 @@
+{
+  "name": "superlocal",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.0",
+  "engines": { "bun": ">=1.4.0" },
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {
+    "dev": "bun --no-env-file scripts/dev.ts",
+    "dev:host": "bun --no-env-file apps/local-host/src/index.ts",
+    "start:host": "bun --no-env-file apps/local-host/src/index.ts",
+    "typecheck:host": "bun run --cwd apps/local-host typecheck",
+    "dev:web": "bun run --cwd apps/web dev",
+    "build:web": "bun run --cwd apps/web build",
+    "test:web": "bun run --cwd apps/web test",
+    "preview:web": "bun run --cwd apps/web preview",
+    "dev:mock": "bun run --cwd apps/mock-api dev",
+    "start:mock": "bun run --cwd apps/mock-api start",
+    "typecheck:mock": "bun run --cwd apps/mock-api typecheck",
+    "dev:sdk": "bun run --cwd packages/inbox-sdk dev",
+    "start:sdk": "bun run --cwd packages/inbox-sdk start",
+    "connect:sdk": "bun run --cwd packages/inbox-sdk connect",
+    "typecheck": "bun run --cwd packages/inbox-sdk typecheck",
+    "build": "bun run --cwd packages/inbox-sdk build",
+    "test": "bun run --cwd packages/inbox-sdk test",
+    "test:api": "bun run --cwd packages/inbox-sdk test:api",
+    "test:provider": "bun run --cwd packages/inbox-sdk test:provider"
+  }
+}

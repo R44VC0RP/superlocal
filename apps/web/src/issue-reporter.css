@@ -1,0 +1,207 @@
+.issue-reporter {
+  display: flex;
+  flex-direction: column;
+  width: 720px;
+  overflow: hidden;
+  font-size: var(--ui-medium);
+  line-height: 20px;
+}
+.issue-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+.issue-header h2 {
+  flex: 1;
+  font-size: var(--ui-nav);
+  line-height: 24px;
+  font-weight: 400;
+}
+.issue-form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.issue-body,
+.issue-list {
+  padding: 24px;
+  overflow: auto;
+  min-height: 0;
+}
+.issue-screenshot {
+  margin: 0 0 24px;
+}
+.issue-screenshot > a {
+  display: flex;
+  justify-content: center;
+  background: var(--bg);
+}
+.issue-screenshot img {
+  display: block;
+  max-width: 100%;
+  max-height: 260px;
+  object-fit: contain;
+}
+.issue-screenshot figcaption,
+.issue-screenshot figcaption > span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.issue-screenshot figcaption {
+  justify-content: space-between;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: var(--ui-small);
+}
+.issue-screenshot figcaption a {
+  color: var(--accent);
+}
+.issue-description {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.issue-description textarea {
+  width: 100%;
+  min-height: 120px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  line-height: 22px;
+  resize: vertical;
+}
+.issue-description textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.issue-context {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: var(--ui-small);
+  overflow-wrap: anywhere;
+}
+.issue-context span {
+  flex: none;
+}
+.issue-logs {
+  margin-top: 16px;
+  color: var(--muted);
+  font-size: var(--ui-small);
+}
+.issue-logs summary {
+  cursor: pointer;
+}
+.issue-logs pre {
+  max-height: 180px;
+  margin: 8px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font:
+    12px / 18px "Operator Mono Book",
+    monospace;
+}
+.issue-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: none;
+  gap: 16px;
+  padding: 16px 24px;
+  border-top: 1px solid var(--border);
+}
+.issue-footer > span {
+  font-size: var(--ui-small);
+  color: var(--muted);
+}
+.issue-footer button {
+  white-space: nowrap;
+}
+.issue-error {
+  color: #ef9c9c;
+  margin-top: 12px;
+}
+.issue-list-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+.issue-list-row:first-child {
+  padding-top: 0;
+}
+.issue-list-row:last-child {
+  border-bottom: 0;
+}
+.issue-list-row strong {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.issue-list-row span,
+.issue-list-row time {
+  color: var(--muted);
+  font-size: var(--ui-small);
+}
+.issue-list-row:hover strong {
+  color: var(--accent);
+}
+.issue-capture-status {
+  position: fixed;
+  bottom: 24px;
+  left: 64px;
+  z-index: 1100;
+  padding: 12px 16px;
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  pointer-events: none;
+}
+@media (max-width: 600px) {
+  .issue-header,
+  .issue-footer {
+    padding: 12px 16px;
+  }
+  .issue-body,
+  .issue-list {
+    padding: 16px;
+  }
+  .issue-description textarea {
+    font-size: 16px;
+  }
+  .issue-footer {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .issue-footer button {
+    min-height: 40px;
+  }
+  .issue-context {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+}
+.issue-discard {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 24px;
+}
+
+.issue-discard span { flex: 1 1 180px; }

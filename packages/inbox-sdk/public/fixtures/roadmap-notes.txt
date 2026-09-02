@@ -1,0 +1,34 @@
+OPENMAIL / QUARTERLY ROADMAP WORKSHOP
+Internal working notes
+
+CUSTOMER OUTCOMES
+
+1. Make the first connected account feel immediately useful.
+   - Reduce time from signup to first meaningful action.
+   - Preserve familiar folder names and existing labels.
+   - Explain account colors without adding another onboarding screen.
+
+2. Keep account separation obvious across every interaction.
+   - Sender lines retain account color in conversation view.
+   - Search results stay scoped to the current user.
+   - Attachments, drafts, and scheduled messages never cross accounts.
+
+3. Give people fewer reasons to revisit the same message.
+   - Sensible snooze presets for later today and next week.
+   - Predictable archive and undo behavior.
+   - Read states that stay consistent between list and detail views.
+
+PLATFORM PRIORITIES
+
+- Provider token encryption and independent failure recovery.
+- Incremental synchronization with bounded retries and jitter.
+- Accessible keyboard navigation and reliable focus restoration.
+- Account-scoped attachment preview URLs and cache keys.
+
+OPEN QUESTIONS
+
+- Which search operators should be visible before the external beta?
+- Should scheduled sending default to the sender's local timezone?
+- Do custom labels need colors in the initial release?
+
+Owners: Priya Shah, Alex Morgan, Marcus Chen, Naomi Park

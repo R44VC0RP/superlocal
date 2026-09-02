@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 740" role="img" aria-labelledby="title description">
+  <title id="title">Material notes from an independent hotel</title>
+  <desc id="description">Forest-green, brass, and clay-colored paper samples layered like a designer's material board.</desc>
+  <defs>
+    <pattern id="grid" width="34" height="34" patternUnits="userSpaceOnUse">
+      <path d="M34 0H0v34" fill="none" stroke="#d4cab6" stroke-width="1" opacity=".55" />
+    </pattern>
+    <linearGradient id="brass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e2c987" />
+      <stop offset="1" stop-color="#ab8241" />
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="740" fill="#f1ebdf" />
+  <rect x="49" y="47" width="1102" height="644" fill="url(#grid)" />
+  <rect x="118" y="124" width="359" height="491" rx="3" fill="#41614c" transform="rotate(-6 297 369)" />
+  <rect x="196" y="171" width="315" height="435" rx="3" fill="#f9f6ee" transform="rotate(5 353 388)" />
+  <rect x="257" y="258" width="134" height="10" rx="5" fill="#526b54" transform="rotate(5 324 263)" />
+  <rect x="253" y="293" width="187" height="6" rx="3" fill="#b8b0a0" transform="rotate(5 347 296)" />
+  <rect x="251" y="314" width="165" height="6" rx="3" fill="#cec6b8" transform="rotate(5 333 317)" />
+  <circle cx="803" cy="318" r="202" fill="#b67e66" />
+  <circle cx="803" cy="318" r="159" fill="#cfab8b" />
+  <rect x="732" y="242" width="145" height="158" rx="72" fill="url(#brass)" />
+  <circle cx="804" cy="286" r="13" fill="#f1ebdf" />
+  <path d="M804 329v32m-13-10h26" stroke="#64482a" stroke-width="7" stroke-linecap="round" />
+  <rect x="668" y="563" width="329" height="47" rx="2" fill="#f9f6ee" />
+  <text x="694" y="593" fill="#4e604d" font-family="Georgia,serif" font-size="17" letter-spacing="3">NORTHLINE / NO. 08</text>
+  <rect x="965" y="174" width="91" height="185" rx="2" fill="#6f805d" transform="rotate(11 1010 266)" />
+</svg>

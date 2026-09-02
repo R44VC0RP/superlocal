@@ -1,0 +1,41 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 371 >>
+stream
+BT
+/F1 24 Tf
+54 724 Td
+(STUDIOFORM) Tj
+/F1 12 Tf
+0 -42 Td
+(Invoice 1847) Tj
+0 -24 Td
+(Project: Northline identity, phase two) Tj
+0 -24 Td
+(Bill to: Northline Hospitality) Tj
+0 -36 Td
+(Strategy and positioning workshop       $1,800.00) Tj
+0 -22 Td
+(Visual identity and presentation        $3,000.00) Tj
+0 -36 Td
+(Total due                               $4,800.00) Tj
+0 -26 Td
+(Payment due: September 12, 2026) Tj
+ET
+endstream
+endobj
+trailer
+<< /Root 1 0 R /Size 6 >>
+%%EOF

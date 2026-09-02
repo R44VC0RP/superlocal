@@ -1,0 +1,28 @@
+@font-face { font-family: "Operator Mono Book"; font-display: swap; src: url("/assets/90f738072707e49088fd.otf") ; }
+@font-face { font-family: "Adelle"; font-weight: normal; font-display: swap; src: url("/assets/37f1e549e4d9e4a73abe.woff2") ; }
+@font-face { font-family: "Adelle"; font-weight: 100; font-display: swap; src: url("/assets/82b124e2faa538f3e72d.woff2") ; }
+@font-face { font-family: "Adelle"; font-style: italic; font-display: swap; src: url("/assets/1d807afd54bf83be61f5.woff2") ; }
+@font-face { font-family: "Adelle"; font-weight: 700; font-display: swap; src: url("/assets/6bd9c8c2bb523631a533.woff2") ; }
+@font-face { font-family: "Adelle"; font-weight: 700; font-style: italic; font-display: swap; src: url("/assets/df9b65907f666562627e.woff2") ; }
+@font-face { font-family: "SuperSansMail Mono"; font-display: swap; src: url("/assets/8225d8c9dc5096ee23d1.ttf") ; }
+@font-face { font-family: SuperMailSans; font-weight: normal; font-display: swap; src: url("/assets/61d96e9ccb089bdad7cf.woff2") ; }
+@font-face { font-family: SuperMailSans; font-weight: 100; font-display: swap; src: url("/assets/74d503026ddaa1faa88c.woff2") ; }
+@font-face { font-family: SuperMailSans; font-style: italic; font-display: swap; src: url("/assets/411a2a1d793bd5a446be.woff2") ; }
+@font-face { font-family: SuperMailSans; font-weight: 700; font-display: swap; src: url("/assets/c52edd77feb182576cb3.woff2") ; }
+@font-face { font-family: SuperMailSans; font-weight: 700; font-style: italic; font-display: swap; src: url("/assets/66af9858d4658a1711fe.woff2") ; }
+@font-face { font-family: SuperMailSerif; font-weight: normal; font-display: swap; src: url("/assets/f478bf3da41abddbebf2.woff2") ; }
+@font-face { font-family: SuperMailSerif; font-style: italic; font-display: swap; src: url("/assets/2620df8f34dd3915e012.woff2") ; }
+@font-face { font-family: SuperMailSerif; font-weight: 700; font-display: swap; src: url("/assets/49f6347040e47b7e6a6e.woff2") ; }
+@font-face { font-family: SuperMailSerif; font-weight: 700; font-style: italic; font-display: swap; src: url("/assets/8c37bb7970a3bf7222cc.woff2") ; }
+@font-face { font-family: "Consolas Email"; font-display: swap; src: url("/assets/829673d30ab956af56ac.woff2") ; }
+@font-face { font-family: "Adelle Email"; font-weight: normal; font-display: swap; src: url("/assets/37f1e549e4d9e4a73abe.woff2") ; }
+@font-face { font-family: "Adelle Email"; font-style: italic; font-display: swap; src: url("/assets/1d807afd54bf83be61f5.woff2") ; }
+@font-face { font-family: "Adelle Email"; font-weight: bold; font-display: swap; src: url("/assets/7663d87514b689918d46.woff2") ; }
+@font-face { font-family: "Adelle Email"; font-weight: bold; font-style: italic; font-display: swap; src: url("/assets/3562d20760ede13eba35.woff2") ; }
+@font-face { font-family: "SuperMailSans Email"; font-weight: normal; font-display: swap; src: url("/assets/61d96e9ccb089bdad7cf.woff2") ; }
+@font-face { font-family: "SuperMailSans Email"; font-weight: 100; font-display: swap; src: url("/assets/74d503026ddaa1faa88c.woff2") ; }
+@font-face { font-family: "SuperMailSans Email"; font-style: italic; font-display: swap; src: url("/assets/411a2a1d793bd5a446be.woff2") ; }
+@font-face { font-family: "SuperMailSans Email"; font-weight: 700; font-display: swap; src: url("/assets/d8de650758e11884a187.woff2") ; }
+@font-face { font-family: "SuperMailSans Email"; font-weight: 700; font-style: italic; font-display: swap; src: url("/assets/30e8f67e72fd950390fe.woff2") ; }
+@font-face { font-family: color-emoji-override; font-display: optional; unicode-range: U+2049, U+203C, U+2639, U+263A, U+2B05-2B0B, U+2190-2199; src: local("Apple Color Emoji"), local("Segoe UI Emoji"), local("Noto Color Emoji"); }
+@font-face { font-family: emoji-flag-fallbacks; unicode-range: U+1F3F3, U+1F1E6-1F1FF; src: url("/assets/8a95c13ff2b49fd2e576.woff2"); }

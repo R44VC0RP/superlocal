@@ -1,0 +1,41 @@
+:root { font-family: "Helvetica Neue", sans-serif; font-size: 16px; line-height: 1.5; color: #222; background: #fff; font-synthesis: none; -webkit-font-smoothing: antialiased; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; padding: 20px; }
+main { max-width: 1200px; margin-inline: auto; }
+h1 { font-size: 22px; }
+h2 { font-size: 18px; }
+h3 { font-size: 16px; }
+h1, h2, h3 { line-height: 1.2; margin: 0 0 12px; overflow-wrap: anywhere; }
+p { margin: 8px 0; }
+section { margin-top: 24px; min-width: 0; }
+button, input, select { font: inherit; max-width: 100%; }
+button, input:not([type="checkbox"]), select { min-height: 40px; padding: 6px 10px; }
+button { cursor: pointer; }
+button:disabled { cursor: default; }
+input[type="search"], input[type="password"] { min-width: 0; width: 280px; }
+label:has(input[type="checkbox"]) { display: flex; align-items: center; gap: 8px; min-height: 40px; overflow-wrap: anywhere; }
+summary { cursor: pointer; padding-block: 8px; }
+ul { list-style: none; margin: 0; padding: 0; }
+li { margin-block: 8px; overflow-wrap: anywhere; }
+li p, small { color: #555; }
+small { font-size: 14px; }
+pre, code { font-family: "Berkeley Mono", monospace; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+#status { min-height: 24px; overflow-wrap: anywhere; }
+#status[data-error="true"] { color: #a00000; }
+#message-count { font-variant-numeric: tabular-nums; }
+.reader-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 28px; align-items: start; }
+.reader-layout:has(#reader[hidden]) { grid-template-columns: 1fr; }
+#reader { margin-top: 0; }
+#message-meta { white-space: pre-line; overflow-wrap: anywhere; }
+#message-body { font: inherit; max-width: 70ch; margin-block: 20px; }
+.message { display: block; width: 100%; text-align: start; background: transparent; color: inherit; border: 0; border-bottom: 1px solid #ddd; padding: 12px 4px; overflow-wrap: anywhere; }
+.message strong, .message small { display: block; }
+.message:hover, .message[aria-pressed="true"] { background: #f2f2f2; }
+#memberships .actions { margin-block: 8px; }
+@media (max-width: 700px) {
+  body { padding: 16px; }
+  .reader-layout { grid-template-columns: 1fr; }
+  button, input:not([type="checkbox"]), select, label:has(input[type="checkbox"]), summary { min-height: 44px; }
+}

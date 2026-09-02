@@ -1,0 +1,19 @@
+{
+  "name": "@superlocal/mock-api",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "engines": { "bun": ">=1.4.0" },
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "inbox-sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.0"
+  }
+}
