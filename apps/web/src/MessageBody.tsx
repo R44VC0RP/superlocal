@@ -40,6 +40,35 @@ function linkedText(text: string): ReactNode[] {
   return result;
 }
 
+function unavailableImage(image: HTMLImageElement, reason: "inline image unavailable" | "image unavailable") {
+  if (image.dataset.inboxImageError) return;
+  image.dataset.inboxImageError = reason;
+  const style = image.ownerDocument.defaultView?.getComputedStyle(image);
+  if (image.getAttribute("alt") === "" || style?.display === "none" || style?.visibility === "hidden") {
+    image.style.setProperty("opacity", "0", "important");
+    return;
+  }
+  const missing = image.ownerDocument.createElement("span");
+  const bounds = image.getBoundingClientRect();
+  const width = bounds.width || image.width;
+  const height = bounds.height || image.height;
+  const compact = width > 0 && width <= 64;
+  const label = image.alt ? `${image.alt} (${reason})` : reason === "image unavailable" ? "Image unavailable" : "Inline image unavailable";
+  missing.setAttribute("role", "img");
+  missing.setAttribute("aria-label", label);
+  missing.title = label;
+  missing.dataset.inboxImageError = reason;
+  missing.textContent = compact ? "×" : label;
+  missing.style.cssText = 'display:inline-block;box-sizing:border-box;max-width:100%;padding:6px 8px;background:#f1f1f1;color:#555;font:13px/1.5 "Helvetica Neue",sans-serif;letter-spacing:normal;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:middle';
+  if (compact) {
+    missing.style.width = `${width}px`;
+    missing.style.height = missing.style.lineHeight = `${height || width}px`;
+    missing.style.padding = "0";
+    missing.style.textAlign = "center";
+  }
+  image.replaceWith(missing);
+}
+
 function emailDocument(html: string, styles: string, fontSize: string) {
   const doc = new DOMParser().parseFromString(html, "text/html");
   const id = crypto.randomUUID();
@@ -74,11 +103,7 @@ function emailDocument(html: string, styles: string, fontSize: string) {
   doc.head.replaceChildren(charset, policy, referrer, viewport, defaults, author);
   for (const image of doc.querySelectorAll('img[data-inbox-tracking="true"]')) image.remove();
   for (const image of doc.querySelectorAll<HTMLImageElement>('img[src^="cid:" i]')) {
-    const missing = doc.createElement("span");
-    missing.setAttribute("role", "img");
-    missing.textContent = image.alt ? `${image.alt} (inline image unavailable)` : "Inline image unavailable";
-    missing.style.cssText = 'display:inline-block;max-width:100%;padding:6px 8px;background:#f1f1f1;color:#555;font:13px/1.5 "Helvetica Neue",sans-serif;overflow-wrap:anywhere';
-    image.replaceWith(missing);
+    unavailableImage(image, "inline image unavailable");
   }
   let blockedImages = 0;
   for (const image of doc.querySelectorAll<HTMLImageElement>("img[data-openmail-src]:not([src])")) {
@@ -143,11 +168,19 @@ export default function MessageBody({ html, text = "", format, styles = "", font
     frameSize.observe(element);
     const onKey = (event: KeyboardEvent) => { activate(); keyboard(event); };
     const onFocus = () => activate();
+    const onError = (event: Event) => {
+      const image = event.target as HTMLImageElement | null;
+      if (image?.tagName === "IMG" && image.hasAttribute("src")) unavailableImage(image, "image unavailable");
+      schedule();
+    };
     doc.addEventListener("keydown", onKey, true);
     doc.addEventListener("pointerdown", onFocus, true);
     doc.addEventListener("focusin", onFocus, true);
     doc.addEventListener("load", schedule, true);
-    doc.addEventListener("error", schedule, true);
+    doc.addEventListener("error", onError, true);
+    for (const image of Array.from(doc.images)) {
+      if (image.hasAttribute("src") && image.complete && !image.naturalWidth) unavailableImage(image, "image unavailable");
+    }
     void doc.fonts.ready.then(schedule);
     measure();
     cleanup.current = () => {
@@ -159,7 +192,7 @@ export default function MessageBody({ html, text = "", format, styles = "", font
       doc.removeEventListener("pointerdown", onFocus, true);
       doc.removeEventListener("focusin", onFocus, true);
       doc.removeEventListener("load", schedule, true);
-      doc.removeEventListener("error", schedule, true);
+      doc.removeEventListener("error", onError, true);
     };
   }
 
