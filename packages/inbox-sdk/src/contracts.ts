@@ -67,6 +67,8 @@ export interface InboxOptions {
   concurrency?: number
   log?: (event: { code: string; operation: string }) => void
   allowProviderWrites?: boolean
+  /** Host defaults for owners without a saved policy; saved user choices always win. */
+  defaultPolicy?: Partial<Policy>
   /** Trusted host callback returning complete, usable credentials for this connection. */
   resolveCredentials?(context: CredentialContext): Promise<Record<string, unknown>>
   /** Return true only after verifying replacement credentials address the same upstream store. */

@@ -89,6 +89,7 @@ export async function createMockHost(overrides: MockConfigOverrides = {}): Promi
     inbox = createInbox({
       database: config.cachePath, encryptionKey: config.encryptionKey,
       providers: [createMockProviderDefinition(store)], allowProviderWrites: config.allowProviderWrites,
+      defaultPolicy: { remoteImages: true },
       syncIntervalMs: SYNC_INTERVAL_MS,
       // Fail closed if a future change accidentally tries to use the SDK-injected transport.
       fetch: Object.assign(async (_request: Parameters<typeof fetch>[0], _init?: RequestInit): Promise<Response> => {

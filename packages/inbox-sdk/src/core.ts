@@ -52,6 +52,12 @@ function text(value: unknown, field: string, max = 255): string {
 }
 
 export function createInbox(options: InboxOptions): Inbox {
+  const defaultPolicy: Policy = { remoteImages: false, undoSendSeconds: 10, ...options.defaultPolicy }
+  if (Object.keys(defaultPolicy).some(key => !['remoteImages', 'undoSendSeconds'].includes(key)) ||
+    typeof defaultPolicy.remoteImages !== 'boolean' || !Number.isInteger(defaultPolicy.undoSendSeconds) ||
+    defaultPolicy.undoSendSeconds < 0 || defaultPolicy.undoSendSeconds > 120) {
+    throw new InboxError('VALIDATION', 'Invalid default policy.')
+  }
   const definitions = new Map(options.providers.map(definition => [definition.id, { ...definition, scopes: [...definition.scopes ?? []] }]))
   if (definitions.size !== options.providers.length) throw new InboxError('DUPLICATE_PROVIDER', 'Provider IDs must be unique.')
   const crypto = createCredentialCrypto({ NODE_ENV: 'production', CREDENTIAL_ENCRYPTION_KEY: options.encryptionKey })
@@ -384,7 +390,7 @@ export function createInbox(options: InboxOptions): Inbox {
   function getPolicy(owner: string): Policy {
     ownerId(owner)
     const row = db.query<{ data: string }, [string]>('SELECT data FROM sdk_policy WHERE owner=?').get(owner)
-    return row ? JSON.parse(row.data) : { remoteImages: false, undoSendSeconds: 10 }
+    return row ? JSON.parse(row.data) : { ...defaultPolicy }
   }
 
   function selector(value: MailboxSelector): MailboxSelector {

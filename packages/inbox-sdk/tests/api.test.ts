@@ -2085,6 +2085,19 @@ describe('policy privacy and replayable changes', () => {
     expect(await h.inbox.policy('bob')).toEqual(bob)
   })
 
+  test('host image defaults apply to new owners without overwriting saved user choices', async () => {
+    const h = await fixture({ defaultPolicy: { remoteImages: true } })
+    const initial = await h.inbox.policy('alice')
+    expect(initial).toEqual({ remoteImages: true, undoSendSeconds: 10 })
+    initial.remoteImages = false
+    expect((await h.inbox.policy('alice')).remoteImages).toBe(true)
+    await h.json<Policy>('alice', '/policy', { remoteImages: false }, 'PATCH')
+    await h.restart()
+    expect((await h.inbox.policy('alice')).remoteImages).toBe(false)
+    expect((await h.inbox.policy('bob')).remoteImages).toBe(true)
+    expect(() => createInbox({ encryptionKey: KEY, providers: [], defaultPolicy: { remoteImages: 'true' as unknown as boolean } })).toThrow()
+  })
+
   test('change replay is owner-scoped, paged in commit order, resumable after restart, and empty without an explicit cursor', async () => {
     const h = await fixture()
     const alice = await h.seed('alice', 'changes-alice')
