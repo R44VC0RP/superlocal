@@ -2146,6 +2146,73 @@ test('Gmail rotating download handles retain stable MIME attachment identity and
 })
 
 describe('Gmail read-only body and pagination regressions', () => {
+  test('explicit HTML UTF-8 declarations override legacy MIME only for valid original UTF-8 bytes', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    const plain = 'Plain caf\u00e9 body.'
+    const body = '<body>Keep\u00a0both\u00a0spaces \u00a9</body>'
+    for (const html of [
+      `<html><head><meta charset="UTF-8"></head>${body}</html>`,
+      `<!doctype html><html><head><META content="text/html; charset='utf-8'" HTTP-EQUIV="Content-Type"></head>${body}</html>`,
+      `\ufeff<html><head></head>${body}</html>`,
+    ]) {
+      const native = { id: 'utf8-html', threadId: 'utf8-thread', internalDate: '1767225600000', payload: {
+        mimeType: 'multipart/alternative', parts: [
+          { partId: '0', mimeType: 'text/plain', headers: [
+            { name: 'Content-Type', value: 'text/plain; charset=ISO-8859-1' },
+            { name: 'Content-Transfer-Encoding', value: 'QUOTED-PRINTABLE' },
+          ], body: { data: Buffer.from(plain, 'latin1').toString('base64url') } },
+          { partId: '1', mimeType: 'text/html', headers: [
+            { name: 'Content-Type', value: 'text/html; charset=ISO-8859-1' },
+            { name: 'Content-Transfer-Encoding', value: 'QUOTED-PRINTABLE' },
+          ], body: { data: Buffer.from(html, 'utf8').toString('base64url') } },
+        ],
+      } }
+      const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+        expect(String(input)).toBe('https://gmail.invalid/gmail/v1/users/me/messages/utf8-html?format=full')
+        expect(init?.method ?? 'GET').toBe('GET')
+        return Response.json(native)
+      }) as typeof fetch
+      const provider = await definition.create({ accountId: 'gmail-utf8', accessToken: 'offline-token',
+        scopes: ['https://www.googleapis.com/auth/gmail.readonly'], baseUrl: 'https://gmail.invalid/gmail/v1', fetch: fetcher })
+      try {
+        const message = await provider.getMessage(native.id)
+        expect(message.bodyHtml).toBe(html.replace(/^\ufeff/, ''))
+        expect(message.bodyText).toBe(plain)
+        expect(message.attachments).toEqual([])
+      } finally { await provider.disconnect() }
+    }
+  })
+
+  test('invalid UTF-8, non-head declarations and non-HTML parts retain their MIME charset', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    const declared = '<html><head><meta charset="utf-8"></head><body>caf\u00e9 \u00a9</body></html>'
+    for (const [mimeType, charset, bytes] of [
+      ['text/html', 'ISO-8859-1', Buffer.from(declared, 'latin1')],
+      ['text/html', 'windows-1252', Buffer.from('<html><head></head><body>\u00a9</body></html>')],
+      ['text/html', 'ISO-8859-1', Buffer.from('<html><head><!-- <meta charset="utf-8"> --><script>const example = `<meta charset="utf-8">`</script><template><meta charset="utf-8"></template></head><body><meta charset="utf-8">\u00a9</body></html>')],
+      ['text/html', 'ISO-8859-1', Buffer.from('<html><head><meta charset="windows-1252"><meta charset="utf-8"></head><body>\u00a9</body></html>')],
+      ['text/html', 'utf-16le', Buffer.from(declared, 'utf16le')],
+      ['text/plain', 'ISO-8859-1', Buffer.from(declared)],
+    ] as const) {
+      const native = { id: 'legacy-body', threadId: 'legacy-thread', internalDate: '1767225600000', payload: {
+        partId: '0', mimeType, headers: [{ name: 'Content-Type', value: `${mimeType}; charset=${charset}` }],
+        body: { data: bytes.toString('base64url') },
+      } }
+      const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+        expect(String(input)).toBe('https://gmail.invalid/gmail/v1/users/me/messages/legacy-body?format=full')
+        expect(init?.method ?? 'GET').toBe('GET')
+        return Response.json(native)
+      }) as typeof fetch
+      const provider = await definition.create({ accountId: 'gmail-legacy', accessToken: 'offline-token',
+        scopes: ['https://www.googleapis.com/auth/gmail.readonly'], baseUrl: 'https://gmail.invalid/gmail/v1', fetch: fetcher })
+      try {
+        const message = await provider.getMessage(native.id)
+        expect(mimeType === 'text/html' ? message.bodyHtml : message.bodyText).toBe(new TextDecoder(charset).decode(bytes))
+        expect(message.attachments).toEqual([])
+      } finally { await provider.disconnect() }
+    }
+  })
+
   test('attachment-backed bodies hydrate full reads while attached files and metadata reads stay lazy', async () => {
     const definition = builtInProviders.find(provider => provider.id === 'gmail')!
     const text = 'External caf\u00e9 body.'

@@ -1,3 +1,4 @@
+import { parseDocument } from 'htmlparser2'
 import nodemailer from 'nodemailer'
 import sanitizeHtml from 'sanitize-html'
 import {
@@ -402,7 +403,34 @@ async function extractParts(part: GmailPart | undefined, messageId: string, acco
         } catch {
           decoder = new TextDecoder('utf-8')
         }
-        const content = decoder.decode(decodeBase64Url(data))
+        const bytes = decodeBase64Url(data)
+        let content = decoder.decode(bytes)
+        if (mimeType === 'text/html' && decoder.encoding !== 'utf-8' && !decoder.encoding.startsWith('utf-16')) {
+          // A conflicting head declaration or BOM can identify mislabeled UTF-8 HTML,
+          // but only a strict decode of the original bytes may override the MIME charset.
+          try {
+            const utf8 = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+            let explicitUtf8 = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
+            if (!explicitUtf8) {
+              const document = parseDocument(utf8)
+              const root = document.children.find(node => node.type === 'tag')
+              const head = root?.type === 'tag' && root.name === 'html'
+                ? root.children.find(node => node.type === 'tag') : root
+              if (head?.type === 'tag' && head.name === 'head') for (const meta of head.children) {
+                if (meta.type !== 'tag' || meta.name !== 'meta') continue
+                const declared = meta.attribs.charset ?? (meta.attribs['http-equiv']?.trim().toLowerCase() === 'content-type'
+                  ? /(?:^|;)\s*charset\s*=\s*(?:"([^"]*)"|'([^']*)'|([^;\s]+))/i.exec(meta.attribs.content ?? '')?.slice(1).find(Boolean)
+                  : undefined)
+                if (!declared) continue
+                try {
+                  explicitUtf8 = new TextDecoder(declared).encoding === 'utf-8'
+                  break
+                } catch { /* Ignore unsupported declarations, not the MIME charset. */ }
+              }
+            }
+            if (explicitUtf8) content = utf8
+          } catch { /* Invalid UTF-8 bytes retain their declared MIME decoding. */ }
+        }
         if (content.trim()) {
           if (mimeType === 'text/plain') bodyText = content
           else bodyHtml = content
