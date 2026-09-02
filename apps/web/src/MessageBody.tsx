@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useMemo, useRef, type ReactNode } from "react";
+import { useEffectEvent, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
 
 type MessageBodyProps = {
   html: string;
@@ -42,6 +42,8 @@ function linkedText(text: string): ReactNode[] {
 
 function emailDocument(html: string, styles: string, fontSize: string) {
   const doc = new DOMParser().parseFromString(html, "text/html");
+  const id = crypto.randomUUID();
+  doc.documentElement.dataset.inboxDocument = id;
   const policy = doc.createElement("meta");
   policy.httpEquiv = "Content-Security-Policy";
   policy.content = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src https: http: data:; font-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
@@ -89,7 +91,7 @@ function emailDocument(html: string, styles: string, fontSize: string) {
     // Keep image selectors, dimensions and alt semantics without a broken-image icon.
     image.style.setProperty("opacity", "0", "important");
   }
-  return { html: `<!doctype html>${doc.documentElement.outerHTML}`, blockedImages };
+  return { id, html: `<!doctype html>${doc.documentElement.outerHTML}`, blockedImages };
 }
 
 export default function MessageBody({ html, text = "", format, styles = "", fontSize, onActivate, onKeyboard, onImageSettings }: MessageBodyProps) {
@@ -101,12 +103,22 @@ export default function MessageBody({ html, text = "", format, styles = "", font
   const document = useMemo(() => plain ? null : emailDocument(html, styles, fontSize), [plain, html, styles, fontSize]);
   const content = useMemo(() => plain ? linkedText(text) : null, [plain, text]);
 
-  useEffect(() => () => cleanup.current(), []);
+  useLayoutEffect(() => {
+    if (!document) return;
+    let waiting = 0;
+    const attach = () => {
+      const doc = frame.current?.contentDocument;
+      if (doc?.body && doc.documentElement?.dataset.inboxDocument === document.id && doc.readyState !== "loading") loaded();
+      else waiting = requestAnimationFrame(attach);
+    };
+    waiting = requestAnimationFrame(attach);
+    return () => { cancelAnimationFrame(waiting); cleanup.current(); };
+  }, [document]);
 
   function loaded() {
-    cleanup.current();
     const element = frame.current, doc = element?.contentDocument;
-    if (!element || !doc?.body) return;
+    if (!element || !doc?.body || doc.documentElement.dataset.inboxDocument !== document?.id) return;
+    cleanup.current();
     let pending = 0;
     let width = element.clientWidth;
     let disposed = false;
