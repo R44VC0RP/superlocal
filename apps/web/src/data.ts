@@ -18,6 +18,9 @@ export type Message = {
   date: string;
   receivedAt?: string;
   body: string;
+  bodyText?: string;
+  bodyFormat?: "html" | "text";
+  bodyDocument?: { html: string; styles: string };
   attachments?: Attachment[];
   scheduledAt?: string;
   cancelled?: boolean;

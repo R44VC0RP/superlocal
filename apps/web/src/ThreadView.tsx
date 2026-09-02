@@ -7,6 +7,7 @@ import {
   type CSSProperties,
 } from "react";
 import Composer from "./Composer";
+import MessageBody from "./MessageBody";
 import { Icon, IconButton } from "./components";
 import {
   displayDate,
@@ -49,6 +50,7 @@ type ThreadViewProps = {
   onOpenProfile: () => void;
   onSearch?: () => void;
   onToggleFocus?: () => void;
+  onImageSettings: () => void;
 };
 
 export default function ThreadView({
@@ -72,6 +74,7 @@ export default function ThreadView({
   onOpenProfile,
   onSearch,
   onToggleFocus,
+  onImageSettings,
 }: ThreadViewProps) {
   const [expanded, setExpanded] = useState<string[]>([
     mail.messages.at(-1)?.id || "",
@@ -225,7 +228,16 @@ export default function ThreadView({
     scrollToMessage.current = "";
   }, [expanded]);
 
-  const shortcut = useEffectEvent((event: KeyboardEvent) => {
+  function messageLinks(root: ParentNode): HTMLAnchorElement[] {
+    const elements = root.querySelectorAll<HTMLAnchorElement | HTMLIFrameElement>(
+      '.thread-body a[href]:not([aria-disabled="true"]), .message-html-frame, .thread-attachments a[href]:not([aria-disabled="true"])',
+    );
+    return Array.from(elements).flatMap(element => element.tagName === "IFRAME"
+      ? Array.from((element as HTMLIFrameElement).contentDocument?.querySelectorAll<HTMLAnchorElement>('a[href]:not([aria-disabled="true"])') ?? [])
+      : [element as HTMLAnchorElement]).filter(link => link.getClientRects().length > 0);
+  }
+
+  const shortcut = useEffectEvent((event: KeyboardEvent, bodyMessage?: HTMLElement) => {
     if (
       event.defaultPrevented ||
       event.isComposing ||
@@ -234,7 +246,7 @@ export default function ThreadView({
       document.querySelector('[role="dialog"], [aria-modal="true"]')
     )
       return;
-    const target = event.target instanceof HTMLElement ? event.target : null;
+    const target = event.target && (event.target as Node).nodeType === 1 ? event.target as HTMLElement : null;
     const command = event.metaKey && !event.ctrlKey && !event.altKey;
     const deleteComment =
       command && !event.shiftKey && ["Backspace", "Delete"].includes(event.key);
@@ -247,7 +259,7 @@ export default function ThreadView({
       return;
 
     const key = event.key.toLowerCase();
-    const focusedMessage = target?.closest<HTMLElement>(
+    const focusedMessage = bodyMessage ?? target?.closest<HTMLElement>(
       "[data-thread-message]",
     );
     const messageId =
@@ -255,9 +267,6 @@ export default function ThreadView({
     const messageIndex = mail.messages.findIndex(
       (message) => message.id === messageId,
     );
-    const linkSelector =
-      '.thread-body a[href]:not([aria-disabled="true"]), .thread-attachments a[href]:not([aria-disabled="true"])';
-
     if (deleteComment) {
       const commentId =
         target?.closest<HTMLElement>("[data-comment-id]")?.dataset.commentId;
@@ -271,17 +280,14 @@ export default function ThreadView({
     } else if (command && !event.shiftKey && key === "u" && marketing) {
       unsubscribe();
     } else if (command && !event.shiftKey && key === "o") {
-      const links = Array.from(
-        scroller.current.querySelectorAll<HTMLAnchorElement>(linkSelector),
-      ).filter((link) => link.getClientRects().length > 0);
+      const links = messageLinks(scroller.current);
       const focusedLink = target?.closest<HTMLAnchorElement>("a[href]");
       if (focusedLink && links.includes(focusedLink)) focusedLink.click();
       else {
         const link =
           links.find(
             (item) =>
-              item.closest<HTMLElement>("[data-thread-message]")?.dataset
-                .threadMessage === messageId,
+              (item.closest<HTMLElement>("[data-thread-message]") ?? item.ownerDocument.defaultView?.frameElement?.closest<HTMLElement>("[data-thread-message]"))?.dataset.threadMessage === messageId,
           ) || links[0];
         if (!link) return;
         link.focus();
@@ -347,9 +353,7 @@ export default function ThreadView({
           behavior: "auto",
         });
       } else if (key === "tab" && focusedMessage) {
-        const links = Array.from(
-          focusedMessage.querySelectorAll<HTMLAnchorElement>(linkSelector),
-        ).filter((link) => link.getClientRects().length > 0);
+        const links = messageLinks(focusedMessage);
         const index = links.indexOf(target as HTMLAnchorElement);
         const next =
           index >= 0 ? links[index + (event.shiftKey ? -1 : 1)] : undefined;
@@ -367,6 +371,22 @@ export default function ThreadView({
     document.addEventListener("keydown", handler, true);
     return () => document.removeEventListener("keydown", handler, true);
   }, []);
+
+  function bodyKeyboard(event: KeyboardEvent, id: string) {
+    const article = scroller.current?.querySelector<HTMLElement>(`[data-thread-message="${CSS.escape(id)}"]`);
+    if (!article) return;
+    shortcut(event, article);
+    if (event.defaultPrevented || event.key === "Tab") return;
+    const target = event.target as HTMLElement | null;
+    if (["Enter", " "].includes(event.key) && target?.closest?.("a, button")) return;
+    const forwarded = new KeyboardEvent("keydown", {
+      key: event.key, code: event.code, altKey: event.altKey, ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey, shiftKey: event.shiftKey, repeat: event.repeat,
+      isComposing: event.isComposing, bubbles: true, cancelable: true,
+    });
+    article.dispatchEvent(forwarded);
+    if (forwarded.defaultPrevented) event.preventDefault();
+  }
 
   function revealMessage(id: string) {
     activeMessage.current = id;
@@ -577,7 +597,7 @@ export default function ThreadView({
                     onClick={() => setExpanded([...expanded, message.id])}
                   >
                     <strong>{sent ? "Me" : message.from}</strong>
-                    <span>{plainText(message.body)}</span>
+                    <span>{message.bodyFormat === "text" ? message.bodyText : plainText(message.body)}</span>
                     <time dateTime={message.receivedAt} title={message.receivedAt ? new Date(message.receivedAt).toLocaleString() : message.date}>{message.date}</time>
                     <Icon name="ChevronDown" size={12} />
                   </button>
@@ -699,9 +719,15 @@ export default function ThreadView({
                       </dl>
                     )}
                     {message.loaded === false ? <div className="message-body-loading" role="status">Loading message…</div> : (
-                      <div
-                        className={`message-body thread-body ${preferences.fontSize === "Large" ? "message-large-text" : preferences.fontSize === "Small" ? "message-small-text" : ""}`}
-                        dangerouslySetInnerHTML={{ __html: message.body }}
+                      <MessageBody
+                        html={message.bodyDocument?.html ?? message.body}
+                        styles={message.bodyDocument?.styles}
+                        text={message.bodyText}
+                        format={message.bodyFormat}
+                        fontSize={preferences.fontSize}
+                        onActivate={() => { activeMessage.current = message.id; }}
+                        onKeyboard={event => bodyKeyboard(event, message.id)}
+                        onImageSettings={onImageSettings}
                       />
                     )}
                     {isInvitation && (

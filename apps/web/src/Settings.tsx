@@ -1120,8 +1120,8 @@ export function Settings({
     case "Images":
       content = (
         <>
-          {toggle("showImages", "Automatically show remote images", true)}
-          {toggle("imagePrivacy", "Protect email activity", true)}
+          {toggle("showImages", "Automatically show remote images", false, "Loads images directly from senders’ servers.")}
+          <div className="settings-control-row"><span>Known tracking pixels</span><span>Blocked</span></div>
           {toggle("showAvatars", "Show sender avatars")}
         </>
       );

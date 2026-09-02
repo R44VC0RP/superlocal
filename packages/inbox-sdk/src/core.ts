@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { Context, Effect, Either, Fiber, Layer, ManagedRuntime, Schedule } from 'effect'
 import { createCredentialCrypto } from '../server/crypto'
-import { sanitizeEmailHtml } from '../server/sanitize'
+import { sanitizeEmailBody } from '../server/sanitize'
 import { ProviderError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
 import { CredentialError, InboxError, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
   type DraftInput, type Folder, type Inbox, type InboxOptions, type Label, type Message,
@@ -1555,9 +1555,9 @@ export function createInbox(options: InboxOptions): Inbox {
     message: (owner, id) => run(() => {
       const row = messageRow(owner, id); const body = JSON.parse(row.body)
       const policy = getPolicy(owner)
-      let html = sanitizeEmailHtml(body.bodyHtml || `<pre>${String(body.bodyText).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')}</pre>`, policy.remoteImages, true)
-      for (const blob of body.attachments as BlobInfo[]) if (blob.contentId) html = html.replaceAll(`cid:${blob.contentId}`, `/v1/blobs/${blob.id}`)
-      return { ...summary(row), bcc: body.bcc, bodyText: body.bodyText, bodyHtml: html, attachments: body.attachments, ...(body.replyTo ? { replyTo: body.replyTo } : {}) }
+      const bodyText = typeof body.bodyText === 'string' ? body.bodyText : ''
+      const presentation = sanitizeEmailBody(body.bodyHtml, bodyText, policy.remoteImages, true, body.attachments)
+      return { ...summary(row), bcc: body.bcc, bodyText, ...presentation, attachments: body.attachments, ...(body.replyTo ? { replyTo: body.replyTo } : {}) }
     }),
     threads: (owner, query = {}) => run(() => {
       const condition = where(owner, query); const page = pagination(owner, query, 'threads')

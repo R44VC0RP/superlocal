@@ -93,7 +93,12 @@ const messageSummary = z.object({
   folder: z.string(), folderIds: z.array(id), labelIds: z.array(id), hasAttachments: z.boolean(),
   snoozedUntil: z.string().nullable(),
 })
-const message = messageSummary.extend({ bcc: z.array(participant), bodyText: z.string(), bodyHtml: z.string(), attachments: z.array(blobInfo), replyTo: z.array(participant).optional() })
+const message = messageSummary.extend({
+  bcc: z.array(participant), bodyText: z.string(), bodyHtml: z.string(),
+  bodyFormat: z.enum(['html', 'text']).optional(),
+  bodyDocument: z.object({ html: z.string(), styles: z.string() }).optional(),
+  attachments: z.array(blobInfo), replyTo: z.array(participant).optional(),
+})
 const mailboxSelector = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('all') }),
   z.strictObject({ kind: z.enum(['domain', 'address']), value: name }),

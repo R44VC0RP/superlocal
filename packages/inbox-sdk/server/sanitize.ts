@@ -361,13 +361,7 @@ export function sanitizeEmailStyles(html: string): string {
   return css.includes('<') || Buffer.byteLength(css) > MAX_EMAIL_STYLE_OUTPUT_BYTES ? '' : css
 }
 
-export function sanitizeEmailHtml(
-  html: string,
-  remoteImages = true,
-  blockTracking = false,
-): string {
-  if (typeof html !== 'string' || html.length === 0) return ''
-
+function inlineEmailStyles(html: string): string {
   let content = html
   if (/<style(?:\s|>)/i.test(html)) {
     try {
@@ -389,9 +383,35 @@ export function sanitizeEmailHtml(
     }
   }
 
-  return sanitizeHtml(content, {
+  return content
+}
+
+function emailImageKey(source: string, attributes: Record<string, string>): string {
+  return JSON.stringify([source, attributes.class ?? '', attributes.width ?? '', attributes.height ?? ''])
+}
+
+function sanitizeEmailMarkup(
+  html: string,
+  remoteImages: boolean,
+  blockTracking: boolean,
+  options: {
+    document?: boolean
+    trackingImages?: Set<string>
+    contentIds?: ReadonlyMap<string, string>
+  } = {},
+): string {
+  function resolveCid(value: string): string {
+    const cid = value.trim().match(/^cid:(.+)$/i)?.[1]
+    if (!cid || !options.contentIds) return value
+    let decoded = cid
+    try { decoded = decodeURIComponent(cid) } catch { /* Match malformed escapes literally. */ }
+    return options.contentIds.get(cid) ?? options.contentIds.get(decoded) ?? value
+  }
+
+  return sanitizeHtml(html, {
     allowedTags: [
       ...sanitizeHtml.defaults.allowedTags,
+      ...(options.document ? ['html', 'body'] : []),
       'img',
       'figure',
       'figcaption',
@@ -404,7 +424,7 @@ export function sanitizeEmailHtml(
     allowedAttributes: {
       '*': ['class', 'dir', 'lang', 'title', 'aria-label', 'align', 'bgcolor', 'valign', 'role', 'style'],
       a: ['href', 'name', 'target', 'rel'],
-      img: ['src', 'data-openmail-src', 'alt', 'width', 'height', 'loading', 'title'],
+      img: ['src', 'data-openmail-src', 'alt', 'width', 'height', 'loading', 'title', ...(options.document ? ['data-inbox-tracking'] : [])],
       table: ['width', 'height', 'cellpadding', 'cellspacing', 'border'],
       td: ['width', 'height', 'colspan', 'rowspan', 'align', 'valign'],
       th: ['width', 'height', 'colspan', 'rowspan', 'align', 'valign'],
@@ -412,6 +432,7 @@ export function sanitizeEmailHtml(
       ol: ['start', 'type'],
       li: ['value'],
       source: ['media', 'type'],
+      ...(options.document ? { body: ['text'] } : {}),
     },
     allowedStyles: { '*': SAFE_EMAIL_STYLES },
     allowedSchemes: ['http', 'https', 'mailto', 'tel', 'cid'],
@@ -421,6 +442,8 @@ export function sanitizeEmailHtml(
     nonTextTags: ['script', 'style', 'textarea', 'option', 'xmp', 'head'],
     transformTags: {
       body: (_tagName, attributes) => {
+        // Real roots retain presentational hints without promoting them to inline CSS.
+        if (options.document) return { tagName: 'body', attribs: attributes }
         const hasColorStyle = /(?:^|;)\s*(?:background(?:-color)?|color)\s*:/i
           .test(attributes.style ?? '')
         if (!hasColorStyle && !attributes.bgcolor && !attributes.text) {
@@ -462,11 +485,12 @@ export function sanitizeEmailHtml(
       }),
       a: (_tagName, attributes) => ({
         tagName: 'a',
-        attribs: { ...attributes, rel: 'noopener noreferrer', target: '_blank' },
+        attribs: { ...attributes, ...(attributes.href ? { href: resolveCid(attributes.href) } : {}), rel: 'noopener noreferrer', target: '_blank' },
       }),
       img: (_tagName, attributes) => {
         const sanitized = { ...attributes }
         delete sanitized['data-openmail-src']
+        delete sanitized['data-inbox-tracking']
         const source = sanitized.src?.trim() ?? ''
 
         const remote = /^https?:\/\//i.test(source)
@@ -480,20 +504,79 @@ export function sanitizeEmailHtml(
             })
           } catch { /* Invalid CSS cannot supply a tracking signal. */ }
         }
+        const imageKey = emailImageKey(source, sanitized)
         const trackingPixel = isTrackingImage({ src: source, width: sanitized.width, height: sanitized.height, style })
+          || (options.document && options.trackingImages?.has(imageKey))
+        if (!options.document && trackingPixel) options.trackingImages?.add(imageKey)
 
-        if (remote && (!remoteImages || (blockTracking && trackingPixel))) {
+        if (options.document && trackingPixel) {
+          sanitized['data-inbox-tracking'] = 'true'
+          delete sanitized.src
+        } else if (remote && (!remoteImages || (blockTracking && trackingPixel))) {
           sanitized['data-openmail-src'] = source
           delete sanitized.src
         } else if (/^data:/i.test(source) && !SAFE_DATA_IMAGE.test(source)) {
           delete sanitized.src
           delete sanitized['data-openmail-src']
         }
+        if (sanitized.src) sanitized.src = resolveCid(sanitized.src)
 
         return { tagName: 'img', attribs: sanitized }
       },
     },
   })
+}
+
+export function sanitizeEmailHtml(
+  html: string,
+  remoteImages = true,
+  blockTracking = false,
+): string {
+  if (typeof html !== 'string' || html.length === 0) return ''
+  return sanitizeEmailMarkup(inlineEmailStyles(html), remoteImages, blockTracking)
+}
+
+export function sanitizeEmailBody(
+  html: string,
+  bodyText: string,
+  remoteImages = false,
+  blockTracking = true,
+  attachments: ReadonlyArray<{ id: string; contentId?: string }> = [],
+): {
+  bodyHtml: string
+  bodyFormat: 'html' | 'text'
+  bodyDocument?: { html: string; styles: string }
+} {
+  if (typeof html === 'string' && html.trim()) {
+    const contentIds = new Map(attachments.filter(blob => blob.contentId).map(blob => [
+      blob.contentId!, `/v1/blobs/${encodeURIComponent(blob.id)}`,
+    ]))
+    // Collect actual inlined tracking signals, independently of the remote-image policy.
+    const trackingImages = new Set<string>()
+    const bodyHtml = sanitizeEmailMarkup(inlineEmailStyles(html), remoteImages, blockTracking, { contentIds, trackingImages })
+    const documentHtml = sanitizeEmailMarkup(html, remoteImages, blockTracking, { document: true, trackingImages, contentIds })
+    let hasContent = false
+    new Parser({
+      ontext(text) {
+        if (text.replace(/[\s\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '')) hasContent = true
+      },
+      onopentag(name, attributes) {
+        if (name === 'img' && attributes['data-inbox-tracking'] !== 'true'
+          && (attributes.src || attributes['data-openmail-src'] || attributes.alt?.trim())) hasContent = true
+      },
+    }).end(documentHtml)
+    if (hasContent) return {
+      bodyHtml,
+      bodyFormat: 'html',
+      bodyDocument: { html: documentHtml, styles: sanitizeEmailStyles(html) },
+    }
+  }
+
+  const text = typeof bodyText === 'string' ? bodyText : ''
+  return {
+    bodyHtml: sanitizeEmailHtml(`<pre>${text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')}</pre>`, remoteImages, blockTracking),
+    bodyFormat: 'text',
+  }
 }
 
 export const sanitizeHtmlContent = sanitizeEmailHtml

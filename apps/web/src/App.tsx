@@ -314,7 +314,8 @@ export default function App() {
   useEffect(() => {
     if (!inbox.policy) return;
     const sendDelay = inbox.policy.undoSendSeconds ? `${inbox.policy.undoSendSeconds} seconds` : "No delay";
-    setPreferences(previous => previous.sendDelay === sendDelay ? previous : { ...previous, sendDelay });
+    const showImages = inbox.policy.remoteImages;
+    setPreferences(previous => previous.sendDelay === sendDelay && previous.showImages === showImages ? previous : { ...previous, sendDelay, showImages });
   }, [inbox.policy]);
   useEffect(() => {
     if (!inbox.accounts.length || inbox.accounts.some(account => account.id === route.account)) return;
@@ -326,7 +327,7 @@ export default function App() {
   useEffect(() => {
     if (!currentMail || currentMail.operationId) return;
     void store.loadThread(currentMail.id).catch(() => {});
-  }, [store, currentMail?.id, currentMail?.messages.map(message => `${message.id}:${message.revision}`).join(",")]);
+  }, [store, currentMail?.id, currentMail?.messages.map(message => `${message.id}:${message.revision}`).join(","), inbox.policy?.remoteImages]);
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     document.documentElement.dataset.style =
@@ -468,12 +469,13 @@ export default function App() {
     closeNavigation();
   }
   function updatePreferences(patch: Partial<Preferences>) {
-    const { sendDelay, ...local } = patch;
+    const { sendDelay, showImages, ...local } = patch;
     setPreferences((p) => ({ ...p, ...local }));
     if (typeof sendDelay === "string") {
       const seconds = Number.parseInt(sendDelay, 10) || 0;
       void store.setPolicy({ undoSendSeconds: Math.min(120, seconds) }).catch(actionError);
     }
+    if (typeof showImages === "boolean") void store.setPolicy({ remoteImages: showImages }).catch(actionError);
     if (patch.splits && !patch.splits.includes(route.split))
       navigate({ split: patch.splits[0] || "Other" });
     if (typeof patch.profileName === "string")
@@ -1482,6 +1484,7 @@ export default function App() {
             }}
             onSearch={() => currentDraft && startSearch(currentDraft.id)}
             onToggleFocus={toggleComposeFocus}
+            onImageSettings={() => openSettings("Images")}
             onOpenProfile={() => {
               setProfile(true);
               setMobileSidebar(true);

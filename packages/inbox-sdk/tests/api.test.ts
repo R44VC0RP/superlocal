@@ -1323,6 +1323,84 @@ describe('blob privacy and draft editing', () => {
     expect((await h.inbox.message('alice', id)).isRead).toBe(false)
   })
 
+  test('isolated email documents preserve sender roots and responsive CSS without weakening image privacy', async () => {
+    const h = await fixture()
+    const { account, box } = await h.connect('alice', 'email-document', [native('styled', {
+      bodyHtml: `<html lang="ar" dir="rtl"><head><style>
+        body { color: #123456; font-family: "Helvetica Neue", sans-serif; }
+        .layout { width: 600px; }
+        @media (max-width: 640px) { .layout { width: 100%; } }
+        img.hidden-pixel { display: none; }
+        @import url("https://unsafe.example.test/style.css");
+      </style></head><body class="sender-document" style="padding:12px">
+        <table class="layout"><tr><td>Example content</td></tr></table>
+        <img class="hero" src="https://assets.example.test/hero.png" data-inbox-tracking="true" width="600" height="240">
+        <img class="hidden-pixel" src="https://assets.example.test/hidden.png">
+        <script>unsafe()</script>
+      </body></html>`,
+    })])
+    await h.sync('alice', account.id)
+    const id = (await h.page()).items[0]!.id
+    const mailbox = (await h.inbox.mailboxes('alice')).find(item => item.sourceId === account.id)!
+    const response = await h.request('alice', `/mailboxes/${mailbox.id}/messages/${id}`)
+    expect(response.status).toBe(200)
+    const blocked = await response.json() as Message
+    expect(blocked.bodyFormat).toBe('html')
+    expect(blocked.bodyDocument!.html).toContain('<html lang="ar" dir="rtl">')
+    expect(blocked.bodyDocument!.html).toContain('<body class="sender-document" style="padding:12px">')
+    expect(blocked.bodyDocument!.styles).toContain('@media (max-width: 640px)')
+    expect(blocked.bodyDocument!.styles).toContain('width: 100%')
+    expect(blocked.bodyHtml).toContain('width:600px')
+    expect(blocked.bodyDocument!.html).toContain('<table class="layout">')
+    expect(JSON.stringify(blocked.bodyDocument)).not.toContain('unsafe()')
+    expect(blocked.bodyDocument!.styles).not.toContain('@import')
+    const blockedImages = blocked.bodyDocument!.html.match(/<img\b[^>]*>/g)!
+    expect(blockedImages[0]).toContain('data-openmail-src="https://assets.example.test/hero.png"')
+    expect(blockedImages[0]).not.toContain('data-inbox-tracking')
+    expect(blockedImages[1]).toContain('data-inbox-tracking="true"')
+    expect(blockedImages[1]).not.toMatch(/\ssrc=/)
+    expect(blockedImages[1]).not.toContain('data-openmail-src')
+    await h.inbox.setPolicy('alice', { remoteImages: true })
+    const allowed = await (await h.request('alice', `/mailboxes/${mailbox.id}/messages/${id}`)).json() as Message
+    const allowedImages = allowed.bodyDocument!.html.match(/<img\b[^>]*>/g)!
+    expect(allowedImages[0]).toContain('src="https://assets.example.test/hero.png"')
+    expect(allowedImages[1]).toContain('data-inbox-tracking="true"')
+    expect(allowedImages[1]).not.toMatch(/\ssrc=/)
+    expect(box.calls.mutate).toEqual([])
+    expect(allowed.isRead).toBe(false)
+    await invalid(await h.request('bob', `/mailboxes/${mailbox.id}/messages/${id}`), 404)
+  })
+
+  test('plain email reads preserve exact text and use it when HTML is empty or noncontent', async () => {
+    const h = await fixture()
+    const bodyText = '\n  Literal <tags> & symbols\r\n\tquoted > reply\nhttps://example.test/path(test).\ntrailing  \n'
+    const variants = ['', '  \n ', '<html><head><script>unsafe()</script></head><body><div> </div></body></html>', '<img src="https://tracker.example.test/pixel" width="1" height="1" alt="Tracking pixel">']
+    const { account, box } = await h.connect('alice', 'plain-email', [
+      ...variants.map((bodyHtml, index) => native(`plain-${index}`, { bodyHtml, bodyText })),
+      native('image-only', { bodyHtml: '<img src="https://assets.example.test/photo.png" alt="Example photo">', bodyText: 'Image alternative' }),
+    ])
+    await h.sync('alice', account.id)
+    const rows = (await h.page()).items
+    for (const row of rows) {
+      const response = await h.request('alice', `/messages/${row.id}`)
+      expect(response.status).toBe(200)
+      const message = await response.json() as Message
+      if (row.subject === 'Subject image-only') {
+        expect(message.bodyFormat).toBe('html')
+        expect(message.bodyDocument!.html).toContain('alt="Example photo"')
+      } else {
+        expect(message.bodyText).toBe(bodyText)
+        expect(message.bodyFormat).toBe('text')
+        expect(message.bodyDocument).toBeUndefined()
+        expect(message.bodyHtml).toContain('&lt;tags&gt; &amp; symbols')
+        expect(message.bodyHtml).not.toContain('<script')
+      }
+      expect(message.isRead).toBe(false)
+    }
+    expect(rows).toHaveLength(5)
+    expect(box.calls.mutate).toEqual([])
+  })
+
   test('incomplete autosaves preserve exact text and editor HTML, with multiple independent drafts per source thread', async () => {
     const h = await fixture()
     const { account, box } = await h.seed('alice', 'autosave')

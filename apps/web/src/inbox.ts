@@ -97,6 +97,7 @@ export class InboxStore {
   private boxes: Mailbox[] = [];
   private summaries = new Map<string, MailboxMessageSummary[]>();
   private details = new Map<string, SdkMessage>();
+  private bodyEpoch = 0;
   private blobInfo = new Map<string, BlobInfo>();
   private folders = new Map<string, Folder[]>();
   private labels: Label[] = [];
@@ -332,6 +333,10 @@ export class InboxStore {
           if (raw.revision === recovered.revision && completeRecipients(recovered.draft)) this.saveTimers.set(raw.id, setTimeout(() => void this.flushDraft(raw.id).catch(() => {}), 450));
         }
       }
+      if (this.state.policy && this.state.policy.remoteImages !== policy.remoteImages) {
+        this.bodyEpoch++;
+        this.details.clear();
+      }
       this.publish({ policy, host, loading: false, refreshing: false, error: null }); this.rebuild();
     })();
     this.refreshPromise = work.finally(() => { if (this.refreshPromise === finished) this.refreshPromise = undefined; });
@@ -404,6 +409,7 @@ export class InboxStore {
           return { id: row.id, revision: row.revision, from: row.from.name || row.from.email, email: row.from.email, to: addresses(row.to), cc: addresses(row.cc),
             bcc: detail ? addresses(detail.bcc) : undefined, date: displayTime(row.receivedAt).date, receivedAt: row.receivedAt,
             body: detail?.bodyHtml ?? "", loaded: !!detail, outgoing: row.folder === "sent", hasAttachments: row.hasAttachments,
+            bodyText: detail?.bodyText, bodyFormat: detail?.bodyFormat, bodyDocument: detail?.bodyDocument,
             ...(operation?.accountId === source.id ? { operationId: operation.id, sendStatus: operation.status } : {}),
             attachments: detail?.attachments.map(info => this.file(info)), };
         });
@@ -451,14 +457,18 @@ export class InboxStore {
     const mail = this.state.mail.find(mail => mail.id === id);
     if (!mail || mail.operationId) return Promise.resolve();
     const generation = this.generation;
+    const bodyEpoch = this.bodyEpoch;
     const work = (async () => {
       for (const message of mail.messages) if (!message.pending && this.details.get(message.id)?.revision !== message.revision) {
         const detail = await this.client.mailboxMessage(mail.mailboxId!, message.id, this.requestOptions());
-        if (generation !== this.generation) return;
+        if (generation !== this.generation || bodyEpoch !== this.bodyEpoch) return;
         this.details.set(message.id, detail);
       }
       this.rebuild();
-    })().catch(error => { this.fail(error, "read"); throw error; }).finally(() => this.loadingThreads.delete(id));
+    })().catch(error => { this.fail(error, "read"); throw error; }).finally(() => {
+      this.loadingThreads.delete(id);
+      if (generation === this.generation && bodyEpoch !== this.bodyEpoch) void this.loadThread(id).catch(() => {});
+    });
     this.loadingThreads.set(id, work); return work;
   };
 
@@ -677,7 +687,15 @@ export class InboxStore {
     }
     await this.refresh(true);
   };
-  setPolicy = async (policy: Partial<Policy>) => { const saved = await this.client.setPolicy(policy, this.requestOptions()); this.publish({ policy: saved }); };
+  setPolicy = async (policy: Partial<Policy>) => {
+    const saved = await this.client.setPolicy(policy, this.requestOptions());
+    if (this.state.policy?.remoteImages !== saved.remoteImages) {
+      this.bodyEpoch++;
+      this.details.clear();
+    }
+    this.publish({ policy: saved });
+    this.rebuild();
+  };
   sync = async (boxId: string) => this.act("sync", async () => {
     const { box } = this.account(boxId);
     await this.client.syncMailbox(box.id, { folder: "inbox" }, this.requestOptions());

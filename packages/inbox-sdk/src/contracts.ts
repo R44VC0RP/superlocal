@@ -188,6 +188,10 @@ export interface Message extends MessageSummary {
   bcc: Participant[]
   bodyText: string
   bodyHtml: string
+  /** Selected display representation, not the original MIME type. */
+  bodyFormat?: 'html' | 'text'
+  /** Parse html as an isolated document; retains html/body attributes and unscoped sanitized CSS. */
+  bodyDocument?: { html: string; styles: string }
   attachments: BlobInfo[]
   replyTo?: Participant[]
 }
