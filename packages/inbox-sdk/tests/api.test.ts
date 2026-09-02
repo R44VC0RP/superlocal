@@ -1371,6 +1371,47 @@ describe('blob privacy and draft editing', () => {
     await invalid(await h.request('bob', `/mailboxes/${mailbox.id}/messages/${id}`), 404)
   })
 
+  test('email backgrounds follow image policy while retaining safe layout and authenticated inline resources', async () => {
+    const h = await fixture()
+    const inline: Attachment = { id: 'background-part', filename: 'cover.png', contentType: 'image/png', size: 4, url: 'https://upstream.example.test/cover.png', inline: true, contentId: 'cover@example.test' }
+    const { account, box } = await h.connect('alice', 'email-backgrounds', [native('backgrounds', {
+      bodyHtml: `<html><head><style>
+        .hero { background: #123456 url("https://assets.example.test/hero.png") center / cover no-repeat; }
+        .pixel { background-image: url("https://tracker.example.test/pixel"); }
+      </style></head><body>
+        <table background="https://assets.example.test/table.png"><tr><td class="hero">Example content</td></tr></table>
+        <div style="background-image:url(cid:cover@example.test);background-size:contain;background-repeat:no-repeat">Inline cover</div>
+        <div style="background-image:url(javascript:unsafe())">Safe text</div>
+      </body></html>`,
+      attachments: [inline],
+    }), native('background-only', {
+      bodyHtml: '<html><head><style>@media (min-width: 300px) { .poster { height:180px; background-image:url("https://assets.example.test/poster.png"); } }</style></head><body><div class="poster"></div></body></html>',
+      bodyText: 'Picture alternative',
+    })])
+    await h.sync('alice', account.id)
+    const rows = (await h.page()).items
+    const id = rows.find(row => row.subject === 'Subject backgrounds')!.id
+    const blocked = await h.inbox.message('alice', id)
+    const blob = blocked.attachments[0]!
+    expect(blocked.bodyDocument!.styles).toContain('#123456')
+    expect(JSON.stringify(blocked.bodyDocument)).not.toContain('https://assets.example.test')
+    expect(JSON.stringify(blocked.bodyDocument)).not.toContain('javascript:')
+    expect(blocked.bodyDocument!.html).toContain(`/v1/blobs/${blob.id}`)
+    await h.inbox.setPolicy('alice', { remoteImages: true })
+    const message = await (await h.request('alice', `/messages/${id}`)).json() as Message
+    expect(message.bodyDocument!.styles).toContain('https://assets.example.test/hero.png')
+    expect(message.bodyDocument!.styles).toContain('cover')
+    expect(message.bodyDocument!.html).toContain('https://assets.example.test/table.png')
+    expect(message.bodyDocument!.html).toContain(`/v1/blobs/${blob.id}`)
+    expect(JSON.stringify(message.bodyDocument)).not.toContain('tracker.example.test')
+    expect(JSON.stringify(message.bodyDocument)).not.toContain('javascript:')
+    expect(box.calls.mutate).toEqual([])
+    expect(message.isRead).toBe(false)
+    const poster = await h.inbox.message('alice', rows.find(row => row.subject === 'Subject background-only')!.id)
+    expect(poster.bodyFormat).toBe('html')
+    expect(poster.bodyDocument!.styles).toContain('https://assets.example.test/poster.png')
+  })
+
   test('plain email reads preserve exact text and use it when HTML is empty or noncontent', async () => {
     const h = await fixture()
     const bodyText = '\n  Literal <tags> & symbols\r\n\tquoted > reply\nhttps://example.test/path(test).\ntrailing  \n'

@@ -1,7 +1,9 @@
+import { isIP } from 'node:net'
 import { Parser } from 'htmlparser2'
 import juice from 'juice'
-import postcss, { type AtRule, type Root } from 'postcss'
+import postcss, { type AtRule, type ChildNode, type Root } from 'postcss'
 import selectorParser from 'postcss-selector-parser'
+import valueParser from 'postcss-value-parser'
 import sanitizeHtml from 'sanitize-html'
 import { isTrackingImage } from '../src/email-images.ts'
 
@@ -99,6 +101,163 @@ const SAFE_EMAIL_STYLES: Record<string, RegExp[]> = {
   'border-spacing': [cssList(CSS_LENGTH, 2)],
   'vertical-align': [cssPattern(`(?:baseline|sub|super|text-top|text-bottom|middle|top|bottom|${CSS_LENGTH})`)],
   'object-fit': [/^(?:fill|contain|cover|none|scale-down)$/i],
+}
+
+const SAFE_EMAIL_TAGS = [
+  ...sanitizeHtml.defaults.allowedTags,
+  'img', 'figure', 'figcaption', 'font', 'picture', 's', 'source', 'strike',
+]
+const BACKGROUND_PROPERTIES = new Set([
+  'background', 'background-image', 'background-size', 'background-repeat',
+  'background-position', 'background-position-x', 'background-position-y',
+])
+const HTML_BACKGROUND_TAGS = new Set(['body', 'table', 'td', 'th'])
+const BACKGROUND_POSITION = cssPattern(`(?:left|right|top|bottom|center|${CSS_SIGNED_LENGTH})`)
+const BACKGROUND_SIZE = cssPattern(`(?:auto|cover|contain|${CSS_LENGTH})`)
+const BACKGROUND_REPEAT = /^(?:repeat|repeat-x|repeat-y|no-repeat|space|round)$/i
+type ImageSignals = Omit<Parameters<typeof isTrackingImage>[0], 'src'>
+type EmailStyleContext = {
+  remoteImages?: boolean
+  contentIds?: ReadonlyMap<string, string>
+  trackingBackgrounds?: ReadonlySet<string>
+  onTrackingBackground?: (source: string) => void
+  onBackgroundContent?: () => void
+}
+
+function emailStyleSignals(nodes: readonly ChildNode[], attributes: Record<string, string> = {}): ImageSignals {
+  const style: Record<string, string> = {}
+  const important = new Set<string>()
+  for (const node of nodes) {
+    if (node.type !== 'decl') continue
+    const property = node.prop.toLowerCase()
+    if (!['width', 'height', 'display', 'visibility', 'opacity'].includes(property) || (important.has(property) && !node.important)) continue
+    style[property] = node.value.trim().toLowerCase()
+    if (node.important) important.add(property)
+  }
+  return { width: attributes.width, height: attributes.height, style }
+}
+
+function resolveBackgroundImage(source: string, contentIds?: ReadonlyMap<string, string>): string {
+  if (source.length > 1_024 || /[\\\u0000-\u001f\u007f<>]/.test(source)) return ''
+  source = source.trim()
+  const cid = source.match(/^cid:(.+)$/i)?.[1]
+  if (cid) {
+    let decoded = cid
+    try { decoded = decodeURIComponent(cid) } catch { /* Match malformed escapes literally. */ }
+    const target = contentIds?.get(cid) ?? contentIds?.get(decoded)
+    return target && /^\/v1\/blobs\/[a-z\d_-]+$/i.test(target) ? target : ''
+  }
+  if (SAFE_DATA_IMAGE.test(source)) return source.replace(/\s/g, '')
+  if (!/^https?:\/\//i.test(source)) return ''
+  try {
+    const url = new URL(source)
+    const host = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '')
+    // Only DNS-host HTTP(S) URLs: no credentials, IP literals, or local-only host names.
+    if (url.username || url.password || isIP(host) || !host.includes('.') || /\.(?:localhost|local|internal)$/i.test(host)) return ''
+    return url.href
+  } catch { return '' }
+}
+
+function filterBackgroundImage(source: string, context: EmailStyleContext, signals: ImageSignals): string {
+  if (!source) return ''
+  let trackingSource = source
+  try { trackingSource = decodeURIComponent(source) } catch { /* Malformed escapes cannot hide the original URL. */ }
+  if (isTrackingImage({ src: trackingSource, ...signals }) || context.trackingBackgrounds?.has(source)) {
+    context.onTrackingBackground?.(source)
+    return ''
+  }
+  context.onBackgroundContent?.()
+  return !/^https?:/i.test(source) || context.remoteImages === true ? source : ''
+}
+
+function sanitizeBackgroundValue(property: string, value: string, context: EmailStyleContext, signals: ImageSignals): string {
+  if (!value || value.length > 1_024) return ''
+  const parsed = valueParser(value)
+  let invalid = false
+  let count = 0
+  parsed.walk(node => {
+    if (++count > 128 || node.type === 'comment' || ('unclosed' in node && node.unclosed)) invalid = true
+  })
+  if (invalid) return ''
+  const nodes = parsed.nodes.filter(node => node.type !== 'space')
+  if (nodes.length === 1 && nodes[0]?.type === 'word' && /^(?:inherit|initial|unset|revert)$/i.test(nodes[0].value)) return nodes[0].value
+  const layers: valueParser.Node[][] = [[]]
+  for (const node of nodes) {
+    if (node.type === 'div' && node.value === ',') layers.push([])
+    else layers.at(-1)!.push(node)
+  }
+  if (layers.length > 8 || layers.some(layer => !layer.length)) return ''
+  const output: string[][] = []
+  const images: Array<{ source: string; layer: string[]; index: number }> = []
+  for (const layer of layers) {
+    const tokens: string[] = []
+    let imageCount = 0
+    let slash = false
+    for (const node of layer) {
+      if (node.type === 'function' && node.value.toLowerCase() === 'url' && ['background', 'background-image'].includes(property)) {
+        if (++imageCount > 1) return ''
+        // Reparse uppercase URL() through the parser's URL-token grammar too.
+        const normalized = valueParser(`url(${valueParser.stringify(node.nodes)})`).nodes
+        const urlNode = normalized.length === 1 && normalized[0]?.type === 'function' ? normalized[0] : undefined
+        const argument = urlNode?.nodes.length === 1 ? urlNode.nodes[0] : undefined
+        const source = urlNode && !urlNode.unclosed && argument && (argument.type === 'string' || argument.type === 'word')
+          && !('unclosed' in argument && argument.unclosed)
+          && (argument.type === 'string' || !/[\s()"']/.test(argument.value))
+          ? resolveBackgroundImage(argument.value, context.contentIds) : ''
+        images.push({ source, layer: tokens, index: tokens.length })
+        tokens.push('none')
+      } else if (node.type === 'div' && node.value === '/' && property === 'background' && !slash && tokens.length && node !== layer.at(-1)) {
+        slash = true
+        tokens.push('/')
+      } else {
+        const token = valueParser.stringify(node)
+        const word = node.type === 'word'
+        const permitted = property === 'background-image' ? word && /^none$/i.test(token)
+          : property === 'background-size' ? word && BACKGROUND_SIZE.test(token)
+          : property === 'background-repeat' ? word && BACKGROUND_REPEAT.test(token)
+          : property.startsWith('background-position') ? word && BACKGROUND_POSITION.test(token)
+          : property === 'background' && (
+            (word && (BACKGROUND_POSITION.test(token) || BACKGROUND_SIZE.test(token) || BACKGROUND_REPEAT.test(token)
+              || /^(?:none|scroll|fixed|local|border-box|padding-box|content-box)$/i.test(token)))
+            || ((word || node.type === 'function') && color.test(token))
+          )
+        if (!permitted) return ''
+        tokens.push(token)
+      }
+    }
+    if ((property === 'background-image' && tokens.length !== 1)
+      || (property === 'background-size' && (tokens.length > 2 || (tokens.length > 1 && tokens.some(token => /^(?:cover|contain)$/i.test(token)))))
+      || (property === 'background-repeat' && (tokens.length > 2 || (tokens.length > 1 && tokens.some(token => /^repeat-[xy]$/i.test(token)))))
+      || (property.startsWith('background-position') && tokens.length > (property === 'background-position' ? 4 : 2))) return ''
+    output.push(tokens)
+  }
+  for (const image of images) {
+    const source = filterBackgroundImage(image.source, context, signals)
+    if (source) image.layer[image.index] = `url("${source}")`
+  }
+  return output.map(layer => layer.join(' ')).join(', ')
+}
+
+function sanitizeEmailStyleValue(property: string, value: string, context: EmailStyleContext, signals: ImageSignals): string {
+  if (BACKGROUND_PROPERTIES.has(property)) return sanitizeBackgroundValue(property, value, context, signals)
+  return Object.hasOwn(SAFE_EMAIL_STYLES, property) && SAFE_EMAIL_STYLES[property]!.some(pattern => pattern.test(value)) ? value : ''
+}
+
+function sanitizeInlineEmailStyles(value: string, context: EmailStyleContext, attributes: Record<string, string>): string {
+  try {
+    const root = postcss.parse(`email{${value}}`)
+    const rule = root.nodes[0]
+    if (root.nodes.length !== 1 || rule?.type !== 'rule' || rule.selector !== 'email') return ''
+    const signals = emailStyleSignals(rule.nodes, attributes)
+    const declarations: string[] = []
+    for (const node of rule.nodes) {
+      if (node.type !== 'decl' || !/^[a-z][a-z-]*$/i.test(node.prop)) continue
+      const property = node.prop.toLowerCase()
+      const clean = sanitizeEmailStyleValue(property, node.value.trim(), context, signals)
+      if (clean) declarations.push(postcss.decl({ prop: property, value: clean, important: node.important }).toString())
+    }
+    return declarations.join(';')
+  } catch { return '' }
 }
 
 function sanitizeEmailMediaQuery(query: string): string {
@@ -225,7 +384,10 @@ function sanitizeEmailSelector(value: string): string {
   return safe.toString()
 }
 
-export function sanitizeEmailStyles(html: string): string {
+export function sanitizeEmailStyles(
+  html: string,
+  context: Pick<EmailStyleContext, 'remoteImages' | 'contentIds' | 'trackingBackgrounds'> = {},
+): string {
   if (typeof html !== 'string' || !/<style(?:\s|>)/i.test(html)) return ''
 
   const stylesheets: Array<{ css: string; media: string }> = []
@@ -278,6 +440,11 @@ export function sanitizeEmailStyles(html: string): string {
 
   if (exceeded || stylesheets.length === 0 || stylesheets.length > 64) return ''
 
+  if (context.remoteImages && !context.trackingBackgrounds) {
+    const trackingBackgrounds = new Set<string>()
+    sanitizeEmailMarkup(inlineEmailStyles(html), false, true, { contentIds: context.contentIds, trackingBackgrounds })
+    context = { ...context, trackingBackgrounds }
+  }
   const output = postcss.root()
   let ruleCount = 0
 
@@ -293,22 +460,15 @@ export function sanitizeEmailStyles(html: string): string {
         if (!selector) continue
 
         const rule = postcss.rule({ selector })
+        const signals = emailStyleSignals(node.nodes ?? [])
 
         for (const declaration of node.nodes ?? []) {
           if (declaration.type !== 'decl' || !/^[a-z][a-z-]*$/i.test(declaration.prop)) continue
 
           const property = declaration.prop.toLowerCase()
-          const patterns = SAFE_EMAIL_STYLES[property]
-          const value = declaration.value.trim()
-
-          if (
-            !patterns ||
-            !value ||
-            value.length > 1_024 ||
-            value.includes('<') ||
-            value.includes('\\') ||
-            !patterns.some((pattern) => pattern.test(value))
-          ) continue
+          if (declaration.value.length > 1_024) continue
+          const value = sanitizeEmailStyleValue(property, declaration.value.trim(), context, signals)
+          if (!value) continue
 
           rule.append(postcss.decl({
             prop: property,
@@ -398,8 +558,11 @@ function sanitizeEmailMarkup(
     document?: boolean
     trackingImages?: Set<string>
     contentIds?: ReadonlyMap<string, string>
+    trackingBackgrounds?: Set<string>
+    backgroundContent?: { value: boolean }
   } = {},
 ): string {
+  const bodyWrappers = new WeakSet<Record<string, string>>()
   function resolveCid(value: string): string {
     const cid = value.trim().match(/^cid:(.+)$/i)?.[1]
     if (!cid || !options.contentIds) return value
@@ -409,44 +572,64 @@ function sanitizeEmailMarkup(
   }
 
   return sanitizeHtml(html, {
-    allowedTags: [
-      ...sanitizeHtml.defaults.allowedTags,
-      ...(options.document ? ['html', 'body'] : []),
-      'img',
-      'figure',
-      'figcaption',
-      'font',
-      'picture',
-      's',
-      'source',
-      'strike',
-    ],
+    allowedTags: [...SAFE_EMAIL_TAGS, ...(options.document ? ['html', 'body'] : [])],
     allowedAttributes: {
       '*': ['class', 'dir', 'lang', 'title', 'aria-label', 'align', 'bgcolor', 'valign', 'role', 'style'],
       a: ['href', 'name', 'target', 'rel'],
       img: ['src', 'data-openmail-src', 'alt', 'width', 'height', 'loading', 'title', ...(options.document ? ['data-inbox-tracking'] : [])],
-      table: ['width', 'height', 'cellpadding', 'cellspacing', 'border'],
-      td: ['width', 'height', 'colspan', 'rowspan', 'align', 'valign'],
-      th: ['width', 'height', 'colspan', 'rowspan', 'align', 'valign'],
+      table: ['width', 'height', 'cellpadding', 'cellspacing', 'border', 'background'],
+      td: ['width', 'height', 'colspan', 'rowspan', 'align', 'valign', 'background'],
+      th: ['width', 'height', 'colspan', 'rowspan', 'align', 'valign', 'background'],
       font: ['color', 'face', 'size'],
       ol: ['start', 'type'],
       li: ['value'],
       source: ['media', 'type'],
-      ...(options.document ? { body: ['text'] } : {}),
+      ...(options.document ? { body: ['text', 'background'] } : {}),
     },
-    allowedStyles: { '*': SAFE_EMAIL_STYLES },
     allowedSchemes: ['http', 'https', 'mailto', 'tel', 'cid'],
-    allowedSchemesByTag: { img: ['http', 'https', 'cid', 'data'] },
+    allowedSchemesByTag: {
+      img: ['http', 'https', 'cid', 'data'],
+      body: ['http', 'https', 'data'], table: ['http', 'https', 'data'],
+      td: ['http', 'https', 'data'], th: ['http', 'https', 'data'],
+    },
     allowProtocolRelative: false,
     disallowedTagsMode: 'discard',
     nonTextTags: ['script', 'style', 'textarea', 'option', 'xmp', 'head'],
     transformTags: {
+      '*': (tagName, attributes) => {
+        const context: EmailStyleContext = {
+          remoteImages, contentIds: options.contentIds, trackingBackgrounds: options.trackingBackgrounds,
+          onTrackingBackground: !options.document ? source => options.trackingBackgrounds?.add(source) : undefined,
+          onBackgroundContent: (SAFE_EMAIL_TAGS.includes(tagName) || tagName === 'html' || tagName === 'body')
+            && options.backgroundContent ? () => { options.backgroundContent!.value = true } : undefined,
+        }
+        const sanitized = { ...attributes }
+        // Every emitted style uses the shared whitelist; URL values get AST/URI validation.
+        if (attributes.style) sanitized.style = sanitizeInlineEmailStyles(attributes.style, context, attributes)
+        if (attributes.background) {
+          delete sanitized.background
+          if (HTML_BACKGROUND_TAGS.has(tagName) || bodyWrappers.has(attributes)) {
+            let signals: ImageSignals = { width: attributes.width, height: attributes.height }
+            try {
+              const rule = postcss.parse(`email{${attributes.style ?? ''}}`).nodes[0]
+              if (rule?.type === 'rule') signals = emailStyleSignals(rule.nodes, attributes)
+            } catch { /* Invalid CSS cannot supply a background tracking signal. */ }
+            const source = filterBackgroundImage(resolveBackgroundImage(attributes.background, options.contentIds), context, signals)
+            if (source) {
+              // Native body hints need CSS in a legacy div; existing author styles still win.
+              if (bodyWrappers.has(attributes)) sanitized.style = `background-image:url("${source}");${sanitized.style ?? ''}`
+              else sanitized.background = source
+            }
+          }
+        }
+        return { tagName, attribs: sanitized }
+      },
       body: (_tagName, attributes) => {
         // Real roots retain presentational hints without promoting them to inline CSS.
         if (options.document) return { tagName: 'body', attribs: attributes }
         const hasColorStyle = /(?:^|;)\s*(?:background(?:-color)?|color)\s*:/i
           .test(attributes.style ?? '')
-        if (!hasColorStyle && !attributes.bgcolor && !attributes.text) {
+        if (!hasColorStyle && !attributes.bgcolor && !attributes.text && !attributes.background) {
           return { tagName: 'body', attribs: attributes }
         }
 
@@ -456,14 +639,13 @@ function sanitizeEmailMarkup(
           attributes.style,
         ].filter(Boolean).join(';')
 
-        return {
-          tagName: 'div',
-          attribs: {
-            ...attributes,
-            class: [attributes.class, 'openmail-email-document'].filter(Boolean).join(' '),
-            style,
-          },
+        const attribs = {
+          ...attributes,
+          class: [attributes.class, 'openmail-email-document'].filter(Boolean).join(' '),
+          style,
         }
+        bodyWrappers.add(attribs)
+        return { tagName: 'div', attribs }
       },
       div: (_tagName, attributes) => ({
         tagName: 'div',
@@ -553,9 +735,12 @@ export function sanitizeEmailBody(
     ]))
     // Collect actual inlined tracking signals, independently of the remote-image policy.
     const trackingImages = new Set<string>()
-    const bodyHtml = sanitizeEmailMarkup(inlineEmailStyles(html), remoteImages, blockTracking, { contentIds, trackingImages })
-    const documentHtml = sanitizeEmailMarkup(html, remoteImages, blockTracking, { document: true, trackingImages, contentIds })
-    let hasContent = false
+    const trackingBackgrounds = new Set<string>()
+    const backgroundContent = { value: false }
+    const bodyHtml = sanitizeEmailMarkup(inlineEmailStyles(html), remoteImages, blockTracking, { contentIds, trackingImages, trackingBackgrounds, backgroundContent })
+    const documentHtml = sanitizeEmailMarkup(html, remoteImages, blockTracking, { document: true, trackingImages, contentIds, trackingBackgrounds, backgroundContent })
+    const styles = sanitizeEmailStyles(html, { remoteImages, contentIds, trackingBackgrounds })
+    let hasContent = backgroundContent.value || /\burl\(/i.test(styles)
     new Parser({
       ontext(text) {
         if (text.replace(/[\s\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '')) hasContent = true
@@ -568,7 +753,7 @@ export function sanitizeEmailBody(
     if (hasContent) return {
       bodyHtml,
       bodyFormat: 'html',
-      bodyDocument: { html: documentHtml, styles: sanitizeEmailStyles(html) },
+      bodyDocument: { html: documentHtml, styles },
     }
   }
 
