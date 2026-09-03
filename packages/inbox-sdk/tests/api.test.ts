@@ -21,6 +21,11 @@ import { createSplitPreferencesStore } from '../../../apps/local-host/src/split-
 import { classifyAttention } from '../../../apps/shared/mail-attention'
 import { normalizeSplits } from '../../../apps/shared/splits'
 import { mailFacts } from '../src/mail-facts'
+import { createDataset, inventory, openMailSource } from '../../../apps/local-host/src/classification/store'
+import { labelRun, trainExport } from '../../../apps/local-host/src/classification/cli'
+import { classifyEmail, InferenceError } from '../../../apps/local-host/src/classification/inference'
+import { validateClassification, type Classification, type ClassificationInput } from '../../../apps/local-host/src/classification/schema'
+import { trainClassifier, predictClassifier, evaluateClassifier, type TrainingExample } from '../../../apps/local-host/src/classification/model'
 import { createMockHost } from '../../../apps/mock-api/src/host'
 import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
@@ -53,6 +58,157 @@ const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => {
   const tasks = cleanup.splice(0).reverse()
   for (const task of tasks) await task()
+})
+
+describe('offline classification dataset', () => {
+  test('the local baseline learns content and requested actions, survives reload, and reports held-out support', () => {
+    const examples: TrainingExample[] = Array.from({ length: 120 }, (_, index) => {
+      const conversation = index % 2 === 0
+      const subject = conversation ? 'Please reply with your approval' : 'Weekly science newsletter digest'
+      const input: ClassificationInput = { subject, from: `sender${index}@example.test`, to: ['reader@example.test'], cc: [], receivedAt: '2026-09-01T12:00:00Z', bodyText: conversation ? 'Please reply to confirm approval of the document. Your answer is needed.' : 'Read this weekly newsletter digest of science stories and discoveries. Unsubscribe here.', bodyTruncated: false, facts: conversation ? { reply: true } : { listId: true, listUnsubscribe: true } }
+      const classification: Classification = { primaryType: conversation ? 'conversation' : 'newsletter', secondaryTypes: [], actions: conversation ? ['reply'] : [], timeSensitivity: 'none', deadline: null, risk: 'none_observed', riskReasons: [], certainty: 'clear', evidence: [{ dimension: 'primaryType', label: conversation ? 'conversation' : 'newsletter', field: 'subject', quote: subject }, ...(conversation ? [{ dimension: 'actions' as const, label: 'reply', field: 'bodyText' as const, quote: 'Please reply' }] : [])] }
+      return { exampleId: `fictional-${index}`, splitGroup: `group-${index}`, input, classification, labelSource: 'llm' }
+    })
+    const model = trainClassifier(examples.slice(0, 80), examples.slice(80, 100), { epochs: 25, dimensions: 4096, seed: 7 })
+    const restored = JSON.parse(JSON.stringify(model))
+    for (const index of [100, 101]) {
+      const input = examples[index]!.input, prediction = predictClassifier(model, input)
+      expect(prediction.primaryType).toBe(examples[index]!.classification.primaryType)
+      expect(prediction.actions.includes('reply')).toBe(index % 2 === 0)
+      expect(predictClassifier(restored, input)).toEqual(prediction)
+      expect(predictClassifier(model, { ...input, from: 'unknown-new-sender@different.test', to: ['another-reader@elsewhere.test'], receivedAt: '2020-01-01T00:00:00Z' })).toEqual(prediction)
+    }
+    const evaluation = evaluateClassifier(model, examples.slice(100))
+    expect(evaluation).toBeDefined()
+    expect(evaluation.types.rawAccuracy).toBe(1)
+    expect(evaluation.types.coverage).toBe(1)
+    expect(evaluation.actions.microF1).toBe(1)
+    const falseAlarm = evaluateClassifier(model, [{ ...examples[100]!, classification: { ...examples[100]!.classification, actions: [] } }])
+    expect(falseAlarm.actions.microPrecision).toBe(0)
+    const negativeValidation = Array.from({ length: 24 }, (_, index) => ({ ...examples[100]!, exampleId: `negative-${index}`, splitGroup: `negative-${index}`, classification: { ...examples[100]!.classification, actions: [] } }))
+    const guarded = trainClassifier(examples.slice(0, 80), negativeValidation, { epochs: 25, dimensions: 4096, seed: 7 })
+    expect(predictClassifier(guarded, examples[100]!.input).actions).toEqual([])
+    expect(JSON.stringify(evaluation)).not.toContain('sender100@example.test')
+    expect(() => predictClassifier({ ...restored, version: 999 }, examples[100]!.input)).toThrow()
+  })
+
+  test('snapshots canonical mail read-only, resumes without relabeling, preserves reviews and exports private grouped training data', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'classification-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const sourcePath = join(root, 'source.sqlite'), datasetPath = join(root, 'dataset', 'labels.sqlite')
+    const writer = new Database(sourcePath)
+    cleanup.push(async () => writer.close())
+    writer.exec(`CREATE TABLE sdk_meta(key TEXT,value TEXT); INSERT INTO sdk_meta VALUES ('epoch','fictional-source');
+      CREATE TABLE sdk_accounts(id TEXT,generation INTEGER,status TEXT); INSERT INTO sdk_accounts VALUES ('source',1,'connected');
+      CREATE TABLE sdk_messages(id TEXT,owner TEXT,account TEXT,generation INTEGER,native_id TEXT,thread_id TEXT,visible TEXT,body TEXT,folder TEXT,deleted INTEGER);`)
+    for (let index = 0; index < 8; index++) {
+      writer.query('INSERT INTO sdk_messages VALUES (?,?,?,?,?,?,?,?,?,?)').run(`m${index}`, 'owner', 'source', 1, `native${index}`, index < 2 ? 'same-thread' : `t${index}`,
+        JSON.stringify({ from: { name: 'Fictional Digest', email: index < 3 ? 'digest@example.test' : `digest${index}@example.test` }, to: [{ email: 'reader@example.test' }], cc: [], subject: 'Weekly newsletter', receivedAt: '2026-09-01T12:00:00Z', isRead: true, isStarred: true, facts: { listId: true, nativeImportant: true, nativeCategories: ['promotions'] } }),
+        JSON.stringify({ bodyText: index === 3 ? 'Weekly newsletter ' + 'x'.repeat(70_000) : index === 4 ? '' : `Weekly newsletter issue ${index}`, bodyHtml: index === 4 ? '<p>Weekly newsletter in HTML only</p>' : '', attachments: [] }), index === 6 ? 'sent' : index === 7 ? 'drafts' : 'inbox', 0)
+    }
+    const source = openMailSource(sourcePath)
+    cleanup.push(async () => source.close())
+    expect(inventory(source).messages).toBe(6)
+    expect(() => source.exec('DELETE FROM sdk_messages')).toThrow()
+    expect(() => createDataset(sourcePath)).toThrow('CLASSIFICATION_DATABASE_REQUIRED')
+    expect(writer.query("SELECT name FROM sqlite_master WHERE name='classification_meta'").get()).toBeNull()
+    let dataset = createDataset(datasetPath)
+    cleanup.push(async () => dataset.close())
+    expect(dataset.prepare(source, { run: 'pilot', model: 'gpt-5.6-sol', seed: 'repeatable', limit: 'all' })).toMatchObject({ selected: 6, truncated: 1, empty: 0 })
+    expect(() => dataset.prepare(source, { run: 'pilot', model: 'gpt-5.6-sol', seed: 'repeatable', limit: 1 })).toThrow('RUN_ALREADY_EXISTS')
+    const controller = new AbortController(), seen: ClassificationInput[] = []
+    const classifier: typeof classifyEmail = async input => {
+      seen.push(input)
+      expect(input.facts).toEqual({ listId: true })
+      expect(Object.keys(input)).not.toContain('isStarred')
+      expect(input.bodyText).not.toContain('CHANGED AFTER SNAPSHOT')
+      const classification: Classification = { primaryType: 'newsletter', secondaryTypes: [], actions: [], timeSensitivity: 'none', deadline: null, risk: 'none_observed', riskReasons: [], certainty: 'clear', evidence: [{ dimension: 'primaryType', label: 'newsletter', field: 'subject', quote: 'Weekly newsletter' }] }
+      return { classification: validateClassification(classification, input), responseId: 'fictional-response', model: 'gpt-5.6-sol', usage: { inputTokens: 10, outputTokens: 20 } }
+    }
+    await labelRun(dataset, { run: 'pilot', apiKey: 'fictional', concurrency: 1, signal: controller.signal, classify: classifier, progress: () => controller.abort() })
+    expect(dataset.status('pilot').counts).toEqual({ completed: 1, pending: 5 })
+    dataset.close(); dataset = createDataset(datasetPath)
+    writer.query('UPDATE sdk_messages SET body=? WHERE id=?').run(JSON.stringify({ bodyText: 'CHANGED AFTER SNAPSHOT', bodyHtml: '' }), 'm0')
+    await labelRun(dataset, { run: 'pilot', apiKey: 'fictional', concurrency: 2, classify: classifier })
+    expect(seen).toHaveLength(6)
+    await labelRun(dataset, { run: 'pilot', apiKey: 'fictional', concurrency: 1, classify: classifier })
+    expect(seen).toHaveLength(6)
+    expect(dataset.status('pilot')).toMatchObject({ counts: { completed: 6 }, usage: { inputTokens: 60, outputTokens: 120 }, reviewed: 0 })
+    const out = join(root, 'export'), exported = dataset.export('pilot', out)
+    expect(exported).toMatchObject({ exported: 5, skipped: 1, reviewExamples: 6 })
+    const reviewRows = (await readFile(join(out, 'review.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    expect(reviewRows.some(row => row.input.bodyText.includes('HTML only'))).toBe(true)
+    const groups = new Map<string, Set<string>>()
+    for (const split of ['train', 'validation', 'test']) {
+      const lines = (await readFile(join(out, `${split}.jsonl`), 'utf8')).trim().split('\n').filter(Boolean)
+      for (const line of lines) { const row = JSON.parse(line); const set = groups.get(row.splitGroup) ?? new Set(); set.add(split); groups.set(row.splitGroup, set); expect(row.messages).toHaveLength(3) }
+      expect((await stat(join(out, `${split}.jsonl`))).mode & 0o777).toBe(0o600)
+    }
+    expect([...groups.values()].every(group => group.size === 1)).toBe(true)
+    expect((await stat(out)).mode & 0o777).toBe(0o700)
+    expect((await stat(datasetPath)).mode & 0o777).toBe(0o600)
+    expect(() => dataset.export('pilot', out)).toThrow()
+    const first = reviewRows.find(row => !row.input.bodyTruncated)
+    expect(() => dataset.review('pilot', [{ exampleId: first.exampleId, classification: first.classification }, { exampleId: 'missing', classification: first.classification }])).toThrow('REVIEW_EXAMPLE_NOT_FOUND')
+    expect(dataset.status('pilot').reviewed).toBe(0)
+    dataset.review('pilot', [{ exampleId: first.exampleId, classification: first.classification }])
+    expect(dataset.export('pilot', join(root, 'gold'), true)).toMatchObject({ exported: 1, reviewedOnly: true })
+    expect(dataset.compare('pilot', 'pilot')).toMatchObject({ overlappingCompleted: 6, changes: {} })
+    expect(dataset.fork('pilot', 'second-model', 'gpt-5.6-terra')).toMatchObject({ selected: 6 })
+    await labelRun(dataset, { run: 'second-model', apiKey: 'expired', concurrency: 1, classify: async () => { throw new InferenceError('INFERENCE_HTTP_ERROR', false, 401) } })
+    expect(dataset.status('second-model').counts).toEqual({ pending: 6 })
+    await labelRun(dataset, { run: 'second-model', apiKey: 'fictional', concurrency: 2, classify: classifier })
+    expect(dataset.compare('pilot', 'second-model')).toMatchObject({ overlappingCompleted: 6, changes: {} })
+    writer.query("UPDATE sdk_messages SET visible=json_set(visible,'$.facts.listId',json('false')) WHERE id='m1'").run()
+    expect(dataset.prepare(source, { run: 'changed-inputs', model: 'gpt-5.6-sol', seed: 'repeatable', limit: 'all' })).toMatchObject({ selected: 6, reused: 4 })
+    const pending = dataset.claim('changed-inputs')!
+    dataset.fail('changed-inputs', pending, 'LABEL_FAILED', false)
+    expect(dataset.retryFailed('changed-inputs')).toBe(1)
+    expect(dataset.status('changed-inputs').counts).toEqual({ completed: 4, pending: 2 })
+    const inspect = new Database(datasetPath)
+    inspect.query("UPDATE runs SET fingerprint='changed' WHERE id='pilot'").run()
+    inspect.close()
+    expect(() => dataset.assertCurrent('pilot')).toThrow('RUN_VERSION_CHANGED')
+    expect(writer.query<{ count: number }, []>('SELECT count(*) count FROM sdk_messages').get()!.count).toBe(8)
+    const manifest = JSON.parse(await readFile(join(out, 'manifest.json'), 'utf8'))
+    await writeFile(join(out, 'manifest.json'), JSON.stringify({ ...manifest, config: { ...manifest.config, preprocessingVersion: 'obsolete' } }))
+    await expect(trainExport(out, join(root, 'bad-model'))).rejects.toThrow('DATASET_VERSION_MISMATCH')
+  })
+
+  test('Responses labeling uses the authorized endpoint and rejects fabricated evidence and incomplete/refused output', async () => {
+    const input: ClassificationInput = { subject: 'Weekly newsletter', from: 'digest@example.test', to: ['reader@example.test'], cc: [], receivedAt: '2026-09-01T12:00:00Z', bodyText: 'Our weekly digest. Unsubscribe here.', bodyTruncated: false, facts: { listId: true } }
+    const classification: Classification = { primaryType: 'newsletter', secondaryTypes: [], actions: [], timeSensitivity: 'none', deadline: null, risk: 'none_observed', riskReasons: [], certainty: 'clear', evidence: [{ dimension: 'primaryType', label: 'newsletter', field: 'bodyText', quote: 'Our weekly digest.' }] }
+    expect(validateClassification(classification, input)).toEqual(classification)
+    expect(() => validateClassification({ ...classification, evidence: [{ ...classification.evidence[0], quote: 'Fabricated source' }] }, input)).toThrow()
+    expect(() => validateClassification({ ...classification, actions: ['reply'] }, input)).toThrow()
+    expect(() => validateClassification({ ...classification, personalImportance: 95 }, input)).toThrow()
+    let calls = 0
+    const fetcher = (async (url: any, init: any) => {
+      calls++
+      expect(String(url)).toBe('https://opencode.ai/inference/openai/v1/responses')
+      const headers = new Headers(init.headers), body = JSON.parse(init.body)
+      expect(headers.get('Authorization')).toBe('Bearer fictional-token')
+      expect(headers.get('x-opencode-org-id')).toBe('fictional-org')
+      expect(body.store).toBe(false)
+      expect(body.text.format.strict).toBe(true)
+      expect(init.redirect).toBe('error')
+      return Response.json({ id: 'response-1', model: 'gpt-5.6-sol', status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(classification) }] }], usage: { input_tokens: 100, output_tokens: 30 } })
+    }) as typeof fetch
+    expect(await classifyEmail(input, { apiKey: 'fictional-token', orgId: 'fictional-org', fetcher })).toMatchObject({ classification, responseId: 'response-1', usage: { inputTokens: 100, outputTokens: 30 } })
+    await expect(classifyEmail(input, { apiKey: 'fictional-token', endpoint: 'https://unapproved.example.test', fetcher })).rejects.toThrow()
+    expect(calls).toBe(1)
+    for (const payload of [
+      { status: 'incomplete', output: [] },
+      { status: 'completed', output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'private refusal marker' }] }] },
+      { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ ...classification, evidence: [{ ...classification.evidence[0], quote: 'Fabricated source' }] }) }] }] },
+    ]) {
+      let failure: any
+      try { await classifyEmail(input, { apiKey: 'fictional-token', fetcher: (async () => Response.json(payload)) as unknown as typeof fetch }) } catch (error) { failure = error }
+      expect(failure).toBeInstanceOf(Error)
+      expect(failure.message).not.toContain('private refusal marker')
+      expect(failure.message).not.toContain('Fabricated source')
+    }
+  })
 })
 
 describe('local performance logging', () => {

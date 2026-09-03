@@ -4,6 +4,7 @@ dist/
 data/
 .env
 .env.*
+/non-gittract.env
 !.env.example
 *.sqlite
 *.sqlite-shm
