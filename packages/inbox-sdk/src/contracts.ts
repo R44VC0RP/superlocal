@@ -188,6 +188,24 @@ export interface MailboxQuery extends Omit<Query, 'accountId'> {
   snoozed?: boolean
 }
 
+export interface MailboxSnapshotInput { mailboxIds: string[]; cursor?: string; limit?: number }
+/** Stable ID inventory, live rows: finish paging, then catch up from the fixed state baseline. */
+export interface MailboxSnapshotPage {
+  items: MailboxMessageSummary[]
+  total: number
+  nextCursor: string | null
+  state: string
+  scopeState: string
+  expiresAt: string
+}
+export interface MailboxChangesInput { mailboxIds: string[]; since: string; scopeState: string; limit?: number }
+export interface MailboxChangesPage extends ChangePage {
+  upserts: MailboxMessageSummary[]
+  /** unselected removes only this scope's membership, not the canonical message. */
+  removed: Array<{ sourceId: string; messageId: string; reason: 'deleted' | 'unselected'; revision: number | null }>
+  resetReason?: 'history' | 'scope'
+}
+
 export interface BlobInfo {
   id: string
   accountId: string
@@ -242,6 +260,8 @@ export interface MessageSummary {
   hasAttachments: boolean
   snoozedUntil: string | null
   facts?: MailFacts
+  /** Opaque presentation/content identity. Legacy rows use a coarse revision fallback; older SDK responses may omit it. */
+  bodyRevision?: string
 }
 
 export interface Message extends MessageSummary {
@@ -410,6 +430,8 @@ export interface Inbox {
   createMailbox(owner: string, input: MailboxInput): Promise<Mailbox>
   updateMailbox(owner: string, id: string, input: { name?: string; status?: Mailbox['status']; defaultSender?: string | null }, revision: number): Promise<Mailbox>
   mailboxMessages(owner: string, query: MailboxQuery): Promise<Page<MailboxMessageSummary>>
+  mailboxSnapshot(owner: string, input: MailboxSnapshotInput): Promise<MailboxSnapshotPage>
+  mailboxChanges(owner: string, input: MailboxChangesInput): Promise<MailboxChangesPage>
   mailboxMessage(owner: string, mailboxId: string, messageId: string): Promise<Message & { sourceId: string; memberships: MailboxMembership[] }>
   setMailboxState(owner: string, mailboxId: string, messageId: string, input: { done?: boolean; snoozedUntil?: string | null }, revision: number): Promise<MailboxMembership>
   /** Atomic local-only state change with a durable idempotency receipt; no provider mutation. */
@@ -418,6 +440,8 @@ export interface Inbox {
   syncMailbox(owner: string, mailboxId: string, options?: SyncRequest): Promise<{ synchronized: number; hasMore: boolean; state: string }>
   sync(owner: string, id: string, options?: SyncRequest): Promise<{ synchronized: number; hasMore: boolean; state: string }>
   folders(owner: string, accountId: string): Promise<Folder[]>
+  /** Materialized folder metadata only; never initializes or calls a provider. */
+  cachedFolders(owner: string, accountId: string): Promise<Folder[]>
   createFolder(owner: string, accountId: string, name: string): Promise<Folder>
   messages(owner: string, query?: Query): Promise<Page<MessageSummary>>
   message(owner: string, id: string): Promise<Message>

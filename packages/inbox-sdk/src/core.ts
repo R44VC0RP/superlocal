@@ -13,7 +13,7 @@ import { CredentialError, InboxError, type Account, type BlobInfo, type ChangeEv
   type MessageSummary, type MutationInput, type Operation, type Participant, type Policy,
   type Problem, type Query, type SyncCheckpoint, type SyncRequest, type ThreadSummary, type Connection, type ConnectionIdentity,
   type Mailbox, type MailboxCandidate, type MailboxInput, type MailboxMembership, type MailboxMessageSummary,
-  type MailboxQuery, type MailboxSelector, type MailboxStateReceipt } from './contracts'
+  type MailboxQuery, type MailboxSelector, type MailboxStateReceipt, type MailboxChangesPage } from './contracts'
 
 type AccountRow = { id: string; owner: string; generation: number; status: Account['status']; data: string; native: string; credentials: string; connection_id: string; connection_generation: number; credential_version: number }
 type ConnectionRow = { id: string; owner: string; generation: number; status: Connection['status']; credential_version: number; data: string; credentials: string }
@@ -24,6 +24,7 @@ type BlobRow = { id: string; owner: string; account: string; generation: number;
 type DataRow = { id: string; owner: string; account: string; data: string }
 type OperationRow = { seq: number; id: string; owner: string; account: string; generation: number; status: Operation['status']; type: Operation['type']; data: string; payload: string; fingerprint: string; key: string; lease: string | null; lease_until: number; next_at: number }
 type MutationPayload = { input: MutationInput; before: Record<string, MessageSummary>; afterRevisions?: Record<string, number>; perMessageChanges?: Record<string, Changes> }
+type MailboxInventory = { owner: string; ids: string[]; scopeHash: string; binding: string; seq: number; expires: number; limit: number; bytes: number; completed: boolean }
 type SendPayload = { draft: Draft; holdUntil: number; nativeSource?: string; nativeThread?: string; inReplyTo?: string; references?: string[]; blobs: BlobInfo[] }
 
 class Environment extends Context.Tag('inbox/Environment')<Environment, { database: Database; now: () => number }>() {}
@@ -76,6 +77,7 @@ export function createInbox(options: InboxOptions): Inbox {
     CREATE TABLE IF NOT EXISTS sdk_messages (id TEXT PRIMARY KEY, owner TEXT NOT NULL, account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, thread_id TEXT NOT NULL, confirmed TEXT NOT NULL, visible TEXT NOT NULL, body TEXT NOT NULL, local_labels TEXT NOT NULL DEFAULT '[]', snoozed_until TEXT, revision INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0, last_mutation_seq INTEGER NOT NULL DEFAULT 0, received_at TEXT NOT NULL, folder TEXT NOT NULL, is_read INTEGER NOT NULL, is_starred INTEGER NOT NULL, subject TEXT NOT NULL, search_text TEXT NOT NULL, UNIQUE(account,generation,native_id), FOREIGN KEY(account,owner) REFERENCES sdk_accounts(id,owner));
     CREATE INDEX IF NOT EXISTS sdk_message_query ON sdk_messages(owner,deleted,received_at,id);
     CREATE INDEX IF NOT EXISTS sdk_message_account ON sdk_messages(owner,account,deleted,received_at,id);
+    CREATE INDEX IF NOT EXISTS sdk_message_inventory ON sdk_messages(owner,account,deleted,received_at DESC,id,generation);
     CREATE INDEX IF NOT EXISTS sdk_message_thread ON sdk_messages(owner,thread_id,deleted,received_at,id);
     CREATE TABLE IF NOT EXISTS sdk_thread_keys (account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(account,generation,native_id));
     CREATE TABLE IF NOT EXISTS sdk_native_keys (account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(account,generation,native_id));
@@ -100,6 +102,7 @@ export function createInbox(options: InboxOptions): Inbox {
     CREATE INDEX IF NOT EXISTS sdk_mailbox_owner ON sdk_mailboxes(owner,source);
     CREATE TABLE IF NOT EXISTS sdk_memberships (owner TEXT NOT NULL, source TEXT NOT NULL, mailbox TEXT NOT NULL, message TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(mailbox,message), FOREIGN KEY(mailbox,owner,source) REFERENCES sdk_mailboxes(id,owner,source), FOREIGN KEY(message,owner,source) REFERENCES sdk_messages(id,owner,account));
     CREATE INDEX IF NOT EXISTS sdk_membership_message ON sdk_memberships(owner,source,message);
+    CREATE INDEX IF NOT EXISTS sdk_membership_read ON sdk_memberships(owner,source,message,mailbox);
     CREATE TABLE IF NOT EXISTS sdk_delivery_evidence (owner TEXT NOT NULL, source TEXT NOT NULL, message TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(message,kind,value), FOREIGN KEY(message,owner,source) REFERENCES sdk_messages(id,owner,account));
     CREATE TABLE IF NOT EXISTS sdk_connection_refresh (connection TEXT PRIMARY KEY, owner TEXT NOT NULL, lease TEXT NOT NULL, until INTEGER NOT NULL, FOREIGN KEY(connection,owner) REFERENCES sdk_connections(id,owner));
   `)
@@ -141,6 +144,11 @@ export function createInbox(options: InboxOptions): Inbox {
   const credentialUpdates = new Set<Promise<CredentialState>>()
   const syncing = new Map<string, Promise<{ synchronized: number; hasMore: boolean; state: string }>>()
   const listeners = new Map<string, Set<() => void>>()
+  const inventories = new Map<string, MailboxInventory>()
+  let inventoryBytes = 0
+  const INVENTORY_BYTES = 32 * 1024 * 1024
+  const READ_BYTES = 4 * 1024 * 1024
+  const READ_MEMBERSHIPS = 5000
   const retention = Math.max(1, Math.trunc(options.eventRetention ?? 10_000))
   const leaseMs = Math.max(100, options.leaseMs ?? 30_000)
   const concurrency = Math.max(1, Math.min(32, options.concurrency ?? 4))
@@ -155,6 +163,7 @@ export function createInbox(options: InboxOptions): Inbox {
       await Promise.allSettled([...instances.values()].map(async provider => (await provider).disconnect()))
       instances.clear()
       listeners.clear()
+      inventories.clear(); inventoryBytes = 0
       if (ownsDatabase) db.close()
     }),
   ))
@@ -518,6 +527,111 @@ export function createInbox(options: InboxOptions): Inbox {
     return { ...value, sourceId: row.account, memberships }
   }
 
+  function mailboxReadScope(owner: string, mailboxIds: string[]) {
+    ownerId(owner)
+    if (!Array.isArray(mailboxIds) || !mailboxIds.length || mailboxIds.length > 1000) throw new InboxError('VALIDATION', 'Select between 1 and 1000 mailboxes.')
+    const ids = [...new Set(mailboxIds.map(value => text(value, 'Mailbox ID', 512)))].sort()
+    const json = JSON.stringify(ids)
+    const rows = db.query<{ id: string; source: string; connection: string; selector: string; status: string; source_generation: number; source_status: string; connection_generation: number; connection_status: string }, [string, string]>(`
+      SELECT b.id,b.source,b.connection,b.selector,json_extract(b.data,'$.status') status,
+        a.generation source_generation,a.status source_status,c.generation connection_generation,c.status connection_status
+      FROM sdk_mailboxes b JOIN sdk_accounts a ON a.id=b.source AND a.owner=b.owner
+      JOIN sdk_connections c ON c.id=b.connection AND c.owner=b.owner
+      JOIN sdk_source_connections s ON s.source=b.source AND s.connection=b.connection AND s.owner=b.owner
+      WHERE b.owner=? AND b.id IN (SELECT value FROM json_each(?)) ORDER BY b.id`).all(owner, json)
+    if (rows.length !== ids.length) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+    const sources = new Set(rows.map(row => row.source))
+    return { ids, json, sources, sourceJson: JSON.stringify([...sources]), hash: fingerprint(ids), binding: fingerprint(rows),
+      attached: rows.every(row => row.status === 'active' || row.status === 'paused'), overhead: 4096 + json.length * 2 + JSON.stringify(rows).length * 2 }
+  }
+
+  function mailboxReadLimit(value: number | undefined): number {
+    const limit = value ?? 500
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new InboxError('VALIDATION', 'Read pages contain between 1 and 500 entries.')
+    return limit
+  }
+
+  function discardInventory(id: string): void {
+    const saved = inventories.get(id)
+    if (saved) { inventoryBytes -= saved.bytes; inventories.delete(id) }
+  }
+
+  function rememberInventory(id: string, value: MailboxInventory): void {
+    for (const [key, saved] of inventories) if (saved.expires <= now()) discardInventory(key)
+    if (value.bytes > INVENTORY_BYTES) throw new InboxError('SNAPSHOT_LIMIT', 'The mailbox inventory exceeds its memory budget.', 413)
+    while (inventories.size >= 8 || inventoryBytes + value.bytes > INVENTORY_BYTES || [...inventories.values()].filter(saved => saved.owner === value.owner).length >= 4) {
+      const ownerFull = [...inventories.values()].filter(saved => saved.owner === value.owner).length >= 4
+      const candidates = [...inventories].filter(([, saved]) => !ownerFull || saved.owner === value.owner)
+      const victim = candidates.find(([, saved]) => saved.completed) ?? candidates[0]
+      if (!victim) throw new InboxError('SNAPSHOT_LIMIT', 'Mailbox inventory capacity is unavailable.', 429, true)
+      discardInventory(victim[0])
+    }
+    inventories.set(id, value); inventoryBytes += value.bytes
+  }
+
+  function appendInventory(id: string, value: MailboxInventory, messageId: string): void {
+    const bytes = 64 + messageId.length * 2
+    if (value.ids.length >= 100000 || value.bytes + bytes > INVENTORY_BYTES) throw new InboxError('SNAPSHOT_LIMIT', 'The mailbox inventory exceeds its bounded capacity.', 413)
+    while (inventoryBytes + bytes > INVENTORY_BYTES) {
+      const candidates = [...inventories].filter(([key]) => key !== id)
+      const victim = candidates.find(([, saved]) => saved.completed) ?? candidates[0]
+      if (!victim) throw new InboxError('SNAPSHOT_LIMIT', 'The mailbox inventory exceeds its memory budget.', 413)
+      discardInventory(victim[0])
+    }
+    value.ids.push(messageId); value.bytes += bytes; inventoryBytes += bytes
+  }
+
+  /** Hydrate only a consecutive bounded ID prefix, never one membership query per message. */
+  function mailboxReadRows(owner: string, scope: ReturnType<typeof mailboxReadScope>, ids: string[]) {
+    type Meta = { id: string; account: string; revision: number; deleted: number; generation: number; source_generation: number; bytes: number }
+    const items = new Map<string, MailboxMessageSummary>()
+    const rows = new Map<string, Meta>()
+    if (!ids.length) return { items, rows, consumed: 0 }
+    const json = JSON.stringify(ids)
+    for (const row of db.query<Meta, [string, string]>(`SELECT m.id,m.account,m.revision,m.deleted,m.generation,a.generation source_generation,length(CAST(m.visible AS BLOB)) bytes
+      FROM sdk_messages m JOIN sdk_accounts a ON a.id=m.account AND a.owner=m.owner WHERE m.owner=? AND m.id IN (SELECT value FROM json_each(?))`).all(owner, json)) rows.set(row.id, row)
+    const wanted = ids.flatMap((id, ordinal) => {
+      const row = rows.get(id)
+      return row && !row.deleted && row.generation === row.source_generation && scope.sources.has(row.account) ? [{ id, source: row.account, ordinal }] : []
+    })
+    // CROSS JOIN keeps this bounded ID list outermost. Letting SQLite reorder it
+    // scanned the entire source membership index once per page on the 50k cache.
+    const membershipRows = db.query<{ ordinal: number; message: string; data: string }, [string, string, string]>(`
+      SELECT json_extract(w.value,'$.ordinal') ordinal,v.message,v.data FROM json_each(?) w
+      CROSS JOIN sdk_memberships v INDEXED BY sdk_membership_read ON v.owner=? AND v.source=json_extract(w.value,'$.source') AND v.message=json_extract(w.value,'$.id')
+      WHERE v.mailbox IN (SELECT value FROM json_each(?)) ORDER BY ordinal,v.mailbox LIMIT ${READ_MEMBERSHIPS + 1}`).all(JSON.stringify(wanted), owner, scope.json)
+    // If the budget cuts through a membership group, leave that whole message for the next page.
+    const boundary = membershipRows.length > READ_MEMBERSHIPS ? membershipRows[READ_MEMBERSHIPS]!.ordinal : ids.length
+    const memberships = new Map<string, { states: MailboxMembership[]; bytes: number }>()
+    for (const row of membershipRows) {
+      if (row.ordinal >= boundary) break
+      const group = memberships.get(row.message) ?? { states: [], bytes: 0 }
+      const state = JSON.parse(row.data) as MailboxMembership
+      group.states.push({ mailboxId: state.mailboxId, messageId: state.messageId, revision: state.revision, done: state.done, snoozedUntil: state.snoozedUntil })
+      group.bytes += Buffer.byteLength(row.data)
+      memberships.set(row.message, group)
+    }
+    let consumed = 0, bytes = 0
+    const selected: string[] = []
+    for (const id of ids.slice(0, boundary)) {
+      const row = rows.get(id), group = memberships.get(id)
+      const cost = group ? (row?.bytes ?? 0) + group.bytes + 1024 : 256
+      if (cost > READ_BYTES - 512 * 1024) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'One mailbox summary exceeds the read budget.', 413)
+      if (bytes + cost > READ_BYTES - 512 * 1024) break
+      bytes += cost; consumed++
+      if (group) selected.push(id)
+    }
+    if (!consumed) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The mailbox read could not advance within its budget.', 413)
+    if (selected.length) {
+      const loaded = db.query<MessageRow, [string, string]>('SELECT id,owner,account,visible FROM sdk_messages WHERE owner=? AND id IN (SELECT value FROM json_each(?))').all(owner, JSON.stringify(selected))
+      for (const row of loaded) {
+        const { snoozedUntil: _legacy, ...value } = summary(row)
+        items.set(row.id, { ...value, sourceId: row.account, memberships: memberships.get(row.id)!.states })
+      }
+    }
+    return { items, rows, consumed }
+  }
+
   async function providerFor(row: AccountRow, reason: CredentialContext['reason'] = 'operation'): Promise<InboxProvider> {
     if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed.', 409)
     const definition = definitions.get(JSON.parse(row.data).providerId)
@@ -789,6 +903,8 @@ export function createInbox(options: InboxOptions): Inbox {
       labelIds: [], hasAttachments: attachments.length > 0, snoozedUntil: null, facts: mailFacts(mail) }
     const body = JSON.stringify({ bcc: mail.bcc, bodyText: mail.bodyText, bodyHtml: mail.bodyHtml, attachments,
       replyTo: normalized.replyTo, rfcMessageId: normalized.rfcMessageId, references: normalized.references, inReplyTo: normalized.inReplyTo })
+    summary.bodyRevision = createHmac('sha256', options.encryptionKey)
+      .update(JSON.stringify([row.owner, row.id, row.generation, id])).update('\0').update(body).digest('base64url')
     const confirmed = JSON.stringify(summary)
     if (old && !old.deleted && old.confirmed === confirmed && old.body === body) return old.id
     db.query(`INSERT INTO sdk_messages(id,owner,account,generation,native_id,thread_id,confirmed,visible,body,received_at,folder,is_read,is_starred,subject,search_text)
@@ -806,6 +922,9 @@ export function createInbox(options: InboxOptions): Inbox {
   const cachedFacts = new Map<string, NonNullable<MessageSummary['facts']>>()
   function summary(row: MessageRow): MessageSummary {
     const value: MessageSummary = JSON.parse(row.visible)
+    value.bodyRevision = createHmac('sha256', options.encryptionKey).update(JSON.stringify([
+      'body-view-v1', epoch, value.accountId, value.id, value.bodyRevision ?? null, value.bodyRevision ? null : value.revision,
+    ])).digest('base64url')
     if (!value.facts) {
       const key = `${value.id}:${value.revision}`
       let facts = cachedFacts.get(key)
@@ -1642,6 +1761,109 @@ export function createInbox(options: InboxOptions): Inbox {
       return { items: rows.map(row => mailboxSummary(row, selection.ids)), total, state: page.state,
         nextCursor: page.offset + rows.length < total ? token(owner, sequence(owner), `${page.hash}:${page.offset + rows.length}`) : null }
     }),
+    mailboxSnapshot: (owner, input) => run(() => db.transaction(() => {
+      if (!input || Object.keys(input).some(key => !['mailboxIds', 'cursor', 'limit'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox snapshot input.')
+      const scope = mailboxReadScope(owner, input.mailboxIds)
+      let key: string, saved: MailboxInventory, offset = 0, created = false
+      if (input.cursor !== undefined) {
+        const cursor = decode(owner, text(input.cursor, 'Snapshot cursor', 4096))
+        const parts = cursor.query?.split(':')
+        if (!parts || parts.length !== 3 || parts[0] !== 'mailbox-snapshot') throw new InboxError('INVALID_CURSOR', 'Not a mailbox snapshot cursor.')
+        key = parts[1]!
+        const cached = inventories.get(key)
+        if (!cached || cached.owner !== owner || cached.expires <= now() || cursor.epoch !== epoch) {
+          if (cached?.owner === owner) discardInventory(key)
+          throw new InboxError('SNAPSHOT_EXPIRED', 'Restart the expired mailbox inventory.', 410, true)
+        }
+        saved = cached
+        if (saved.scopeHash !== scope.hash || input.limit !== undefined && mailboxReadLimit(input.limit) !== saved.limit || cursor.seq !== saved.seq) throw new InboxError('INVALID_CURSOR', 'Snapshot cursor does not match this selection.')
+        offset = Number(parts[2])
+        if (!Number.isSafeInteger(offset) || offset < 0 || offset > saved.ids.length) throw new InboxError('INVALID_CURSOR', 'Invalid snapshot position.')
+        if (!scope.attached || saved.binding !== scope.binding) { discardInventory(key); throw new InboxError('SNAPSHOT_SCOPE_CHANGED', 'Reload the changed mailbox selection.', 409, true) }
+        inventories.delete(key); inventories.set(key, saved)
+      } else {
+        if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+        const limit = mailboxReadLimit(input.limit)
+        const seq = sequence(owner)
+        key = randomUUID()
+        saved = { owner, ids: [], scopeHash: scope.hash, binding: scope.binding, seq, expires: now() + 300000, limit, bytes: scope.overhead + owner.length * 2 + 4096, completed: false }
+        rememberInventory(key, saved)
+        created = true
+        const inventory = db.query<{ id: string }, [string, string, string]>(`SELECT m.id FROM sdk_messages m INDEXED BY sdk_message_inventory
+          JOIN sdk_accounts a ON a.id=m.account AND a.owner=m.owner
+          WHERE m.owner=? AND m.account IN (SELECT value FROM json_each(?)) AND m.deleted=0 AND m.generation=a.generation
+            AND EXISTS(SELECT 1 FROM sdk_memberships v INDEXED BY sdk_membership_read WHERE v.owner=m.owner AND v.source=m.account AND v.message=m.id
+              AND v.mailbox IN (SELECT value FROM json_each(?)))
+          ORDER BY m.received_at DESC,m.id ASC LIMIT 100001`)
+        try { for (const row of inventory.iterate(owner, scope.sourceJson, scope.json)) appendInventory(key, saved, row.id) }
+        catch (error) { discardInventory(key); throw error }
+      }
+      try {
+        const selected = saved.ids.slice(offset, offset + saved.limit)
+        const page = mailboxReadRows(owner, scope, selected)
+        const next = offset + page.consumed
+        if (next >= saved.ids.length) saved.completed = true
+        const result = { items: selected.slice(0, page.consumed).flatMap(id => page.items.has(id) ? [page.items.get(id)!] : []), total: saved.ids.length,
+          nextCursor: next < saved.ids.length ? token(owner, saved.seq, `mailbox-snapshot:${key}:${next}`) : null,
+          state: token(owner, saved.seq), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`), expiresAt: new Date(saved.expires).toISOString() }
+        if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The mailbox page exceeds its encoded budget.', 413)
+        return result
+      } catch (error) { if (created) discardInventory(key); throw error }
+    }).deferred()),
+    mailboxChanges: (owner, input) => run(() => db.transaction(() => {
+      if (!input || Object.keys(input).some(key => !['mailboxIds', 'since', 'scopeState', 'limit'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox changes input.')
+      const scope = mailboxReadScope(owner, input.mailboxIds)
+      const bound = decode(owner, text(input.scopeState, 'Mailbox scope state', 4096))
+      const parts = bound.query?.split(':')
+      if (!parts || parts.length !== 3 || parts[0] !== 'mailbox-scope' || parts[1] !== scope.hash) throw new InboxError('INVALID_CURSOR', 'State does not match this mailbox selection.')
+      const from = decode(owner, text(input.since, 'Change state', 4096))
+      if (from.query !== null) throw new InboxError('INVALID_CURSOR', 'A query cursor cannot resume mailbox changes.')
+      const head = sequence(owner)
+      const reset = (reason: 'scope' | 'history'): MailboxChangesPage => ({ events: [], upserts: [], removed: [], state: token(owner, head), hasMore: false, resetRequired: true, resetReason: reason })
+      if (!scope.attached || bound.epoch !== epoch || parts[2] !== scope.binding) return reset('scope')
+      const floor = db.query<{ floor: number }, [string]>('SELECT floor FROM sdk_states WHERE owner=?').get(owner)?.floor ?? 0
+      if (from.epoch !== epoch || from.seq < floor || from.seq > head) return reset('history')
+      const limit = mailboxReadLimit(input.limit)
+      const rows = db.query<{ seq: number; data: string }, [string, number, number, number]>('SELECT seq,data FROM sdk_events WHERE owner=? AND seq>? AND seq<=? ORDER BY seq LIMIT ?').all(owner, from.seq, head, limit + 1)
+      const mailboxIds = new Set(scope.ids)
+      const candidates: Array<{ seq: number; event: ChangeEvent; messageId?: string }> = []
+      const ids = new Set<string>()
+      let eventBytes = 0
+      for (const row of rows.slice(0, limit)) {
+        const event = { ...JSON.parse(row.data), id: token(owner, row.seq) } as ChangeEvent
+        const size = Buffer.byteLength(JSON.stringify(event))
+        if (size > 512 * 1024) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'One change exceeds the read budget.', 413)
+        if (eventBytes + size > 512 * 1024) break
+        eventBytes += size
+        const messageId = event.accountId && scope.sources.has(event.accountId) && (event.type === 'mail.changed' || event.type === 'membership.updated' && !!event.mailboxId && mailboxIds.has(event.mailboxId)) ? event.entityId : undefined
+        if (messageId) ids.add(messageId)
+        candidates.push({ seq: row.seq, event, ...(messageId ? { messageId } : {}) })
+      }
+      const requested = [...ids]
+      const hydrated = mailboxReadRows(owner, scope, requested)
+      const available = new Set(requested.slice(0, hydrated.consumed))
+      const events: ChangeEvent[] = [], selected = new Map<string, string>()
+      let through = from.seq
+      for (const candidate of candidates) {
+        if (candidate.messageId && !available.has(candidate.messageId)) break
+        through = candidate.seq
+        if (candidate.messageId) { selected.set(candidate.messageId, candidate.event.accountId!); events.push(candidate.event) }
+        else if (!['mail.changed', 'membership.updated'].includes(candidate.event.type)) events.push(candidate.event)
+      }
+      const upserts: MailboxMessageSummary[] = [], removed: MailboxChangesPage['removed'] = []
+      for (const [messageId, sourceId] of selected) {
+        const value = hydrated.items.get(messageId)
+        if (value) upserts.push(value)
+        else {
+          const row = hydrated.rows.get(messageId)
+          const deleted = !row || row.deleted !== 0 || row.generation !== row.source_generation
+          removed.push({ sourceId, messageId, reason: deleted ? 'deleted' : 'unselected', revision: deleted ? row?.revision ?? null : null })
+        }
+      }
+      const result: MailboxChangesPage = { events, upserts, removed, state: token(owner, through), hasMore: through < head, resetRequired: false }
+      if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The mailbox changes exceed their encoded budget.', 413)
+      return result
+    }).deferred()),
     mailboxMessage: (owner, mailboxId, messageId) => run(async () => {
       membership(owner, mailboxId, messageId)
       const message = await inbox.message(owner, messageId)
@@ -1729,6 +1951,10 @@ export function createInbox(options: InboxOptions): Inbox {
       const folders = await io(row, p => p.listFolders())
       if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed.', 409)
       return transaction(() => folders.map(folder => folderFor(row, folder.id, folder.folder, folder.name, folder.kind ?? 'folder')))
+    }),
+    cachedFolders: (owner, id) => run(() => {
+      const row = accountRow(owner, id)
+      return db.query<{ data: string }, [string, string, number]>('SELECT data FROM sdk_folders WHERE owner=? AND account=? AND generation=? ORDER BY rowid').all(owner, id, row.generation).map(folder => JSON.parse(folder.data) as Folder)
     }),
     createFolder: (owner, id, name) => run(async () => {
       if (options.allowProviderWrites === false) throw new InboxError('PROVIDER_WRITES_DISABLED', 'Provider writes are disabled for this deployment.', 403)

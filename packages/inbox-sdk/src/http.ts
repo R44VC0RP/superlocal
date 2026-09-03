@@ -70,6 +70,7 @@ const mailboxQuery = querySchema.omit({ accountId: true }).extend({
 })
 const pageQuery = querySchema.pick({ cursor: true, limit: true })
 const accountQuery = querySchema.pick({ accountId: true })
+const folderQuery = z.strictObject({ cached: z.boolean().optional() })
 const changesQuery = z.strictObject({ since: opaque.optional(), limit: z.number().int().min(1).max(1000).optional() })
 const eventsQuery = changesQuery.pick({ since: true })
 const emptyQuery = z.strictObject({})
@@ -98,7 +99,7 @@ const messageSummary = z.object({
   id, accountId: id, threadId: id, revision, from: participant, to: z.array(participant), cc: z.array(participant),
   subject: z.string(), preview: z.string(), receivedAt: z.string(), isRead: z.boolean(), isStarred: z.boolean(),
   folder: z.string(), folderIds: z.array(id), labelIds: z.array(id), hasAttachments: z.boolean(),
-  snoozedUntil: z.string().nullable(), facts: sourceFacts.optional(),
+  snoozedUntil: z.string().nullable(), facts: sourceFacts.optional(), bodyRevision: opaque.optional(),
 })
 const message = messageSummary.extend({
   bcc: z.array(participant), bodyText: z.string(), bodyHtml: z.string(),
@@ -112,6 +113,7 @@ const mailboxSelector = z.discriminatedUnion('kind', [
 ])
 const membership = z.object({ mailboxId: id, messageId: id, revision, done: z.boolean(), snoozedUntil: z.string().nullable() })
 const mailboxMessageSummary = messageSummary.omit({ snoozedUntil: true }).extend({ sourceId: id, memberships: z.array(membership) })
+const mailboxReadInput = z.strictObject({ mailboxIds: z.array(id).min(1).max(1000), limit: z.number().int().min(1).max(500).optional() })
 const threadSummary = z.object({
   id, accountId: id, subject: z.string(), preview: z.string(), messageCount: revision,
   matchingMessageCount: revision, isRead: z.boolean(), isStarred: z.boolean(), lastMessageAt: z.string(),
@@ -165,6 +167,12 @@ const schemas = {
   MailboxMessageSummary: mailboxMessageSummary,
   MailboxMessage: message.extend({ sourceId: id, memberships: z.array(membership) }),
   MailboxMessagePage: z.object({ items: z.array(mailboxMessageSummary), nextCursor: opaque.nullable(), state: opaque, total: revision }),
+  MailboxSnapshotInput: mailboxReadInput.extend({ cursor: opaque.optional() }),
+  MailboxSnapshotPage: z.object({ items: z.array(mailboxMessageSummary).max(500), nextCursor: opaque.nullable(), state: opaque, total: revision, scopeState: opaque, expiresAt: date }),
+  MailboxChangesInput: mailboxReadInput.extend({ since: opaque, scopeState: opaque }),
+  MailboxChangesPage: z.object({ events: z.array(changeEvent).max(500), upserts: z.array(mailboxMessageSummary).max(500),
+    removed: z.array(z.object({ sourceId: id, messageId: id, reason: z.enum(['deleted', 'unselected']), revision: revision.nullable() })).max(500),
+    state: opaque, hasMore: z.boolean(), resetRequired: z.boolean(), resetReason: z.enum(['history', 'scope']).optional() }),
   CredentialState: z.object({ connectionId: id, generation: revision, version: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
     status: z.enum(['connected', 'disconnected', 'reconnect_required']) }),
   CredentialUpdate: z.strictObject({ credentials }),
@@ -214,7 +222,7 @@ function query<T>(c: ApiContext, schema: z.ZodType<T>): T {
     if (key === 'limit') {
       if (!/^[1-9]\d*$/.test(value)) throw new InboxError('INVALID_QUERY', 'Invalid limit', 400)
       input[key] = Number(value)
-    } else if (['unreadOnly', 'starredOnly', 'hasAttachments', 'done', 'snoozed'].includes(key)) {
+    } else if (['unreadOnly', 'starredOnly', 'hasAttachments', 'done', 'snoozed', 'cached'].includes(key)) {
       if (value !== 'true' && value !== 'false') throw new InboxError('INVALID_QUERY', 'Boolean query values must be true or false', 400)
       input[key] = value === 'true'
     } else if (key === 'mailboxIds') {
@@ -483,6 +491,10 @@ export function createInboxApi(options: InboxApiOptions) {
     await Promise.all(input.mailboxIds.map((mailboxId) => inbox.mailbox(owner, mailboxId)))
     return json(c, validate(schemas.MailboxMessagePage, await inbox.mailboxMessages(owner, input)))
   })
+  route('post', '/v1/mailbox-snapshot', { summary: 'Page a stable mailbox ID inventory with live body-free rows', input: 'MailboxSnapshotInput', output: 'MailboxSnapshotPage',
+    description: 'Read-only POST; no Idempotency-Key. Select 1–1000 owned attached mailboxes, up to 500 rows/page. IDs/order and state baseline are fixed for five minutes; row and membership values are current when each page is read. Finish the inventory then apply mailbox-changes from that baseline, merging canonical and membership revisions independently. A 100,000-ID and bounded shared-memory budget applies; expired/evicted/restarted inventories return SNAPSHOT_EXPIRED (410). Scope revocation returns no rows. No query filters; legacy filtered queries remain unchanged.' }, async c => json(c, validate(schemas.MailboxSnapshotPage, await inbox.mailboxSnapshot(c.get('owner'), body(c, schemas.MailboxSnapshotInput)))))
+  route('post', '/v1/mailbox-changes', { summary: 'Reconcile a scoped body-free mailbox view from owner change history', input: 'MailboxChangesInput', output: 'MailboxChangesPage',
+    description: 'Read-only POST; scopeState comes from mailbox-snapshot. At most 500 event-prefix entries are consumed, with current upserts and scoped removals; state advances only through that prefix when hasMore. Current rows may be newer than their events: merge canonical and membership revisions independently and apply deltas in order after initial inventory paging. Metadata events permit targeted metadata refresh. Scope/history resets contain no rows; start a new authorized inventory. Each response has encoded-byte and membership-row budgets.' }, async c => json(c, validate(schemas.MailboxChangesPage, await inbox.mailboxChanges(c.get('owner'), body(c, schemas.MailboxChangesInput)))))
   route('get', '/v1/mailboxes/:id/messages/:messageId', { summary: 'Read a message in an owned mailbox', output: 'MailboxMessage' }, async (c) => {
     const policy = await inbox.policy(c.get('owner'))
     c.header('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
@@ -508,7 +520,7 @@ export function createInboxApi(options: InboxApiOptions) {
   route('delete', '/v1/accounts/:id', { summary: 'Disconnect an account', status: 204 }, async (c) => { await inbox.disconnect(c.get('owner'), pathId(c)); return c.newResponse(null, 204) })
   route('post', '/v1/accounts/:id/reconnect', { summary: 'Reconnect an account', input: 'Reconnect', output: 'Account' }, async (c) => json(c, await inbox.reconnect(c.get('owner'), pathId(c), body(c, schemas.Reconnect))))
   route('post', '/v1/accounts/:id/sync', { summary: 'Synchronize an account', input: 'SyncRequest', output: 'SyncResult' }, async (c) => json(c, await inbox.sync(c.get('owner'), pathId(c), body(c, schemas.SyncRequest, true))))
-  route('get', '/v1/accounts/:id/folders', { summary: 'List provider folders', output: 'Folder[]' }, async (c) => json(c, await inbox.folders(c.get('owner'), pathId(c))))
+  route('get', '/v1/accounts/:id/folders', { summary: 'List provider folders', query: folderQuery, output: 'Folder[]', description: 'cached=true reads only owned materialized folder metadata, without calling a provider. Default and cached=false retain native folder discovery.' }, async (c) => json(c, query(c, folderQuery).cached ? await inbox.cachedFolders(c.get('owner'), pathId(c)) : await inbox.folders(c.get('owner'), pathId(c))))
   route('post', '/v1/accounts/:id/folders', { summary: 'Create a provider folder', input: 'Name', output: 'Folder', status: 201 }, async (c) => json(c, await inbox.createFolder(c.get('owner'), pathId(c), body(c, schemas.Name).name), 201))
   route('get', '/v1/messages', { summary: 'Query messages', query: querySchema, output: 'MessagePage' }, async (c) => json(c, await inbox.messages(c.get('owner'), query(c, querySchema))))
   route('get', '/v1/messages/:id', { summary: 'Read a message without marking it read', output: 'Message' }, async (c) => {

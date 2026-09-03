@@ -106,7 +106,8 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     const target = url(path)
     const method = (init.method ?? 'GET').toUpperCase()
     binary ||= method === 'GET' && /\/v1\/blobs\//.test(target)
-    const mutation = !['GET', 'HEAD', 'OPTIONS'].includes(method)
+    const readPost = method === 'POST' && ['/v1/mailbox-snapshot', '/v1/mailbox-changes'].some(path => target.endsWith(path))
+    const mutation = !readPost && !['GET', 'HEAD', 'OPTIONS'].includes(method)
     if (mutation) clearCache()
     const version = credentialsVersion
     const generation = cacheVersion
@@ -380,6 +381,8 @@ export function createInboxClient(options: InboxClientOptions = {}) {
       return request<Result<'mailboxMessages'>>(`/mailbox-messages${queryString({ ...input, mailboxIds: [...new Set(input.mailboxIds)].sort().join(',') })}`, requestOptions)
     },
     mailboxMessage: (mailboxId: string, messageId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'mailboxMessage'>>(`/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}`, requestOptions),
+    mailboxSnapshot: (input: Parameters<Inbox['mailboxSnapshot']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxSnapshot'>>('/mailbox-snapshot', 'POST', input, requestOptions),
+    mailboxChanges: (input: Parameters<Inbox['mailboxChanges']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxChanges'>>('/mailbox-changes', 'POST', input, requestOptions),
     setMailboxStates: (input: Parameters<Inbox['setMailboxStates']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'setMailboxStates'>>('/mailbox-actions', 'POST', input, requestOptions),
     undoMailboxStates: (id: string, requestOptions: InboxRequestOptions = {}) => write<Result<'undoMailboxStates'>>(`/mailbox-actions/${resourceId(id)}/undo`, 'POST', undefined, requestOptions),
     setMailboxState: async (mailboxId: string, messageId: string, input: Parameters<Inbox['setMailboxState']>[3], revision: number, requestOptions: InboxRequestOptions = {}): Promise<Result<'setMailboxState'>> => {
@@ -401,6 +404,7 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     account: (id: string, requestOptions: InboxRequestOptions = {}) => request<Result<'account'>>(`/accounts/${resourceId(id)}`, requestOptions),
     sync: (id: string, input: SyncRequest = {}, requestOptions: InboxRequestOptions = {}) => write<Result<'sync'>>(`/accounts/${resourceId(id)}/sync`, 'POST', input, requestOptions),
     folders: (accountId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'folders'>>(`/accounts/${resourceId(accountId)}/folders`, requestOptions),
+    cachedFolders: (accountId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'cachedFolders'>>(`/accounts/${resourceId(accountId)}/folders?cached=true`, requestOptions),
     createFolder: (accountId: string, name: string, requestOptions: InboxRequestOptions = {}) => write<Result<'createFolder'>>(`/accounts/${resourceId(accountId)}/folders`, 'POST', { name }, requestOptions),
     messages: (input: Query = {}, requestOptions: InboxRequestOptions = {}) => request<Result<'messages'>>(`/messages${queryString(input)}`, requestOptions),
     message: (id: string, requestOptions: InboxRequestOptions = {}) => request<Result<'message'>>(`/messages/${resourceId(id)}`, requestOptions),
