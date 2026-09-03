@@ -1378,6 +1378,10 @@ export default function App() {
     return () => removeEventListener("keydown", onKey);
   }, []);
 
+  if (inbox.loading && !inbox.error) {
+    return <div className="app" data-inbox-state="loading" />;
+  }
+
   const composer = currentDraft && (
     <Composer
       draft={currentDraft}
@@ -1461,10 +1465,10 @@ export default function App() {
         </div>
       </nav>
       <main className="mail-workspace" data-folder={route.folder}>
-        {(inbox.loading || inbox.error) && (
-          <div className="inbox-connection-status" role={inbox.error ? "alert" : "status"}>
-            <span>{inbox.error || "Connecting to the inbox…"}</span>
-            {inbox.error && <button type="button" onClick={() => { void store.retry(); }}>Retry</button>}
+        {inbox.error && (
+          <div className="inbox-connection-status" role="alert">
+            <span>{inbox.error}</span>
+            <button type="button" onClick={() => { void store.retry(); }}>Retry</button>
           </div>
         )}
         {!inbox.loading && !inbox.error && inbox.host && !inbox.host.allowProviderWrites && (
