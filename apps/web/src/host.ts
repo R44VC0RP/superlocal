@@ -12,6 +12,7 @@ export type HostProvider = {
 
 export type HostConfiguration = {
   mode: "mock" | "real";
+  issueScope?: string;
   allowProviderWrites: boolean;
   providers: HostProvider[];
 };

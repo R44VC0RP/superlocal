@@ -507,7 +507,7 @@ export default function App() {
     try {
       const app = document.querySelector<HTMLElement>(".app");
       if (!app) throw new Error("The page is unavailable.");
-      setIssueReporter({ draft: await captureIssueReport(app) });
+      setIssueReporter({ draft: await captureIssueReport(app, inbox.host?.issueScope) });
     } catch {
       setNotice({
         text: "Could not capture the page. Try the Issue command again.",
@@ -2068,10 +2068,11 @@ export default function App() {
       {issueReporter && (
         <IssueReporter
           draft={issueReporter.draft}
+          issueScope={inbox.host?.issueScope}
           onClose={() => setIssueReporter(null)}
-          onSaved={() => {
+          onSaved={(storage) => {
             setIssueReporter(null);
-            setNotice({ text: "Issue saved locally" });
+            setNotice({ text: storage === "repo" ? "Issue saved to repo" : "Issue saved in this browser only" });
           }}
         />
       )}
