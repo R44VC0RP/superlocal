@@ -22,13 +22,12 @@ function DomainMark({ src }: { src: string | null }) {
   </span>;
 }
 
-export default function SenderContext({ contact, history, mailboxIds, mail, currentThreadId, scopeLabel, remoteImages, showLogos, canCompose, onCompose, onOpen, onImageSettings }: {
+export default function SenderContext({ contact, history, mailboxIds, mail, currentThreadId, remoteImages, showLogos, canCompose, onCompose, onOpen, onImageSettings }: {
   contact: SenderContact;
   history: readonly SenderHistoryMessage[];
   mailboxIds: readonly string[];
   mail: readonly Mail[];
   currentThreadId: string;
-  scopeLabel: string;
   remoteImages: boolean;
   showLogos: boolean;
   canCompose: boolean;
@@ -118,11 +117,6 @@ export default function SenderContext({ contact, history, mailboxIds, mail, curr
         </span>)}
       </div>
       <div className="sender-chart-caption"><span>Last 12 weeks</span><span><i />Sent</span></div>
-      <dl className="sender-recency">
-        {activity.firstMessage !== null && <div><dt>First in cache</dt><dd>{date(activity.firstMessage)}</dd></div>}
-        <div><dt>Last sent</dt><dd>{activity.lastSent !== null ? date(activity.lastSent) : "None in cache"}</dd></div>
-      </dl>
-      <p className="sender-coverage">Cached mail · {scopeLabel}. Older mail and unimported Sent folders may be missing.</p>
     </section>
 
     <section className="sender-conversations" aria-label="Recent conversations with this contact">

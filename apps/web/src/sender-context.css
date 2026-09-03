@@ -34,7 +34,7 @@
 .sender-context details[open] > summary > .icon:last-child { transform: rotate(180deg); }
 .sender-domain-details { margin-block: 4px 16px; }
 .sender-domain-details summary:hover, .sender-level-details summary:hover { color: var(--text); }
-.sender-domain-details dl, .sender-recency { margin: 4px 0 8px; }
+.sender-domain-details dl { margin: 4px 0 8px; }
 .sender-domain-details dl > div { display: grid; gap: 2px; margin-bottom: 10px; }
 .sender-domain-details dd { color: var(--text); overflow-wrap: anywhere; user-select: text; }
 .sender-context p { text-wrap: pretty; }
@@ -66,10 +66,6 @@
 .sender-chart-caption { display: flex; justify-content: space-between; gap: 12px; margin-top: 6px; }
 .sender-chart-caption > span:last-child { display: inline-flex; align-items: center; gap: 5px; }
 .sender-chart-caption i { width: 6px; height: 6px; background: var(--accent); border-radius: 1px; }
-.sender-recency { margin-block: 18px 10px; }
-.sender-recency > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 8px; margin-block: 6px; }
-.sender-recency dd { color: var(--text); font-variant-numeric: tabular-nums; }
-.sender-coverage { color: var(--muted); }
 .sender-conversations { margin-top: 28px; }
 .sender-conversations h3 { margin-bottom: 10px; }
 .sender-conversation { display: flex; flex-direction: column; gap: 2px; min-height: 40px; width: 100%; margin-block: 4px; padding-block: 8px; text-align: start; }

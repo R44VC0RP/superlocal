@@ -1906,7 +1906,6 @@ export default function App() {
               mailboxIds={contextMailboxIds}
               mail={accountMail}
               currentThreadId={currentMail.id}
-              scopeLabel={isUnified ? "selected mailboxes" : "this mailbox"}
               remoteImages={inbox.policy?.remoteImages === true}
               showLogos={preferences.showAvatars !== false}
               canCompose={contextSender?.canSend === true}
