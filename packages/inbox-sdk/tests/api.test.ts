@@ -2279,6 +2279,34 @@ describe('policy privacy and replayable changes', () => {
 })
 
 describe('SSE over real loopback sockets', () => {
+  test('abort while the first change page is pending immediately releases the slot without subscribing late', async () => {
+    const h = await fixture()
+    const page = await h.inbox.changes('alice')
+    const barrier = h.gate(page)
+    let reads = 0
+    let subscriptions = 0
+    const api = createInboxApi({
+      inbox: { ...h.inbox,
+        changes: (...args) => ++reads === 1 ? barrier.wait() : h.inbox.changes(...args),
+        subscribe: (...args) => { subscriptions++; return h.inbox.subscribe(...args) },
+      },
+      authenticate: () => ({ id: 'alice' }), maxStreamsPerOwner: 1,
+    })
+    const controller = h.controller()
+    const pending = h.pending(Promise.resolve(api.request('/v1/events', { signal: controller.signal })))
+    await bounded(barrier.entered, 'pending initial change page')
+    controller.abort()
+    const replacement = await api.request('/v1/events')
+    expect(replacement.status).toBe(200)
+    await replacement.body!.cancel()
+    expect(subscriptions).toBe(1)
+    barrier.release()
+    const aborted = await bounded(pending, 'aborted setup settlement')
+    expect(aborted).toBeDefined()
+    expect(await aborted!.text()).toBe('')
+    expect(subscriptions).toBe(1)
+  })
+
   test('authentication precedes streaming; ready and heartbeats flush, stream limits are per owner, and disconnect releases capacity', async () => {
     const h = await fixture()
     await h.seed('alice', 'socket-auth')
@@ -2633,6 +2661,63 @@ describe('framework-neutral client against the real HTTP adapter', () => {
 })
 
 describe('client event streams over real loopback sockets', () => {
+  test('HTTP errors expose safe Retry-After hints and unchanged constructor fields', async () => {
+    for (const [header, expected] of [['2', 2000], ['invalid', undefined], ['-1', undefined], ['1.5', undefined]] as const) {
+      const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: Object.assign(async () => Response.json(
+        { error: 'Too many requests', code: 'STREAM_LIMIT', retryable: true },
+        { status: 429, headers: { 'Retry-After': header } },
+      ), { preconnect() {} }) })
+      for (const operation of [() => client.accounts(), () => client.events({ reconnect: false }).next()]) {
+        await expect(operation()).rejects.toMatchObject({ name: 'ApiError', status: 429, code: 'STREAM_LIMIT', retryable: true, retryAfterMs: expected })
+      }
+    }
+    const date = new Date(Date.now() + 10000).toUTCString()
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: Object.assign(async () => Response.json(
+      { code: 'STREAM_LIMIT', retryable: true }, { status: 429, headers: { 'Retry-After': date } },
+    ), { preconnect() {} }) })
+    const issue = await client.events({ reconnect: false }).next().catch(error => error)
+    expect(issue.retryAfterMs).toBeGreaterThan(8000)
+    expect(issue.retryAfterMs).toBeLessThanOrEqual(10000)
+  })
+
+  test('reconnect respects Retry-After, backs off repeated stream limits, and return cancels the wait', async () => {
+    const requested: number[] = []
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: Object.assign(async () => {
+      requested.push(Date.now())
+      return Response.json({ code: 'STREAM_LIMIT', retryable: true }, { status: 429, headers: { 'Retry-After': '1' } })
+    }, { preconnect() {} }) })
+    const iterator = client.events({ reconnectMs: 0 })
+    const next = iterator.next()
+    await bounded((async () => { while (requested.length < 3) await Bun.sleep(10) })(), 'three bounded stream retries')
+    expect(requested[1]! - requested[0]!).toBeGreaterThanOrEqual(990)
+    expect(requested[2]! - requested[1]!).toBeGreaterThanOrEqual(1490)
+    await bounded(iterator.return!(), 'cancel retry wait')
+    expect((await next).done).toBe(true)
+    const count = requested.length
+    await Bun.sleep(30)
+    expect(requested).toHaveLength(count)
+  })
+
+  test('invalid event content types cancel their body and iterator return interrupts a pending read', async () => {
+    let cancelled = 0
+    const invalidClient = createInboxClient({ baseUrl: 'http://inbox.test', fetch: Object.assign(async () => new Response(
+      new ReadableStream<Uint8Array>({ cancel() { cancelled++ } }), { headers: { 'Content-Type': 'application/octet-stream' } },
+    ), { preconnect() {} }) })
+    await expect(invalidClient.events({ reconnect: false }).next()).rejects.toMatchObject({ code: 'INVALID_EVENT_STREAM' })
+    expect(cancelled).toBe(1)
+    const h = await fixture()
+    const client = createInboxClient({ baseUrl: h.socket({ maxStreamsPerOwner: 1 }), headers: { authorization: 'Bearer alice' } })
+    const iterator = client.events({ reconnect: false })
+    expect((await bounded(iterator.next(), 'ready before iterator return')).value?.type).toBe('ready')
+    const waiting = iterator.next()
+    await bounded(iterator.return!(), 'return during pending read')
+    expect((await waiting).done).toBe(true)
+    await Bun.sleep(30)
+    const replacement = client.events({ reconnect: false })
+    expect((await bounded(replacement.next(), 'replacement after iterator return')).value?.type).toBe('ready')
+    await replacement.return!()
+  })
+
   test('consumed change events invalidate affected cached queries, message detail, and thread summaries', async () => {
     const h = await fixture()
     await h.seed('alice', 'client-stream-effects')

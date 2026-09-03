@@ -1757,6 +1757,14 @@ describe('imap capability boundaries and SDK integration', () => {
     expect((await h.provider.getMessage(h.rootId)).bodyText).toBe('')
     h.imapPeer!.edit(1, message => { message.bodyStructure.childNodes[0].childNodes.pop() })
     expect((await h.provider.getMessage(h.rootId)).bodyText).toBe('café')
+    // A real backfill page was blocked by one malformed UTF-8 plain alternative.
+    // Keep its valid prefix and an explicit replacement, not a guessed legacy charset.
+    h.imapPeer!.edit(1, message => { message.bodyStructure.childNodes[0].childNodes[0].parameters.charset = 'utf-8' })
+    expect((await h.provider.getMessage(h.rootId)).bodyText).toBe('caf\uFFFD')
+    const page = await h.provider.sync(undefined, { limit: 25 })
+    expect(page.messages.find(message => message.id === h.rootId)?.bodyText).toBe('caf\uFFFD')
+    expect(page.hasMore).toBe(false)
+    expect(h.writes!()).toBe(0)
     h.imapPeer!.edit(1, message => { message.bodyStructure.childNodes[0].childNodes[0].size = 9 * 1024 * 1024 })
     await failure(() => h.provider.getMessage(h.rootId), 'UPSTREAM', false)
     h.imapPeer!.edit(1, message => { const part = message.bodyStructure.childNodes[0].childNodes[0]; part.size = 4; part.parameters.charset = 'x-unsupported-encoding' })

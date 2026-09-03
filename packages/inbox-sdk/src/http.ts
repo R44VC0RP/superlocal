@@ -685,14 +685,18 @@ export function createInboxApi(options: InboxApiOptions) {
     }
     const frame = (event: string, data: unknown, eventId?: string) => encoder.encode(`${eventId ? `id: ${eventId}\n` : ''}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
     try {
-      page = await inbox.changes(owner, { since: cursor, limit: STREAM_PAGE_SIZE })
-      // A reread after subscribing closes the read/subscribe race; notifications carry no data.
-      unsubscribe = inbox.subscribe(owner, wake)
-      pollTimer = setInterval(wake, streamPollMs)
-      heartbeatTimer = setInterval(() => { heartbeat = true; resume() }, heartbeatMs)
+      // Setup can await storage: cancellation and the lifetime bound must own the slot
+      // before that await, not only after the first page eventually resolves.
       lifetimeTimer = setTimeout(cleanup, STREAM_LIFETIME_MS)
       c.req.raw.signal.addEventListener('abort', cleanup, { once: true })
       if (c.req.raw.signal.aborted) cleanup()
+      if (!closed) page = await inbox.changes(owner, { since: cursor, limit: STREAM_PAGE_SIZE })
+      if (!closed) {
+        // A reread after subscribing closes the read/subscribe race; notifications carry no data.
+        unsubscribe = inbox.subscribe(owner, wake)
+        pollTimer = setInterval(wake, streamPollMs)
+        heartbeatTimer = setInterval(() => { heartbeat = true; resume() }, heartbeatMs)
+      }
     } catch (error) { cleanup(); throw error }
     const stream = new ReadableStream<Uint8Array>({
       start(value) { controller = value; if (closed) value.close() },
@@ -722,6 +726,7 @@ export function createInboxApi(options: InboxApiOptions) {
             if (readNeeded) {
               readNeeded = false
               const identity = await options.authenticate(c.req.raw)
+              if (closed) return
               if (identity?.id !== owner) throw new InboxError('UNAUTHENTICATED', 'Authentication required', 401)
               page = await inbox.changes(owner, { since: cursor, limit: STREAM_PAGE_SIZE })
               index = 0

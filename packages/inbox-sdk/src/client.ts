@@ -26,6 +26,7 @@ export class ApiError extends Error {
     readonly status: number,
     readonly code = 'HTTP_ERROR',
     readonly retryable = false,
+    readonly retryAfterMs?: number,
   ) { super(message) }
 }
 
@@ -35,11 +36,15 @@ const MAX_CACHE_BODY = 1024 * 1024
 const MAX_EVENT_BUFFER = 64 * 1024
 const changeTypes = new Set(['mail.changed', 'account.updated', 'draft.updated', 'operation.updated', 'label.updated', 'policy.updated', 'connection.updated', 'mailbox.updated', 'membership.updated'])
 
-function apiProblem(value: unknown, status: number): ApiError {
+function apiProblem(value: unknown, status: number, headers?: Headers): ApiError {
   const problem = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const retryAfter = headers?.get('retry-after')?.trim()
+  const delay = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000
+    : retryAfter && /^[A-Za-z]{3}, /.test(retryAfter) ? Date.parse(retryAfter) - Date.now() : NaN
   return new ApiError(
     typeof problem.error === 'string' ? problem.error : 'Request failed', status,
     typeof problem.code === 'string' ? problem.code : 'HTTP_ERROR', problem.retryable === true,
+    Number.isFinite(delay) ? Math.min(2147483647, Math.max(0, delay)) : undefined,
   )
 }
 
@@ -148,7 +153,7 @@ export function createInboxClient(options: InboxClientOptions = {}) {
           let problem: unknown
           try { problem = await response.json() } catch { problem = null }
           ensureCurrent()
-          throw apiProblem(problem, response.status)
+          throw apiProblem(problem, response.status, response.headers)
         }
         if (response.status === 204 || method === 'HEAD') return { data: undefined as T, headers: response.headers }
         if (binary) {
@@ -209,19 +214,24 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     async function* stream(): AsyncGenerator<InboxEvent, void, unknown> {
       let cursor = eventOptions.since
       let retryMs = reconnectMs
+      let failures = 0
       while (!signal.aborted && version === credentialsVersion) {
         let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+        let body: ReadableStream<Uint8Array> | null | undefined
+        let retryAfterMs = 0
+        const startedAt = Date.now()
         const cancelReader = () => { void reader?.cancel().catch(() => {}) }
         try {
           const requestHeaders = new Headers(headers)
           requestHeaders.set('Accept', 'text/event-stream')
           if (cursor !== undefined) requestHeaders.set('Last-Event-ID', cursor)
           const response = await fetcher(url(`/events${queryString(cursor === undefined ? {} : { since: cursor })}`), { headers: requestHeaders, credentials: 'include', cache: 'no-store', signal })
+          body = response.body
           if (signal.aborted || version !== credentialsVersion) { await response.body?.cancel().catch(() => {}); return }
           if (!response.ok) {
             let problem: unknown
             try { problem = await response.json() } catch { problem = null }
-            throw apiProblem(problem, response.status)
+            throw apiProblem(problem, response.status, response.headers)
           }
           if (!(response.headers.get('content-type') ?? '').toLowerCase().startsWith('text/event-stream') || !response.body) {
             throw new ApiError('The API did not return an event stream', 502, 'INVALID_EVENT_STREAM')
@@ -309,13 +319,21 @@ export function createInboxClient(options: InboxClientOptions = {}) {
           if (eventOptions.reconnect === false) throw error
           if (error instanceof ApiError && !error.retryable) throw error
           if (!(error instanceof ApiError) && !(error instanceof TypeError)) throw error
+          if (error instanceof ApiError) retryAfterMs = error.retryAfterMs ?? 0
         } finally {
           signal.removeEventListener('abort', cancelReader)
-          await reader?.cancel().catch(() => {})
+          // A rejected content type can still have a live response body; release it too.
+          if (reader) await reader.cancel().catch(() => {})
+          else await body?.cancel().catch(() => {})
           reader?.releaseLock()
         }
         if (eventOptions.reconnect === false) return
-        await wait(retryMs, signal)
+        // Rapid failures/early closes must not turn every tab into a one-second retry loop.
+        // A healthy stream rotation resets the backoff, but a ready frame alone does not.
+        failures = Date.now() - startedAt >= 30000 ? 0 : Math.min(failures + 1, 8)
+        const backoff = failures ? Math.min(30000, Math.max(1000, retryMs) * 2 ** (failures - 1)) : retryMs
+        const delay = failures ? backoff * (0.75 + Math.random() * 0.25) : backoff
+        await wait(Math.max(retryAfterMs, delay), signal)
       }
     }
     const iterator = stream()

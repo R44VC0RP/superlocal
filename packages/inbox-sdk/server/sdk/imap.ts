@@ -467,9 +467,13 @@ export class ImapProvider implements InboxProvider {
     const content = await streamBuffer(result.content, MAX_BODY_BYTES)
     const charset = result.meta.charset ?? part.parameters?.charset ?? 'utf-8'
     try {
-      return new TextDecoder(charset, { fatal: true }).decode(content)
+      // ImapFlow converts supported text charsets to UTF-8. Real mail can still
+      // contain malformed bytes: use the standard replacement character rather
+      // than letting one damaged alternative block this whole sync page forever.
+      // Unknown charset labels still throw; never guess a different encoding.
+      return new TextDecoder(charset).decode(content)
     } catch {
-      throw new UnsupportedOperationError('imap', 'decoding this message character encoding without data loss')
+      throw new UnsupportedOperationError('imap', 'decoding this message character encoding')
     }
   }
 
