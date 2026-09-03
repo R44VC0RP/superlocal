@@ -1543,10 +1543,6 @@ export default function App() {
                   onClick={() => setNavigation(!navigation)}
                 />
               )}
-              {!search && !selected.length && <button type="button" className="inbox-scope-selector" onClick={() => openOverlay("accounts")} title={accountTitle} aria-label={`Choose inbox. Current: ${accountTitle}`}>
-                <Icon name={isUnified ? "Inbox" : "Envelope"} size={16} />
-                <span>{accountTitle}</span><Icon name="ChevronDown" size={12} />
-              </button>}
               {search ? (
                 <div className="search-field">
                   <input
