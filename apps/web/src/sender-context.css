@@ -1,0 +1,78 @@
+.sender-context {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 32px var(--sidebar-gutter) 24px;
+  color: var(--muted);
+  font: var(--ui-small)/1.5 var(--font);
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+  overscroll-behavior: contain;
+}
+.sender-heading { display: flex; align-items: center; gap: 12px; }
+.sender-context dd { margin: 0; }
+.sender-heading > div { min-width: 0; }
+.sender-heading h2 { font-size: var(--ui-nav); font-weight: 600; line-height: 1.4; color: var(--text); overflow-wrap: anywhere; }
+.sender-domain-mark { width: 44px; height: 44px; flex: 0 0 44px; display: grid; place-items: center; color: var(--muted); position: relative; }
+.sender-domain-mark img { position: absolute; width: 40px; height: 40px; object-fit: contain; opacity: 0; }
+.sender-domain-mark img.is-loaded { opacity: 1; }
+.sender-root-link { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-height: 40px; margin-block: -6px -8px; }
+.sender-root-link span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sender-root-link .icon { flex: 0 0 12px; }
+.sender-hostname { display: block; overflow-wrap: anywhere; }
+.sender-address { margin-block: 16px 4px; overflow-wrap: anywhere; user-select: text; }
+.sender-address > span { color: var(--muted); }
+.sender-compose { display: flex; align-items: center; gap: 8px; min-height: 40px; color: var(--text); text-align: start; }
+.sender-compose .icon { color: var(--muted); }
+.sender-context :is(a, button, summary) { border-radius: 4px; }
+.sender-context :is(a, button, summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.sender-context :is(a, button):hover { color: var(--text); }
+.sender-context button:disabled { opacity: 0.5; cursor: default; }
+.sender-context summary { list-style: none; display: flex; align-items: center; cursor: pointer; gap: 8px; min-height: 40px; }
+.sender-context summary::-webkit-details-marker { display: none; }
+.sender-context summary > .icon:last-child { margin-inline-start: auto; flex-shrink: 0; }
+.sender-context details[open] > summary > .icon:last-child { transform: rotate(180deg); }
+.sender-domain-details { margin-block: 4px 16px; }
+.sender-domain-details summary:hover, .sender-level-details summary:hover { color: var(--text); }
+.sender-domain-details dl, .sender-recency { margin: 4px 0 8px; }
+.sender-domain-details dl > div { display: grid; gap: 2px; margin-bottom: 10px; }
+.sender-domain-details dd { color: var(--text); overflow-wrap: anywhere; user-select: text; }
+.sender-context p { text-wrap: pretty; }
+.sender-domain-details p, .sender-level-details p { margin-block: 8px; }
+.sender-domain-lookup { display: inline-flex; min-height: 40px; align-items: center; gap: 6px; }
+.sender-settings-link { display: block; min-height: 40px; text-decoration: underline; text-underline-offset: 3px; }
+.sender-exchanges h3, .sender-conversations h3 { color: var(--text); font-size: var(--ui-small); font-weight: 600; line-height: 1.5; }
+.sender-history-scope { display: flex; gap: 16px; margin-block: 4px; }
+.sender-history-scope button { min-height: 40px; position: relative; color: var(--muted); white-space: nowrap; }
+.sender-history-scope button[aria-pressed="true"] { color: var(--text); }
+.sender-history-scope button[aria-pressed="true"]::after { content: ""; height: 1px; background: currentColor; position: absolute; inset-inline: 0; bottom: 3px; }
+.sender-level-details { margin-block: 6px 12px; }
+.sender-level-details summary { gap: 8px; flex-wrap: wrap; font-variant-numeric: tabular-nums; color: var(--text); }
+.sender-level-scale { display: flex; align-items: flex-end; gap: 3px; height: 16px; flex-shrink: 0; }
+.sender-level-scale i { width: 4px; height: 12px; border-radius: 1px; background: var(--border); }
+.sender-level-scale i.is-filled { background: var(--accent); }
+.sender-level-name { color: var(--muted); }
+.sender-counts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.sender-counts > div { display: flex; flex-direction: column-reverse; }
+.sender-counts dd { color: var(--text); font-size: var(--ui-subject); line-height: 1.4; font-weight: 500; font-variant-numeric: tabular-nums; }
+.sender-counts dt { margin-top: 2px; }
+.sender-two-way { margin-block: 12px 16px; font-variant-numeric: tabular-nums; }
+.sender-activity-chart { display: flex; align-items: flex-end; height: 40px; gap: 5px; }
+.sender-week { display: flex; flex: 1; min-width: 0; height: 100%; flex-direction: column; justify-content: flex-end; position: relative; }
+.sender-week::before { content: ""; height: 1px; background: var(--border); position: absolute; bottom: 0; inset-inline: 0; }
+.sender-week i { display: block; min-height: 0; position: relative; }
+.sender-week-received { background: var(--muted); opacity: 0.6; }
+.sender-week-sent { background: var(--accent); }
+.sender-chart-caption { display: flex; justify-content: space-between; gap: 12px; margin-top: 6px; }
+.sender-chart-caption > span:last-child { display: inline-flex; align-items: center; gap: 5px; }
+.sender-chart-caption i { width: 6px; height: 6px; background: var(--accent); border-radius: 1px; }
+.sender-recency { margin-block: 18px 10px; }
+.sender-recency > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 8px; margin-block: 6px; }
+.sender-recency dd { color: var(--text); font-variant-numeric: tabular-nums; }
+.sender-coverage { color: var(--muted); }
+.sender-conversations { margin-top: 28px; }
+.sender-conversations h3 { margin-bottom: 10px; }
+.sender-conversation { display: flex; flex-direction: column; gap: 2px; min-height: 40px; width: 100%; margin-block: 4px; padding-block: 8px; text-align: start; }
+.sender-conversation > span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+.sender-conversation time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.sender-conversation[aria-current="true"] > span { color: var(--text); }

@@ -9,6 +9,7 @@ import { readSaved, writeSaved } from "./storage";
 import { matchesSearch } from "./mail-search";
 import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, type HostConfiguration, type InboxViewPreferences } from "./host";
 import { UNIFIED_ACCOUNT, unifiedMail, unifiedThreadId } from "./mail-model";
+import type { SenderHistoryMessage } from "./sender-context";
 
 type Edit = { draft: Draft; revision: number; version: number; error?: string };
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
@@ -19,6 +20,7 @@ export type InboxSnapshot = {
   sources: Account[];
   viewPreferences: InboxViewPreferences | null;
   mail: Mail[];
+  senderHistory: SenderHistoryMessage[];
   drafts: Draft[];
   labels: Record<string, string[]>;
   loading: boolean;
@@ -31,7 +33,7 @@ export type InboxSnapshot = {
   operations: Readonly<Record<string, Operation>>;
 };
 
-const initial: InboxSnapshot = { accounts: [], mailboxes: [], sources: [], viewPreferences: null, mail: [], drafts: [], labels: {}, loading: true, refreshing: false, pending: 0, unsaved: false, error: null, policy: null, host: null, operations: {} };
+const initial: InboxSnapshot = { accounts: [], mailboxes: [], sources: [], viewPreferences: null, mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, refreshing: false, pending: 0, unsaved: false, error: null, policy: null, host: null, operations: {} };
 const recoveryKey = "sdk-draft-recovery";
 const outboxKey = "sdk-outbox-references";
 const formatAddress = (person: Participant) => person.name && person.name !== person.email
@@ -422,6 +424,7 @@ export class InboxStore {
         canSend: this.state.host?.allowProviderWrites === true && source.status === "connected" && box.status === "active" && source.capabilities.send && !!box.defaultSender };
     });
     const mail: Mail[] = [], labelNames: Record<string, string[]> = {};
+    const senderHistory = new Map<string, SenderHistoryMessage>();
     const sentMessages = new Map<string, Operation>();
     for (const operation of this.operations.values()) if (operation.type === "send") {
       for (const result of operation.results) if (result.status === "succeeded") sentMessages.set(result.messageId, operation);
@@ -433,6 +436,16 @@ export class InboxStore {
       labelNames[box.id] = [...new Set([...labels.map(label => label.name), ...nativeFolders.filter(folder => folder.kind === "label").map(folder => folder.name)])];
       const groups = new Map<string, MailboxMessageSummary[]>();
       for (const row of this.summaries.get(box.id) ?? []) {
+        // Reuse normalized, body-free SDK facts. Overlapping views contribute
+        // memberships, never extra exchanges; different sources stay separate.
+        const key = `${source.id}\0${row.id}`, previous = senderHistory.get(key);
+        const mailboxIds = [...new Set([...(previous?.mailboxIds ?? []), box.id])];
+        senderHistory.set(key, previous && previous.revision > row.revision ? { ...previous, mailboxIds } : {
+          id: row.id, sourceId: source.id, threadId: row.threadId, revision: row.revision,
+          from: row.from, to: row.to, cc: row.cc, subject: row.subject, receivedAt: row.receivedAt, folder: row.folder,
+          outgoing: row.folder === "sent" || row.folderIds.includes("sent") || sentMessages.get(row.id)?.accountId === source.id,
+          mailboxIds,
+        });
         const group = groups.get(row.threadId) ?? []; group.push(row); groups.set(row.threadId, group);
       }
       for (const [thread, rows] of groups) {
@@ -505,7 +518,7 @@ export class InboxStore {
       return { ...(edit?.draft ?? this.uiDraft(raw)), popOut: this.popouts.get(raw.id) ?? edit?.draft.popOut ?? false,
         saving: this.saves.has(raw.id) || !!edit && !edit.error && completeRecipients(edit.draft), dirty: !!edit, saveError: edit?.error };
     });
-    this.publish({ accounts, mail, drafts, labels: labelNames, unsaved: this.edits.size > 0 || this.saves.size > 0, operations: Object.fromEntries(this.operations) });
+    this.publish({ accounts, mail, senderHistory: [...senderHistory.values()], drafts, labels: labelNames, unsaved: this.edits.size > 0 || this.saves.size > 0, operations: Object.fromEntries(this.operations) });
   }
 
   loadThread = (id: string): Promise<void> => {

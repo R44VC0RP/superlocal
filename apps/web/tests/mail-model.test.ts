@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { accounts, seedMail, type Draft, type Mail } from "../src/data.ts";
 import { matchesSearch } from "../src/mail-search.ts";
+import { senderActivity, senderContact, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
 import {
   advanceMail,
   appendOutgoing,
@@ -301,4 +302,89 @@ test("unified rendering retains the newest canonical revision rather than a stal
   assert.equal(combined.messages[0].loaded, false);
   assert.equal(combined.messages[0].body, "");
   assert.equal(combined.unread, false);
+});
+
+test("sender levels count reciprocal conversations, not inbound volume or message opens", () => {
+  const received: SenderHistoryMessage = { id: "in", sourceId: "source", threadId: "thread", revision: 1,
+    from: { name: "Alex", email: "alex@news.example.test" }, to: [{ name: "Me", email: "me@example.test" }], cc: [],
+    subject: "An exchange", receivedAt: deadline, folder: "inbox", outgoing: false, mailboxIds: ["box"] };
+  const newsletters = Array.from({ length: 100 }, (_, index) => ({ ...received, id: `newsletter-${index}`, threadId: `newsletter-${index}` }));
+  assert.equal(senderActivity(newsletters, received.from.email, ["box"], null, due).level, 1);
+  assert.equal(senderActivity([], received.from.email, ["box"], null, due).level, 0);
+  for (const [count, expected] of [[1, 2], [2, 2], [3, 3], [9, 3], [10, 4], [24, 4], [25, 5]]) {
+    const history = Array.from({ length: count }, (_, index) => [
+      { ...received, id: `in-${index}`, threadId: `t-${index}` },
+      { ...received, id: `out-${index}`, threadId: `t-${index}`, outgoing: true, folder: "sent", from: received.to[0], to: [received.from] },
+    ]).flat();
+    const before = structuredClone(history);
+    const activity = senderActivity(history, "ALEX@NEWS.EXAMPLE.TEST", ["box"], null, due);
+    assert.equal(activity.twoWay, count);
+    assert.equal(activity.level, expected);
+    assert.equal(activity.sent, count);
+    assert.equal(activity.received, count);
+    assert.equal(activity.weeks.reduce((sum, week) => sum + week.sent + week.received, 0), count * 2);
+    assert.deepEqual(history, before);
+  }
+});
+
+test("sender history deduplicates view overlap, retains newest facts and never invents cross-source exchanges", () => {
+  const base: SenderHistoryMessage = { id: "shared", sourceId: "a", threadId: "same-thread-id", revision: 1,
+    from: { name: "Alex", email: "alex@example.test" }, to: [{ name: "Me", email: "me@example.test" }], cc: [],
+    subject: "Same subject", receivedAt: deadline, folder: "inbox", outgoing: false, mailboxIds: ["all"] };
+  const alias = { ...base, mailboxIds: ["address"] };
+  const unrelatedReply = { ...base, id: "out", sourceId: "b", mailboxIds: ["other"], outgoing: true, folder: "sent", from: base.to[0], to: [base.from] };
+  const activity = senderActivity([base, alias, unrelatedReply], base.from.email, ["all", "address", "other"], null, due);
+  assert.equal(activity.received, 1);
+  assert.equal(activity.sent, 1);
+  assert.equal(activity.conversations, 2);
+  assert.equal(activity.twoWay, 0);
+  assert.equal(activity.level, 1);
+  assert.equal(senderActivity([base, unrelatedReply], base.from.email, [], null, due).conversations, 0);
+  const current = { ...alias, revision: 2, folder: "trash" };
+  assert.equal(senderActivity([current, base], base.from.email, ["all"], null, due).received, 0);
+  assert.equal(senderActivity([base, alias], base.from.email, ["address"], null, due).received, 1);
+});
+
+test("sender history matches exact addresses or explicit domain boundaries and excludes unsent or hidden mail", () => {
+  const base: SenderHistoryMessage = { id: "a", sourceId: "source", threadId: "t", revision: 1,
+    from: { name: "A", email: "a@em1.example.test" }, to: [{ name: "Me", email: "me@example.test" }], cc: [],
+    subject: "Mail", receivedAt: deadline, folder: "inbox", outgoing: false, mailboxIds: ["box"] };
+  const other = { ...base, id: "b", from: { name: "B", email: "b@example.test" } };
+  const unrelated = { ...base, id: "evil", from: { name: "Other", email: "a@notexample.test" } };
+  const child = { ...base, id: "child", from: { name: "Child", email: "a@example.test.evil.test" } };
+  const excluded = ["trash", "spam", "draft", "drafts", "scheduled"].map(folder => ({ ...base, id: folder, folder }));
+  const future = { ...base, id: "future", receivedAt: new Date(due + 1000).toISOString() };
+  const invalidDate = { ...base, id: "bad-date", receivedAt: "not a date" };
+  const sent = { ...base, id: "cc-sent", outgoing: true, folder: "sent", from: base.to[0], to: [], cc: [base.from] };
+  const history = [base, other, unrelated, child, ...excluded, future, invalidDate, sent];
+  assert.equal(senderActivity(history, base.from.email, ["box"], null, due).received, 1);
+  const grouped = senderActivity(history, base.from.email, ["box"], "example.test", due);
+  assert.equal(grouped.received, 2);
+  assert.equal(grouped.sent, 1);
+  assert.equal(grouped.twoWay, 1);
+  assert.equal(grouped.lastSent, due);
+});
+
+test("sender selection follows the exact message or outgoing recipient, never the latest self reply", () => {
+  const incoming: SenderHistoryMessage = { id: "first", sourceId: "source", threadId: "thread", revision: 1,
+    from: { name: "Alex", email: "alex@example.test" }, to: [{ name: "Me", email: "me@example.test" }], cc: [],
+    subject: "Mail", receivedAt: deadline, folder: "inbox", outgoing: false, mailboxIds: ["box"] };
+  const later = { ...incoming, id: "second", from: { name: "Jamie", email: "jamie@example.test" }, receivedAt: new Date(due + 1000).toISOString() };
+  const outgoing = { ...incoming, id: "reply", from: incoming.to[0], to: [incoming.to[0], incoming.from], outgoing: true, folder: "sent", receivedAt: new Date(due + 2000).toISOString() };
+  const boxes = [{ id: "box", sourceId: "source", name: "Me", email: incoming.to[0].email, canSend: true }];
+  const thread: Mail = { ...inbox, sourceId: "source", messages: [incoming, later, outgoing].map(item => ({ id: item.id, email: item.from.email, from: item.from.name, to: "", date: "Today", body: "" })) };
+  const history = [incoming, later, outgoing];
+  assert.equal(senderContact(thread, history, boxes).email, later.from.email);
+  assert.equal(senderContact(thread, history, boxes, incoming.id).email, incoming.from.email);
+  assert.deepEqual(senderContact(thread, history, boxes, outgoing.id), { ...incoming.from, messageId: outgoing.id, role: "recipient" });
+  assert.equal(senderContact({ ...thread, messages: [thread.messages[2]] }, history, boxes).role, "recipient");
+});
+
+test("sender host extraction normalizes IDNs without accepting URLs, extra addresses or IP literals", () => {
+  assert.equal(senderHostname("mail@em1.Cloudflare.com"), "em1.cloudflare.com");
+  assert.equal(senderHostname("mail@bücher.de"), "xn--bcher-kva.de");
+  assert.equal(senderHostname("mail@em1.cloudflare.com."), "em1.cloudflare.com");
+  for (const address of ["a@b@cloudflare.com", "Cloudflare <mail@cloudflare.com>", "a@cloudflare.com/path", "a@cloudflare.com?x=1", "a@cloudflare.com:443", "a@127.0.0.1", "a@[::1]", "a@localhost"]) {
+    assert.equal(senderHostname(address), null, address);
+  }
 });

@@ -44,6 +44,8 @@ import { resolveMailShortcut } from "./mail-shortcuts";
 import MailCommandDialog, { type CommandItem } from "./MailCommandDialog";
 import IssueReporter from "./IssueReporter";
 import { captureIssueReport, type IssueReport } from "./issue-reports";
+import SenderContext from "./SenderContext";
+import { senderContact } from "./sender-context";
 
 type Route = {
   account: string;
@@ -162,7 +164,7 @@ export default function App() {
     url.searchParams.delete("connection");
     history.replaceState(null, "", url);
   }, []);
-  const [profile, setProfile] = useState(false);
+  const [senderSelection, setSenderSelection] = useState<{ threadId: string; messageId: string } | null>(null);
   const [mobileSidebar, setMobileSidebar] = useState(false);
   const [userProfile, setUserProfile] = useState(() =>
     loadSaved("profile", {
@@ -267,6 +269,11 @@ export default function App() {
   );
   const isDrafts = route.folder === "Drafts" && !search;
   const currentMail = accountMail.find((m) => m.id === route.thread);
+  const contextContact = useMemo(() => currentMail && !currentMail.operationId
+    ? senderContact(currentMail, inbox.senderHistory, inbox.accounts, senderSelection?.threadId === currentMail.id ? senderSelection.messageId : undefined)
+    : null, [currentMail, inbox.senderHistory, inbox.accounts, senderSelection]);
+  const contextMailboxIds = useMemo(() => isUnified ? unifiedMailboxIds : [route.account], [isUnified, unifiedMailboxIds, route.account]);
+  const contextSender = currentMail && contextContact ? store.defaultMailbox(route.account, currentMail, contextContact.messageId ?? undefined) : undefined;
   // A reply keeps its thread association when the user changes its From account.
   const currentDraft =
     drafts.find((d) => d.id === route.draft) ||
@@ -419,7 +426,7 @@ export default function App() {
     history.pushState(null, "", `#/${params}`);
     setRoute(next);
     closeNavigation();
-    setProfile(false);
+    setSenderSelection(null);
     setMobileSidebar(false);
   }
   function closeNavigation() {
@@ -637,7 +644,7 @@ export default function App() {
       void store.flushDraft(currentDraft.id).catch(actionError);
     }
     navigate({ thread: undefined, draft: undefined, view: undefined });
-    setProfile(false);
+    setSenderSelection(null);
   }
   function toggleComposeFocus() {
     if (document.activeElement?.closest(".compose-view"))
@@ -686,6 +693,15 @@ export default function App() {
     }
     try { await store.newDraft(route.account, { mode, popOut, mail: currentMail, sourceMessageId }); }
     catch (error) { actionError(error); }
+  }
+  async function composeContact() {
+    if (!contextContact || !contextSender?.canSend) return;
+    motion.prepare("switch");
+    try {
+      const draft = await store.newDraft(contextSender.id, { to: contextContact.email });
+      navigate({ draft: draft.id, thread: undefined, view: undefined });
+      setSearch(false);
+    } catch (error) { actionError(error); }
   }
   function updateDraft(draft: Draft) {
     const current = drafts.find(value => value.id === draft.id);
@@ -1172,7 +1188,7 @@ export default function App() {
               : "list",
       editing: !!editing,
       richText: !!editing?.hasAttribute("contenteditable"),
-      interactive: !!target?.closest("button,a"),
+      interactive: !!target?.closest("button,a,summary"),
       modal: !!document.querySelector("[aria-modal=true]"),
       navigation,
       settings,
@@ -1511,8 +1527,8 @@ export default function App() {
             onSearch={() => currentDraft && startSearch(currentDraft.id)}
             onToggleFocus={toggleComposeFocus}
             onImageSettings={() => openSettings("Images")}
-            onOpenProfile={() => {
-              setProfile(true);
+            onOpenProfile={(messageId) => {
+              setSenderSelection({ threadId: currentMail.id, messageId });
               setMobileSidebar(true);
             }}
           />
@@ -1836,7 +1852,7 @@ export default function App() {
           settings
             ? "Settings"
             : currentMail || route.draft
-              ? "Contact details"
+              ? "Sender context"
               : "Recent Opens"
         }
       >
@@ -1886,13 +1902,25 @@ export default function App() {
                 ))}
               </div>
             </section>
-          ) : currentMail || route.draft || profile ? (
+          ) : currentMail && contextContact && !route.draft ? (
+            <SenderContext
+              key={`${route.account}:${contextContact.email.toLowerCase()}`}
+              contact={contextContact}
+              history={inbox.senderHistory}
+              mailboxIds={contextMailboxIds}
+              mail={accountMail}
+              currentThreadId={currentMail.id}
+              scopeLabel={isUnified ? "selected mailboxes" : "this mailbox"}
+              remoteImages={inbox.policy?.remoteImages === true}
+              showLogos={preferences.showAvatars !== false}
+              canCompose={contextSender?.canSend === true}
+              onCompose={() => { void composeContact(); }}
+              onOpen={openMail}
+              onImageSettings={() => openSettings("Images")}
+            />
+          ) : currentMail || route.draft ? (
             <div className="contact-panel">
-              <h2>
-                {route.draft || currentMail?.folder === "Sent"
-                  ? userProfile.name
-                  : currentMail?.from || userProfile.name}
-              </h2>
+              <h2>{userProfile.name}</h2>
               <div className="contact-identity">
                 <div className="contact-avatar">
                   <Icon name="User" size={45} />
@@ -1902,68 +1930,31 @@ export default function App() {
                 </div>
                 <div>
                   <b>
-                    {route.draft
-                      ? currentDraft?.from || accountEmail
-                      : currentMail?.email || accountEmail}
+                    {currentDraft?.from || currentMail?.email || accountEmail}
                   </b>
-                  <p>{route.draft ? userProfile.location : ""}</p>
+                  <p>{userProfile.location}</p>
                 </div>
               </div>
-              {route.draft ? (
-                <>
-                  <button
-                    className="primary-button"
-                    onClick={() => openOverlay("profile")}
-                  >
-                    Edit Profile
-                  </button>
-                  <p className="contact-bio">{userProfile.bio}</p>
-                  {userProfile.website && <button
-                    className="contact-link"
-                    onClick={() =>
-                      window.open(
-                        `https://${userProfile.website}`,
-                        "_blank",
-                        "noopener,noreferrer",
-                      )
-                    }
-                  >
-                    <Icon name="Link" />
-                    {userProfile.website}
-                  </button>}
-                </>
-              ) : (
-                <>
-                  <button
-                    className="contact-link"
-                    disabled={!activeAccount?.canSend}
-                    onClick={() => { void newDraft().then(draft => { if (draft) store.editDraft({ ...draft, to: currentMail?.email || "" }); }); }}
-                  >
-                    <Icon name="Envelope" />
-                    Compose email
-                  </button>
-                  <h3>Recent conversations</h3>
-                  {accountMail
-                    .filter((m) => m.email === currentMail?.email)
-                    .slice(0, 5)
-                    .map((m) => (
-                      <button
-                        key={m.id}
-                        className="related-mail"
-                        onClick={() => openMail(m)}
-                      >
-                        {m.subject}
-                        <span>{m.date}</span>
-                      </button>
-                    ))}
-                  {currentMail?.opened && (
-                    <div className="contact-read-status">
-                      <Icon name="Eye" />
-                      Last opened {currentMail.opened}
-                    </div>
-                  )}
-                </>
-              )}
+              <button
+                className="primary-button"
+                onClick={() => openOverlay("profile")}
+              >
+                Edit Profile
+              </button>
+              <p className="contact-bio">{userProfile.bio}</p>
+              {userProfile.website && <button
+                className="contact-link"
+                onClick={() =>
+                  window.open(
+                    `https://${userProfile.website}`,
+                    "_blank",
+                    "noopener,noreferrer",
+                  )
+                }
+              >
+                <Icon name="Link" />
+                {userProfile.website}
+              </button>}
             </div>
           ) : preferences.recentOpens ? (
             <RecentOpens mail={recent} />

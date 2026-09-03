@@ -74,7 +74,7 @@ type ThreadViewProps = {
   onSend: (draft: Draft, when?: string, options?: SendOptions) => Promise<boolean>;
   onDiscard: () => Promise<boolean>;
   onReloadDraft: () => void;
-  onOpenProfile: () => void;
+  onOpenProfile: (messageId: string) => void;
   onSearch?: () => void;
   onToggleFocus?: () => void;
   onImageSettings: () => void;
@@ -378,7 +378,7 @@ export default function ThreadView({
       } else if (!event.shiftKey && key === "m" && commentInput.current) {
         commentInput.current.focus();
       } else if (key === " ") {
-        if (target?.closest('button, a, [role="button"]')) return;
+        if (target?.closest('button, a, summary, [role="button"]')) return;
         scroller.current.scrollBy({
           top: scroller.current.clientHeight * 0.85 * (event.shiftKey ? -1 : 1),
           behavior: "auto",
@@ -643,7 +643,7 @@ export default function ThreadView({
                         <button
                           type="button"
                           className="thread-sender-name"
-                          onClick={onOpenProfile}
+                          onClick={() => onOpenProfile(message.id)}
                         >
                           {sent ? "Me" : message.from}
                         </button>
@@ -728,7 +728,7 @@ export default function ThreadView({
                       <dl className="thread-details">
                         <dt>From</dt>
                         <dd>
-                          <button type="button" onClick={onOpenProfile}>
+                          <button type="button" onClick={() => onOpenProfile(message.id)}>
                             {message.from}
                           </button>{" "}
                           <span>&lt;{message.email}&gt;</span>

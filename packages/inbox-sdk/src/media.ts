@@ -275,6 +275,59 @@ async function content(response: Response, maximum: number, signal: AbortSignal)
   }
 }
 
+/** Server-only image fetch. The caller owns the deadline, policy and cache; no transport is chosen implicitly. */
+export async function fetchPublicImage(input: {
+  source: string; network: MediaNetwork | undefined; signal: AbortSignal
+  maxBytes: number; cacheTtlMs: number; authorize: () => void | Promise<void>
+}): Promise<MediaContent & { lifetime: number }> {
+  const { network, signal, maxBytes: maximum, cacheTtlMs: ttl } = input
+  if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 16 * MiB
+    || !Number.isSafeInteger(ttl) || ttl < 1 || ttl > 7 * 24 * 60 * 60_000) {
+    throw new InboxError('VALIDATION', 'Invalid media limits.')
+  }
+  const authorize = async () => {
+    signal.throwIfAborted()
+    await interruptible(Promise.resolve(input.authorize()), signal)
+    signal.throwIfAborted()
+  }
+  await authorize()
+  if (!network) throw issue('MEDIA_NETWORK_DISABLED', 503)
+  let url = destination(input.source)
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    await authorize()
+    const hostname = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '')
+    const addresses = isIP(hostname) ? [hostname] : await interruptible(network.resolve(hostname, signal), signal)
+    if (!addresses.length || addresses.length > 32) throw issue('MEDIA_DNS', 502, true)
+    const families = addresses.map(publicAddress)
+    const address = addresses[0]!, family = families[0]!
+    await authorize()
+    const response = await interruptible(network.request({ url: url.href, address, family,
+      headers: Object.freeze({ Accept: 'image/png,image/jpeg,image/gif,image/webp,image/svg+xml', 'Accept-Encoding': 'identity' }) }, signal), signal)
+    try {
+      await authorize()
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        if (hop === MAX_REDIRECTS) throw issue('MEDIA_REDIRECT_LIMIT', 502)
+        const location = response.headers.get('location')
+        if (!location || location.length > 8192) throw issue('MEDIA_REDIRECT_INVALID', 502)
+        try { url = destination(new URL(location, url).href) }
+        catch (error) { throw error instanceof InboxError ? error : issue('MEDIA_REDIRECT_INVALID', 502) }
+        continue
+      }
+      if (response.status !== 200) throw issue(`MEDIA_UPSTREAM_${response.status}`, response.status === 404 ? 404 : 502, response.status >= 500 || response.status === 429)
+      const declared = response.headers.get('content-type') ?? ''
+      const svg = declared.split(';', 1)[0]!.trim().toLowerCase() === 'image/svg+xml'
+      const bytes = await content(response, svg ? Math.min(maximum, MAX_SVG_IMAGE_BYTES) : maximum, signal)
+      const image = imageContent(bytes, declared, maximum)
+      const control = response.headers.get('cache-control') ?? ''
+      const maxAge = /(?:^|,)\s*max-age\s*=\s*"?(\d+)/i.exec(control)?.[1]
+      const lifetime = /(?:^|,)\s*(?:no-store|no-cache)\b/i.test(control) ? 0 : Math.min(ttl, maxAge === undefined ? ttl : Number(maxAge) * 1000)
+      await authorize()
+      return { ...image, lifetime, noStore: /(?:^|,)\s*no-store\b/i.test(control) }
+    } finally { void response.body?.cancel().catch(() => {}) }
+  }
+  throw issue('MEDIA_REDIRECT_LIMIT', 502)
+}
+
 type CacheRow = { resource: string; type: string | null; content: Uint8Array | null; code: string | null; status: number; retryable: number; expires: number }
 type Job = { owner: string; controller: AbortController; promise: Promise<MediaContent> }
 
@@ -346,41 +399,6 @@ export function createMediaStore(input: {
     return releaseSlot
   }
 
-  async function load(source: string, signal: AbortSignal, authorize: () => void): Promise<MediaContent & { lifetime: number }> {
-    if (!network) throw issue('MEDIA_NETWORK_DISABLED', 503)
-    let url = destination(source)
-    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-      authorize(); signal.throwIfAborted()
-      const hostname = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '')
-      const addresses = isIP(hostname) ? [hostname] : await interruptible(network.resolve(hostname, signal), signal)
-      if (!addresses.length || addresses.length > 32) throw issue('MEDIA_DNS', 502, true)
-      const families = addresses.map(publicAddress)
-      authorize(); signal.throwIfAborted()
-      const response = await interruptible(network.request({ url: url.href, address: addresses[0]!, family: families[0]!,
-        headers: Object.freeze({ Accept: 'image/png,image/jpeg,image/gif,image/webp,image/svg+xml', 'Accept-Encoding': 'identity' }) }, signal), signal)
-      try {
-        if ([301, 302, 303, 307, 308].includes(response.status)) {
-          if (hop === MAX_REDIRECTS) throw issue('MEDIA_REDIRECT_LIMIT', 502)
-          const location = response.headers.get('location')
-          if (!location || location.length > 8192) throw issue('MEDIA_REDIRECT_INVALID', 502)
-          try { url = destination(new URL(location, url).href) }
-          catch (error) { throw error instanceof InboxError ? error : issue('MEDIA_REDIRECT_INVALID', 502) }
-          continue
-        }
-        if (response.status !== 200) throw issue(`MEDIA_UPSTREAM_${response.status}`, response.status === 404 ? 404 : 502, response.status >= 500 || response.status === 429)
-        const declared = response.headers.get('content-type') ?? ''
-        const svg = declared.split(';', 1)[0]!.trim().toLowerCase() === 'image/svg+xml'
-        const bytes = await content(response, svg ? Math.min(maximum, MAX_SVG_IMAGE_BYTES) : maximum, signal)
-        const image = imageContent(bytes, declared, maximum)
-        const control = response.headers.get('cache-control') ?? ''
-        const maxAge = /(?:^|,)\s*max-age\s*=\s*"?(\d+)/i.exec(control)?.[1]
-        const lifetime = /(?:^|,)\s*(?:no-store|no-cache)\b/i.test(control) ? 0 : Math.min(ttl, maxAge === undefined ? ttl : Number(maxAge) * 1000)
-        return { ...image, lifetime, noStore: /(?:^|,)\s*no-store\b/i.test(control) }
-      } finally { void response.body?.cancel().catch(() => {}) }
-    }
-    throw issue('MEDIA_REDIRECT_LIMIT', 502)
-  }
-
   return {
     async get(owner: string, messageId: string, resource: string, source: string, authorize: () => void): Promise<MediaContent> {
       authorize()
@@ -415,7 +433,7 @@ export function createMediaStore(input: {
           let release: (() => void) | undefined
           try {
             release = await slot(controller.signal)
-            const result = await load(source, controller.signal, authorize)
+            const result = await fetchPublicImage({ source, network, signal: controller.signal, authorize, maxBytes: maximum, cacheTtlMs: ttl })
             authorize(); controller.signal.throwIfAborted()
             save(owner, messageId, resource, result, result.lifetime)
             return result

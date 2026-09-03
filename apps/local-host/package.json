@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "@superlocal/mock-api": "workspace:*",
-    "inbox-sdk": "workspace:*"
+    "inbox-sdk": "workspace:*",
+    "tldts": "^7.4.11"
   },
   "devDependencies": {
     "@types/bun": "latest",

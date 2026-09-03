@@ -7,6 +7,7 @@ import { loadLocalConfig, object, type LocalConfig } from './config'
 import { createInboxViewPreferencesStore, INBOX_PREFERENCES_BODY_LIMIT } from './inbox-preferences'
 import { createRealRegistrations, type HostProvider, type HostProviderRegistration } from './providers'
 import { openLocalRuntime } from './runtime'
+import { createSenderDomainHost } from './sender-domains'
 
 const safeHeaders = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', Vary: 'Origin, Cookie' }
 function problem(status: number, code: string, error: string): Response {
@@ -85,6 +86,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     inboxPreferences = createInboxViewPreferencesStore(runtime.database, inbox, owner)
   } catch (error) { try { if (mock) await mock.close(); else await inbox?.close() } finally { runtime.database.close() }; throw error }
   const liveInbox = inbox
+  const senderDomains = createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' })
   const origins = new Set(config.web.allowedOrigins)
   const hosts = new Set([`127.0.0.1:${config.backend.port}`, `localhost:${config.backend.port}`, ...config.web.allowedOrigins.map(value => new URL(value).host)])
   const cookieName = `superlocal_${config.instanceId.replaceAll('-', '')}_${config.mode}`
@@ -137,6 +139,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       return problem(401, 'UNAUTHENTICATED', 'Initialize a local browser session first.')
     }
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
+    if (url.pathname.startsWith('/host/sender-domains/')) return senderDomains.fetch(request)
     if (url.pathname === '/host/inbox-preferences') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Inbox preferences take no query parameters.')
       if (request.method === 'GET') return Response.json(await inboxPreferences.read(), { headers: safeHeaders })
@@ -195,6 +198,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       sessions.clear()
       streamShutdown.abort()
       return closing = (async () => {
+        await senderDomains.close()
         await Promise.allSettled([...pending])
         try { if (mock) await mock.close(); else await liveInbox.close() } finally { runtime.database.close() }
       })()

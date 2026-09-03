@@ -1135,9 +1135,9 @@ export function Settings({
     case "Images":
       content = (
         <>
-          {toggle("showImages", "Automatically show remote images", false, "Loads images directly from senders’ servers.")}
+          {toggle("showImages", "Automatically show remote images", false, "Loads eligible remote images through the Inbox SDK’s authenticated media service.")}
           <div className="settings-control-row"><span>Known tracking pixels</span><span>Blocked</span></div>
-          {toggle("showAvatars", "Show sender avatars")}
+          {toggle("showAvatars", "Show sender domain logos", true, "Uses Google favicons for the root domain only, never the email address. Remote images must also be enabled.")}
         </>
       );
       break;

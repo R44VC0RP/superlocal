@@ -10,7 +10,12 @@
     "./provider": "./server/sdk/types.ts",
     "./providers": "./src/providers.ts",
     "./client": "./src/client.ts",
-    "./http": "./src/http.ts"
+    "./http": "./src/http.ts",
+    "./media": {
+      "types": "./src/media.ts",
+      "bun": "./src/media.ts",
+      "node": "./src/media.ts"
+    }
   },
   "engines": { "bun": ">=1.4.0" },
   "scripts": {
