@@ -226,19 +226,49 @@ export function createDataset(path: string) {
         return { run, reviewed: records.length }
       })()
     },
-    export(run: string, directory: string, reviewedOnly = false) {
-      const config = JSON.parse(getRun(run).config_json) as RunConfiguration
-      const root = privateDirectory(directory)
-      const rows = db.query<{ id: string; origin: string; source: string; message: string; thread: string; content_hash: string; input_json: string; original_json: string; result_json: string; reviewed: string | null }, [string]>(`SELECT e.*,j.result_json,(SELECT classification_json FROM reviews r WHERE r.run=j.run AND r.example=j.example ORDER BY r.id DESC LIMIT 1) reviewed FROM jobs j JOIN examples e ON e.id=j.example WHERE j.run=? AND j.status='completed' ORDER BY e.id`).all(run)
-      // A sender stays in one split; union by thread and exact text prevents those duplicates crossing splits too.
-      const parents = new Map<string, string>()
+    partition(run: string, developmentRuns: string[] = []) {
+      getRun(run)
+      if (developmentRuns.length > 20 || new Set(developmentRuns).size !== developmentRuns.length) throw new Error('INVALID_DEVELOPMENT_RUNS')
+      const senderKey = (sender: string | null, fallback: string, id: string) => `sender:${digest((sender || fallback).trim().toLowerCase() || id)}`
+      const developmentSenders = new Set<string>()
+      for (const previous of developmentRuns) {
+        getRun(previous)
+        const senders = db.query<{ id: string; sender: string | null; fallback: string }, [string]>("SELECT e.id,json_extract(e.original_json,'$.from.email') sender,json_extract(e.input_json,'$.from') fallback FROM jobs j JOIN examples e ON e.id=j.example WHERE j.run=?").all(previous)
+        for (const row of senders) developmentSenders.add(senderKey(row.sender, row.fallback, row.id))
+      }
+      // Labeling failures and model disagreements must never change the cohort's split assignment.
+      const cohort = db.query<{ id: string; origin: string; source: string; thread: string; sender: string | null; input_json: string }, [string]>("SELECT e.id,e.origin,e.source,e.thread,json_extract(e.original_json,'$.from.email') sender,e.input_json FROM jobs j JOIN examples e ON e.id=j.example WHERE j.run=? ORDER BY e.id").all(run)
+      const parents = new Map<string, string>(), senders = new Map<string, string>()
+      const normalizeTemplate = (value: string) => value.normalize('NFKC').toLowerCase()
+        .replace(/https?:\/\/\S+|www\.\S+|[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+/gu, ' ')
+        .replace(/\p{N}+/gu, '0').replace(/\s+/g, ' ').trim()
       const find = (key: string): string => { const parent = parents.get(key); if (!parent) { parents.set(key, key); return key }; if (parent === key) return key; const root = find(parent); parents.set(key, root); return root }
       const unite = (a: string, b: string) => { const x = find(a), y = find(b); if (x !== y) parents.set(x < y ? y : x, x < y ? x : y) }
-      const groupKeys = (row: typeof rows[number], input: ClassificationInput) => {
-        const original = object(JSON.parse(row.original_json)), sender = text(object(original.from).email)
-        return [`sender:${digest((sender || input.from).trim().toLowerCase() || row.id)}`, `thread:${row.origin}:${row.source}:${row.thread}`, `body:${digest(input.subject + '\n' + input.bodyText)}`]
+      for (const row of cohort) {
+        const input: ClassificationInput = JSON.parse(row.input_json), sender = senderKey(row.sender, input.from, row.id)
+        senders.set(row.id, sender)
+        unite(sender, `thread:${row.origin}:${row.source}:${row.thread}`)
+        unite(sender, `body:${digest(input.subject + '\n' + input.bodyText)}`)
+        const template = normalizeTemplate(input.subject) + '\n' + normalizeTemplate(input.bodyText)
+        if (template.length >= 80) unite(sender, `template:${digest(template)}`)
       }
-      for (const row of rows) { const keys = groupKeys(row, JSON.parse(row.input_json)); unite(keys[0]!, keys[1]!); unite(keys[0]!, keys[2]!) }
+      const anchors = new Map<string, string>(), exposed = new Set<string>()
+      for (const sender of senders.values()) {
+        const root = find(sender), anchor = anchors.get(root)
+        if (!anchor || sender < anchor) anchors.set(root, sender)
+        if (developmentSenders.has(sender)) exposed.add(root)
+      }
+      return cohort.map(row => {
+        const root = find(senders.get(row.id)!), anchor = anchors.get(root)!, bucket = parseInt(digest(anchor).slice(0, 8), 16) % 100
+        const split = exposed.has(root) || bucket < 80 ? 'train' : bucket < 90 ? 'validation' : 'test'
+        return { exampleId: row.id, split, splitGroup: digest(anchor), developmentExposed: exposed.has(root) }
+      })
+    },
+    export(run: string, directory: string, reviewedOnly = false, developmentRuns: string[] = []) {
+      const config = JSON.parse(getRun(run).config_json) as RunConfiguration
+      const root = privateDirectory(directory)
+      const rows = db.query<{ id: string; source: string; message: string; content_hash: string; input_json: string; result_json: string; reviewed: string | null }, [string]>(`SELECT e.id,e.source,e.message,e.content_hash,e.input_json,j.result_json,(SELECT classification_json FROM reviews r WHERE r.run=j.run AND r.example=j.example ORDER BY r.id DESC LIMIT 1) reviewed FROM jobs j JOIN examples e ON e.id=j.example WHERE j.run=? AND j.status='completed' ORDER BY e.id`).all(run)
+      const partition = new Map(this.partition(run, developmentRuns).map(row => [row.exampleId, row]))
       const descriptors = new Map<string, number>()
       let exported = 0, skipped = 0
       const counts: Record<string, number> = { train: 0, validation: 0, test: 0 }
@@ -251,13 +281,12 @@ export function createDataset(path: string) {
           const example = { exampleId: row.id, sourceId: row.source, messageId: row.message, contentHash: row.content_hash, input, classification, labelSource, model: result.model, responseId: result.responseId }
           writeSync(descriptors.get('review')!, JSON.stringify(example) + '\n')
           if ((reviewedOnly && !row.reviewed) || (!row.reviewed && (input.bodyTruncated || classification.certainty !== 'clear'))) { skipped++; continue }
-          const group = find(groupKeys(row, input)[0]!), bucket = parseInt(digest(group).slice(0, 8), 16) % 100
-          const split = bucket < 80 ? 'train' : bucket < 90 ? 'validation' : 'test'
-          writeSync(descriptors.get(split)!, JSON.stringify({ ...example, splitGroup: digest(group), messages: [{ role: 'system', content: config.instructions }, { role: 'user', content: JSON.stringify(input) }, { role: 'assistant', content: JSON.stringify(classification) }] }) + '\n')
+          const { split, splitGroup } = partition.get(row.id)!
+          writeSync(descriptors.get(split)!, JSON.stringify({ ...example, splitGroup, messages: [{ role: 'system', content: config.instructions }, { role: 'user', content: JSON.stringify(input) }, { role: 'assistant', content: JSON.stringify(classification) }] }) + '\n')
           counts[split]++; exported++
         }
         const fd = openSync(resolve(root, 'manifest.json'), 'wx', 0o600)
-        try { writeSync(fd, JSON.stringify({ version: 1, run, createdAt: new Date().toISOString(), config, exported, skipped, counts, reviewedOnly, labelQuality: 'LLM labels are not ground truth; held-out LLM labels measure imitation, not accuracy.', sourceFormat: 'Decoded SDK text/HTML snapshots; not original RFC822 MIME.', splitPolicy: 'Connected sender/thread/exact-text groups, hash 80/10/10; near-duplicate campaigns still require review. Frozen for this export only.' }, null, 2) + '\n') } finally { closeSync(fd) }
+        try { writeSync(fd, JSON.stringify({ version: 1, run, createdAt: new Date().toISOString(), config, exported, skipped, counts, reviewedOnly, developmentRuns, splitPolicyVersion: 3, labelQuality: 'LLM labels are not ground truth; held-out LLM labels measure imitation, not accuracy.', sourceFormat: 'Decoded SDK text/HTML snapshots; not original RFC822 MIME.', splitPolicy: 'All selected snapshots, including failed/unlabeled entries. Connected sender/thread/exact-text/normalized-template components anchored to sender; hash 80/10/10. Templates normalize whitespace, URLs, addresses and digits (minimum80characters). Components containing senders from development runs are training-only. Other near-duplicate campaigns still require review.' }, null, 2) + '\n') } finally { closeSync(fd) }
       } finally { for (const fd of descriptors.values()) closeSync(fd) }
       return { run, exported, skipped, counts, reviewExamples: rows.length, reviewedOnly }
     },

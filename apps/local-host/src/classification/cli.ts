@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util'
 import { classifyEmail, InferenceError } from './inference'
 import { createDataset, inventory, openMailSource, privateDirectory } from './store'
 import type { TrainingExample } from './model'
-import { preprocessingVersion, taxonomyVersion, validateClassification, validateClassificationInput } from './schema'
+import { preprocessingVersion, promptVersion, taxonomyVersion, validateClassification, validateClassificationInput } from './schema'
 
 function readExamples(path: string): TrainingExample[] {
   const rows = readFileSync(path, 'utf8').split('\n').filter(line => line.trim()).map(line => JSON.parse(line))
@@ -18,7 +18,7 @@ function savePrivate(path: string, value: unknown) {
   try { writeSync(fd, JSON.stringify(value) + '\n') } finally { closeSync(fd) }
 }
 
-export async function trainExport(inputDirectory: string, outputDirectory: string) {
+export async function trainExport(inputDirectory: string, outputDirectory: string, options: { deferTest?: boolean } = {}) {
   const { trainClassifier, evaluateClassifier, predictClassifier } = await import('./model')
   const manifestText = readFileSync(resolve(inputDirectory, 'manifest.json'), 'utf8'), manifest = JSON.parse(manifestText)
   if (manifest.version !== 1 || manifest.config?.taxonomyVersion !== taxonomyVersion || manifest.config?.preprocessingVersion !== preprocessingVersion) throw new Error('DATASET_VERSION_MISMATCH')
@@ -35,7 +35,12 @@ export async function trainExport(inputDirectory: string, outputDirectory: strin
   }
   if (!training.length) throw new Error('EMPTY_TRAINING_SPLIT')
   const started = performance.now()
-  const candidates = validation.length >= 20 ? [{ dimensions: 4096, epochs: 24 }, { dimensions: 8192, epochs: 24 }, { dimensions: 8192, epochs: 48 }] : [{ dimensions: 4096, epochs: 24 }]
+  const candidates = validation.length >= 20 ? [
+    { dimensions: 4096, epochs: 24, groupBalance: false },
+    { dimensions: 4096, epochs: 24, groupBalance: true },
+    { dimensions: 8192, epochs: 24, groupBalance: true },
+    { dimensions: 16384, epochs: 24, groupBalance: true },
+  ] : [{ dimensions: 4096, epochs: 24, groupBalance: false }]
   const fitted = candidates.map(options => {
     const model = trainClassifier(training, validation, options)
     return { model, options, evaluation: evaluateClassifier(model, validation) }
@@ -46,16 +51,16 @@ export async function trainExport(inputDirectory: string, outputDirectory: strin
   const selected = ranked[0]!, model = selected.model
   const trainingMs = performance.now() - started
   const timings: number[] = []
-  for (const row of test.slice(0, 100)) { const start = performance.now(); predictClassifier(model, row.input); timings.push(performance.now() - start) }
+  for (const row of (options.deferTest ? validation : test).slice(0, 100)) { const start = performance.now(); predictClassifier(model, row.input); timings.push(performance.now() - start) }
   timings.sort((a, b) => a - b)
   const metrics = { trainingSamples: training.length, validationSamples: validation.length, testSamples: test.length,
-    validation: selected.evaluation, test: evaluateClassifier(model, test), trainingMs,
+    validation: selected.evaluation, test: options.deferTest ? null : evaluateClassifier(model, test), testEvaluated: !options.deferTest, trainingMs,
     selection: { selected: selected.options, criterion: 'Validation type macro-F1, then action micro-F1, then raw type accuracy. These are selection metrics, not independent estimates.', candidates: fitted.map(value => ({ ...value.options, typeMacroF1: value.evaluation.types.macroF1, actionMicroF1: value.evaluation.actions.microF1, typeCoverage: value.evaluation.types.coverage })) },
     predictionTiming: { samples: timings.length, medianMs: timings.length ? timings[Math.floor(timings.length / 2)] : null, p95Ms: timings.length ? timings[Math.min(timings.length - 1, Math.ceil(timings.length * 0.95) - 1)] : null },
     interpretation: 'Metrics against unreviewed LLM labels measure teacher agreement, not human-verified accuracy. No claim of generalization beyond this held-out mailbox sample.',
   }
   const root = privateDirectory(outputDirectory)
-  savePrivate(resolve(root, 'model.json'), { version: 1, model, dataset: { run: manifest.run, manifestHash: createHash('sha256').update(manifestText).digest('hex'), taxonomyVersion } })
+  savePrivate(resolve(root, 'model.json'), { version: 1, model, trainingImplementationHash: createHash('sha256').update(readFileSync(resolve(import.meta.dir, 'model.ts'))).digest('hex'), dataset: { run: manifest.run, manifestHash: createHash('sha256').update(manifestText).digest('hex'), taxonomyVersion } })
   savePrivate(resolve(root, 'metrics.json'), metrics)
   return metrics
 }
@@ -65,9 +70,9 @@ export async function labelRun(dataset: Dataset, options: {
   run: string; apiKey: string; orgId?: string; concurrency: number; signal?: AbortSignal;
   classify?: typeof classifyEmail; progress?: (completed: number) => void;
 }) {
-  if (!Number.isSafeInteger(options.concurrency) || options.concurrency < 1 || options.concurrency > 16) throw new Error('INVALID_CONCURRENCY')
+  if (!Number.isSafeInteger(options.concurrency) || options.concurrency < 1 || options.concurrency > 64) throw new Error('INVALID_CONCURRENCY')
   const config = dataset.assertCurrent(options.run), classify = options.classify ?? classifyEmail
-  let completed = 0, stopped: string | null = null
+  let completed = 0, stopped: string | null = null, retryAfterMs = 0
   await Promise.all(Array.from({ length: options.concurrency }, async () => {
     while (!options.signal?.aborted && !stopped) {
       const job = dataset.claim(options.run)
@@ -79,16 +84,18 @@ export async function labelRun(dataset: Dataset, options: {
       } catch (error) {
         const code = error instanceof InferenceError ? error.code : 'LABEL_FAILED'
         const interrupted = options.signal?.aborted
-        const configurationFailure = error instanceof InferenceError && [400, 401, 403, 404].includes(error.status ?? 0)
+        const rateLimited = error instanceof InferenceError && error.status === 429
+        const configurationFailure = error instanceof InferenceError && [400, 401, 403, 404, 429].includes(error.status ?? 0)
         const releaseAttempt = !!(interrupted || configurationFailure)
         const retry = releaseAttempt || error instanceof InferenceError && error.retryable && job.attempts < 3
         dataset.fail(options.run, job, interrupted ? 'INTERRUPTED' : code, retry, releaseAttempt)
-        if (configurationFailure) stopped = code
+        if (configurationFailure) stopped = rateLimited ? 'RATE_LIMITED' : code
+        if (rateLimited) retryAfterMs = Math.max(retryAfterMs, error.retryAfterMs ?? 30_000)
         if (retry && !interrupted && !stopped) await Bun.sleep(Math.min(10_000, 1000 * 2 ** job.attempts))
       }
     }
   }))
-  return { ...dataset.status(options.run), stopped: options.signal?.aborted ? 'INTERRUPTED' : stopped }
+  return { ...dataset.status(options.run), stopped: options.signal?.aborted ? 'INTERRUPTED' : stopped, retryAfterMs }
 }
 
 const help = `Offline email classification (does not change the inbox)
@@ -102,26 +109,31 @@ status    --dataset /absolute/path/labels.sqlite --run pilot-v1
 fork      --dataset /absolute/path/labels.sqlite --from pilot-v1 --run pilot-v2 [--model gpt-5.6-terra]
 compare   --dataset /absolute/path/labels.sqlite --left pilot-v1 --right pilot-v2
 review    --dataset /absolute/path/labels.sqlite --run pilot-v1 --input /private/reviews.jsonl
-export    --dataset /absolute/path/labels.sqlite --run pilot-v1 --out /private/new-export [--reviewed-only]
-train     --input /private/export-directory --out /private/new-model-directory
+export    --dataset /absolute/path/labels.sqlite --run pilot-v1 --out /private/new-export [--reviewed-only] [--development-run previous-pilot]
+train     --input /private/export-directory --out /private/new-model-directory [--defer-test]
 evaluate  --model-file /private/model/model.json --input /private/export/test.jsonl
 predict   --model-file /private/model/model.json --input /private/examples.jsonl --out /private/new-predictions
+audit     --input /private/blind-inputs.jsonl --out /private/new-audit --allow-email-upload [--model gpt-5.6-terra] [--concurrency 4]
 
 prepare defaults to a separate classification/labels.sqlite beside the source database.
 Pass --dataset to override. Every run is an immutable selection and configuration.
 label resumes unfinished work; a changed taxonomy/prompt requires a new run ID.
 fork reuses the exact frozen inputs to compare another model or revised taxonomy/prompt.
 --retry-failed explicitly retries exhausted failures, preserving previous attempt history.
+Concurrency is bounded to 1–64. A 429 stops new claims and releases throttled attempts for resume; retryAfterMs reports the provider cooldown.
 The explicitly read --key-file defaults to non-gittract.env in the project root (0600).
 Set OPENCODE_API_KEY in that file; optional OPENCODE_ORG_ID supports session tokens.
 Only label uploads email content, to the fixed OpenCode Responses endpoint with store:false.
 review input: one {"exampleId":"...","classification":{...}} record per line; corrections append.
 Exports contain private mail: 0600 files outside this checkout; existing exports are not overwritten.
 Unreviewed ambiguous/truncated results go to review.jsonl, not training files.
+--development-run is repeatable; previously explored sender components cannot enter validation/test.
 All labels are generic. Provider categories and personal importance are not training inputs.
 train fits a local message-type/action baseline; validation selects a small fixed feature/epoch grid and abstention thresholds. Test stays held out until selection finishes.
+--defer-test leaves final evaluation untouched while comparing learner families using validation only.
 It does not train time sensitivity or risk prediction yet. LLM-label scores are teacher agreement.
 predict runs locally without a key; each input line is a ClassificationInput or {input,exampleId}.
+audit sends only {exampleId,input} sources, never existing labels or predictions, to an independent LLM. It persists every success/failure/unstarted record; this is not human ground truth.
 `
 
 function credentials(path: string) {
@@ -137,21 +149,45 @@ function credentials(path: string) {
 async function main() {
   process.umask(0o077)
   const { values, positionals } = parseArgs({ args: Bun.argv.slice(2), allowPositionals: true, strict: true, options: {
-    source: { type: 'string' }, dataset: { type: 'string' }, run: { type: 'string' }, from: { type: 'string' }, model: { type: 'string', default: 'gpt-5.6-sol' },
+    source: { type: 'string' }, dataset: { type: 'string' }, run: { type: 'string' }, from: { type: 'string' }, model: { type: 'string' },
     limit: { type: 'string', default: '200' }, seed: { type: 'string', default: 'pilot-v1' }, concurrency: { type: 'string', default: '4' },
     'key-file': { type: 'string' }, 'model-file': { type: 'string' }, 'allow-email-upload': { type: 'boolean' }, out: { type: 'string' }, input: { type: 'string' },
     left: { type: 'string' }, right: { type: 'string' }, 'reviewed-only': { type: 'boolean' }, 'retry-failed': { type: 'boolean' }, help: { type: 'boolean' },
+    'development-run': { type: 'string', multiple: true },
+    'defer-test': { type: 'boolean' },
   } })
   if (values.help || !positionals.length) { console.log(help); return }
   const command = positionals[0]
-  if (positionals.length !== 1 || !['inventory', 'prepare', 'label', 'status', 'fork', 'compare', 'review', 'export', 'train', 'evaluate', 'predict'].includes(command!)) throw new Error('UNKNOWN_COMMAND_USE_HELP')
+  if (positionals.length !== 1 || !['inventory', 'prepare', 'label', 'status', 'fork', 'compare', 'review', 'export', 'train', 'evaluate', 'predict', 'audit'].includes(command!)) throw new Error('UNKNOWN_COMMAND_USE_HELP')
   const required = (name: 'source' | 'run' | 'dataset' | 'out' | 'input' | 'left' | 'right' | 'from' | 'model-file'): string => {
     const value = values[name]
     if (!value?.trim()) throw new Error(`MISSING_${name.toUpperCase()}`)
     return value
   }
   const print = (value: unknown) => console.log(JSON.stringify(value, null, 2))
-  if (command === 'train') { print(await trainExport(required('input'), required('out'))); return }
+  if (command === 'audit') {
+    if (!values['allow-email-upload']) throw new Error('EXPLICIT_ALLOW_EMAIL_UPLOAD_REQUIRED')
+    const { auditExamples, auditInputHash } = await import('./audit')
+    const examples = readFileSync(required('input'), 'utf8').split('\n').filter(line => line.trim()).map(line => { const row = JSON.parse(line); return { exampleId: row.exampleId, input: row.input } })
+    const cohortHash = createHash('sha256').update(JSON.stringify(examples.map(row => [row.exampleId, auditInputHash(row.input)]))).digest('hex')
+    const model = values.model ?? 'gpt-5.6-terra', key = credentials(values['key-file'] ?? resolve(import.meta.dir, '../../../../non-gittract.env'))
+    const root = privateDirectory(required('out')), fd = openSync(resolve(root, 'audit.jsonl'), 'wx', 0o600)
+    const controller = new AbortController(), stop = () => controller.abort()
+    process.once('SIGINT', stop); process.once('SIGTERM', stop)
+    try {
+      let finished = 0
+      const records = await auditExamples(examples, { model, ...key, concurrency: Number(values.concurrency), signal: controller.signal, onResult: record => {
+        writeSync(fd, JSON.stringify(record) + '\n'); finished++
+        if (finished % 25 === 0) print({ persistedAuditRecords: finished })
+      } })
+      const counts = { succeeded: records.filter(row => row.status === 'succeeded').length, failed: records.filter(row => row.status === 'failed').length, unstarted: records.filter(row => row.status === 'unstarted').length }
+      savePrivate(resolve(root, 'manifest.json'), { version: 1, cohortHash, cohortSize: examples.length, taxonomyVersion, promptVersion, model, counts, createdAt: new Date().toISOString(), interpretation: 'Blind LLM audit, not human-reviewed ground truth.' })
+      print({ model, cohortSize: examples.length, ...counts })
+      if (counts.failed || counts.unstarted) process.exitCode = 1
+    } finally { closeSync(fd); process.off('SIGINT', stop); process.off('SIGTERM', stop) }
+    return
+  }
+  if (command === 'train') { print(await trainExport(required('input'), required('out'), { deferTest: values['defer-test'] })); return }
   if (command === 'evaluate' || command === 'predict') {
     const savedText = readFileSync(required('model-file'), 'utf8'), saved = JSON.parse(savedText)
     if (saved.version !== 1 || saved.dataset?.taxonomyVersion !== taxonomyVersion) throw new Error('MODEL_VERSION_MISMATCH')
@@ -186,7 +222,7 @@ async function main() {
       const limit = values.limit === 'all' ? 'all' : Number(values.limit)
       if (limit !== 'all' && (!Number.isSafeInteger(limit) || limit < 1)) throw new Error('INVALID_LIMIT')
       const source = openMailSource(resolve(required('source')))
-      try { print(dataset.prepare(source, { run: required('run'), model: values.model, seed: values.seed, limit })) } finally { source.close() }
+      try { print(dataset.prepare(source, { run: required('run'), model: values.model ?? 'gpt-5.6-sol', seed: values.seed, limit })) } finally { source.close() }
     } else if (command === 'label') {
       if (!values['allow-email-upload']) throw new Error('EXPLICIT_ALLOW_EMAIL_UPLOAD_REQUIRED')
       if (values['retry-failed']) dataset.retryFailed(required('run'))
@@ -201,12 +237,12 @@ async function main() {
         if (result.stopped || result.counts.failed || result.counts.pending || result.counts.processing) process.exitCode = 1
       } finally { process.off('SIGINT', stop); process.off('SIGTERM', stop) }
     } else if (command === 'status') print(dataset.status(required('run')))
-    else if (command === 'fork') print(dataset.fork(required('from'), required('run'), values.model))
+    else if (command === 'fork') print(dataset.fork(required('from'), required('run'), values.model ?? 'gpt-5.6-sol'))
     else if (command === 'compare') print(dataset.compare(required('left'), required('right')))
     else if (command === 'review') {
       const records = readFileSync(required('input'), 'utf8').split('\n').filter(line => line.trim()).map(line => JSON.parse(line))
       print(dataset.review(required('run'), records))
-    } else if (command === 'export') print(dataset.export(required('run'), required('out'), !!values['reviewed-only']))
+    } else if (command === 'export') print(dataset.export(required('run'), required('out'), !!values['reviewed-only'], values['development-run'] ?? []))
   } finally { dataset.close() }
 }
 

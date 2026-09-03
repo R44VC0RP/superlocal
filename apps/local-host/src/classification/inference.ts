@@ -22,14 +22,16 @@ export class InferenceError extends Error {
   readonly code: string
   readonly retryable: boolean
   readonly status?: number
+  readonly retryAfterMs?: number
 
-  constructor(code: string, retryable = false, status?: number) {
+  constructor(code: string, retryable = false, status?: number, retryAfterMs?: number) {
     const safeCode = errorCodes.has(code) ? code : 'INFERENCE_FAILURE'
     super(safeCode)
     this.name = 'InferenceError'
     this.code = safeCode
     this.retryable = retryable === true
     if (Number.isInteger(status) && status! >= 100 && status! <= 599) this.status = status
+    if (Number.isFinite(retryAfterMs) && retryAfterMs! >= 0) this.retryAfterMs = Math.ceil(retryAfterMs!)
   }
 }
 
@@ -181,14 +183,16 @@ export async function classifyEmail(input: ClassificationInput, options: Inferen
       if (!response.ok) {
         // Do not read error bodies: gateways can echo email, credentials, or prompts there.
         void response.body?.cancel().catch(() => {})
-        throw new InferenceError('INFERENCE_HTTP_ERROR', response.status === 408 || response.status === 429 || response.status >= 500, response.status)
+        const retryAfter = response.headers.get('retry-after')
+        const retryAfterMs = retryAfter === null ? undefined : /^\d+(?:\.\d+)?$/.test(retryAfter) ? Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - Date.now())
+        throw new InferenceError('INFERENCE_HTTP_ERROR', response.status === 408 || response.status === 429 || response.status >= 500, response.status, retryAfterMs)
       }
       if (response.redirected) throw new InferenceError('INFERENCE_ENDPOINT_INVALID')
       return parseResult(await readResponse(response), source)
     }
     return await Promise.race([request(), aborted])
   } catch (error) {
-    if (error instanceof InferenceError) throw new InferenceError(error.code, error.retryable, error.status)
+    if (error instanceof InferenceError) throw new InferenceError(error.code, error.retryable, error.status, error.retryAfterMs)
     if (controller?.signal.aborted) throw new InferenceError(timedOut ? 'INFERENCE_TIMEOUT' : 'INFERENCE_ABORTED', timedOut)
     // Native fetch, stream, JSON, and caller-supplied fetch errors may include sensitive data.
     throw new InferenceError('INFERENCE_NETWORK_ERROR', true)

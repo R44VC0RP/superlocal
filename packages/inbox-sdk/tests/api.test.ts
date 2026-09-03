@@ -26,6 +26,7 @@ import { labelRun, trainExport } from '../../../apps/local-host/src/classificati
 import { classifyEmail, InferenceError } from '../../../apps/local-host/src/classification/inference'
 import { validateClassification, type Classification, type ClassificationInput } from '../../../apps/local-host/src/classification/schema'
 import { trainClassifier, predictClassifier, evaluateClassifier, type TrainingExample } from '../../../apps/local-host/src/classification/model'
+import { auditExamples, auditInputHash, compareAudits } from '../../../apps/local-host/src/classification/audit'
 import { createMockHost } from '../../../apps/mock-api/src/host'
 import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
@@ -61,6 +62,39 @@ afterEach(async () => {
 })
 
 describe('offline classification dataset', () => {
+  test('blind auditing excludes teacher labels and accounts for failed, missing and changed-source examples', async () => {
+    const input: ClassificationInput = { subject: 'Weekly newsletter', from: 'digest@example.test', to: ['reader@example.test'], cc: [], receivedAt: '2026-09-01T12:00:00Z', bodyText: 'Our weekly digest.', bodyTruncated: false, facts: { listId: true } }
+    const classification: Classification = { primaryType: 'newsletter', secondaryTypes: [], actions: [], timeSensitivity: 'none', deadline: null, risk: 'none_observed', riskReasons: [], certainty: 'clear', evidence: [{ dimension: 'primaryType', label: 'newsletter', field: 'bodyText', quote: 'Our weekly digest.' }] }
+    const examples = Array.from({ length: 5 }, (_, index) => ({ exampleId: `audit-${index}`, input, teacherLabel: 'not-sent', prediction: 'not-sent' }))
+    let active = 0, maximum = 0, persisted = 0
+    const records = await auditExamples(examples, { model: 'gpt-5.6-terra', apiKey: 'fictional', concurrency: 2,
+      classify: async source => {
+        expect(source).toEqual(input)
+        expect(Object.keys(source)).not.toContain('teacherLabel')
+        maximum = Math.max(maximum, ++active); await Promise.resolve(); active--
+        return { classification, model: 'gpt-5.6-terra', responseId: null, usage: { inputTokens: 10, outputTokens: 10 } }
+      }, onResult: () => { persisted++ },
+    })
+    expect(maximum).toBeLessThanOrEqual(2); expect(persisted).toBe(5)
+    expect(records.every(row => row.inputHash === auditInputHash(input) && row.status === 'succeeded')).toBe(true)
+    const primary = examples.map(row => ({ exampleId: row.exampleId, inputHash: auditInputHash(input), classification }))
+    const compared = compareAudits(primary, [records[0]!, { ...records[1]!, classification: { ...classification, primaryType: 'promotion' } },
+      { ...records[2]!, status: 'failed', classification: null, errorCode: 'INFERENCE_TIMEOUT', usage: null },
+      { ...records[3]!, inputHash: '0'.repeat(64) }])
+    expect(compared).toMatchObject({ total: 5, compared: 2, failure: 1, missing: 1, inputHashMismatch: 1, coverage: 0.4, primaryTypeAgreement: 0.5 })
+    expect(JSON.stringify(compared)).not.toContain('Our weekly digest.')
+    const limited = await auditExamples(examples, { model: 'gpt-5.6-terra', apiKey: 'fictional', concurrency: 1,
+      classify: async () => { throw new InferenceError('INFERENCE_HTTP_ERROR', true, 429, 60_000) },
+    })
+    expect(limited.map(row => row.status)).toEqual(['failed', 'unstarted', 'unstarted', 'unstarted', 'unstarted'])
+    expect(limited.every(row => row.retryAfterMs === 60_000)).toBe(true)
+    const unauthorized = await auditExamples(examples, { model: 'gpt-5.6-terra', apiKey: 'fictional', concurrency: 1,
+      classify: async () => { throw new InferenceError('INFERENCE_HTTP_ERROR', false, 401) },
+    })
+    expect(unauthorized[1]!.errorCode).toBe('AUDIT_CONFIGURATION_STOPPED')
+    await expect(auditExamples(examples, { model: 'gpt-5.6-terra', apiKey: 'fictional', classify: async () => ({ classification, model: 'gpt-5.6-terra', responseId: null, usage: { inputTokens: 1, outputTokens: 1 } }), onResult: () => { throw new Error('private persistence details') } })).rejects.toThrow('AUDIT_PERSISTENCE_FAILED')
+  })
+
   test('the local baseline learns content and requested actions, survives reload, and reports held-out support', () => {
     const examples: TrainingExample[] = Array.from({ length: 120 }, (_, index) => {
       const conversation = index % 2 === 0
@@ -85,6 +119,9 @@ describe('offline classification dataset', () => {
     expect(evaluation.actions.microF1).toBe(1)
     const falseAlarm = evaluateClassifier(model, [{ ...examples[100]!, classification: { ...examples[100]!.classification, actions: [] } }])
     expect(falseAlarm.actions.microPrecision).toBe(0)
+    const uncertain = evaluateClassifier(model, [{ ...examples[100]!, input: { ...examples[100]!.input, subject: '', bodyText: '' }, classification: { primaryType: 'unknown', actions: [] } }])
+    expect(uncertain.types.coverage).toBe(0)
+    expect(uncertain.types.accuracy).toBe(0)
     const negativeValidation = Array.from({ length: 24 }, (_, index) => ({ ...examples[100]!, exampleId: `negative-${index}`, splitGroup: `negative-${index}`, classification: { ...examples[100]!.classification, actions: [] } }))
     const guarded = trainClassifier(examples.slice(0, 80), negativeValidation, { epochs: 25, dimensions: 4096, seed: 7 })
     expect(predictClassifier(guarded, examples[100]!.input).actions).toEqual([])
@@ -103,8 +140,8 @@ describe('offline classification dataset', () => {
       CREATE TABLE sdk_messages(id TEXT,owner TEXT,account TEXT,generation INTEGER,native_id TEXT,thread_id TEXT,visible TEXT,body TEXT,folder TEXT,deleted INTEGER);`)
     for (let index = 0; index < 8; index++) {
       writer.query('INSERT INTO sdk_messages VALUES (?,?,?,?,?,?,?,?,?,?)').run(`m${index}`, 'owner', 'source', 1, `native${index}`, index < 2 ? 'same-thread' : `t${index}`,
-        JSON.stringify({ from: { name: 'Fictional Digest', email: index < 3 ? 'digest@example.test' : `digest${index}@example.test` }, to: [{ email: 'reader@example.test' }], cc: [], subject: 'Weekly newsletter', receivedAt: '2026-09-01T12:00:00Z', isRead: true, isStarred: true, facts: { listId: true, nativeImportant: true, nativeCategories: ['promotions'] } }),
-        JSON.stringify({ bodyText: index === 3 ? 'Weekly newsletter ' + 'x'.repeat(70_000) : index === 4 ? '' : `Weekly newsletter issue ${index}`, bodyHtml: index === 4 ? '<p>Weekly newsletter in HTML only</p>' : '', attachments: [] }), index === 6 ? 'sent' : index === 7 ? 'drafts' : 'inbox', 0)
+        JSON.stringify({ from: { name: `person${index}@mail.test via Fictional Digest`, email: index < 3 ? 'digest@example.test' : `digest${index}@example.test` }, to: [{ email: 'reader@example.test' }], cc: [], subject: 'Weekly newsletter', receivedAt: '2026-09-01T12:00:00Z', isRead: true, isStarred: true, facts: { listId: true, nativeImportant: true, nativeCategories: ['promotions'] } }),
+        JSON.stringify({ bodyText: index === 3 ? 'Weekly newsletter ' + 'x'.repeat(70_000) : index === 4 ? '' : [2, 5].includes(index) ? `Weekly newsletter issue ${index}. This fictional publication contains an extended digest of scientific discoveries and helpful updates. See https://example.test/read?tracking=${index}` : `Weekly newsletter issue ${index}`, bodyHtml: index === 4 ? '<p>Weekly newsletter in HTML only</p>' : '', attachments: [] }), index === 6 ? 'sent' : index === 7 ? 'drafts' : 'inbox', 0)
     }
     const source = openMailSource(sourcePath)
     cleanup.push(async () => source.close())
@@ -115,6 +152,10 @@ describe('offline classification dataset', () => {
     let dataset = createDataset(datasetPath)
     cleanup.push(async () => dataset.close())
     expect(dataset.prepare(source, { run: 'pilot', model: 'gpt-5.6-sol', seed: 'repeatable', limit: 'all' })).toMatchObject({ selected: 6, truncated: 1, empty: 0 })
+    const frozenPartition = dataset.partition('pilot')
+    const componentSizes = new Map<string, number>()
+    for (const row of frozenPartition) componentSizes.set(row.splitGroup, (componentSizes.get(row.splitGroup) ?? 0) + 1)
+    expect(Math.max(...componentSizes.values())).toBe(4)
     expect(() => dataset.prepare(source, { run: 'pilot', model: 'gpt-5.6-sol', seed: 'repeatable', limit: 1 })).toThrow('RUN_ALREADY_EXISTS')
     const controller = new AbortController(), seen: ClassificationInput[] = []
     const classifier: typeof classifyEmail = async input => {
@@ -134,6 +175,7 @@ describe('offline classification dataset', () => {
     await labelRun(dataset, { run: 'pilot', apiKey: 'fictional', concurrency: 1, classify: classifier })
     expect(seen).toHaveLength(6)
     expect(dataset.status('pilot')).toMatchObject({ counts: { completed: 6 }, usage: { inputTokens: 60, outputTokens: 120 }, reviewed: 0 })
+    expect(dataset.partition('pilot')).toEqual(frozenPartition)
     const out = join(root, 'export'), exported = dataset.export('pilot', out)
     expect(exported).toMatchObject({ exported: 5, skipped: 1, reviewExamples: 6 })
     const reviewRows = (await readFile(join(out, 'review.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
@@ -155,10 +197,17 @@ describe('offline classification dataset', () => {
     expect(dataset.export('pilot', join(root, 'gold'), true)).toMatchObject({ exported: 1, reviewedOnly: true })
     expect(dataset.compare('pilot', 'pilot')).toMatchObject({ overlappingCompleted: 6, changes: {} })
     expect(dataset.fork('pilot', 'second-model', 'gpt-5.6-terra')).toMatchObject({ selected: 6 })
+    expect(dataset.partition('second-model')).toEqual(frozenPartition)
+    expect(dataset.partition('second-model', ['pilot']).every(row => row.split === 'train' && row.developmentExposed)).toBe(true)
     await labelRun(dataset, { run: 'second-model', apiKey: 'expired', concurrency: 1, classify: async () => { throw new InferenceError('INFERENCE_HTTP_ERROR', false, 401) } })
     expect(dataset.status('second-model').counts).toEqual({ pending: 6 })
     await labelRun(dataset, { run: 'second-model', apiKey: 'fictional', concurrency: 2, classify: classifier })
     expect(dataset.compare('pilot', 'second-model')).toMatchObject({ overlappingCompleted: 6, changes: {} })
+    dataset.fork('pilot', 'throttled', 'gpt-5.6-sol')
+    const throttled = await labelRun(dataset, { run: 'throttled', apiKey: 'fictional', concurrency: 64, classify: async () => { throw new InferenceError('INFERENCE_HTTP_ERROR', true, 429, 42_000) } })
+    expect(throttled).toMatchObject({ stopped: 'RATE_LIMITED', retryAfterMs: 42_000, counts: { pending: 6 } })
+    await labelRun(dataset, { run: 'throttled', apiKey: 'fictional', concurrency: 2, classify: classifier })
+    expect(dataset.status('throttled').counts).toEqual({ completed: 6 })
     writer.query("UPDATE sdk_messages SET visible=json_set(visible,'$.facts.listId',json('false')) WHERE id='m1'").run()
     expect(dataset.prepare(source, { run: 'changed-inputs', model: 'gpt-5.6-sol', seed: 'repeatable', limit: 'all' })).toMatchObject({ selected: 6, reused: 4 })
     const pending = dataset.claim('changed-inputs')!
@@ -197,6 +246,10 @@ describe('offline classification dataset', () => {
     expect(await classifyEmail(input, { apiKey: 'fictional-token', orgId: 'fictional-org', fetcher })).toMatchObject({ classification, responseId: 'response-1', usage: { inputTokens: 100, outputTokens: 30 } })
     await expect(classifyEmail(input, { apiKey: 'fictional-token', endpoint: 'https://unapproved.example.test', fetcher })).rejects.toThrow()
     expect(calls).toBe(1)
+    let limited: any
+    try { await classifyEmail(input, { apiKey: 'fictional-token', fetcher: (async () => new Response('private error body', { status: 429, headers: { 'Retry-After': '42' } })) as unknown as typeof fetch }) } catch (error) { limited = error }
+    expect(limited).toMatchObject({ status: 429, retryAfterMs: 42_000, retryable: true })
+    expect(limited.message).not.toContain('private error body')
     for (const payload of [
       { status: 'incomplete', output: [] },
       { status: 'completed', output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'private refusal marker' }] }] },

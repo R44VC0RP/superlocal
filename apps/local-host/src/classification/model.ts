@@ -17,6 +17,7 @@ type Distribution = {
   actions: Record<Action, { positive: number; negative: number }>
   labelSources: LabelSources
 }
+type GroupSupport = { known: number; missing: number; types: Record<EmailType, number>; actions: Record<Action, number> }
 type ThresholdSelection = { method: 'validation' | 'conservative_default' | 'disabled'; accepted: number | null; precision: number | null }
 export type Model = {
   version: 1
@@ -28,10 +29,12 @@ export type Model = {
   weights: { types: number[][]; actions: number[][] }
   /** Hashes, not plaintext tokens. The entire model should still be treated as private. */
   lexicalHashes: number[]
-  hyperparameters: { epochs: number; seed: number; learningRate: number; l2: number; minimumClassSamples: number; minimumKnownFraction: number }
+  hyperparameters: { epochs: number; seed: number; learningRate: number; l2: number; minimumClassSamples: number; minimumKnownFraction: number; groupWeighting?: 'none' | 'inverse_sqrt_capped_4' }
   thresholds: { type: number; actions: Record<Action, number> }
   selection: { targetPrecision: number; minimumAccepted: number; type: ThresholdSelection; actions: Record<Action, ThresholdSelection> }
   training: Distribution
+  /** Aggregate independent-group counts only; absent in older version-1 artifacts. */
+  trainingGroups?: GroupSupport
   validation: Distribution
   loss: { type: number[]; actions: number[] }
   warnings: string[]
@@ -67,7 +70,7 @@ export type Evaluation = {
 
 const types = Object.keys(taxonomy.types) as EmailType[]
 const actions = Object.keys(taxonomy.actions) as Action[]
-const maxExamples = 20_000, maxVocabulary = 65_536, reserved = 2 + sourceFactKeys.length
+const maxExamples = 50_000, maxVocabulary = 65_536, reserved = 2 + sourceFactKeys.length
 const scoreNote = 'Scores are uncalibrated model scores. Agreement with LLM labels is pseudo-label agreement, not ground-truth quality; human-label agreement also depends on review quality. Validation-selected thresholds require an untouched test set for an independent estimate.'
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
 const fail = (code: string): never => { throw new Error(code) }
@@ -218,16 +221,32 @@ function chooseThreshold(candidates: Array<{ score: number; correct: boolean }>,
   return choice
 }
 
-/** Fits only training examples. Validation is used only for threshold selection; no test input is accepted. */
-export function trainClassifier(training: TrainingExample[], validation: TrainingExample[], opts: { epochs?: number; dimensions?: number; seed?: number } = {}): Model {
+/** Fits only training examples. Validation is used only for threshold selection; no test input is accepted.
+ * Repeated sender/thread/template groups receive less influence, without using identity as a feature.
+ * Feature version 1 is unchanged: older saved models retain exactly the same predictions.
+ */
+export function trainClassifier(training: TrainingExample[], validation: TrainingExample[], opts: { epochs?: number; dimensions?: number; seed?: number; groupBalance?: boolean } = {}): Model {
   validateExamples(training); validateExamples(validation)
   if (!training.length) fail('CLASSIFIER_TRAINING_EMPTY')
   if (!object(opts)) fail('CLASSIFIER_OPTIONS_INVALID')
-  const epochs = opts.epochs ?? 24, dimensions = opts.dimensions ?? 4_096, seed = opts.seed ?? 42
-  if (!Number.isInteger(epochs) || !bounded(epochs, 1, 100) || !Number.isInteger(dimensions) || !bounded(dimensions, 4_096, 8_192) || !Number.isInteger(seed) || !bounded(seed, 0, 4294967295)) fail('CLASSIFIER_OPTIONS_INVALID')
+  const epochs = opts.epochs ?? 24, dimensions = opts.dimensions ?? 4_096, seed = opts.seed ?? 42, groupBalance = opts.groupBalance ?? false
+  if (!Number.isInteger(epochs) || !bounded(epochs, 1, 100) || !Number.isInteger(dimensions) || !bounded(dimensions, 4_096, 16_384) || !Number.isInteger(seed) || !bounded(seed, 0, 4294967295) || typeof groupBalance !== 'boolean') fail('CLASSIFIER_OPTIONS_INVALID')
   const ids = new Set(training.flatMap(example => example.exampleId ? [example.exampleId] : []))
   const groups = new Set(training.flatMap(example => example.splitGroup ? [example.splitGroup] : []))
   if (validation.some(example => example.exampleId && ids.has(example.exampleId) || example.splitGroup && groups.has(example.splitGroup))) fail('CLASSIFIER_SPLIT_OVERLAP')
+  const groupSizes = new Map<string, number>(), typeGroups = mapTypes(() => new Set<string>()), actionGroups = mapActions(() => new Set<string>())
+  for (const example of training) {
+    if (!example.splitGroup) continue
+    groupSizes.set(example.splitGroup, (groupSizes.get(example.splitGroup) ?? 0) + 1)
+    typeGroups[example.classification.primaryType].add(example.splitGroup)
+    for (const label of example.classification.actions) actionGroups[label].add(example.splitGroup)
+  }
+  const trainingGroups: GroupSupport = { known: groupSizes.size, missing: training.filter(example => !example.splitGroup).length,
+    types: mapTypes(label => typeGroups[label].size), actions: mapActions(label => actionGroups[label].size) }
+  const groupWeights = training.map(example => groupBalance && example.splitGroup ? 1 / Math.sqrt(groupSizes.get(example.splitGroup)!) : 1)
+  const meanGroupWeight = groupWeights.reduce((sum, weight) => sum + weight, 0) / training.length
+  // Normalization preserves the learning-rate scale; the cap limits the influence of singleton/noisy groups.
+  const sampleWeights = groupWeights.map(weight => Math.min(4, weight / meanGroupWeight))
   const frequencies = new Map<number, number>()
   for (const example of training) {
     for (const id of new Set(lexical(example.input).flatMap(field => [...field.keys()]))) frequencies.set(id, (frequencies.get(id) ?? 0) + 1)
@@ -238,10 +257,10 @@ export function trainClassifier(training: TrainingExample[], validation: Trainin
   const model: Model = {
     version: 1, featureVersion: 1, taxonomyVersion, preprocessingVersion, dimensions, labels: { types: [...types], actions: [...actions] },
     weights: { types: types.map(() => Array(dimensions).fill(0)), actions: actions.map(() => Array(dimensions).fill(0)) }, lexicalHashes,
-    hyperparameters: { epochs, seed, learningRate: 0.25, l2: 0.0001, minimumClassSamples: 3, minimumKnownFraction: 0.2 },
+    hyperparameters: { epochs, seed, learningRate: 0.25, l2: 0.0001, minimumClassSamples: 3, minimumKnownFraction: 0.2, groupWeighting: groupBalance ? 'inverse_sqrt_capped_4' : 'none' },
     thresholds: { type: 0.8, actions: mapActions(() => 0.75) },
     selection: { targetPrecision: 0.9, minimumAccepted: 20, type: defaultSelection(), actions: mapActions(defaultSelection) },
-    training: distribution(training), validation: distribution(validation), loss: { type: [], actions: [] }, warnings: ['UNCALIBRATED_SCORES', 'LEXICAL_BASELINE_NOT_SEMANTIC_GROUNDING', 'TEST_NOT_USED_FOR_SELECTION'],
+    training: distribution(training), trainingGroups, validation: distribution(validation), loss: { type: [], actions: [] }, warnings: ['UNCALIBRATED_SCORES', 'LEXICAL_BASELINE_NOT_SEMANTIC_GROUNDING', 'TEST_NOT_USED_FOR_SELECTION'],
   }
   if (training.some(example => !example.splitGroup) || validation.some(example => !example.splitGroup)) model.warnings.push('SPLIT_GROUPS_UNVERIFIED')
   if (frequencies.size > maxVocabulary) model.warnings.push('VOCABULARY_CAPPED')
@@ -250,6 +269,10 @@ export function trainClassifier(training: TrainingExample[], validation: Trainin
   if (model.training.labelSources.llm) model.warnings.push('TRAINED_ON_PSEUDO_LABELS')
   if (types.filter(label => model.training.types[label] > 0).length < 2) model.warnings.push('TYPE_DIVERSITY_INSUFFICIENT_ABSTAINING')
   for (const label of types) if (model.training.types[label] < model.hyperparameters.minimumClassSamples) model.warnings.push(`TYPE_LOW_SUPPORT_${label.toUpperCase()}`)
+  if (!trainingGroups.missing) {
+    for (const label of types) if (model.training.types[label] && trainingGroups.types[label] < 5) model.warnings.push(`TYPE_FEW_INDEPENDENT_GROUPS_${label.toUpperCase()}`)
+    for (const label of actions) if (model.training.actions[label].positive && trainingGroups.actions[label] < 5) model.warnings.push(`ACTION_FEW_INDEPENDENT_GROUPS_${label.toUpperCase()}`)
+  }
   const vectors = training.map(example => features(example.input, dimensions, vocabulary)), order = training.map((_, index) => index), next = random(seed)
   const targets = training.map(example => ({ type: types.indexOf(example.classification.primaryType), actions: actions.map(label => Number(example.classification.actions.includes(label))) }))
   const actionBalance = actions.map(label => Math.min(8, Math.sqrt((model.training.actions[label].negative + 1) / (model.training.actions[label].positive + 1))))
@@ -267,12 +290,12 @@ export function trainClassifier(training: TrainingExample[], validation: Trainin
     const rate = model.hyperparameters.learningRate / Math.sqrt(1 + epoch * 0.15)
     for (const index of order) {
       const vector = vectors[index], target = targets[index], probabilities = softmax(model.weights.types, vector)
-      for (let label = 0; label < types.length; label++) update(model.weights.types[label], vector, rate * (Number(label === target.type) - probabilities[label]))
+      for (let label = 0; label < types.length; label++) update(model.weights.types[label], vector, rate * sampleWeights[index] * (Number(label === target.type) - probabilities[label]))
       for (let label = 0; label < actions.length; label++) {
         const support = model.training.actions[actions[label]]
         if (!support.positive || !support.negative) continue
         const score = sigmoid(dot(model.weights.actions[label], vector))
-        update(model.weights.actions[label], vector, rate * (target.actions[label] - score) * (target.actions[label] ? actionBalance[label] : 1))
+        update(model.weights.actions[label], vector, rate * sampleWeights[index] * (target.actions[label] - score) * (target.actions[label] ? actionBalance[label] : 1))
       }
     }
     const decay = Math.exp(-rate * model.hyperparameters.l2 * training.length)
@@ -308,7 +331,7 @@ export function trainClassifier(training: TrainingExample[], validation: Trainin
 export function validateModel(value: unknown): Model {
   const invalid = () => fail('CLASSIFIER_MODEL_INVALID')
   if (!object(value) || value.version !== 1 || value.featureVersion !== 1 || value.taxonomyVersion !== taxonomyVersion || value.preprocessingVersion !== preprocessingVersion ||
-    !Number.isInteger(value.dimensions) || !bounded(value.dimensions, 4_096, 8_192) || !object(value.labels) ||
+    !Number.isInteger(value.dimensions) || !bounded(value.dimensions, 4_096, 16_384) || !object(value.labels) ||
     !Array.isArray(value.labels.types) || !Array.isArray(value.labels.actions) || value.labels.types.length !== types.length || value.labels.actions.length !== actions.length ||
     value.labels.types.join('|') !== types.join('|') || value.labels.actions.join('|') !== actions.join('|') ||
     !object(value.weights) || !object(value.hyperparameters) || !object(value.thresholds) || !object(value.selection) || !object(value.loss)) return invalid()
@@ -326,6 +349,7 @@ export function validateModel(value: unknown): Model {
   const hp = value.hyperparameters
   if (!Number.isInteger(hp.epochs) || !bounded(hp.epochs, 1, 100) || !Number.isInteger(hp.seed) || !bounded(hp.seed, 0, 4294967295) ||
     hp.learningRate !== 0.25 || hp.l2 !== 0.0001 || hp.minimumClassSamples !== 3 || hp.minimumKnownFraction !== 0.2 ||
+    hp.groupWeighting !== undefined && hp.groupWeighting !== 'none' && hp.groupWeighting !== 'inverse_sqrt_capped_4' ||
     !bounded(value.thresholds.type, 0, 1.01) || !object(value.thresholds.actions) || !actions.every(label => bounded((value.thresholds as Model['thresholds']).actions[label], 0, 1.01))) return invalid()
   for (const name of ['training', 'validation']) {
     const dist = value[name]
@@ -337,6 +361,22 @@ export function validateModel(value: unknown): Model {
     }
     const sources = dist.labelSources
     if (!count(sources.llm) || !count(sources.human) || !count(sources.unspecified) || sources.llm + sources.human + sources.unspecified !== dist.samples || name === 'training' && !dist.samples) return invalid()
+  }
+  if (value.trainingGroups !== undefined) {
+    const support = value.trainingGroups, training = value.training as Distribution
+    if (!object(support) || !count(support.known) || !count(support.missing) || support.known + support.missing > training.samples ||
+      !object(support.types) || !object(support.actions)) return invalid()
+    if (support.missing < training.samples && !support.known) return invalid()
+    for (const label of types) {
+      const groups = support.types[label]
+      if (!count(groups) || groups > Math.min(training.types[label], support.known) || training.types[label] > support.missing && !groups) return invalid()
+    }
+    const typeMemberships = types.reduce((sum, label) => sum + (support.types as Record<EmailType, number>)[label], 0)
+    if (typeMemberships < support.known || typeMemberships > training.samples - support.missing) return invalid()
+    for (const label of actions) {
+      const groups = support.actions[label]
+      if (!count(groups) || groups > Math.min(training.actions[label].positive, support.known)) return invalid()
+    }
   }
   if (value.selection.targetPrecision !== 0.9 || value.selection.minimumAccepted !== 20 || !object(value.selection.actions)) return invalid()
   const selections = [value.selection.type, ...actions.map(label => (value.selection as Model['selection']).actions[label])]
@@ -376,7 +416,7 @@ export function evaluateClassifier(model: Model, examples: TrainingExample[]): E
   let correct = 0, rawCorrect = 0, covered = 0, coveredCorrect = 0, exactActions = 0
   for (const example of examples) {
     const raw = rawPrediction(model, features(example.input, model.dimensions, vocabulary)), result = prediction(model, raw)
-    const match = result.primaryType === example.classification.primaryType
+    const match = !result.abstained && result.primaryType === example.classification.primaryType
     correct += Number(match); rawCorrect += Number(raw.label === example.classification.primaryType)
     covered += Number(!result.abstained); coveredCorrect += Number(!result.abstained && match)
     typeCounts[result.primaryType].predicted++
