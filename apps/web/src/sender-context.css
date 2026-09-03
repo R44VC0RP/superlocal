@@ -48,7 +48,7 @@
 .sender-history-scope button[aria-pressed="true"]::after { content: ""; height: 1px; background: currentColor; position: absolute; inset-inline: 0; bottom: 3px; }
 .sender-level-details { margin-block: 6px 12px; }
 .sender-level-details summary { gap: 8px; flex-wrap: wrap; font-variant-numeric: tabular-nums; color: var(--text); }
-.sender-level-scale { display: flex; align-items: flex-end; gap: 3px; height: 16px; flex-shrink: 0; }
+.sender-level-scale { display: flex; align-items: center; gap: 3px; height: 16px; flex-shrink: 0; }
 .sender-level-scale i { width: 4px; height: 12px; border-radius: 1px; background: var(--border); }
 .sender-level-scale i.is-filled { background: var(--accent); }
 .sender-level-name { color: var(--muted); }
