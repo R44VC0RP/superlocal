@@ -198,11 +198,14 @@ export function Modal({
   onClose,
   label,
   className = "",
+  initialFocus = "input",
 }: {
   children: ReactNode;
   onClose: () => void;
   label: string;
   className?: string;
+  /** "input" focuses the first text field (or first control); "dialog" focuses the dialog itself so no control shows a focus ring on open. */
+  initialFocus?: "input" | "dialog";
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const close = useEffectEvent(onClose);
@@ -214,14 +217,18 @@ export function Modal({
           'button:not(:disabled),input,textarea,select,[tabindex="0"],[contenteditable="true"]',
         ) || []),
       ].filter((e) => e.offsetParent !== null);
-    const items = focusable();
-    (
-      items.find(
-        (e) =>
-          e.tagName === "INPUT" &&
-          !["radio", "checkbox"].includes((e as HTMLInputElement).type),
-      ) || items[0]
-    )?.focus();
+    if (initialFocus === "dialog") {
+      ref.current?.focus({ preventScroll: true });
+    } else {
+      const items = focusable();
+      (
+        items.find(
+          (e) =>
+            e.tagName === "INPUT" &&
+            !["radio", "checkbox"].includes((e as HTMLInputElement).type),
+        ) || items[0]
+      )?.focus();
+    }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
@@ -259,6 +266,7 @@ export function Modal({
         role="dialog"
         aria-modal="true"
         aria-label={label}
+        tabIndex={-1}
         className={`modal ${className}`}
       >
         {children}

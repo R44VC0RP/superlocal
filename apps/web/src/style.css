@@ -1274,6 +1274,9 @@ kbd {
   overflow: auto;
   box-shadow: 0 12px 40px #0005;
 }
+.modal:focus {
+  outline: none;
+}
 .app-modal {
   width: 560px;
 }

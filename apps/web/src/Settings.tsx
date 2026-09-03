@@ -1493,6 +1493,7 @@ export function Settings({
         <Modal
           label={dialogTitle}
           onClose={closeDetail}
+          initialFocus={page === "Mailboxes" || page === "Add Accounts" ? "dialog" : "input"}
           className={`settings-dialog settings-${page.toLowerCase().replaceAll(" ", "-")}-dialog ${page === "Split Inbox" ? "settings-split-dialog" : ""}`}
         >
           <header className="settings-dialog-header">

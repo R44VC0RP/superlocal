@@ -893,7 +893,7 @@ button.settings-menu-row,
 }
 .settings-mailboxes-dialog .settings-dialog-body {
   display: flex;
-  overflow: hidden;
+  overflow: visible;
 }
 .settings-add-accounts-dialog .settings-dialog-body {
   display: block;
@@ -913,7 +913,9 @@ button.settings-menu-row,
   min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  padding-inline: 2px 4px;
+  /* Room for 2px focus rings + 2px offset so they are not clipped by the scroll container. */
+  padding: 4px 4px 8px;
+  margin-inline: -4px;
   scrollbar-width: thin;
 }
 .settings-dialog .mailbox-mode {
