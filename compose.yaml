@@ -1,7 +1,7 @@
 services:
   superlocal:
     build: .
-    image: superlocal:local
+    image: "${SUPERLOCAL_IMAGE:-superlocal:local}"
     init: true
     restart: unless-stopped
     stop_grace_period: 30s

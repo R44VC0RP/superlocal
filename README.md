@@ -43,7 +43,7 @@ variables used locally. They are runtime inputs, not image build arguments.
 After updating the checkout, run `docker compose up -d --build --wait` again.
 Compose replaces the app container and reattaches the same volume. A hosting
 platform's Git-triggered redeploy must likewise retain this volume at `/persist`;
-no GitHub deployment workflow or remote host is configured by these files.
+the GitHub workflow below publishes images but does not restart a remote host.
 `docker compose down` retains the volume; **do not use `down -v` or delete the
 volume when updating**. Back up config, databases and keys together with the app
 stopped. Existing Mac installations are not imported automatically.
@@ -57,6 +57,32 @@ with private directories and `0600` config/key files.
 Only the web port is published, on host loopback. The backend stays inside the
 container. Public hosting/authentication is unchanged. Browser-local settings
 and recovery copies remain in the browser; this volume preserves server state.
+
+### Published images
+
+Pushes to `main` build and publish **Linux AMD64 and ARM64** images at
+`ghcr.io/r44vc0rp/superlocal:latest`. The workflow can also be run manually on
+`main`. It uses GitHub's built-in `GITHUB_TOKEN` with package-write permission;
+no Docker Hub account or registry password is needed. Images also receive a
+`sha-<full-commit-sha>` tag, and the workflow records the digest for pinned deploys.
+
+To run or update the published image without building it locally:
+
+```sh
+SUPERLOCAL_IMAGE=ghcr.io/r44vc0rp/superlocal:latest \
+  docker compose up -d --no-build --pull always --wait
+```
+
+The same `superlocal-state` volume is retained. Set `SUPERLOCAL_IMAGE` to a
+commit-specific tag or digest to select a particular version; database migrations
+may still limit downgrades. Other container hosts can use the same image and mount
+`/persist` without Compose. Server restarts/webhooks remain host-specific.
+
+GHCR packages initially default to private, even for a public repository. The
+package owner must set its visibility to public once for anonymous pulls. A
+private package instead requires a GitHub token with `read:packages` on the
+deployment host. This workflow never includes runtime mail, keys or config in
+the image, and does not change the application's local-only authentication.
 
 ## One inbox, separate mailboxes
 
