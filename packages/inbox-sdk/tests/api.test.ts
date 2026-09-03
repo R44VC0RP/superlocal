@@ -64,7 +64,7 @@ afterEach(async () => {
 
 describe('offline classification dataset', () => {
   test('portable linear inference loads bounded JSON, ignores identities and measures abstentions consistently', () => {
-    const actions = Object.keys(taxonomy.actions), types = Object.keys(taxonomy.types)
+    const actions = Object.keys(taxonomy.actions) as Classification['actions'], types = Object.keys(taxonomy.types)
     const sourceBooleans = [...sourceFactKeys, 'bodyTruncated'], width = 3 + sourceBooleans.length
     const coef = (index: number) => Array.from({ length: width }, (_, i) => Number(i === index) * 2)
     const support = { samples: 30, types: Object.fromEntries(types.map(t => [t, ['notification', 'promotion', 'transaction'].includes(t) ? 10 : 0])),
@@ -86,6 +86,13 @@ describe('offline classification dataset', () => {
     expect(predictLinearClassifier(model, { ...input, subject: 'salé', bodyText: '' }).primaryType).toBe('promotion')
     const empty = predictLinearClassifier(model, { ...input, subject: '', bodyText: 'https://fictional.test/pay pay@example.test', facts: { listId: true } })
     expect(empty.abstained).toBe(true); expect(empty.actions).toEqual([])
+    expect(empty.abstainedActions).toEqual(actions)
+    expect(prediction.abstainedActions).not.toContain('pay')
+    const disabled = JSON.parse(saved)
+    disabled.actions.pay.selection = { method: 'disabled', threshold: 0, accepted: 0, precision: null }
+    const disabledPrediction = predictLinearClassifier(validateLinearModel(disabled), input)
+    expect(disabledPrediction.actionScores.pay).toBeGreaterThan(0)
+    expect(disabledPrediction.actions).toEqual([]); expect(disabledPrediction.abstainedActions).toEqual(actions)
     const measured = evaluatePredictions({ training: model.training, warnings: [] }, [{ input, classification: { primaryType: 'unknown', actions: [] }, labelSource: 'llm' }], [empty])
     expect(measured.types.accuracy).toBe(0); expect(measured.types.coverage).toBe(0)
     expect(() => evaluatePredictions({ training: model.training, warnings: [] }, [], [prediction])).toThrow('CLASSIFIER_PREDICTIONS_INVALID')
@@ -164,6 +171,7 @@ describe('offline classification dataset', () => {
     const negativeValidation = Array.from({ length: 24 }, (_, index) => ({ ...examples[100]!, exampleId: `negative-${index}`, splitGroup: `negative-${index}`, classification: { ...examples[100]!.classification, actions: [] } }))
     const guarded = trainClassifier(examples.slice(0, 80), negativeValidation, { epochs: 25, dimensions: 4096, seed: 7 })
     expect(predictClassifier(guarded, examples[100]!.input).actions).toEqual([])
+    expect(predictClassifier(guarded, examples[100]!.input).abstainedActions).toContain('reply')
     expect(JSON.stringify(evaluation)).not.toContain('sender100@example.test')
     expect(() => predictClassifier({ ...restored, version: 999 }, examples[100]!.input)).toThrow()
   })

@@ -201,7 +201,7 @@ function features(model: LinearModel, input: ClassificationInput, state: Compile
 }
 
 /** Uncalibrated SVM scores, not probabilities. No identity features or email side effects. */
-export function predictLinearClassifier(model: LinearModel, input: ClassificationInput): { primaryType: EmailType; rawPrimaryType: EmailType; typeScore: number; actions: Action[]; actionScores: Record<string, number>; abstained: boolean } {
+export function predictLinearClassifier(model: LinearModel, input: ClassificationInput): { primaryType: EmailType; rawPrimaryType: EmailType; typeScore: number; actions: Action[]; actionScores: Record<string, number>; abstainedActions: Action[]; abstained: boolean } {
   model = validateLinearModel(model); validateClassificationInput(input)
   const vector = features(model, input, compiled.get(model)!)
   const dot = (row: number[], intercept: number) => vector.entries.reduce((sum, [id, value]) => sum + row[id] * value, 0) + intercept
@@ -209,12 +209,13 @@ export function predictLinearClassifier(model: LinearModel, input: Classificatio
   const ranked = scores.map((score, i) => ({ score, i })).sort((a, b) => b.score - a.score || a.i - b.i)
   const rawPrimaryType = model.types.classes[ranked[0].i], typeScore = ranked[0].score - ranked[1].score
   const abstained = !vector.grounded || rawPrimaryType === 'unknown' || model.training.types[rawPrimaryType] < 3 || model.types.selection.method === 'disabled' || typeScore < model.types.selection.threshold
-  const actionScores: Record<string, number> = {}, selected: Action[] = []
+  const actionScores: Record<string, number> = {}, selected: Action[] = [], abstainedActions: Action[] = []
   for (const label of actions) {
     const head = model.actions[label]
     const score = head.constant === null ? dot(head.coef!, head.intercept) : head.constant ? 1e9 : -1e9
     actionScores[label] = score
-    if (vector.grounded && head.selection.method !== 'disabled' && score >= head.selection.threshold) selected.push(label)
+    if (!vector.grounded || head.selection.method === 'disabled') abstainedActions.push(label)
+    else if (score >= head.selection.threshold) selected.push(label)
   }
-  return { primaryType: abstained ? 'unknown' : rawPrimaryType, rawPrimaryType, typeScore, actions: selected, actionScores, abstained }
+  return { primaryType: abstained ? 'unknown' : rawPrimaryType, rawPrimaryType, typeScore, actions: selected, actionScores, abstainedActions, abstained }
 }

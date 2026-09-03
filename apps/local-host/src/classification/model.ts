@@ -45,6 +45,8 @@ export type Prediction = {
   typeScore: number
   actions: Action[]
   actionScores: Record<Action, number>
+  /** These heads made no decision; an empty actions list is not a negative label for them. */
+  abstainedActions: Action[]
   /** Type abstention only; independently supported actions may still be returned. */
   abstained: boolean
 }
@@ -190,12 +192,14 @@ function rawPrediction(model: Model, vector: Features) {
 }
 function prediction(model: Model, raw: ReturnType<typeof rawPrediction>): Prediction {
   const abstained = !raw.eligible || raw.typeScore < model.thresholds.type
+  const abstainedActions = actions.filter(action => !raw.grounded || model.selection.actions[action].method === 'disabled' || model.thresholds.actions[action] > 1 ||
+    model.training.actions[action].positive < model.hyperparameters.minimumClassSamples || model.training.actions[action].negative < model.hyperparameters.minimumClassSamples)
   return {
     primaryType: abstained ? 'unknown' : raw.label,
     typeScore: raw.typeScore,
-    actions: actions.filter(action => raw.grounded && model.training.actions[action].positive >= model.hyperparameters.minimumClassSamples &&
-      model.training.actions[action].negative >= model.hyperparameters.minimumClassSamples && raw.actionScores[action] >= model.thresholds.actions[action]),
+    actions: actions.filter(action => !abstainedActions.includes(action) && raw.actionScores[action] >= model.thresholds.actions[action]),
     actionScores: raw.actionScores,
+    abstainedActions,
     abstained,
   }
 }

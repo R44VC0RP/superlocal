@@ -134,6 +134,7 @@ train fits a local message-type/action baseline; validation selects a small fixe
 It does not train time sensitivity or risk prediction yet. LLM-label scores are teacher agreement.
 predict runs locally without a key; each input line is a ClassificationInput or {input,exampleId}.
 predict/evaluate also accept opt-in plain-JSON word-TFIDF/SVM artifacts; inference needs no Python.
+predict reports abstainedActions separately: disabled/unsupported heads are not confident negative action labels.
 audit sends only {exampleId,input} sources, never existing labels or predictions, to an independent LLM. It persists every success/failure/unstarted record; this is not human ground truth.
 `
 
