@@ -82,6 +82,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
   let deltaGate: Promise<void> | undefined, releaseDelta: (() => void) | undefined, deltaHeld = false;
   let liveEvents = false, readyEvents = 0, mailEvents = 0, inventoryRequests = 0, deltaRequests = 0;
   let gate: Promise<void> | undefined, loseResponses = 0, replayAuthFailures = 0, snapshotFailures = 0, bodyReads = 0, operationReads = 0;
+  let unrelatedOperationReads = 0;
   const posted: Array<{ input: import("inbox-sdk/types").MutationInput; operation: import("inbox-sdk/types").Operation }> = [];
   const flagRequests: import("inbox-sdk/types").MutationInput[] = [];
   const membershipRequests: Array<Parameters<import("inbox-sdk/types").Inbox["setMailboxStates"]>[1]> = [];
@@ -102,7 +103,9 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     const primary = boxes.find(box => box.sourceId === source.accountId)!;
     const candidate = (await host.inbox.mailboxCandidates(host.owner, primary.connectionId)).find(candidate => candidate.sourceId === source.accountId && candidate.selector.kind === "domain")!;
     const overlap = await host.inbox.createMailbox(host.owner, { sourceId: source.accountId, name: "Fictional overlap", selector: candidate.selector });
-    const storage = new Map<string, string>();
+    const storage = new Map<string, string>([["superlocal:sdk-outbox-references", JSON.stringify([
+      { id: "unattached-operation", draftId: "unattached-draft", accountId: "unattached-source", mailboxId: "unattached-box" },
+    ])]]);
     Object.assign(globalThis, {
       location: new URL("http://localhost:41999"), window: new EventTarget(),
       document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
@@ -132,6 +135,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
       });
       if (/\/mailboxes\/[^/]+\/messages\/[^/]+$/.test(url.pathname)) bodyReads++;
       if (/\/operations\/[^/]+$/.test(url.pathname)) operationReads++;
+      if (url.pathname === "/v1/operations/unattached-operation") unrelatedOperationReads++;
       const headers = new Headers(init?.headers); headers.set("Authorization", "Bearer fictional-optimistic-client-token");
       if (url.pathname === "/v1/operations" && init?.method === "POST") {
         flagRequests.push({ ...JSON.parse(String(init.body)), idempotencyKey: headers.get("Idempotency-Key") });
@@ -179,6 +183,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     }) as typeof fetch;
     const store = new InboxStore(); stop = store.start();
     await until(() => store.getSnapshot().loaded, "real SDK snapshot loaded");
+    assert.equal(unrelatedOperationReads, 0, "bootstrap does not request another source's saved outbox references");
     const view = (boxId = primary.id) => store.getSnapshot().mail.find(mail => mail.account === boxId && mail.sourceId === source.accountId && mail.subject === "Optimistic client fixture")!;
     const other = () => store.getSnapshot().mail.find(mail => mail.account === UNIFIED_ACCOUNT && mail.sourceId === scopes[1].accountId && mail.subject === "Optimistic client fixture")!;
     const selected = view(), id = selected.messages[0].id;
@@ -580,6 +585,32 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     // notification is sent after release; the dirty pass must catch this one.
     stop(); liveEvents = true; stop = store.start(); await store.refresh();
     await until(() => readyEvents > 0, "real SDK event stream is connected");
+
+    // Deterministic performance contract: ordinary E/W and their Undo must
+    // update their captured memberships without body hydration, native writes,
+    // a new inventory, or replacement of unrelated rendered conversations.
+    const interactive = () => store.getSnapshot().mail.find(mail => mail.account === UNIFIED_ACCOUNT && mail.sourceId === source.accountId && mail.subject === "Scale fixture 2")!;
+    const guardScans = inventoryRequests, guardBodies = bodyReads, guardNativeCalls = providerCalls;
+    const guardNeighbor = unrelated(), guardDrafts = store.getSnapshot().drafts;
+    const guardUndoDone = await store.action([interactive()], "done");
+    assert.ok(interactive().messages.every(message => message.memberships!.every(state => state.done)));
+    assert.equal(store.getSnapshot().pending, 0, "Done releases the action queue after its durable receipt");
+    await guardUndoDone();
+    assert.ok(interactive().messages.every(message => message.memberships!.every(state => !state.done)));
+    const guardUndoFeedback = await store.action([interactive()], "not-important");
+    assert.ok(interactive().messages.every(message => message.memberships!.every(state => state.done)));
+    assert.equal(store.getSnapshot().pending, 0, "W releases the action queue after its durable receipt");
+    await guardUndoFeedback();
+    await store.retry(); // Drain the real event/metadata path, not just the immediate local projection.
+    assert.ok(interactive().messages.every(message => message.memberships!.every(state => !state.done)));
+    assert.equal(inventoryRequests, guardScans, "E/W/Undo and their events never restart full-mailbox inventory paging");
+    assert.equal(bodyReads, guardBodies, "E/W/Undo never hydrate message bodies over HTTP");
+    assert.equal(providerCalls, guardNativeCalls, "mailbox-local workflows never invoke native flag writes");
+    assert.strictEqual(unrelated(), guardNeighbor, "E/W/Undo preserve unrelated rendered conversation identity");
+    assert.strictEqual(store.getSnapshot().drafts, guardDrafts, "local workflow updates preserve unchanged drafts");
+    assert.equal(unrelatedOperationReads, 0, "forced metadata refresh ignores outbox references from unattached sources");
+    assert.ok(JSON.parse(storage.get("superlocal:sdk-outbox-references")!).some((ref: { id: string }) => ref.id === "unattached-operation"), "ignoring unrelated references must not delete recovery data");
+
     deltaGate = new Promise(resolve => { releaseDelta = resolve; }); deltaHeld = false;
     window.dispatchEvent(new Event("focus"));
     await until(() => deltaHeld, "last delta response held after capturing its old head");
