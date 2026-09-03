@@ -926,8 +926,11 @@ button.settings-menu-row,
 }
 .settings-add-accounts-dialog .settings-dialog-body {
   display: block;
-  overflow: auto;
+  overflow: hidden auto;
   overscroll-behavior: contain;
+  /* Rows bleed 8px past the text edge for their hover surface; give the scroll area that room. */
+  margin-inline: -8px;
+  padding-inline: 8px;
 }
 .mailbox-settings {
   display: flex;
