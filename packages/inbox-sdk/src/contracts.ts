@@ -74,7 +74,8 @@ export interface ProviderDefinition {
   name: string
   connection?: 'oauth' | 'credentials'
   scopes?: string[]
-  create(credentials: ProviderCredentials & Record<string, unknown>): InboxProvider | Promise<InboxProvider>
+  /** Runtime cancellation is separate from provider-validated credential fields. */
+  create(credentials: ProviderCredentials & Record<string, unknown>, context?: { signal: AbortSignal }): InboxProvider | Promise<InboxProvider>
   refresh?(credentials: Record<string, unknown>, signal: AbortSignal, context?: CredentialContext): Promise<Record<string, unknown>>
   discover?(provider: InboxProvider): Promise<ConnectionSources>
   mailboxSelection?: 'automatic' | 'manual'
@@ -112,6 +113,7 @@ export interface Account {
   status: 'connected' | 'disconnected' | 'reconnect_required'
   capabilities: Readonly<ProviderCapabilities>
   features: { localDrafts: true; localLabels: true; snooze: true; scheduledSend: boolean; undoSend: boolean }
+  /** Coverage describes the primary inbox lane, not completion of every native folder. */
   sync: { lastSyncAt: string | null; coverage: 'empty' | 'partial' | 'complete'; problem: string | null }
   revision: number
   connectionId?: string

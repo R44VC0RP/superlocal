@@ -53,7 +53,9 @@ function credentialsFor(provider: HostProviderRegistration, input: Record<string
   for (const field of fields) {
     const value = input.credentials[field.name]
     if (value === undefined && !field.required) continue
-    if (typeof value !== 'string' || value.length > 4096 || value.trim() !== value || /[\x00-\x1f\x7f]/.test(value) || field.required && !value) throw invalid()
+    // Mail passwords are opaque. Spaces are significant; never trim or normalize them.
+    if (typeof value !== 'string' || value.length > 4096 || field.type !== 'password' && (value.trim() !== value || /[\x00-\x1f\x7f]/.test(value)) || field.required && !value) throw invalid()
+    if (field.type === 'select' && !field.options?.some(option => option.value === value)) throw invalid()
     credentials[field.name] = value
   }
   return credentials
@@ -150,14 +152,15 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites,
         providers: descriptors.map(provider => ({ ...provider, connectionIds: connections.filter(connection => connection.providerId === provider.id).map(connection => connection.id) })) }, { headers: safeHeaders })
     }
-    const connect = /^\/host\/providers\/([a-z][a-z0-9-]*)\/connect$/.exec(url.pathname)
+    const connect = /^\/host\/providers\/([a-z][a-z0-9-]*)\/(?:connect|connections\/([^/]+)\/reconnect)$/.exec(url.pathname)
     if (connect && request.method === 'POST') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Connection input belongs in the JSON body.')
       const provider = registrations.find(provider => provider.onboarding.id === connect[1])
       if (!provider) return problem(404, 'HOST_PROVIDER_DISABLED', 'This provider is not enabled in the current mode.')
       if (!provider.onboarding.ready) return problem(409, 'HOST_PROVIDER_NOT_READY', provider.onboarding.setupMessage ?? 'Complete the provider configuration and restart.')
       const credentials = credentialsFor(provider, await jsonBody(request))
-      return Response.json(await provider.connect(liveInbox, owner, credentials, origin!), { headers: safeHeaders })
+      if (connect[2] && !provider.reconnect) return problem(409, 'HOST_RECONNECT_UNAVAILABLE', 'This provider requires a new authorization flow.')
+      return Response.json(await (connect[2] ? provider.reconnect!(liveInbox, owner, connect[2], credentials) : provider.connect(liveInbox, owner, credentials, origin!)), { headers: safeHeaders })
     }
     // Browser credentials go ONLY through the declared host onboarding fields, never raw SDK connection APIs.
     let path: string

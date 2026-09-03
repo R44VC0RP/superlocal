@@ -6,6 +6,8 @@ import { pathToFileURL } from 'node:url'
 import { ImapFlow } from 'imapflow'
 import type SMTPTransport from 'nodemailer/lib/smtp-transport'
 import { builtInProviders } from '../src/providers'
+import { createInbox } from '../src/core'
+import { Database } from 'bun:sqlite'
 import type { ProviderDefinition } from '../src/contracts'
 import { ImapProvider, type ImapCredentials } from '../server/sdk/imap'
 import type {
@@ -66,6 +68,12 @@ interface ContractHarness {
   nativeArrival?: () => Promise<string>
   nativeRemove?: (id: string) => Promise<void>
   nativeUidReset?: () => void
+  imapPeer?: {
+    capabilities: Map<string, boolean>
+    configure(input: { noCopyUid?: boolean; failFlag?: string; readOnly?: boolean; failAppend?: boolean }): void
+    edit(uid: number, update: (message: Wire) => void): void
+    commands: Array<{ method: string; uid?: string; readOnly?: boolean }>
+  }
   resources?: () => { locks: number; connections: number; transports: number }
   send: (input: SendInput) => Promise<SendResult>
   track: (message: MailMessage, provider?: InboxProvider) => void
@@ -506,6 +514,10 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
   let locks = 0
   let transports = 0
   let nextFault: Fault | undefined
+  const capabilities = new Map(['IMAP4rev1', 'UIDPLUS', 'MOVE', 'CONDSTORE'].map(value => [value, true]))
+  let behavior: { noCopyUid?: boolean; failFlag?: string; readOnly?: boolean; failAppend?: boolean } = {}
+  const commands: Array<{ method: string; uid?: string; readOnly?: boolean }> = []
+  const nativeId = (uid: number, path = 'INBOX', account = 'primary') => `imap:${account}:${encodeURIComponent(path)}:${uidValidity}:${uid}`
   let enteredResolve: (() => void) | undefined
   let enteredPromise = Promise.resolve()
   const seed = (account: string, path: string, uid: number, subject: string, options: Wire = {}) => {
@@ -534,6 +546,10 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
         messageId: options.messageId ?? (uid === 1 ? rootRfc : `<${uid}-${token}@example.test>`),
         ...(options.inReplyTo || uid === 2 ? { inReplyTo: options.inReplyTo ?? rootRfc } : {}),
       },
+      headers: Buffer.from(Object.entries({ 'message-id': options.messageId ?? (uid === 1 ? rootRfc : `<${uid}-${token}@example.test>`),
+        ...(options.inReplyTo || uid === 2 ? { 'in-reply-to': options.inReplyTo ?? rootRfc, references: (options.references ?? [rootRfc]).join(' ') } : {}),
+        'x-inbox-contract': token, ...options.headers,
+      }).map(([key, value]) => `${key}: ${value}`).join('\r\n') + '\r\n\r\n'),
       bodyStructure: { type: 'multipart/mixed', childNodes: [
         { part: '1', type: 'text/plain', size: Buffer.byteLength(text), parameters: { charset: 'utf-8' } },
         { part: '2', type: 'text/html', size: Buffer.byteLength(html), parameters: { charset: 'utf-8' } },
@@ -563,9 +579,12 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
   }
   class NativeImap extends EventEmitter {
     usable = false
+    capabilities = capabilities
+    get enabled() { return new Set(capabilities.keys()) }
     mailbox: Wire | false = false
     constructor(readonly account: string) { super(); clients.add(this) }
     async connect() {
+      commands.push({ method: 'connect' })
       rejectFault()
       if (nextFault === 'hang') {
         nextFault = undefined; enteredResolve?.()
@@ -589,10 +608,13 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
       if (!exists) accounts.get(this.account)!.set(path, new Map())
       return { path, created: !exists }
     }
-    async getMailboxLock(path: string) {
+    async getMailboxLock(path: string, options: Wire = {}) {
       rejectFault()
       if (!accounts.get(this.account)!.has(path)) throw new Error('Native mailbox missing')
-      this.mailbox = { path, uidValidity, highestModseq: modseq, exists: accounts.get(this.account)!.get(path)!.size }
+      commands.push({ method: 'open', readOnly: options.readOnly })
+      this.mailbox = { path, uidValidity, ...(capabilities.has('CONDSTORE') ? { highestModseq: modseq } : {}),
+        exists: accounts.get(this.account)!.get(path)!.size, readOnly: behavior.readOnly ?? options.readOnly,
+        permanentFlags: new Set(['\\Seen', '\\Flagged', '\\Deleted']) }
       locks++
       let released = false
       return { release() { if (!released) { locks--; released = true } } }
@@ -625,30 +647,56 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
       if (!message) throw new Error('Native UID missing')
       const bytes = message.parts.get(part) as Buffer | undefined
       if (!bytes) throw new Error('Native MIME part missing')
+      if (bytes.length === 0) return {} // iCloud's zero-octet part response has no literal stream
       const broken = nextFault === 'body'; if (broken) nextFault = undefined
-      const item = message.bodyStructure.childNodes.find((item: Wire) => item.part === part)
-      return { meta: { charset: 'utf-8', contentType: item.type, filename: item.dispositionParameters?.filename },
+      const flatten = (item: Wire): Wire[] => [item, ...(item.childNodes ?? []).flatMap(flatten)]
+      const item = flatten(message.bodyStructure).find((item: Wire) => item.part === part)!
+      return { meta: { charset: item.parameters?.charset ?? 'utf-8', contentType: item.type, filename: item.dispositionParameters?.filename },
         content: broken ? Readable.from((async function* () { yield bytes.subarray(0, 1); throw new Error('Native literal truncated') })()) : Readable.from([bytes]),
       }
     }
     async messageFlagsAdd(uid: string, flags: string[]) {
+      commands.push({ method: 'addFlags', uid })
+      if (this.mailbox && this.mailbox.readOnly) throw new Error('Read-only native mailbox')
+      if (flags.includes(behavior.failFlag ?? '')) return false
       writeCount++; const message = await this.fetchOne(uid); if (!message) return false
       flags.forEach((flag) => message.flags.add(flag)); changes.set(`${this.account}:${this.mailbox && this.mailbox.path}:${uid}`, Number(++modseq)); return true
     }
     async messageFlagsRemove(uid: string, flags: string[]) {
+      commands.push({ method: 'removeFlags', uid })
+      if (this.mailbox && this.mailbox.readOnly) throw new Error('Read-only native mailbox')
       writeCount++; const message = await this.fetchOne(uid); if (!message) return false
       flags.forEach((flag) => message.flags.delete(flag)); changes.set(`${this.account}:${this.mailbox && this.mailbox.path}:${uid}`, Number(++modseq)); return true
     }
     async messageDelete(uid: string) {
+      commands.push({ method: capabilities.has('UIDPLUS') ? 'uidExpunge' : 'unsafeExpunge', uid })
       writeCount++; const path = this.mailbox && this.mailbox.path
       accounts.get(this.account)!.get(path)!.delete(Number(uid)); this.emit('expunge', { path, uid: Number(uid), vanished: true }); return true
     }
     async messageMove(uid: string, destination: string) {
+      commands.push({ method: 'move', uid })
       const message = await this.fetchOne(uid); if (!message) return false
       await this.messageDelete(uid)
       const moved = ++serial
       accounts.get(this.account)!.get(destination)!.set(moved, { ...message, uid: moved })
-      return { uidMap: new Map([[Number(uid), moved]]), uidValidity }
+      return { ...(behavior.noCopyUid ? {} : { uidMap: new Map([[Number(uid), moved]]), uidValidity }) }
+    }
+    async messageCopy(uid: string, destination: string) {
+      commands.push({ method: 'copy', uid })
+      const message = await this.fetchOne(uid); if (!message) return false
+      writeCount++
+      const copied = ++serial
+      accounts.get(this.account)!.get(destination)!.set(copied, { ...message, uid: copied })
+      return { ...(behavior.noCopyUid ? {} : { uidMap: new Map([[Number(uid), copied]]), uidValidity }) }
+    }
+    async append(path: string, source: Buffer) {
+      commands.push({ method: 'append' }); writeCount++
+      if (behavior.failAppend) return false
+      const mime = readMime(source)
+      const uid = ++serial
+      seed(this.account, path, uid, mime.headers.subject ?? '', { messageId: mime.headers['message-id'], from: mime.headers.from,
+        to: mime.headers.to, cc: mime.headers.cc, bcc: mime.headers.bcc })
+      return { uid, uidValidity, path }
     }
   }
   const definition: ProviderDefinition = {
@@ -661,11 +709,22 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
         return {
           async sendMail(input: SMTPTransport.MailOptions) {
             rejectFault(); writeCount++
-            const messageId = `<smtp-${++serial}-${token}@example.test>`
+            serial++
+            const mime = readMime(Buffer.from(input.raw as Buffer))
+            const messageId = mime.headers['message-id']!
+            const flatten = (part: MimePart): MimePart[] => [part, ...part.parts.flatMap(flatten)]
+            const parts = flatten(mime)
+            const files = parts.filter(part => part.filename).map(part => ({ filename: part.filename, content: part.content,
+              contentType: part.type, cid: part.headers['content-id']?.replace(/^<|>$/g, ''), contentDisposition: part.headers['content-disposition']?.split(';')[0] }))
             const addresses = [input.to, input.cc, input.bcc].flatMap((value) => Array.isArray(value) ? value : [value])
               .map((value) => typeof value === 'string' ? /<([^>]+)>/.exec(value)?.[1] ?? value : value?.address)
             for (const email of [PRIMARY, SECONDARY]) {
-              if (addresses.includes(email)) seed(email, 'INBOX', serial, input.subject ?? '', { ...input, bcc: [], messageId })
+              if (addresses.includes(email)) seed(email, 'INBOX', serial, mime.headers.subject ?? '', {
+                from: mime.headers.from, to: mime.headers.to, cc: mime.headers.cc, bcc: mime.headers.bcc,
+                messageId, headers: mime.headers, inReplyTo: mime.headers['in-reply-to'], references: mime.headers.references?.match(/<[^>]+>/g),
+                text: parts.find(part => part.type === 'text/plain' && !part.filename)?.content.toString().replace(/\r\n/g, '\n'),
+                html: parts.find(part => part.type === 'text/html')?.content.toString(), attachments: files,
+              })
             }
             const accepted = addresses.filter((email): email is string => typeof email === 'string')
             const sender = Array.isArray(input.from) ? input.from[0] : input.from
@@ -684,22 +743,24 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
   const provider = await definition.create(credentials)
   const other = await definition.create({ ...credentials, accountId: 'secondary', email: SECONDARY, imap: { host: 'native-peer.invalid', user: SECONDARY, password: 'offline' } })
   const remove = (target: InboxProvider, id: string) => {
-    const [box, , uid] = id.split(':')
+    const [, , box, , uid] = id.split(':')
     accounts.get(target.accountId === 'primary' ? PRIMARY : SECONDARY)!.get(decodeURIComponent(box!))?.delete(Number(uid))
   }
   return {
     provider, other, definition, credentials, email: PRIMARY, sender: PRIMARY, recipient: SECONDARY, recipientProvider: other, otherEmail: SECONDARY, token, scope: 'inbox',
-    ids: ['INBOX:100:1', 'INBOX:100:2', 'INBOX:100:3'], rootId: 'INBOX:100:1', rootThread: rootRfc, rootRfc, expectedSender: WRITER, expectedReplyTo: [WRITER],
+    ids: [nativeId(1), nativeId(2), nativeId(3)], rootId: nativeId(1), rootThread: rootRfc, rootRfc, expectedSender: WRITER, expectedReplyTo: [WRITER],
     ownedMessages: true, isolatedSnapshot: true,
     fault(fault) { nextFault = fault; enteredPromise = new Promise((resolve) => { enteredResolve = resolve }) }, entered: () => enteredPromise,
     writes: () => writeCount,
-    nativeArrival: async () => { const uid = ++serial; seed(PRIMARY, 'INBOX', uid, `${token} arrival`); return `INBOX:${uidValidity}:${uid}` },
+    nativeArrival: async () => { const uid = ++serial; seed(PRIMARY, 'INBOX', uid, `${token} arrival`); return nativeId(uid) },
     nativeRemove: async (id) => {
-      const uid = Number(id.split(':')[2]); const message = accounts.get(PRIMARY)!.get('INBOX')!.get(uid)!
+      const uid = Number(id.split(':')[4]); const message = accounts.get(PRIMARY)!.get('INBOX')!.get(uid)!
       accounts.get(PRIMARY)!.get('INBOX')!.delete(uid); accounts.get(PRIMARY)!.get('Archive')!.set(++serial, { ...message, uid: serial })
       for (const client of clients) if (client.account === PRIMARY && client.mailbox && client.mailbox.path === 'INBOX') client.emit('expunge', { path: 'INBOX', uid, vanished: true })
     },
     nativeUidReset: () => { uidValidity++ },
+    imapPeer: { capabilities, commands, configure(input) { behavior = { ...behavior, ...input } },
+      edit(uid, update) { update(accounts.get(PRIMARY)!.get('INBOX')!.get(uid)!); changes.set(`${PRIMARY}:INBOX:${uid}`, Number(++modseq)) } },
     resources: () => ({ locks, connections: [...clients].filter((client) => client.usable).length, transports }),
     send: (input) => provider.send(input), track() {},
     removeMessage: async (target, id) => { remove(target, id) },
@@ -1552,6 +1613,304 @@ runProviderContract({ name: 'imap receive-only deterministic native peer (not fu
   capabilities: Object.fromEntries(CAPABILITY_KEYS.map((key) => [key, receiveOnly.includes(key)])) as unknown as ProviderCapabilities,
   ownedMessages: true, isolatedSnapshot: true, secondAccount: true, nativeFailures: true, nativeArrival: true, cleanupFolders: true,
   harness: () => imapHarness(false),
+})
+
+describe('imap capability boundaries and SDK integration', () => {
+  let h: ContractHarness
+  beforeEach(async () => { h = await imapHarness(true) })
+  afterEach(async () => { await h.close() })
+
+  test('reads use EXAMINE, and ordinary attachments are fetched only on explicit download', async () => {
+    await h.provider.listMessages({ limit: 2 })
+    expect(h.imapPeer!.commands.filter(command => command.method === 'open').every(command => command.readOnly === true)).toBe(true)
+    expect(h.writes!()).toBe(0)
+    await h.provider.mutate(h.rootId, { isStarred: true })
+    expect(h.imapPeer!.commands.filter(command => command.method === 'open').at(-1)?.readOnly).toBe(false)
+  })
+
+  for (const condstore of [true, false]) test(`flags and absent UIDs reconcile after a fresh adapter with CONDSTORE=${condstore}`, async () => {
+    if (!condstore) h.imapPeer!.capabilities.delete('CONDSTORE')
+    const snapshot = await h.provider.sync(null, { limit: 100 })
+    h.imapPeer!.edit(2, message => message.flags.add('\\Flagged'))
+    await h.nativeRemove!(h.rootId)
+    await h.provider.disconnect()
+    const replacement = await h.definition.create(h.credentials)
+    try {
+      const next = await replacement.sync(snapshot.cursor, { limit: 100, knownMessageIds: snapshot.messages.map(message => message.id) })
+      expect(next.messages.find(message => message.id === h.ids[1])?.isStarred).toBe(true)
+      expect(next.removedMessageIds).toContain(h.rootId)
+      expect(next.retiredMessageIds).toContain(h.rootId)
+      expect(next.deletedMessageIds).toEqual([])
+    } finally { await replacement.disconnect() }
+  })
+
+  test('incremental continuations never exceed the limit or advance past unreturned flags', async () => {
+    const snapshot = await h.provider.sync(null, { limit: 100 })
+    for (const uid of [1, 2, 3]) h.imapPeer!.edit(uid, message => message.flags.add('\\Seen'))
+    let cursor = snapshot.cursor
+    const ids: string[] = []
+    for (let page = 0; page < 4; page++) {
+      const next = await h.provider.sync(cursor, { limit: 1, knownMessageIds: h.ids })
+      expect(next.fullSync).toBe(false)
+      expect(next.messages.length).toBeLessThanOrEqual(1)
+      expect(next.messages.every(message => message.isRead)).toBe(true)
+      ids.push(...next.messages.map(message => message.id))
+      cursor = next.recentCursor ?? next.cursor
+      if (!next.hasMore) break
+    }
+    expect(ids.sort()).toEqual([...h.ids].sort())
+    expect((await h.provider.sync(cursor, { limit: 1 })).messages).toEqual([])
+  })
+
+  test('recent sync never imports old unfetched mail just because its flags changed', async () => {
+    const snapshot = await h.provider.sync(null, { limit: 1 })
+    h.imapPeer!.edit(1, message => message.flags.add('\\Seen'))
+    h.imapPeer!.edit(3, message => message.flags.add('\\Flagged'))
+    const recent = await h.provider.sync(snapshot.recentCursor, { knownMessageIds: snapshot.messages.map(message => message.id) })
+    expect(recent.messages.map(message => message.id)).toEqual([h.ids[2]!])
+    expect(recent.messages[0]!.isStarred).toBe(true)
+    expect(recent.fullSync).toBe(false)
+  })
+
+  test('polling without CONDSTORE fetches only flags for unchanged SDK-known messages', async () => {
+    h.imapPeer!.capabilities.delete('CONDSTORE')
+    const first = await h.provider.sync(null, { limit: 100 })
+    const options = { knownMessageIds: first.messages.map(message => message.id),
+      knownMessageStates: first.messages.map(message => ({ id: message.id, isRead: message.isRead, isStarred: message.isStarred })) }
+    expect((await h.provider.sync(first.cursor, options)).messages).toEqual([])
+    h.imapPeer!.edit(2, message => message.flags.add('\\Flagged'))
+    const next = await h.provider.sync(first.cursor, options)
+    expect(next.messages.map(message => message.id)).toEqual([h.ids[1]!])
+    expect(next.messages[0]!.isStarred).toBe(true)
+  })
+
+  test('a new arrival during an incremental continuation remains available on the next poll', async () => {
+    const snapshot = await h.provider.sync(null, { limit: 100 })
+    for (const uid of [1, 2, 3]) h.imapPeer!.edit(uid, message => message.flags.add('\\Seen'))
+    const first = await h.provider.sync(snapshot.cursor, { limit: 1 })
+    const arrival = await h.nativeArrival!()
+    let cursor = first.cursor
+    for (let page = 0; page < 5; page++) {
+      const next = await h.provider.sync(cursor, { limit: 1 }); cursor = next.cursor
+      if (!next.hasMore) break
+    }
+    expect((await h.provider.sync(cursor, { limit: 100 })).messages.map(message => message.id)).toContain(arrival)
+  })
+
+  test('original reply headers remain authoritative when the IMAP envelope omits the parent', async () => {
+    h.imapPeer!.edit(2, message => { delete message.envelope.inReplyTo })
+    const reply = await h.provider.getMessage(h.ids[1]!)
+    expect(reply.inReplyTo).toBe(h.rootRfc)
+    expect(reply.threadId).toBe(h.rootRfc)
+  })
+
+  test('UIDVALIDITY changes retire old mailbox instances, not reuse colliding UIDs', async () => {
+    const snapshot = await h.provider.sync(null, { limit: 100 })
+    h.nativeUidReset!()
+    const reset = await h.provider.sync(snapshot.cursor, { knownMessageIds: h.ids })
+    expect(reset.fullSync).toBe(true)
+    expect(reset.retiredMessageIds).toEqual(expect.arrayContaining(h.ids))
+    expect(reset.messages.every(message => !h.ids.includes(message.id))).toBe(true)
+    await failure(() => h.provider.getMessage(h.rootId), 'INVALID_CURSOR')
+  })
+
+  test('without UIDPLUS, delete and mixed move operations fail before flags change', async () => {
+    h.imapPeer!.capabilities.delete('UIDPLUS')
+    await h.provider.getAccount()
+    expect(h.provider.capabilities.permanentDelete).toBe(false)
+    expect(h.provider.capabilities.archive).toBe(false)
+    await failure(() => h.provider.mutate(h.rootId, { deletePermanently: true }), 'UNSUPPORTED_OPERATION')
+    await failure(() => h.provider.mutate(h.rootId, { isRead: true, folder: 'archive' }), 'UNSUPPORTED_OPERATION')
+    expect(h.writes!()).toBe(0)
+    expect(h.imapPeer!.commands.some(command => command.method === 'unsafeExpunge')).toBe(false)
+  })
+
+  test('COPYUID fallback moves only the selected UID and leaves other Deleted messages intact', async () => {
+    h.imapPeer!.capabilities.delete('MOVE')
+    h.imapPeer!.edit(3, message => message.flags.add('\\Deleted'))
+    const result = await h.provider.mutate(h.rootId, { folder: 'archive' })
+    expect(result?.folder).toBe('archive')
+    expect(result?.id).not.toBe(h.rootId)
+    expect((await h.provider.getMessage(h.ids[2]!)).id).toBe(h.ids[2])
+    expect(h.imapPeer!.commands.filter(command => command.method === 'uidExpunge')).toEqual([{ method: 'uidExpunge', uid: '1' }])
+    expect(h.imapPeer!.commands.some(command => command.method === 'unsafeExpunge')).toBe(false)
+  })
+
+  test('a missing COPYUID is partial, never guessed from an RFC Message-ID or followed by deletion', async () => {
+    h.imapPeer!.capabilities.delete('MOVE')
+    h.imapPeer!.configure({ noCopyUid: true })
+    let caught: any
+    try { await h.provider.mutate(h.rootId, { isRead: true, folder: 'archive' }) } catch (error) { caught = error }
+    expect(caught).toMatchObject({ name: 'ProviderMutationError', retryable: false, sourceRetired: false })
+    expect((await h.provider.getMessage(h.rootId)).isRead).toBe(true)
+    expect(h.imapPeer!.commands.some(command => command.method === 'uidExpunge')).toBe(false)
+  })
+
+  test('plain alternatives preserve emptiness, mixed body sections, and non-UTF8 bytes without fetching attached text', async () => {
+    h.imapPeer!.edit(1, message => {
+      message.bodyStructure.childNodes[0] = { type: 'multipart/alternative', childNodes: [
+        { part: '1.1', type: 'text/plain', size: 4, parameters: { charset: 'windows-1252' } },
+        { part: '1.2', type: 'text/plain', size: 0, parameters: { charset: 'utf-8' } },
+      ] }
+      message.parts.set('1.1', Buffer.from([0x63, 0x61, 0x66, 0xe9])); message.parts.set('1.2', Buffer.alloc(0))
+    })
+    expect((await h.provider.getMessage(h.rootId)).bodyText).toBe('')
+    h.imapPeer!.edit(1, message => { message.bodyStructure.childNodes[0].childNodes.pop() })
+    expect((await h.provider.getMessage(h.rootId)).bodyText).toBe('café')
+    h.imapPeer!.edit(1, message => { message.bodyStructure.childNodes[0].childNodes[0].size = 9 * 1024 * 1024 })
+    await failure(() => h.provider.getMessage(h.rootId), 'UPSTREAM', false)
+    h.imapPeer!.edit(1, message => { const part = message.bodyStructure.childNodes[0].childNodes[0]; part.size = 4; part.parameters.charset = 'x-unsupported-encoding' })
+    await failure(() => h.provider.getMessage(h.rootId), 'UNSUPPORTED_OPERATION', false)
+    expect(h.resources!().locks).toBe(0)
+  })
+
+  test('SMTP rejects other From identities and header injection before a send', async () => {
+    const base = { to: h.recipient, subject: 'safe', bodyText: TEXT }
+    await failure(() => h.provider.send({ ...base, from: h.otherEmail! }), 'AUTHORIZATION')
+    await failure(() => h.provider.send({ ...base, headers: { Bcc: h.otherEmail! } }), 'VALIDATION')
+    await failure(() => h.provider.send({ ...base, headers: { 'X-Test': 'value\r\nBcc: unknown@example.test' } }), 'VALIDATION')
+    await failure(() => h.provider.mutate(h.rootId, { folder: 'starred', isStarred: false, isRead: true }), 'VALIDATION')
+    expect(h.writes!()).toBe(0)
+  })
+
+  test('TLS verification cannot be disabled, and certificate failures are nonretryable and secret-free', async () => {
+    expect(() => new ImapProvider({ ...h.credentials, imap: { host: 'native-peer.invalid', user: h.email, password: 'synthetic', tls: { rejectUnauthorized: false } } })).toThrow('certificate verification cannot be disabled')
+    const secret = 'synthetic-secret-that-must-not-escape'
+    const native = Object.assign(new EventEmitter(), { usable: false,
+      async connect() { throw Object.assign(new Error(`${secret} at auth.native-peer.invalid`), { code: 'CERT_HAS_EXPIRED', authenticationFailed: true }) }, close() {} })
+    const provider = new ImapProvider(h.credentials, { createClient(options) {
+      expect(options.tls?.rejectUnauthorized).toBe(true)
+      expect(options.tls?.servername).toBe('native-peer.invalid')
+      expect(options.logger).toBe(false)
+      return native as unknown as ImapFlow
+    } })
+    try {
+      let caught: any
+      try { await provider.getAccount() } catch (error) { caught = error }
+      expect(caught).toMatchObject({ code: 'NETWORK', retryable: false })
+      expect(`${caught.message} ${JSON.stringify(caught)}`).not.toContain(secret)
+      expect(caught.cause).toBeUndefined()
+    } finally { await provider.disconnect() }
+  })
+
+  test('rejected IMAP credentials stop polling and require host reauthorization instead of repeated login attempts', async () => {
+    const database = new Database(':memory:')
+    let sdk = createInbox({ database, encryptionKey: '5'.repeat(64), providers: [h.definition] })
+    try {
+      const account = await sdk.connect('alice', { providerId: 'imap', credentials: h.credentials })
+      await sdk.close()
+      sdk = createInbox({ database, encryptionKey: '5'.repeat(64), providers: [h.definition] })
+      const before = h.imapPeer!.commands.filter(command => command.method === 'connect').length
+      h.fault!({ status: 401 })
+      await expect(sdk.sync('alice', account.id)).rejects.toMatchObject({ code: 'CREDENTIALS_REVOKED' })
+      expect((await sdk.account('alice', account.id)).status).toBe('reconnect_required')
+      await sdk.poll()
+      expect(h.imapPeer!.commands.filter(command => command.method === 'connect').length).toBe(before + 1)
+    } finally { await sdk.close(); database.close() }
+  })
+
+  test('explicit APPEND policy saves one Sent copy with a usable mapped ID and private BCC', async () => {
+    const provider = await h.definition.create({ ...h.credentials, sentCopy: 'append' })
+    try {
+      const sent = await provider.send({ to: h.recipient, bcc: h.email, subject: 'Sent copy', bodyText: TEXT })
+      expect(sent.providerMessageId).toBeDefined()
+      const message = await provider.getMessage(sent.providerMessageId!)
+      expect(message.folder).toBe('sent')
+      expect(message.bcc.map(person => person.email)).toContain(h.email)
+      expect((await provider.listMessages({ folder: 'sent' })).items.length).toBe(1)
+      expect(h.imapPeer!.commands.filter(command => command.method === 'append')).toHaveLength(1)
+    } finally { await provider.disconnect() }
+  })
+
+  test('SDK canonical ownership, move/undo and local Done/snooze survive adapter replacement', async () => {
+    const database = new Database(':memory:')
+    let sdk = createInbox({ database, encryptionKey: '6'.repeat(64), providers: [h.definition] })
+    try {
+      const account = await sdk.connect('alice', { providerId: 'imap', credentials: h.credentials })
+      await sdk.folders('alice', account.id)
+      await sdk.sync('alice', account.id, { limit: 1 })
+      expect((await sdk.account('alice', account.id)).sync.coverage).toBe('partial')
+      await sdk.sync('alice', account.id, { folder: 'sent', limit: 3 })
+      expect((await sdk.account('alice', account.id)).sync.coverage).toBe('partial')
+      await sdk.sync('alice', account.id, { limit: 3, reset: true })
+      const first = (await sdk.messages('alice', { accountId: account.id })).items[0]!
+      const mailbox = (await sdk.mailboxes('alice'))[0]!
+      const membership = (await sdk.mailboxMessage('alice', mailbox.id, first.id)).memberships[0]!
+      const before = h.writes!()
+      await sdk.setMailboxState('alice', mailbox.id, first.id, { done: true, snoozedUntil: '2099-01-01T00:00:00.000Z' }, membership.revision)
+      expect(h.writes!()).toBe(before)
+      const op = await sdk.mutate('alice', { messageIds: [first.id], changes: { folder: 'archive' }, idempotencyKey: 'move-identity' })
+      await sdk.runDue()
+      expect((await sdk.operation('alice', op.id)).status).toBe('succeeded')
+      expect((await sdk.message('alice', first.id)).folder).toBe('archive')
+      const reverse = await sdk.undo('alice', op.id); await sdk.runDue()
+      expect((await sdk.operation('alice', reverse.id)).status).toBe('succeeded')
+      expect((await sdk.message('alice', first.id)).folder).toBe('inbox')
+      await sdk.close()
+      sdk = createInbox({ database, encryptionKey: '6'.repeat(64), providers: [h.definition] })
+      await sdk.sync('alice', account.id, { limit: 3 })
+      expect((await sdk.messages('alice')).total).toBe(3)
+      expect((await sdk.message('alice', first.id)).id).toBe(first.id)
+      expect((await sdk.mailboxMessage('alice', mailbox.id, first.id)).memberships[0]).toMatchObject({ done: true, snoozedUntil: '2099-01-01T00:00:00.000Z' })
+      await expect(sdk.message('bob', first.id)).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    } finally { await sdk.close(); database.close() }
+  })
+
+  test('SDK partial writes retain confirmed flags, refuse undo, and do not retry an ambiguous move', async () => {
+    const sdk = createInbox({ encryptionKey: '7'.repeat(64), providers: [h.definition] })
+    try {
+      const account = await sdk.connect('alice', { providerId: 'imap', credentials: h.credentials })
+      await sdk.sync('alice', account.id, { limit: 3 })
+      const first = (await sdk.messages('alice')).items[0]!
+      h.imapPeer!.configure({ failFlag: '\\Flagged' })
+      const op = await sdk.mutate('alice', { messageIds: [first.id], changes: { isRead: true, isStarred: true }, idempotencyKey: 'partial-flags' })
+      await sdk.runDue()
+      expect((await sdk.operation('alice', op.id))).toMatchObject({ status: 'partial', problem: { code: 'PARTIAL_MUTATION', retryable: false } })
+      expect(await sdk.message('alice', first.id)).toMatchObject({ isRead: true, isStarred: false })
+      await expect(sdk.undo('alice', op.id)).rejects.toMatchObject({ code: 'CANNOT_UNDO' })
+      const writes = h.writes!(); await sdk.runDue(); expect(h.writes!()).toBe(writes)
+    } finally { await sdk.close() }
+  })
+
+  test('an authoritative move receipt merges a concurrently synchronized destination without changing the original public ID', async () => {
+    let sdk: ReturnType<typeof createInbox>
+    let observed = false
+    const definition: ProviderDefinition = { ...h.definition, async create(credentials) {
+      const provider = await h.definition.create(credentials), mutate = provider.mutate.bind(provider)
+      provider.mutate = async (id, changes) => {
+        const result = await mutate(id, changes)
+        if (changes.folder === 'archive') { await sdk.sync('alice', provider.accountId, { folder: 'archive' }); observed = true }
+        return result
+      }
+      return provider
+    } }
+    sdk = createInbox({ encryptionKey: '9'.repeat(64), providers: [definition] })
+    try {
+      const account = await sdk.connect('alice', { providerId: 'imap', credentials: h.credentials })
+      await sdk.sync('alice', account.id)
+      const original = (await sdk.messages('alice')).items[0]!
+      const operation = await sdk.mutate('alice', { messageIds: [original.id], changes: { folder: 'archive' }, idempotencyKey: 'concurrent-move-echo' })
+      await sdk.runDue()
+      expect(observed).toBe(true)
+      expect((await sdk.operation('alice', operation.id)).status).toBe('succeeded')
+      expect((await sdk.messages('alice')).total).toBe(3)
+      expect(await sdk.message('alice', original.id)).toMatchObject({ id: original.id, folder: 'archive' })
+    } finally { await sdk.close() }
+  })
+
+  test('SDK accepted SMTP with failed Sent APPEND is a durable partial result, never a resend', async () => {
+    const sdk = createInbox({ encryptionKey: '8'.repeat(64), providers: [h.definition], defaultPolicy: { undoSendSeconds: 0 } })
+    try {
+      const account = await sdk.connect('alice', { providerId: 'imap', credentials: { ...h.credentials, sentCopy: 'append' } })
+      const draft = await sdk.createDraft('alice', { accountId: account.id, to: [{ email: h.recipient, name: h.recipient }], subject: 'partial sent', bodyText: TEXT })
+      h.imapPeer!.configure({ failAppend: true })
+      const input = { revision: draft.revision, idempotencyKey: 'partial-sent' }
+      const op = await sdk.submit('alice', draft.id, input); await sdk.runDue()
+      expect(await sdk.operation('alice', op.id)).toMatchObject({ status: 'partial', problem: { code: 'SENT_COPY_UNCONFIRMED' } })
+      const writes = h.writes!(); expect((await sdk.submit('alice', draft.id, input)).id).toBe(op.id)
+      await sdk.runDue(); expect(h.writes!()).toBe(writes)
+    } finally { await sdk.close() }
+  })
 })
 
 describe('provider-specific native failures and effective grants', () => {

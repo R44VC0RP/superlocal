@@ -6,7 +6,7 @@ import { Context, Effect, Either, Fiber, Layer, ManagedRuntime, Schedule } from 
 import { createCredentialCrypto } from '../server/crypto'
 import { sanitizeEmailBody } from '../server/sanitize'
 import { createMediaStore } from './media'
-import { ProviderError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
+import { ProviderError, ProviderMutationError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
 import { CredentialError, InboxError, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
   type DraftInput, type Folder, type Inbox, type InboxOptions, type Label, type Message,
   type MessageSummary, type MutationInput, type Operation, type Participant, type Policy,
@@ -595,7 +595,7 @@ export function createInbox(options: InboxOptions): Inbox {
     if (!instance) {
       instance = Promise.resolve(definition.create({ ...credentials, accountId: row.id, userId: row.owner, sdkMailboxScopes: undefined,
         fetch: ((input, init) => (options.fetch ?? globalThis.fetch)(input, { ...init,
-          signal: AbortSignal.any([controller!.signal, init?.signal ?? AbortSignal.timeout(30_000)]) })) as typeof fetch })).then(provider => {
+          signal: AbortSignal.any([controller!.signal, init?.signal ?? AbortSignal.timeout(30_000)]) })) as typeof fetch }, { signal: controller.signal })).then(provider => {
         if (provider.accountId !== row.id) throw new InboxError('INVALID_PROVIDER', 'Provider returned a foreign account.', 502)
         return provider
       })
@@ -612,6 +612,11 @@ export function createInbox(options: InboxOptions): Inbox {
     if (!current(row) || instances.get(key) !== instance || retiring.has(key) || !controllers.has(key)) {
       throw new InboxError('CREDENTIALS_CHANGED', 'Connection credentials changed during this request.', 409, true)
     }
+    return provider
+  }
+
+  function refreshCapabilities(row: AccountRow, provider: InboxProvider): void {
+    if (!current(row)) return
     const account = JSON.parse(accountRow(row.owner, row.id).data) as Account
     if (fingerprint(account.capabilities) !== fingerprint(provider.capabilities)) {
       account.capabilities = { ...provider.capabilities }
@@ -620,7 +625,6 @@ export function createInbox(options: InboxOptions): Inbox {
       db.query('UPDATE sdk_accounts SET data=? WHERE id=? AND owner=? AND generation=?').run(JSON.stringify(account), row.id, row.owner, row.generation)
       event(row.owner, 'account.updated', row.id, row.id)
     }
-    return provider
   }
 
   async function io<T>(row: AccountRow, action: (provider: InboxProvider) => Promise<T>): Promise<T> {
@@ -632,12 +636,14 @@ export function createInbox(options: InboxOptions): Inbox {
       activeRequests.set(key, (activeRequests.get(key) ?? 0) + 1)
       const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)])
       try {
-        return await new Promise<T>((resolve, reject) => {
-          const abort = () => reject(new InboxError('NETWORK', 'Mailbox request interrupted.', 502, true))
+        const result = await new Promise<T>((resolve, reject) => {
+          const abort = () => { retireInstance(key, true); reject(new InboxError('NETWORK', 'Mailbox request interrupted.', 502, true)) }
           if (signal.aborted) { abort(); return }
           signal.addEventListener('abort', abort, { once: true })
           Promise.resolve().then(() => action(provider)).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort))
         })
+        refreshCapabilities(row, provider)
+        return result
       } catch (error) {
         if (error instanceof CredentialError && error.reason === 'revoked') {
           const grant = connectionRow(row.owner, row.connection_id)
@@ -732,13 +738,34 @@ export function createInbox(options: InboxOptions): Inbox {
 
   function persist(row: AccountRow, mail: MailMessage, reason: ChangeEvent['reason'], preferredId?: string, fence = Infinity): string {
     if (mail.accountId !== row.id) throw new InboxError('INVALID_PROVIDER', 'Provider returned mail for another account.', 502)
-    const old = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=?').get(row.id, row.generation, mail.id)
-      ?? (preferredId ? db.query<MessageRow, [string, string]>('SELECT * FROM sdk_messages WHERE id=? AND account=?').get(preferredId, row.id) : null)
+    const exact = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=?').get(row.id, row.generation, mail.id)
+    const preferred = preferredId ? db.query<MessageRow, [string, string]>('SELECT * FROM sdk_messages WHERE id=? AND account=?').get(preferredId, row.id) : null
+    if (preferred && exact && preferred.id !== exact.id) {
+      // A sync can observe a move's new UID before its command receipt is committed.
+      // Only the explicit mutation receipt authorizes this merge; never match subjects
+      // or RFC Message-ID. Keep the original public identity and retire the sync echo.
+      db.query('UPDATE sdk_messages SET native_id=?,deleted=2,revision=revision+1 WHERE id=?').run(`merged:${exact.id}`, exact.id)
+      db.query('UPDATE sdk_native_keys SET message_id=? WHERE account=? AND generation=? AND message_id=?').run(preferred.id, row.id, row.generation, exact.id)
+      for (const membership of db.query<MembershipRow, [string, string]>('SELECT * FROM sdk_memberships WHERE owner=? AND message=?').all(row.owner, exact.id)) {
+        const state: MailboxMembership = { ...JSON.parse(membership.data), messageId: preferred.id }
+        db.query('INSERT OR IGNORE INTO sdk_memberships VALUES (?,?,?,?,?)').run(row.owner, row.id, membership.mailbox, preferred.id, JSON.stringify(state))
+      }
+      db.query('INSERT OR IGNORE INTO sdk_delivery_evidence SELECT owner,source,?,kind,value FROM sdk_delivery_evidence WHERE owner=? AND message=?').run(preferred.id, row.owner, exact.id)
+      for (const stored of db.query<DataRow, [string, string]>('SELECT * FROM sdk_drafts WHERE owner=? AND account=?').all(row.owner, row.id)) {
+        const draft = JSON.parse(stored.data) as Draft
+        if (draft.sourceMessageId !== exact.id || draft.status !== 'active') continue
+        draft.sourceMessageId = preferred.id; draft.revision++
+        db.query('UPDATE sdk_drafts SET data=? WHERE id=?').run(JSON.stringify(draft), draft.id)
+        event(row.owner, 'draft.updated', row.id, draft.id)
+      }
+      event(row.owner, 'mail.changed', row.id, exact.id, 'deleted')
+    }
+    const old = preferred ?? exact
       ?? db.query<MessageRow, [string, number, string]>('SELECT m.* FROM sdk_native_keys k JOIN sdk_messages m ON m.id=k.message_id WHERE k.account=? AND k.generation=? AND k.native_id=?').get(row.id, row.generation, mail.id)
       ?? (mail.folder === 'sent' && mail.rfcMessageId ? db.query<MessageRow, [string, number, string, string]>("SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id LIKE 'submission:%' AND json_extract(body,'$.rfcMessageId')=? AND lower(json_extract(visible,'$.from.email'))=lower(?)").get(row.id, row.generation, mail.rfcMessageId, mail.from.email) : null)
-    if (old?.deleted) return old.id
+    if (old?.deleted === 1) return old.id
     if (old) recordEvidence(row, mail, old.id, reason)
-    if (old && (reason === 'backfill' || old.last_mutation_seq > fence)) return old.id
+    if (old && !old.deleted && (reason === 'backfill' || old.last_mutation_seq > fence)) return old.id
     if (old && old.native_id !== mail.id && !preferredId && !old.native_id.startsWith('submission:')) return old.id
     const id = old?.id ?? preferredId ?? randomUUID()
     const threadKey = mail.threadId || mail.id
@@ -761,9 +788,9 @@ export function createInbox(options: InboxOptions): Inbox {
     const body = JSON.stringify({ bcc: mail.bcc, bodyText: mail.bodyText, bodyHtml: mail.bodyHtml, attachments,
       replyTo: normalized.replyTo, rfcMessageId: normalized.rfcMessageId, references: normalized.references, inReplyTo: normalized.inReplyTo })
     const confirmed = JSON.stringify(summary)
-    if (old && old.confirmed === confirmed && old.body === body) return old.id
+    if (old && !old.deleted && old.confirmed === confirmed && old.body === body) return old.id
     db.query(`INSERT INTO sdk_messages(id,owner,account,generation,native_id,thread_id,confirmed,visible,body,received_at,folder,is_read,is_starred,subject,search_text)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET native_id=excluded.native_id,confirmed=excluded.confirmed,body=excluded.body,received_at=excluded.received_at,subject=excluded.subject,search_text=excluded.search_text`).run(
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET native_id=excluded.native_id,confirmed=excluded.confirmed,body=excluded.body,received_at=excluded.received_at,subject=excluded.subject,search_text=excluded.search_text,deleted=0`).run(
       id, row.owner, row.id, row.generation, mail.id, threadId, confirmed, confirmed, body, mail.receivedAt, mail.folder,
       Number(mail.isRead), Number(mail.isStarred), mail.subject,
       [mail.subject, mail.preview, mail.bodyText, JSON.stringify(mail.from), JSON.stringify(mail.to), JSON.stringify(mail.cc)].join('\n'))
@@ -964,8 +991,9 @@ export function createInbox(options: InboxOptions): Inbox {
             op.status = 'failed'; op.problem = { code: 'RECIPIENTS_REJECTED', message: 'The provider rejected all recipients.', retryable: false }
             saveOperation(row, op); restoreDraft(row); return
           }
-          op.status = rejected ? 'partial' : 'succeeded'
+          op.status = rejected || receipt.sentCopyUnconfirmed ? 'partial' : 'succeeded'
           if (rejected) op.problem = { code: 'RECIPIENTS_REJECTED', message: 'The provider rejected some recipients.', retryable: false }
+          else if (receipt.sentCopyUnconfirmed) op.problem = { code: 'SENT_COPY_UNCONFIRMED', message: 'The message was accepted, but its Sent copy is unconfirmed. Do not resend.', retryable: false }
           const mail: MailMessage = { id: receipt.providerMessageId ?? `submission:${op.id}`, accountId: account.id,
             threadId: receipt.threadId ?? payload.nativeThread ?? `submission:${op.id}`, from: { name: draft.from, email: draft.from },
             to: draft.to, cc: draft.cc, bcc: draft.bcc, subject: draft.subject, preview: draft.bodyText.slice(0, 200),
@@ -1039,7 +1067,13 @@ export function createInbox(options: InboxOptions): Inbox {
           if (issue.retryable && op.attempts < 5) throw error
           transaction(() => {
             if (!ownsLease(row)) return
-            const problem: Problem = { code: issue.code, message: issue.message, retryable: false }
+            if (error instanceof ProviderMutationError) {
+              if (error.confirmedMessage) persist(account, error.confirmedMessage, 'mutation', id)
+              else if (error.sourceRetired) db.query('UPDATE sdk_messages SET deleted=2,revision=revision+1 WHERE id=? AND owner=?').run(id, row.owner)
+            }
+            const problem: Problem = error instanceof ProviderMutationError
+              ? { code: 'PARTIAL_MUTATION', message: 'Some mailbox changes may have succeeded. Synchronize before retrying; automatic undo is unavailable.', retryable: false }
+              : { code: issue.code, message: issue.message, retryable: false }
             op.results.push({ messageId: id, status: 'failed', problem }); op.problem = problem
             db.query('UPDATE sdk_operations SET data=? WHERE id=?').run(JSON.stringify(op), op.id)
             project(id); event(row.owner, 'mail.changed', row.account, id)
@@ -1049,7 +1083,7 @@ export function createInbox(options: InboxOptions): Inbox {
       transaction(() => {
         if (!ownsLease(row)) return
         const succeeded = op.results.filter(result => result.status === 'succeeded').length
-        op.status = succeeded === payload.input.messageIds.length ? 'succeeded' : succeeded ? 'partial' : 'failed'
+        op.status = succeeded === payload.input.messageIds.length ? 'succeeded' : succeeded || op.results.some(result => result.problem?.code === 'PARTIAL_MUTATION') ? 'partial' : 'failed'
         saveOperation(row, op)
       })
     } catch (error) {
@@ -1142,7 +1176,7 @@ export function createInbox(options: InboxOptions): Inbox {
       const controller = new AbortController()
       const provider = await definition.create({ ...credentials, accountId: id, userId: owner,
         sdkMailboxScopes: undefined, fetch: ((input, init) => (options.fetch ?? globalThis.fetch)(input, { ...init,
-          signal: AbortSignal.any([controller.signal, init?.signal ?? AbortSignal.timeout(30_000)]) })) as typeof fetch })
+          signal: AbortSignal.any([controller.signal, init?.signal ?? AbortSignal.timeout(30_000)]) })) as typeof fetch }, { signal: controller.signal })
       try {
         const native = await provider.getAccount()
         if (provider.accountId !== id || native.id !== id) throw new InboxError('INVALID_PROVIDER', 'Provider returned a foreign account.', 502)
@@ -1194,7 +1228,7 @@ export function createInbox(options: InboxOptions): Inbox {
       const controller = new AbortController()
       const provider = await definition.create({ ...credentials, accountId: id, userId: owner, sdkMailboxScopes: undefined,
         fetch: ((input, init) => (options.fetch ?? globalThis.fetch)(input, { ...init,
-          signal: AbortSignal.any([controller.signal, init?.signal ?? AbortSignal.timeout(30_000)]) })) as typeof fetch })
+          signal: AbortSignal.any([controller.signal, init?.signal ?? AbortSignal.timeout(30_000)]) })) as typeof fetch }, { signal: controller.signal })
       try {
         const native = await provider.getAccount()
         const previous = JSON.parse(old.data) as Account
@@ -1269,7 +1303,7 @@ export function createInbox(options: InboxOptions): Inbox {
         const source = accountRow(owner, sourceId)
         if (source.connection_id !== id || source.status === 'disconnected') continue
         const provider = await definition.create({ ...credentials, accountId: sourceId, userId: owner, sdkMailboxScopes: undefined,
-          fetch: ((request, init) => (options.fetch ?? globalThis.fetch)(request, { ...init, signal: AbortSignal.any([signal, ...(init?.signal ? [init.signal] : [])]) })) as typeof fetch })
+          fetch: ((request, init) => (options.fetch ?? globalThis.fetch)(request, { ...init, signal: AbortSignal.any([signal, ...(init?.signal ? [init.signal] : [])]) })) as typeof fetch }, { signal })
         created.push(provider)
         const native = await credentialCall(signal, () => provider.getAccount())
         if (provider.accountId !== sourceId || native.id !== sourceId) throw new InboxError('INVALID_PROVIDER', 'Provider returned a foreign account.', 502)
@@ -1312,17 +1346,23 @@ export function createInbox(options: InboxOptions): Inbox {
       const saved = db.query<{ data: string }, [string, number, string, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND scope=? AND lane=?').get(id, row.generation, checkpointScope, lane)
       const checkpoint: SyncCheckpoint = request.reset || !saved ? { cursor: null, initialized: false } : JSON.parse(saved.data)
       let fence: number
+      const known = db.query<{ native_id: string; is_read: number; is_starred: number }, [string, number]>(
+        "SELECT native_id,json_extract(confirmed,'$.isRead') is_read,json_extract(confirmed,'$.isStarred') is_starred FROM sdk_messages WHERE account=? AND generation=? AND deleted=0").all(id, row.generation)
       const syncOptions = { folder: scope, limit: request.limit ?? 100, ...(selection?.scopes ? { mailboxScopes: selection.scopes } : {}) }
+      // Runtime hints are separate from providers' validated operation input.
+      const syncContext = {
+        knownMessageIds: known.map(message => message.native_id),
+        knownMessageStates: known.map(message => ({ id: message.native_id, isRead: Boolean(message.is_read), isStarred: Boolean(message.is_starred) })) }
       let page: SyncResult
       try {
         const provider = await providerFor(row)
         if (!provider.capabilities.sync) throw new InboxError('UNSUPPORTED_OPERATION', 'Synchronization is unavailable.', 409)
         fence = sequence(owner)
-        try { page = await io(row, p => p.sync(checkpoint.cursor, syncOptions)) }
+        try { page = await io(row, p => p.sync(checkpoint.cursor, syncOptions, syncContext)) }
         catch (error) {
           if (!(error instanceof ProviderError) || error.code !== 'INVALID_CURSOR' || !checkpoint.cursor) throw error
           checkpoint.cursor = null; checkpoint.initialized = false
-          page = await io(row, p => p.sync(null, syncOptions))
+          page = await io(row, p => p.sync(null, syncOptions, syncContext))
         }
       } catch (error) {
         if (error instanceof CredentialError && error.reason === 'revoked') throw error
@@ -1356,6 +1396,14 @@ export function createInbox(options: InboxOptions): Inbox {
         if (!scopeCurrent()) throw new InboxError('SCOPE_CHANGED', 'Mailbox selection changed during synchronization.', 409)
         const reason = lane === 'backfill' ? 'backfill' : page.fullSync || !checkpoint.initialized ? 'initial' : 'arrival'
         for (const message of page.messages) persist(row, message, reason, undefined, fence)
+        for (const nativeId of page.retiredMessageIds ?? []) {
+          const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
+          if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
+          // A mailbox-scoped identity vanished. Hide this instance, without inventing an
+          // Archive membership or permanently tombstoning possible later authoritative evidence.
+          db.query('UPDATE sdk_messages SET deleted=2,revision=revision+1 WHERE id=?').run(removed.id)
+          event(owner, 'mail.changed', id, removed.id, 'deleted')
+        }
         for (const nativeId of page.deletedMessageIds) {
           const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
           if (removed && lane !== 'backfill' && removed.last_mutation_seq <= fence) {
@@ -1379,7 +1427,9 @@ export function createInbox(options: InboxOptions): Inbox {
         }
         db.query('INSERT INTO sdk_checkpoints VALUES (?,?,?,?,?) ON CONFLICT(account,generation,scope,lane) DO UPDATE SET data=excluded.data').run(id, row.generation, checkpointScope, lane, JSON.stringify({ cursor, initialized: true }))
         const account = JSON.parse(accountRow(owner, id).data) as Account
-        const coverage = page.hasMore ? 'partial' : 'complete'
+        // An incremental poll finishing is not proof that older history was imported.
+        const coverage = scope !== 'inbox' ? account.sync.coverage
+          : page.hasMore ? 'partial' : page.snapshotComplete === false ? account.sync.coverage : 'complete'
         const changed = account.sync.coverage !== coverage || account.sync.problem !== null
         account.sync = { lastSyncAt: new Date(now()).toISOString(), coverage, problem: null }
         if (changed) account.revision += 1

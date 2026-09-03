@@ -28,6 +28,8 @@ export default function ProviderConnections({ host, store }: { host: HostConfigu
   const [syncIssues, setSyncIssues] = useState<SyncIssue[]>([]);
   const [stopping, setStopping] = useState(false);
   const [recheckRequired, setRecheckRequired] = useState(false);
+  const [reconnectTargets, setReconnectTargets] = useState<Record<string, string>>({});
+  const [serverPresets, setServerPresets] = useState<Record<string, string>>({});
   const controller = useRef<AbortController | null>(null);
   const recheckController = useRef<AbortController | null>(null);
   const mounted = useRef(false);
@@ -127,8 +129,11 @@ export default function ProviderConnections({ host, store }: { host: HostConfigu
     const signal = operation.signal;
     const form = event.currentTarget;
     const credentials = Object.fromEntries([...new FormData(form)].filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+    // Credentials exist only in this submission. Clear password controls on failure too;
+    // never put mail passwords in React state, draft recovery, storage, or URLs.
+    for (const input of form.querySelectorAll<HTMLInputElement>('input[type="password"]')) input.value = "";
     try {
-      const result = await connectHostProvider(provider.id, credentials, signal);
+      const result = await connectHostProvider(provider.id, credentials, signal, reconnectTargets[provider.id] || undefined);
       form.reset();
       if (result.authorizeUrl) {
         const url = new URL(result.authorizeUrl, location.origin);
@@ -139,11 +144,22 @@ export default function ProviderConnections({ host, store }: { host: HostConfigu
       if (!result.connectionId) throw new Error("The host did not return a connection.");
       await store.refresh(true);
       if (signal.aborted) return;
+      if (provider.mailboxSelection === "automatic") {
+        const mailbox = store.getSnapshot().mailboxes.find(box => box.connectionId === result.connectionId && box.status === "active");
+        if (!mailbox) { setNotice("Mailbox connected. Resume its mailbox in settings to load mail."); return; }
+        await store.client.syncMailbox(mailbox.id, { lane: "latest", limit: 25 }, { signal });
+        await store.refresh(true);
+        setNotice("Mailbox connected. Recent mail is available; your Unified inbox selection and pins are unchanged.");
+        return;
+      }
       setNotice(`${provider.name} connected. Choose which mailboxes to add.`);
       await discover(provider.id, [result.connectionId], signal);
     } catch (cause) {
       if (mounted.current && !signal.aborted) setError(problem(cause, "Could not connect this account."));
-    } finally { finish(); }
+    } finally {
+      for (const field of provider.fields ?? []) if (field.type === "password") credentials[field.name] = "";
+      finish();
+    }
   }
 
   async function showMailboxes(provider: HostProvider) {
@@ -298,27 +314,50 @@ export default function ProviderConnections({ host, store }: { host: HostConfigu
           : configuration.allowProviderWrites ? "A connection supplies credentials. Choose mailboxes to add the domains or addresses you want in the inbox." : "Real accounts are read-only. Sending and provider changes are disabled."}
       </p>
       {providers.length === 0 && <p className="settings-note">No providers are enabled in the local host configuration.</p>}
-      {providers.map(provider => (
+      {providers.map(provider => {
+        const target = reconnectTargets[provider.id] || "";
+        const source = snapshot.sources.find(source => source.connectionId === target);
+        const preset = serverPresets[provider.id] || "icloud";
+        const fieldInput = (field: NonNullable<HostProvider["fields"]>[number]) => <label className="settings-field" key={field.name}>
+          <span>{field.type === "password" && provider.id === "imap" && preset !== "icloud" ? "Mail password" : field.label}</span>
+          {field.type === "select" ? <select name={field.name} required={field.required} value={serverPresets[provider.id] || field.defaultValue}
+            disabled={busy !== null} onChange={event => setServerPresets(previous => ({ ...previous, [provider.id]: event.target.value }))}>
+            {field.options?.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select> : <input name={field.name} type={field.type} required={field.required} maxLength={4096}
+            defaultValue={field.name === "email" ? source?.email : field.defaultValue} readOnly={field.name === "email" && !!source}
+            autoComplete="off" autoCapitalize="none" spellCheck={false} disabled={busy !== null} />}
+        </label>;
+        return (
         <section className="provider-connection" key={provider.id} aria-label={`${provider.name} connection`}>
           <div className="provider-connection-heading">
             <h3>{provider.name}</h3>
             <span className="mailbox-count">{provider.connectionIds.length ? `${provider.connectionIds.length} ${provider.connectionIds.length === 1 ? "connection" : "connections"}` : provider.ready ? "Not connected" : "Setup required"}</span>
           </div>
           {!provider.ready ? <p className="settings-note">{provider.setupMessage || "Configure this provider in your local host before connecting."}</p> : provider.connection !== "none" && (
-            <form onSubmit={event => void connect(event, provider)}>
-              {(provider.fields ?? []).map(field => (
-                <label className="settings-field" key={field.name}>
-                  <span>{field.label}</span>
-                  <input name={field.name} type={field.type === "password" ? "password" : "text"} required={field.required}
-                    autoComplete="off" autoCapitalize="none" spellCheck={false} disabled={busy !== null} />
-                </label>
-              ))}
+            <form key={`${provider.id}:${target}:${preset}`} onSubmit={event => void connect(event, provider)}>
+              {provider.reconnect && provider.connectionIds.length > 0 && <label className="settings-field">
+                <span>Connection</span>
+                <select value={target} disabled={busy !== null} onChange={event => setReconnectTargets(previous => ({ ...previous, [provider.id]: event.target.value }))}>
+                  <option value="">New mailbox</option>
+                  {provider.connectionIds.map(id => {
+                    const account = snapshot.sources.find(source => source.connectionId === id);
+                    return <option key={id} value={id}>Reconnect {account?.email || account?.name || "mailbox"}{account?.status === "reconnect_required" ? " · Sign-in required" : ""}</option>;
+                  })}
+                </select>
+              </label>}
+              {(provider.fields ?? []).filter(field => !field.advanced).map(fieldInput)}
+              {preset !== "icloud" && provider.fields?.some(field => field.advanced) && <details>
+                <summary>Advanced server settings</summary>
+                <p className="settings-note">Server endpoints and required TLS are set by the selected host preset. Change presets in the local host configuration.</p>
+                {provider.fields.filter(field => field.advanced).map(fieldInput)}
+              </details>}
+              {provider.credentialHelp && preset === "icloud" && <p className="settings-note">{provider.credentialHelp.text} <a href={provider.credentialHelp.url} target="_blank" rel="noopener noreferrer">Create an app-specific password</a></p>}
               <button className="settings-button" type="submit" disabled={busy !== null}>
-                {busy?.providerId === provider.id && busy.action === "connect" ? "Connecting…" : provider.actionLabel || `Connect ${provider.name}`}
+                {busy?.providerId === provider.id && busy.action === "connect" ? "Connecting…" : target ? "Reconnect mailbox" : provider.actionLabel || `Connect ${provider.name}`}
               </button>
             </form>
           )}
-          {provider.ready && provider.connectionIds.length > 0 && (
+          {provider.ready && provider.connectionIds.length > 0 && provider.mailboxSelection !== "automatic" && (
             <button className="settings-text-button" type="button" disabled={busy !== null} onClick={() => void showMailboxes(provider)}>
               {busy?.providerId === provider.id && busy.action === "discover" ? "Finding mailboxes…" : choices?.providerId === provider.id && recheckRequired ? "Recheck mailboxes" : "Choose mailboxes"}
             </button>
@@ -378,7 +417,7 @@ export default function ProviderConnections({ host, store }: { host: HostConfigu
             </div>
           )}
         </section>
-      ))}
+      ); })}
       {syncIssues.length > 0 && <div className="provider-sync-issues" role="alert">
         <p>Mailboxes were added, but initial sync failed for {syncIssues.length} {syncIssues.length === 1 ? "source" : "sources"}. Sync again from the inbox when the connection is available.</p>
         <ul>{syncIssues.map(issue => <li key={issue.sourceId}><span title={sourceNames.get(issue.sourceId)}>{sourceNames.get(issue.sourceId) || "Connected source"}</span><span>{issue.message}</span></li>)}</ul>

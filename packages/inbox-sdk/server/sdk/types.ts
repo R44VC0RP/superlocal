@@ -33,6 +33,8 @@ export interface ProviderCredentials {
   baseUrl?: string
   timeoutMs?: number
   fetch?: typeof globalThis.fetch
+  /** Trusted runtime cancellation; never persisted as credential data. */
+  signal?: AbortSignal
 }
 
 export interface SyncCursor {
@@ -43,7 +45,15 @@ export interface SyncCursor {
   metadata?: Record<string, string>
 }
 
-export interface SyncOptions {
+/** SDK runtime hints; separate from a provider's validated operation options. */
+export interface SyncContext {
+  /** Previously stored native identities, for providers without durable deletion history. */
+  knownMessageIds?: string[]
+  /** Last confirmed upstream flags, not optimistic state or mailbox-local Done/snooze. */
+  knownMessageStates?: Array<{ id: string; isRead: boolean; isStarred: boolean }>
+}
+
+export interface SyncOptions extends SyncContext {
   folder?: MailFolder
   limit?: number
   mailboxScopes?: MailScope[]
@@ -59,6 +69,8 @@ export interface SyncResult {
   recentCursor?: SyncCursor | null
   removedMessageIds?: string[]
   snapshotComplete?: boolean
+  /** Mailbox-scoped instances that no longer exist, not a claim of global message deletion. */
+  retiredMessageIds?: string[]
 }
 
 export type Recipient = string | Participant
@@ -102,6 +114,8 @@ export interface SendResult {
   accepted?: string[]
   rejected?: string[]
   scheduledAt?: string
+  /** SMTP accepted the message, but saving its Sent copy could not be confirmed. Do not resend. */
+  sentCopyUnconfirmed?: boolean
 }
 
 export interface MessageMutation {
@@ -160,7 +174,7 @@ export interface InboxProvider {
   listThreads(options?: ListOptions): Promise<ProviderListResult<MailThread>>
   getMessage(messageId: string): Promise<MailMessage>
   getThread(threadId: string): Promise<MailThread>
-  sync(cursor?: SyncCursor | string | null, options?: SyncOptions): Promise<SyncResult>
+  sync(cursor?: SyncCursor | string | null, options?: SyncOptions, context?: SyncContext): Promise<SyncResult>
   send(input: SendInput): Promise<SendResult>
   mutate(messageId: string, mutation: MessageMutation): Promise<MailMessage | null>
   getAttachment(messageId: string, attachmentId: string, contentId?: string,
@@ -239,6 +253,13 @@ export class ProviderRateLimitError extends ProviderError {
 export class ProviderCursorExpiredError extends ProviderError {
   constructor(provider: InboxProviderType, message = 'Provider sync cursor has expired', options: ProviderErrorOptions = {}) {
     super(provider, 'INVALID_CURSOR', message, options)
+  }
+}
+
+/** A multi-command mutation made progress but could not finish. Never retry it blindly. */
+export class ProviderMutationError extends ProviderError {
+  constructor(provider: InboxProviderType, readonly confirmedMessage?: MailMessage, readonly sourceRetired = false) {
+    super(provider, 'UPSTREAM', 'The mailbox change was only partly confirmed. Synchronize before trying again.')
   }
 }
 

@@ -6,7 +6,10 @@ export type HostProvider = {
   ready: boolean;
   setupMessage?: string;
   actionLabel?: string;
-  fields?: Array<{ name: string; label: string; type: "password" | "text"; required: boolean }>;
+  fields?: Array<{ name: string; label: string; type: "password" | "text" | "email" | "select"; required: boolean; advanced?: boolean; defaultValue?: string; options?: Array<{ value: string; label: string }> }>;
+  mailboxSelection?: "automatic" | "manual";
+  credentialHelp?: { text: string; url: string };
+  reconnect?: boolean;
   connectionIds: string[];
 };
 
@@ -53,8 +56,8 @@ export async function readHostConfiguration(signal: AbortSignal): Promise<HostCo
   return config;
 }
 
-export function connectHostProvider(id: string, credentials: Record<string, string>, signal: AbortSignal) {
-  return request<{ connectionId?: string; authorizeUrl?: string }>(`/host/providers/${encodeURIComponent(id)}/connect`, signal, credentials);
+export function connectHostProvider(id: string, credentials: Record<string, string>, signal: AbortSignal, connectionId?: string) {
+  return request<{ connectionId?: string; authorizeUrl?: string }>(`/host/providers/${encodeURIComponent(id)}/${connectionId ? `connections/${encodeURIComponent(connectionId)}/reconnect` : "connect"}`, signal, credentials);
 }
 
 function isInboxViewPreferences(value: unknown): value is InboxViewPreferences {

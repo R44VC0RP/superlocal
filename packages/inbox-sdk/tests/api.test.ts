@@ -14,6 +14,8 @@ import { CredentialError, InboxError } from '../src/contracts'
 import { createGoogleOAuthHost, type GoogleOAuthConfig, type OAuthAttempt } from '../server/google-oauth'
 import { createGoogleOAuthApi } from '../server/google-oauth-api'
 import { createGoogleOAuthClient } from '../server/google-client'
+import { createLocalHost } from '../../../apps/local-host/src/host'
+import { loadLocalConfig } from '../../../apps/local-host/src/config'
 import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
   Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, Message,
@@ -45,6 +47,55 @@ const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => {
   const tasks = cleanup.splice(0).reverse()
   for (const task of tasks) await task()
+})
+
+describe('IMAP host onboarding boundary', () => {
+  test('fresh checkout stays offline; real iCloud onboarding is explicit, encrypted-SDK-only and endpoint constrained', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'imap-host-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    expect(config.mode).toBe('mock')
+    expect(config.providers.gmail.enabled).toBe(false)
+    expect(config.providers.inbound.enabled).toBe(false)
+    const host = await createLocalHost({ ...config, mode: 'real', dataDir: join(root, 'runtime') }, {})
+    cleanup.push(() => host.close())
+    const origin = config.web.origin
+    const base = `http://localhost:${config.backend.port}`
+    const session = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
+    const cookie = session.headers.get('set-cookie')!.split(';')[0]!
+    const headers = { Origin: origin, Cookie: cookie, 'Content-Type': 'application/json' }
+    const descriptor = await (await host.fetch(new Request(`${base}/host/config`, { headers }))).json()
+    expect(descriptor.providers).toEqual([expect.objectContaining({ id: 'imap', ready: true, mailboxSelection: 'automatic', reconnect: true,
+      fields: [expect.objectContaining({ name: 'email', type: 'email' }), expect.objectContaining({ name: 'password', label: 'App-specific password', type: 'password' })] })])
+    expect(await host.inbox.accounts(host.owner)).toEqual([])
+    let captured: any
+    const original = host.inbox.createConnection
+    host.inbox.createConnection = async (_owner, input, identity) => { captured = { input, identity }; return { id: 'synthetic-connection' } as Connection }
+    try {
+      const path = `${base}/host/providers/imap/connect`
+      const password = '  synthetic\tmail-password  '
+      const connected = await host.fetch(new Request(path, { method: 'POST', headers, body: JSON.stringify({ credentials: { email: 'reader@icloud.com', password } }) }))
+      expect(connected.status).toBe(200)
+      expect(captured.input.credentials.password).toBe(password)
+      expect(captured.identity.issuer).toBe('imaps://imap.mail.me.com:993')
+      expect(captured.identity.subject).toBe('reader@icloud.com')
+      expect(await connected.json()).toEqual({ connectionId: 'synthetic-connection' })
+      captured = null
+      for (const credentials of [
+        { email: 'reader@icloud.com', password, host: '127.0.0.1' },
+        { email: 'reader@icloud.com', password, smtp: { host: '169.254.169.254' } },
+        { email: 'reader@icloud.com', password, tls: { rejectUnauthorized: false } },
+        { email: 'reader@icloud.com', password, preset: 'unconfigured-host' },
+      ]) {
+        expect((await host.fetch(new Request(path, { method: 'POST', headers, body: JSON.stringify({ credentials }) }))).status).toBe(400)
+      }
+      expect(captured).toBeNull()
+      expect((await host.fetch(new Request(path, { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: '{}' }))).status).toBe(401)
+      for (const [method, path] of [['POST', '/v1/connections'], ['POST', '/v1/accounts'], ['PUT', '/v1/connections/any/credentials'], ['POST', '/v1/accounts/any/reconnect']]) {
+        expect((await host.fetch(new Request(`${base}${path}`, { method, headers, body: '{}' }))).status).toBe(403)
+      }
+    } finally { host.inbox.createConnection = original }
+  })
 })
 
 const fullCapabilities: ProviderCapabilities = {

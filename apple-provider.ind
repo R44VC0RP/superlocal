@@ -1,7 +1,12 @@
 # Apple / iCloud Mail provider
 
 Research date: 2026-09-02
-Status: deferred implementation; no iCloud connection or live qualification performed.
+Status: app-specific-password IMAP/SMTP onboarding implemented and narrowly qualified
+with an authorized iCloud account (September 2–3, 2026), including scoped desktop
+browser acceptance. Apple OAuth implementation remains deferred.
+
+See [the method-by-method IMAP review](imap-provider-review.md) for evidence,
+server-dependent capabilities, retained QA artifacts and remaining limitations.
 
 This note concerns **iCloud Mail**, including eligible `icloud.com`, `me.com`,
 and `mac.com` accounts. It does not mean the Apple Mail application, which can
@@ -10,13 +15,13 @@ before implementation: authorization availability and enrollment may change.
 
 ## Recommendation
 
-Pursue Apple's official **iCloud OAuth 2.0 developer-interest route**. Real
+Keep Apple's official **iCloud OAuth 2.0 developer-interest route** as future work. Real
 mailbox authorization exists, but public specifications and automatic enrollment
 sufficient to implement Superlocal's connection have not been established.
 
-Keep **IMAP/SMTP with an app-specific password** as the documented fallback,
-subject to qualifying our adapter. Do not describe the existing generic IMAP
-adapter as production-ready Apple support.
+Use **IMAP/SMTP with an app-specific password** for the implemented connection UI.
+The limited iCloud qualification is documented separately; it is not blanket
+production-readiness or compatibility with every IMAP extension/Apple identity.
 
 OAuth and IMAP are not competing alternatives: OAuth handles authorization;
 IMAP handles mailbox access. Apple's supported token transport still needs to
@@ -119,24 +124,28 @@ downgrading encryption.
 Inbox splits remain client-owned views. Adding Apple support must not turn
 Important/Other classification into provider label, folder, or flag changes.
 
-### Existing code and qualification gaps
+### Implemented subset and remaining qualification
 
 `packages/inbox-sdk/server/sdk/imap.ts` has separate IMAP/SMTP password or
-access-token inputs and TLS controls. Native message identifiers incorporate
-mailbox path, UIDVALIDITY, and UID. The adapter currently advertises
-`drafts: false` and `pushNotifications: false`.
+access-token inputs and mandatory verified TLS. Native message identifiers include
+account, mailbox path, UIDVALIDITY and UID. The host owns the fixed iCloud endpoints
+and approved generic presets; the SDK stores credentials encrypted. The adapter
+continues to advertise native `drafts: false`, `scheduledSend: false`, and
+`pushNotifications: false`; the SDK implements its own drafts/scheduling/undo.
 
-These are code facts, not proof of iCloud compatibility. A later, explicitly
-authorized qualification should cover:
+Authorized native-peer and live SDK checks covered the subset in the linked matrix.
+Do not infer untested behavior from these code facts. Remaining or deliberately
+bounded qualification includes:
 
 1. Authentication, certificate validation, password revocation, reconnects,
    bounded retries, and connection cleanup.
-2. Initial/incremental synchronization, IDLE behavior and reconciliation,
+2. Full-history/other-server synchronization, IDLE behavior and reconciliation,
    folders/special-use attributes, flags, moves/expunges, and UIDVALIDITY
    changes. Do not assume QRESYNC, CONDSTORE, UIDPLUS, or Apple push support.
-3. SMTP delivery, replies, MIME and inline attachments, and exactly one Sent
-   copy. SMTP acceptance does not itself establish Sent-folder persistence;
-   draft capability must be reported honestly.
+3. Other-server SMTP delivery and Sent-copy policy. The qualified iCloud account
+   did not save its SMTP probe to Sent automatically, so its preset appends once.
+   The production reply's MIME/CIDs, RFC parent and exactly one Sent copy were
+   checked. SMTP acceptance alone still does not prove Sent-folder persistence.
 4. Primary addresses, eligible legacy addresses, aliases, custom domains, and
    verified From identities. Separate login identity from sending identity.
 5. Stable message/source identity, threading, restart/recovery, and any
@@ -168,13 +177,13 @@ authorized qualification should cover:
 1. Open [Apple's OAuth interest form](https://developer.apple.com/contact/request/icloud-oauth2/)
    and, with authorization, describe Superlocal's local-host architecture and
    mail-only requirements. Obtain eligibility and technical documentation.
-2. Select the supported authentication path using Apple's response. Retain
-   app-specific-password IMAP/SMTP as the fallback; do not expose an OAuth
+2. Maintain the implemented app-specific-password path while evaluating Apple's
+   response; do not expose an OAuth
    option before it is actually usable.
-3. Implement onboarding and adapter support within the boundaries above,
-   preserving encrypted credentials, secure transport, and honest capabilities.
-4. Obtain separate authorization for dedicated-account qualification before
-   running live reads/writes or connecting a personal account.
+3. Complete coordinating-session browser/integration acceptance of the implemented
+   onboarding without weakening encrypted credentials or secure transport.
+4. Obtain separate authorization before expanding live qualification to other
+   accounts, aliases, custom domains, irreversible deletion or a main-runtime import.
 5. If migrating an existing connection to OAuth, preserve connection identity
    and provider namespace. Replace credentials in place when transport/native
    identities remain compatible. Otherwise reconcile explicitly: RFC
@@ -182,7 +191,7 @@ authorized qualification should cover:
    key. Revoke the old app password only after the new connection succeeds,
    as Apple's authorization guidance recommends.
 
-This note records research and a proposed future plan. It does not authorize
-an Apple application submission, account connection, implementation, or live
-mail tests. No accounts, credentials, or provider state were changed by the
-research.
+The original OAuth research did not change provider state or submit an Apple
+application. Subsequent IMAP qualification was separately authorized and isolated;
+it is recorded in `imap-provider-review.md`. This note does not grant additional
+account access, application submission, password revocation or cleanup permission.
