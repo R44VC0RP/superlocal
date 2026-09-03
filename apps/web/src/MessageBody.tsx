@@ -199,12 +199,27 @@ export default function MessageBody({ html, text = "", format, styles = "", font
     let pending = 0;
     let width = element.clientWidth;
     let disposed = false;
+    const root = doc.documentElement;
+    const originalZoom = root.style.getPropertyValue("zoom"), originalPriority = root.style.getPropertyPriority("zoom");
+    const restoreZoom = () => {
+      if (originalZoom) root.style.setProperty("zoom", originalZoom, originalPriority);
+      else root.style.removeProperty("zoom");
+    };
     const measure = () => {
       pending = 0;
-      if (disposed || !element.isConnected) return;
+      if (disposed || !element.isConnected || width <= 0) return;
+      // Measure the authored canvas afresh, never an already-scaled width.
+      // Scale the whole document so rigid tables, padding, text and images keep
+      // their proportions; changing individual widths cannot fit those layouts.
+      restoreZoom();
       // Measure at a small viewport so shorter content can shrink after a resize.
       element.style.height = "1px";
-      const height = Math.ceil(Math.max(doc.body.scrollHeight, doc.documentElement.scrollHeight, 1));
+      const contentWidth = Math.max(doc.body.scrollWidth, root.scrollWidth, width);
+      const scale = Math.min(1, width / contentWidth);
+      if (scale < 1) root.style.setProperty("zoom", String(scale), "important");
+      // Body scroll dimensions remain in unscaled CSS pixels; the root's scroll
+      // height includes the scaled layout. Do not leave an unscaled blank tail.
+      const height = Math.ceil(Math.max(doc.body.scrollHeight * scale, root.scrollHeight, doc.body.getBoundingClientRect().bottom + (element.contentWindow?.scrollY ?? 0), 1));
       element.style.height = `${height}px`;
       const scrollbar = Math.max(0, (element.contentWindow?.innerHeight ?? height) - doc.documentElement.clientHeight);
       if (scrollbar) element.style.height = `${height + scrollbar}px`;
@@ -241,6 +256,7 @@ export default function MessageBody({ html, text = "", format, styles = "", font
       cancelAnimationFrame(pending);
       bodySize.disconnect();
       frameSize.disconnect();
+      restoreZoom();
       doc.removeEventListener("keydown", onKey, true);
       doc.removeEventListener("pointerdown", onFocus, true);
       doc.removeEventListener("focusin", onFocus, true);
