@@ -1,4 +1,5 @@
 import { ApiError, createInboxClient, type InboxClient } from "inbox-sdk/client";
+import { measurePerformance, measureRequest, measureWork } from "./browser-logs";
 import type {
   Account, BlobInfo, Changes, Draft as SdkDraft, DraftInput, Folder, Label,
   Mailbox, MailboxMembership, MailboxMessageSummary, MailboxStateTarget, Message as SdkMessage, MutationInput, Operation, Participant, Policy,
@@ -199,11 +200,14 @@ export class InboxStore {
     this.client = createInboxClient({ baseUrl: location.origin, fetch: (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const start = performance.now();
       const path = new URL(input instanceof Request ? input.url : String(input), location.origin).pathname;
+      const finish = measureRequest(path, init?.method ?? "GET");
       try {
         const response = await fetch(input, init);
+        finish(response.status);
         console.info({ event: "inbox.request", method: init?.method ?? "GET", path, status: response.status, durationMs: Math.round(performance.now() - start), requestId: response.headers.get("x-request-id") });
         return response;
       } catch (error) {
+        finish(0);
         if (!(error instanceof DOMException && error.name === "AbortError")) console.warn({ event: "inbox.request", method: init?.method ?? "GET", path, code: "NETWORK" });
         throw error;
       }
@@ -489,6 +493,8 @@ export class InboxStore {
 
   refresh = (force = false): Promise<void> => {
     if (this.refreshPromise) return force ? this.refreshPromise.then(() => this.refresh()) : this.refreshPromise;
+    const timing = measurePerformance({ kind: "refresh" });
+    let pages = 0, messages = 0, networkMs = 0;
     const generation = this.generation, options = this.requestOptions();
     const draftEpoch = this.draftEpoch;
     const flagEpoch = this.flagEpoch;
@@ -530,7 +536,9 @@ export class InboxStore {
           try {
             const items: MailboxMessageSummary[] = []; let cursor: string | undefined;
             do {
+              const started = performance.now();
               const page = await this.client.mailboxMessages({ mailboxIds, limit: 100, ...(cursor ? { cursor } : {}) }, options);
+              networkMs += performance.now() - started; pages++; messages += page.items.length;
               items.push(...page.items); cursor = page.nextCursor ?? undefined;
             } while (cursor);
             for (const item of items) for (const membership of item.memberships) {
@@ -606,7 +614,9 @@ export class InboxStore {
       this.publish({ policy, host, viewPreferences, splitPreferences, attentionFeedback: this.feedbackEpoch === feedbackEpoch ? attentionFeedback : this.state.attentionFeedback, mailboxes: selected, sources: accounts, loading: false, loaded: true, refreshing: false, error: null }); this.rebuild();
       this.resolve("snapshot");
     })();
-    this.refreshPromise = work.finally(() => { if (this.refreshPromise === finished) this.refreshPromise = undefined; });
+    this.refreshPromise = work.then(() => { timing({ pages, messages, networkMs, conversations: this.state.mail.length }); }, error => {
+      timing({ pages, messages, networkMs, outcome: "error" }); throw error;
+    }).finally(() => { if (this.refreshPromise === finished) this.refreshPromise = undefined; });
     const finished = this.refreshPromise;
     return finished;
   };
@@ -631,6 +641,7 @@ export class InboxStore {
     };
   }
   private rebuild(onlyThreads?: Set<string>) {
+    const timing = measurePerformance({ kind: "rebuild", full: !onlyThreads });
     const accounts: MailboxOption[] = this.boxes.map(box => {
       const source = this.sourceAccounts.find(account => account.id === box.sourceId)!;
       return { id: box.id, sourceId: source.id, name: box.name || source.name, email: box.defaultSender || source.email, selectorKind: box.selector.kind,
@@ -736,6 +747,7 @@ export class InboxStore {
       // Preserve every unaffected conversation and all body/draft references.
       const updated = new Map(mail.map(conversation => [conversation.id, conversation]));
       this.publish({ mail: this.state.mail.map(conversation => updated.get(conversation.id) ?? conversation) });
+      timing({ conversations: updated.size });
       return;
     }
     mail.sort((a, b) => (b.receivedAt ?? 0) - (a.receivedAt ?? 0) || a.id.localeCompare(b.id));
@@ -745,6 +757,7 @@ export class InboxStore {
         saving: this.saves.has(raw.id) || !!edit && !edit.error && completeRecipients(edit.draft), dirty: !!edit, saveError: edit?.error };
     });
     this.publish({ accounts, mail, senderHistory: [...senderHistory.values()], drafts, labels: labelNames, unsaved: this.edits.size > 0 || this.saves.size > 0, operations: Object.fromEntries(this.operations) });
+    timing({ conversations: mail.length });
   }
 
   loadThread = (id: string): Promise<void> => {
@@ -753,6 +766,7 @@ export class InboxStore {
     if (!mail || mail.operationId) return Promise.resolve();
     const generation = this.generation;
     const bodyEpoch = this.bodyEpoch;
+    const timing = measurePerformance({ kind: "thread", messages: mail.messages.length });
     const work = (async () => {
       for (const message of mail.messages) if (!message.pending && this.details.get(message.id)?.revision !== message.revision) {
         const mailboxId = message.memberships?.[0]?.mailboxId ?? mail.mailboxId!;
@@ -760,8 +774,8 @@ export class InboxStore {
         if (generation !== this.generation || bodyEpoch !== this.bodyEpoch) return;
         this.details.set(message.id, detail);
       }
-      this.rebuild(); this.resolve("thread");
-    })().catch(error => { this.fail(error, "load-thread"); throw error; }).finally(() => {
+      this.rebuild(); this.resolve("thread"); timing();
+    })().catch(error => { timing({ outcome: "error" }); this.fail(error, "load-thread"); throw error; }).finally(() => {
       this.loadingThreads.delete(id);
       if (generation === this.generation && bodyEpoch !== this.bodyEpoch) void this.loadThread(id).catch(() => {});
     });
@@ -1191,19 +1205,22 @@ export class InboxStore {
     return result;
   }
   async act<T>(action: string, work: () => Promise<T>, refresh = true): Promise<T> {
+    const timing = measureWork(action), queuedAt = performance.now();
     const previous = this.actionQueue;
     let release!: () => void;
     this.actionQueue = new Promise<void>(resolve => { release = resolve; });
     this.publish({ pending: this.state.pending + 1 });
     await previous;
+    const queueMs = performance.now() - queuedAt;
     try {
       const result = await work();
       // Durable work, not a whole-inbox scan, owns completion and the queue.
       // Receipt-aware local commands already published their exact changes.
       if (refresh) this.scheduleRefresh();
+      timing({ queueMs });
       return result;
     }
-    catch (error) { this.scheduleRefresh(); this.fail(error, action); throw error; }
+    catch (error) { timing({ queueMs, outcome: "error" }); this.scheduleRefresh(); this.fail(error, action); throw error; }
     finally { release(); this.publish({ pending: Math.max(0, this.state.pending - 1) }); }
   }
   private done(selected: Mail[], done: boolean): Promise<() => Promise<void>> {

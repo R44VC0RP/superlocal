@@ -45,6 +45,7 @@ import MailCommandDialog, { type CommandItem } from "./MailCommandDialog";
 import IssueReporter from "./IssueReporter";
 import Notices, { Notice } from "./Notices";
 import { InboxActionError, type InboxIssue } from "./inbox";
+import { measureAction } from "./browser-logs";
 import { captureIssueReport, type IssueReport } from "./issue-reports";
 import SenderContext from "./SenderContext";
 import { senderContact } from "./sender-context";
@@ -576,7 +577,10 @@ export default function App() {
     </Notices>
   );
   function undoAction(reverse: () => Promise<void>) {
-    return () => { void reverse().catch(actionError); };
+    return () => {
+      const timing = measureAction("undo");
+      void reverse().then(() => { timing.accepted(); timing.finish(); }, error => { actionError(error); timing.finish("error"); });
+    };
   }
   async function reportIssue() {
     if (issueCapturePending.current) return;
@@ -637,19 +641,23 @@ export default function App() {
     }
   }
   function changeSearchQuery(value: string, submit = false) {
+    const timing = measureAction("search");
     motion.prepare(submit ? "return" : "search");
     setQuery(value);
     setSearchSubmitted(submit);
     setHighlight(0);
     if (submit) searchInput.current?.blur();
+    timing.accepted(); timing.finish();
   }
   function openMail(m: Mail) {
+    const timing = measureAction("open", 1);
     if (list.current) listScroll.current = list.current.scrollTop;
     motion.prepare("switch");
     if (preferences.markRead && m.unread && store.supports("read", m.mailboxId ?? m.account))
       void store.action([m], "read").catch(actionError);
     navigate({ thread: m.id, draft: undefined, view: undefined });
     setSelected([]);
+    timing.accepted(); timing.finish();
   }
   function handleMailRow(event: MouseEvent<HTMLDivElement>) {
     if (!(event.target instanceof Element)) return;
@@ -834,7 +842,8 @@ export default function App() {
       return;
     }
     if (!ids.length) return;
-    if (action === "not-important" && inbox.pending) return;
+    const timing = measureAction(action, ids.length);
+    if (action === "not-important" && inbox.pending) { timing.finish("ignored"); return; }
     const previousRoute = route;
     const previousHighlight = highlight;
     const before = mail.filter((m) => ids.includes(m.id));
@@ -846,14 +855,15 @@ export default function App() {
     if (!inbox.host?.allowProviderWrites && before.some(message => !message.operationId) &&
       (["star", "unread", "read", "trash", "spam"].includes(action) || action === "inbox" && before.some(message => ["Auto Archived", "Spam", "Trash"].includes(message.folder)))) {
       setNotice({ text: "Provider changes are disabled by this read-only host." });
+      timing.finish("ignored");
       return;
     }
     const finishMotion = motion.prepare("remove", ids);
     const starred = before.some((m) => !m.starred);
     const unread = before.some((m) => !m.unread);
     let reverse: () => Promise<void>;
-    try { reverse = await store.action(before, action); }
-    catch (error) { actionError(error); return; }
+    try { reverse = await store.action(before, action); timing.accepted(); }
+    catch (error) { actionError(error); timing.finish("error"); return; }
     finally { finishMotion(); }
     const labels: Record<string, string> = {
       done: "Marked as Done.",
@@ -887,6 +897,7 @@ export default function App() {
     if (!["star", "unread"].includes(action))
       setHighlight((v) => Math.max(0, Math.min(v, rowCount - 2)));
     setOverlay(null);
+    timing.finish();
   }
   async function remind(when: string) {
     const before = targets;

@@ -1,4 +1,112 @@
 /// <reference types="vite/client" />
+import { performanceActions, type PerformanceAction, type PerformanceSample } from "../../shared/performance.ts";
+
+let performanceEnabled = false;
+let performanceTab: string | undefined;
+const performanceQueue: PerformanceSample[] = [];
+let performanceTimer: ReturnType<typeof setTimeout> | undefined;
+let performanceSending = false;
+let inputTimings: PerformanceObserver | undefined;
+
+async function flushPerformance(): Promise<void> {
+  if (!performanceEnabled || performanceSending || !performanceQueue.length) return;
+  performanceSending = true;
+  const samples = performanceQueue.splice(0, 50);
+  try {
+    // Never await this transport from a mail action. Failed telemetry is dropped,
+    // not retried, and this fetch is deliberately outside request instrumentation.
+    await fetch("/host/performance", { method: "POST", credentials: "include", keepalive: true,
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ samples }), signal: AbortSignal.timeout(3000) });
+  } catch { /* Timing capture must not produce user errors or recursive logging. */ }
+  finally { performanceSending = false; schedulePerformance(); }
+}
+
+function schedulePerformance() {
+  if (!performanceEnabled || performanceTimer || !performanceQueue.length) return;
+  performanceTimer = setTimeout(() => { performanceTimer = undefined; void flushPerformance(); }, 1000);
+}
+
+export function configurePerformanceLogging(enabled: boolean) {
+  performanceEnabled = enabled;
+  if (enabled) {
+    performanceTab ??= crypto.randomUUID(); schedulePerformance();
+    // Event Timing includes input that waited behind a busy main thread. No key,
+    // DOM target, or typed value is retained. Unsupported browsers simply omit it.
+    if (!inputTimings && typeof PerformanceObserver !== "undefined" && PerformanceObserver.supportedEntryTypes?.includes("event")) {
+      try {
+        inputTimings = new PerformanceObserver(list => {
+          for (const item of list.getEntries()) {
+            const entry = item as PerformanceEventTiming & { interactionId?: number };
+            if (!entry.interactionId) continue;
+            enqueuePerformance({ kind: "input", outcome: "ok", at: Date.now() - Math.max(0, performance.now() - entry.startTime),
+              durationMs: entry.duration, queueMs: Math.max(0, entry.processingStart - entry.startTime), processingMs: Math.max(0, entry.processingEnd - entry.processingStart) });
+          }
+        });
+        inputTimings.observe({ type: "event", durationThreshold: 40 } as PerformanceObserverInit);
+      } catch { inputTimings?.disconnect(); inputTimings = undefined; }
+    }
+  } else {
+    clearTimeout(performanceTimer); performanceTimer = undefined; performanceQueue.length = 0;
+    inputTimings?.disconnect(); inputTimings = undefined;
+  }
+}
+
+type TimingFields = Omit<PerformanceSample, "tab" | "id" | "at" | "durationMs">;
+const rounded = (value: number) => Math.max(0, Math.round(value * 10) / 10);
+const safeAction = (action: string): PerformanceAction => performanceActions.includes(action as PerformanceAction) ? action as PerformanceAction : "other";
+
+function enqueuePerformance(sample: Omit<PerformanceSample, "tab" | "id">) {
+  if (!performanceEnabled || !performanceTab) return;
+  if (performanceQueue.length >= 200) performanceQueue.shift();
+  performanceQueue.push({ ...sample, tab: performanceTab, id: crypto.randomUUID() }); schedulePerformance();
+}
+
+/** Captures only whitelisted counts/enums; never accept mail objects or text. */
+export function measurePerformance(fields: Omit<TimingFields, "outcome">) {
+  const start = performance.now(), at = Date.now();
+  let finished = false;
+  return (extra: Partial<TimingFields> = {}) => {
+    if (finished) return;
+    finished = true;
+    enqueuePerformance({ ...fields, outcome: "ok", ...extra, at, durationMs: rounded(performance.now() - start) });
+  };
+}
+
+export function measureWork(action: string) { return measurePerformance({ kind: "work", action: safeAction(action) }); }
+
+/** Handler-to-next-frame estimate, not a browser paint/INP measurement. */
+export function measureAction(action: string, conversations = 0) {
+  const start = performance.now();
+  const finish = measurePerformance({ kind: "action", action: safeAction(action), conversations });
+  let acceptedMs: number | undefined;
+  return {
+    accepted() { acceptedMs = rounded(performance.now() - start); },
+    finish(outcome: PerformanceSample["outcome"] = "ok") {
+      if (!performanceEnabled || outcome === "ignored" || typeof requestAnimationFrame !== "function") { finish({ outcome, acceptedMs }); return; }
+      if (document.visibilityState !== "visible") { finish({ outcome: "hidden", acceptedMs }); return; }
+      let first = 0, second = 0;
+      const fallback = setTimeout(() => { cancelAnimationFrame(first); cancelAnimationFrame(second); finish({ outcome: "hidden", acceptedMs }); }, 2000);
+      first = requestAnimationFrame(() => { second = requestAnimationFrame(() => { clearTimeout(fallback); finish({ outcome, acceptedMs }); }); });
+    },
+  };
+}
+
+export function measureRequest(path: string, method: string) {
+  const route: PerformanceSample["route"] = path === "/v1/mailbox-messages" ? "mailbox-page"
+    : path.includes("/mailbox-actions") || path.endsWith("/state") ? "mailbox-action"
+    : path.startsWith("/host/attention-feedback") ? "feedback"
+    : path.startsWith("/v1/operations") ? "operation"
+    : /\/messages\/[^/]+$/.test(path) ? "message-body"
+    : path.startsWith("/v1/drafts") ? "draft"
+    : path === "/v1/mailboxes" ? "mailboxes" : "other";
+  const finish = measurePerformance({ kind: "request", route,
+    method: (["GET", "POST", "PATCH", "PUT", "DELETE", "HEAD"].includes(method) ? method : "GET") as PerformanceSample["method"] });
+  const start = performance.now();
+  return (status: number) => {
+    // Refresh summaries retain page/network totals; don't log every fast GET.
+    if (method !== "GET" || status >= 400 || performance.now() - start >= 100) finish({ status, outcome: status && status < 400 ? "ok" : "error" });
+  };
+}
 
 const levels = ["debug", "log", "info", "warn", "error"] as const;
 
@@ -204,4 +312,12 @@ export function startBrowserLogCapture(): () => void {
   return cleanup;
 }
 
-if (import.meta.hot) import.meta.hot.dispose(() => stopCapture?.());
+if (import.meta.hot) {
+  // Iterating on the dev app must not silently turn an active timing session off.
+  performanceTab = import.meta.hot.data.performanceTab;
+  if (import.meta.hot.data.performanceEnabled === true) configurePerformanceLogging(true);
+  import.meta.hot.dispose(data => {
+    data.performanceEnabled = performanceEnabled; data.performanceTab = performanceTab;
+    stopCapture?.(); configurePerformanceLogging(false);
+  });
+}

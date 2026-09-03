@@ -1,5 +1,6 @@
 import type { SplitPreferences } from "../../shared/splits";
 import type { MailboxMembership } from "inbox-sdk/types";
+import { configurePerformanceLogging, measureRequest } from "./browser-logs";
 export type SavedSplitPreferences = SplitPreferences & { revision: number };
 export type AttentionFeedback = { id: string; createdAt: string; status: "pending" | "active" | "retracting" | "retracted" | "failed"; count: number; problem?: string; states?: MailboxMembership[] };
 export type AttentionFeedbackTarget = { sourceId: string; messageId: string; mailboxId: string; messageRevision: number; revision: number };
@@ -23,6 +24,7 @@ export type HostConfiguration = {
   mode: "mock" | "real";
   allowProviderWrites: boolean;
   preferenceScope?: string;
+  performanceLogging?: boolean;
   providers: HostProvider[];
 };
 
@@ -40,8 +42,14 @@ export class InboxViewPreferencesError extends Error {
   }
 }
 
+async function hostFetch(path: string, init: RequestInit): Promise<Response> {
+  const finish = measureRequest(path, init.method ?? "GET");
+  try { const response = await fetch(path, init); finish(response.status); return response; }
+  catch (error) { finish(0); throw error; }
+}
+
 async function request<T>(path: string, signal: AbortSignal, credentials?: Record<string, string>): Promise<T> {
-  const response = await fetch(path, {
+  const response = await hostFetch(path, {
     method: credentials === undefined ? "GET" : "POST",
     credentials: "include", cache: "no-store", signal,
     ...(credentials === undefined ? {} : {
@@ -60,6 +68,7 @@ export async function readHostConfiguration(signal: AbortSignal): Promise<HostCo
   if (!["mock", "real"].includes(config.mode) || typeof config.allowProviderWrites !== "boolean" || !Array.isArray(config.providers)) {
     throw new Error("The host did not provide a valid provider configuration.");
   }
+  configurePerformanceLogging(config.performanceLogging === true);
   return config;
 }
 
@@ -79,7 +88,7 @@ function isInboxViewPreferences(value: unknown): value is InboxViewPreferences {
 }
 
 async function requestInboxViewPreferences(signal: AbortSignal, input?: InboxViewPreferences): Promise<InboxViewPreferences> {
-  const response = await fetch("/host/inbox-preferences", {
+  const response = await hostFetch("/host/inbox-preferences", {
     method: input === undefined ? "GET" : "PUT",
     credentials: "include", cache: "no-store", signal,
     ...(input === undefined ? {} : {
@@ -106,7 +115,7 @@ export function writeInboxViewPreferences(input: InboxViewPreferences, signal: A
 }
 
 async function appRequest<T>(path: string, signal: AbortSignal, method = "GET", input?: unknown): Promise<T> {
-  const response = await fetch(path, { method, signal, credentials: "include", cache: "no-store",
+  const response = await hostFetch(path, { method, signal, credentials: "include", cache: "no-store",
     ...(method === "GET" ? {} : { headers: { "Content-Type": "application/json", "X-Superlocal": "1" }, body: JSON.stringify(input ?? {}) }) });
   const result = await response.json();
   if (!response.ok) throw new InboxViewPreferencesError(typeof result?.error === "string" ? result.error : "The host could not save this action.", response.status, result?.code ?? "HOST_REQUEST_FAILED");

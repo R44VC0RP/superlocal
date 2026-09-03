@@ -10,32 +10,41 @@ import { openLocalRuntime } from './runtime'
 import { createSenderDomainHost } from './sender-domains'
 import { createSplitPreferencesStore } from './split-preferences'
 import { createAttentionFeedbackStore } from './attention-feedback'
+import { isPerformanceSample } from '../../shared/performance'
+import { createPerformanceLog } from './performance-log'
 
 const safeHeaders = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', Vary: 'Origin, Cookie' }
 function problem(status: number, code: string, error: string): Response {
   return Response.json({ code, error, retryable: status >= 500 }, { status, headers: safeHeaders })
 }
 
-async function jsonBody(request: Request, kind: 'connection' | 'preferences' = 'connection'): Promise<Record<string, unknown>> {
-  const limit = kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
-  const description = kind === 'preferences' ? 'Preferences' : 'Connection'
+async function jsonBody(request: Request, kind: 'connection' | 'preferences' | 'performance' = 'connection'): Promise<Record<string, unknown>> {
+  const limit = kind === 'performance' ? 32 * 1024 : kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
+  const description = kind === 'performance' ? 'Performance' : kind === 'preferences' ? 'Preferences' : 'Connection'
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) throw new InboxError('HOST_JSON_REQUIRED', 'Use application/json.', 415)
   const length = request.headers.get('content-length')
   if (length && (!/^\d+$/.test(length) || Number(length) > limit)) throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
-  if (request.headers.has('content-encoding') && request.headers.get('content-encoding') !== 'identity') throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
+  if (request.headers.has('content-encoding') && (kind === 'performance' || request.headers.get('content-encoding') !== 'identity')) throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
   if (!request.body) throw new InboxError('HOST_INVALID_INPUT', 'A JSON object is required.', 400)
   const reader = request.body.getReader()
   const chunks: Uint8Array[] = []
   let size = 0
+  let expired = false
+  const timer = kind === 'performance' ? setTimeout(() => { expired = true; void reader.cancel().catch(() => {}) }, 2000) : undefined
   try {
     while (true) {
       const { value, done } = await reader.read()
+      if (expired) throw new InboxError('HOST_BODY_TIMEOUT', 'Performance input timed out.', 408)
       if (done) break
       size += value.byteLength
-      if (size > limit) { await reader.cancel(); throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413) }
+      if (size > limit) {
+        if (kind === 'performance') void reader.cancel().catch(() => {})
+        else await reader.cancel()
+        throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
+      }
       chunks.push(value)
     }
-  } finally { reader.releaseLock() }
+  } finally { clearTimeout(timer); reader.releaseLock() }
   let input: unknown
   try { input = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))) }
   catch { throw new InboxError('HOST_INVALID_JSON', `Invalid JSON ${kind} input.`, 400) }
@@ -90,6 +99,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
   const liveInbox = inbox
   const splitPreferences = createSplitPreferencesStore(runtime.database, owner)
   const attentionFeedback = createAttentionFeedbackStore(runtime.database, liveInbox, owner)
+  const performanceLog = createPerformanceLog(runtime.dataDir, config.mode)
   const senderDomains = createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' })
   const origins = new Set(config.web.allowedOrigins)
   const hosts = new Set([`127.0.0.1:${config.backend.port}`, `localhost:${config.backend.port}`, ...config.web.allowedOrigins.map(value => new URL(value).host)])
@@ -143,6 +153,16 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       return problem(401, 'UNAUTHENTICATED', 'Initialize a local browser session first.')
     }
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
+    if (url.pathname === '/host/performance') {
+      if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Performance batches take no query parameters.')
+      if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use POST for performance samples.')
+      const input = await jsonBody(request, 'performance')
+      if (Object.keys(input).join(',') !== 'samples' || !Array.isArray(input.samples) || !input.samples.length || input.samples.length > 50 || !input.samples.every(isPerformanceSample)) {
+        return problem(400, 'HOST_INVALID_PERFORMANCE', 'Provide 1–50 content-free timing samples.')
+      }
+      if (!performanceLog.write(input.samples)) return problem(429, 'HOST_PERFORMANCE_DROPPED', 'Timing samples were dropped.')
+      return new Response(null, { status: 204, headers: safeHeaders })
+    }
     if (url.pathname.startsWith('/host/sender-domains/')) return senderDomains.fetch(request)
     if (url.pathname === '/host/split-preferences') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Split preferences take no query parameters.')
@@ -169,7 +189,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       const descriptors: Array<Omit<HostProvider, 'connectionIds'>> = config.mode === 'mock'
         ? [{ id: 'mock', name: 'Offline mock', connection: 'none', enabled: true, ready: true }]
         : registrations.map(registration => registration.onboarding)
-      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites,
+      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true,
         preferenceScope: createHmac('sha256', runtime.sessionKey).update(`split-preferences:${owner}`).digest('hex'),
         providers: descriptors.map(provider => ({ ...provider, connectionIds: connections.filter(connection => connection.providerId === provider.id).map(connection => connection.id) })) }, { headers: safeHeaders })
     }
@@ -218,6 +238,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       return closing = (async () => {
         await senderDomains.close()
         await Promise.allSettled([...pending])
+        await performanceLog.close()
         try { if (mock) await mock.close(); else await liveInbox.close() } finally { runtime.database.close() }
       })()
     },

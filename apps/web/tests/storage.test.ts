@@ -93,3 +93,41 @@ test("unavailable or malformed storage falls back without crashing initializatio
     else Reflect.deleteProperty(globalThis, "localStorage");
   }
 });
+
+test("local timing capture batches bounded metadata without blocking actions or retrying failed logging", async () => {
+  const { configurePerformanceLogging, measureAction, measurePerformance, measureRequest } = await import("../src/browser-logs.ts");
+  const originalFetch = globalThis.fetch;
+  let resolveBatch!: (input: { url: string; body: string }) => void;
+  const batch = new Promise<{ url: string; body: string }>(resolve => { resolveBatch = resolve; });
+  let release!: () => void, requests = 0;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    requests++;
+    resolveBatch({ url: String(input), body: String(init?.body) });
+    await pending;
+    throw new Error("Diagnostic transport unavailable");
+  }) as typeof fetch;
+  try {
+    configurePerformanceLogging(true);
+    const action = measureAction("private search text must never be logged", 2);
+    action.accepted(); action.finish();
+    measureRequest("/v1/mailboxes/private-source/messages/private-message", "PATCH")(200);
+    measurePerformance({ kind: "refresh" })({ pages: 66, messages: 6560, networkMs: 1400 });
+    assert.equal(requests, 0, "timing capture never sends synchronously in the action");
+    const received = await batch;
+    const { samples } = JSON.parse(received.body);
+    assert.equal(received.url, "/host/performance");
+    assert.equal(samples.length, 3);
+    assert.equal(samples[0].action, "other");
+    assert.equal(samples[1].route, "message-body");
+    assert.equal(samples[2].pages, 66);
+    assert.ok(samples.every((sample: { durationMs: number }) => Number.isFinite(sample.durationMs)));
+    assert.ok(!received.body.includes("private"));
+    configurePerformanceLogging(false);
+    release();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(requests, 1, "a failed diagnostic batch is not retried");
+  } finally {
+    configurePerformanceLogging(false); release(); globalThis.fetch = originalFetch;
+  }
+});

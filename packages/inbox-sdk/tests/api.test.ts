@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
-import { createHash, generateKeyPairSync, sign } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib'
 import { SaxesParser } from 'saxes'
@@ -53,6 +53,105 @@ const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => {
   const tasks = cleanup.splice(0).reverse()
   for (const task of tasks) await task()
+})
+
+describe('local performance logging', () => {
+  test('the host accepts only authenticated content-free timing batches and stamps private local metadata', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'performance-host-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
+    cleanup.push(() => host.close())
+    const base = `http://localhost:${config.backend.port}`, origin = config.web.origin
+    const session = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
+    const headers = { Origin: origin, Cookie: session.headers.get('set-cookie')!.split(';')[0]!, 'Content-Type': 'application/json' }
+    const sample = { kind: 'input', action: 'done', tab: randomUUID(), id: randomUUID(), at: Date.now(), durationMs: 12.5, processingMs: 1.5, outcome: 'ok', messages: 2, conversations: 1, pages: 0, full: false }
+    const body = JSON.stringify({ samples: [sample] })
+    expect((await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', body }))).status).toBe(401)
+    expect((await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers: { ...headers, Origin: 'https://evil.test' }, body }))).status).toBe(403)
+    expect((await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers: { Cookie: headers.Cookie, 'Content-Type': 'application/json' }, body }))).status).toBe(403)
+    expect((await host.fetch(new Request(`${base}/host/performance`, { headers }))).status).toBe(405)
+    expect((await host.fetch(new Request(`${base}/host/performance?path=private`, { method: 'POST', headers, body }))).status).toBe(400)
+    for (const key of ['subject', 'sender', 'body', 'url', 'cookie', 'search', 'error', 'owner', 'messageId', 'mode', 'receivedAt']) {
+      const rejected = await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers, body: JSON.stringify({ samples: [{ ...sample, [key]: 'private-marker' }] }) }))
+      expect(rejected.status).toBe(400)
+      expect(await rejected.text()).not.toContain('private-marker')
+    }
+    for (const invalid of [{}, { samples: [] }, { samples: Array.from({ length: 51 }, () => sample) }, { samples: [sample], logs: 'private-marker' },
+      { samples: [{ ...sample, tab: 'private-marker@example.test' }] }, { samples: [{ ...sample, route: 'https://private-marker.test' }] },
+      { samples: [{ ...sample, action: 'private-marker' }] }, { samples: [{ ...sample, messages: 1_000_001 }] }, { samples: [{ ...sample, durationMs: -1 }] }, { samples: [{ ...sample, status: 200.5 }] }]) {
+      expect((await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers, body: JSON.stringify(invalid) }))).status).toBe(400)
+    }
+    for (const encoding of ['gzip', 'identity']) expect((await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers: { ...headers, 'Content-Encoding': encoding }, body }))).status).toBe(415)
+    expect((await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers: { ...headers, 'Content-Type': 'text/plain' }, body }))).status).toBe(415)
+    expect((await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers: { ...headers, 'Content-Length': '32769' }, body }))).status).toBe(413)
+    expect((await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers, body: body + ' '.repeat(32768) }))).status).toBe(413)
+    const oversized = host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers, body: new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new Uint8Array(32769)) }, cancel() { return new Promise<void>(() => {}) } }) }))
+    expect((await bounded(oversized, 'oversized timing upload cancellation')).status).toBe(413)
+    const started = Date.now()
+    expect((await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers, body }))).status).toBe(204)
+    const advertised = await (await host.fetch(new Request(`${base}/host/config`, { headers }))).json()
+    expect(advertised.performanceLogging).toBe(true)
+    await bounded(host.close(), 'performance writer drain')
+    const path = join(root, 'runtime', config.mode, 'performance.jsonl')
+    const text = await readFile(path, 'utf8')
+    const rows = text.trim().split('\n').map(line => JSON.parse(line))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toEqual({ ...sample, mode: config.mode, receivedAt: expect.any(Number) })
+    expect(rows[0].receivedAt).toBeGreaterThanOrEqual(started)
+    expect(rows[0].receivedAt).toBeLessThanOrEqual(Date.now())
+    expect(text).not.toContain('private-marker')
+    expect((await stat(path)).mode & 0o777).toBe(0o600)
+    expect((await stat(join(root, 'runtime', config.mode))).mode & 0o777).toBe(0o700)
+  })
+
+  test('performance logging rotates one bounded private backup and drops excess batches', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'performance-rotation-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
+    cleanup.push(() => host.close())
+    const path = join(root, 'runtime', config.mode, 'performance.jsonl')
+    await writeFile(path, Buffer.alloc(2 * 1024 * 1024 - 1, 32), { mode: 0o644 })
+    const base = `http://localhost:${config.backend.port}`, origin = config.web.origin
+    const session = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
+    const headers = { Origin: origin, Cookie: session.headers.get('set-cookie')!.split(';')[0]!, 'Content-Type': 'application/json' }
+    const body = JSON.stringify({ samples: Array.from({ length: 50 }, () => ({ kind: 'request', tab: randomUUID(), id: randomUUID(), at: Date.now(), durationMs: 1, outcome: 'ok', route: 'mailbox-action', method: 'POST', status: 200 })) })
+    const responses = await Promise.all(Array.from({ length: 30 }, () => host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers, body }))))
+    expect(responses.some(response => response.status === 204)).toBe(true)
+    expect(responses.some(response => response.status === 429)).toBe(true)
+    expect(responses.every(response => response.status === 204 || response.status === 429)).toBe(true)
+    await bounded(host.close(), 'bounded rotation writer drain')
+    const current = await stat(path), backup = await stat(`${path}.1`)
+    expect(current.size).toBeLessThanOrEqual(2 * 1024 * 1024)
+    expect(backup.size).toBeLessThanOrEqual(2 * 1024 * 1024)
+    expect(current.mode & 0o777).toBe(0o600)
+    expect(backup.mode & 0o777).toBe(0o600)
+    const rows = (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    expect(rows.length).toBe(responses.filter(response => response.status === 204).length * 50)
+    expect(rows.length).toBeLessThanOrEqual(1200)
+    expect(rows.every(row => row.mode === config.mode && row.route === 'mailbox-action')).toBe(true)
+    await expect(stat(`${path}.2`)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('a stalled timing upload and an unwritable sink cannot break host mail reads or shutdown', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'performance-failure-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
+    cleanup.push(() => host.close())
+    await mkdir(join(root, 'runtime', config.mode, 'performance.jsonl'))
+    const base = `http://localhost:${config.backend.port}`, origin = config.web.origin
+    const session = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
+    const headers = { Origin: origin, Cookie: session.headers.get('set-cookie')!.split(';')[0]!, 'Content-Type': 'application/json' }
+    const sample = { kind: 'work', tab: randomUUID(), id: randomUUID(), at: Date.now(), durationMs: 1, outcome: 'ok' }
+    expect((await host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers, body: JSON.stringify({ samples: [sample] }) }))).status).toBe(204)
+    expect((await host.fetch(new Request(`${base}/v1/accounts`, { headers }))).status).toBe(200)
+    const stalled = host.fetch(new Request(`${base}/host/performance`, { method: 'POST', headers, body: new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode('{"samples":[')) } }) }))
+    expect((await bounded(stalled, 'timing upload body deadline')).status).toBe(408)
+    expect((await host.fetch(new Request(`${base}/v1/accounts`, { headers }))).status).toBe(200)
+    await bounded(host.close(), 'failed performance sink shutdown')
+  })
 })
 
 describe('Attention baseline and explicit feedback', () => {
