@@ -14,6 +14,7 @@ const iconMarkup: Record<string, { __html: string }> = Object.fromEntries(
 
 const paths: Record<string, ReactNode> = {
   Back: <path d="M16 10H4m5-5-5 5 5 5" />,
+  Refresh: <path d="M17 8a7 7 0 1 0 0 4M17 3v5h-5" />,
   ChevronDown: <path d="m5 7 5 5 5-5" />,
   ChevronUp: <path d="m5 12 5-5 5 5" />,
   ChevronRight: <path d="m7 5 5 5-5 5" />,

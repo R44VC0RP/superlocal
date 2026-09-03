@@ -1663,9 +1663,9 @@ export default function App() {
               )}
               {!selected.length && (
                 <div className="header-actions">
-                  <button type="button" className="text-button inbox-refresh" disabled={!activeAccount || inbox.refreshing} onClick={() => { void store.sync(route.account).catch(actionError); }}>
-                    {inbox.refreshing ? "Refreshing…" : "Refresh"}
-                  </button>
+                  <IconButton name="Refresh" title="Refresh inbox" className="inbox-refresh"
+                    aria-busy={inbox.refreshing} disabled={!activeAccount || inbox.refreshing}
+                    onClick={() => { void store.sync(route.account).catch(actionError); }} />
                   {mailFilter && (
                     <button
                       className="mail-filter"
