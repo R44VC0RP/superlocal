@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
-import { createHash, generateKeyPairSync, sign } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, truncate, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib'
 import { SaxesParser } from 'saxes'
@@ -14,6 +14,9 @@ import { CredentialError, InboxError } from '../src/contracts'
 import { createGoogleOAuthHost, type GoogleOAuthConfig, type OAuthAttempt } from '../server/google-oauth'
 import { createGoogleOAuthApi } from '../server/google-oauth-api'
 import { createGoogleOAuthClient } from '../server/google-client'
+import { createLocalHost } from '../../../apps/local-host/src/host'
+import { ROOT_DIR, type LocalConfig } from '../../../apps/local-host/src/config'
+import { ISSUE_LIMITS, type IssueDetail, type IssuePage, type IssueSummary, type IssueWrite } from '../../../apps/shared/issue-reports'
 import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
   Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, Message,
@@ -619,6 +622,276 @@ function sse(response: Response) {
     },
   }
 }
+
+describe('local issue inbox', () => {
+  const origin = 'http://localhost:5178'
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRzQAAAAASUVORK5CYII=', 'base64')
+  const jpeg = Buffer.from('/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjI4LjEwMgD/2wBDAAgEBAQEBAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABLAAEBAAAAAAAAAAAAAAAAAAAABgEBAAAAAAAAAAAAAAAAAAAABRABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIAAIAAgMBIgACEQADEQD/2gAMAwEAAhEDEQA/AIYA8Ff/2Q==', 'base64')
+  async function issueHost(mode: 'mock' | 'real' = 'mock', shared?: { instanceId: string; dataDir: string }) {
+    const dataDir = shared?.dataDir ?? await mkdtemp(join(TEMP_ROOT, 'local-issues-runtime-'))
+    const instanceId = shared?.instanceId ?? randomUUID()
+    const config: LocalConfig = {
+      configPath: join(dataDir, 'unused-config.json'), instanceId, mode, dataDir,
+      web: { port: 5178, origin, allowedOrigins: [origin] }, backend: { port: 8790 },
+      auth: { method: 'loopback', sessionHours: 1 }, allowProviderWrites: false,
+      providers: { mock: { enabled: true }, inbound: { enabled: false }, gmail: { enabled: false, oauth: { clientId: null, clientSecret: null, scopes: ['openid', 'email'] } } },
+    }
+    const issueDir = join(ROOT_DIR, 'data', 'issues', instanceId, mode)
+    let host = await createLocalHost(config, {})
+    let cookie = ''
+    const request = (path: string, init: RequestInit = {}, authenticated = true) => host.fetch(new Request(`http://localhost:8790${path}`, {
+      ...init, headers: { ...(authenticated ? { cookie } : {}), ...Object.fromEntries(new Headers(init.headers)) },
+    }))
+    const session = async () => {
+      const response = await request('/session', { method: 'POST', headers: { origin, 'x-superlocal': '1' } }, false)
+      expect(response.status).toBe(204)
+      cookie = response.headers.get('set-cookie')!.split(';')[0]!
+    }
+    await session()
+    const scope = (await (await request('/host/config')).json() as { issueScope: string }).issueScope
+    cleanup.push(async () => { await host.close(); if (!shared) { await rm(dataDir, { recursive: true, force: true }); await rm(join(ROOT_DIR, 'data', 'issues', instanceId), { recursive: true, force: true }) } })
+    const input = (change: Partial<IssueWrite> = {}): IssueWrite => ({
+      id: randomUUID(), scope, revision: 0, prompt: 'Fictional issue description', title: 'Superlocal mock inbox',
+      url: `${origin}/?view=inbox#thread=fictional`, capturedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      viewport: { width: 1200, height: 800, pixelRatio: 2 }, build: { mode: 'optimized', assets: ['/assets/index-fictional.js'] },
+      rendering: [{ width: 600, height: 400, scrollWidth: 600, bodyScrollWidth: 900, scale: 0.66 }],
+      logs: [{ time: new Date().toISOString(), level: 'warn', message: 'Fictional browser diagnostic' }], ...change,
+    })
+    const form = (value: unknown, image: Uint8Array = png, type = 'image/png') => {
+      const body = new FormData(); body.append('report', JSON.stringify(value)); body.append('screenshot', new File([new Uint8Array(image)], 'untrusted-name.png', { type })); return body
+    }
+    const put = (value: IssueWrite, image?: Uint8Array, type?: string) => request(`/host/issues/${value.id}`, { method: 'PUT', headers: { origin }, body: form(value, image, type) })
+    return { config, scope, issueDir, input, form, put, request, async restart() { await host.close(); host = await createLocalHost(config, {}); await session() } }
+  }
+
+  test('auth/origin guards precede storage; startup is lazy and mock/real/instance scopes cannot mix', async () => {
+    const h = await issueHost()
+    expect(h.scope).toMatch(/^[0-9a-f]{64}$/)
+    await expect(lstat(h.issueDir)).rejects.toMatchObject({ code: 'ENOENT' })
+    const input = h.input()
+    expect((await h.request('/host/issues', {}, false)).status).toBe(401)
+    expect((await h.request(`/host/issues/${input.id}/screenshot`, {}, false)).status).toBe(401)
+    expect((await h.request('/host/issues', { headers: { origin: 'https://evil.example.test' } })).status).toBe(403)
+    expect((await h.request('/host/issues', { headers: { 'sec-fetch-site': 'same-site' } })).status).toBe(403)
+    expect((await h.request(`/host/issues/${input.id}`, { method: 'PUT', body: h.form(input) })).status).toBe(403)
+    expect((await h.put(input)).status).toBe(200)
+    const real = await issueHost('real', h.config), other = await issueHost('mock')
+    expect(real.scope).not.toBe(h.scope); expect(other.scope).not.toBe(h.scope)
+    expect((await real.put(input)).status).toBe(409)
+    expect((await other.put(input)).status).toBe(409)
+    expect((await real.request(`/host/issues/${input.id}`)).status).toBe(404)
+    expect((await other.request(`/host/issues/${input.id}`)).status).toBe(404)
+    expect((await (await real.request('/host/issues')).json() as IssuePage).items).toEqual([])
+    expect((await h.request('/health')).status).toBe(200)
+  })
+
+  test('first save is a private durable bundle; retries, edits, and restart preserve immutable diagnostics', async () => {
+    const h = await issueHost(), input = h.input({ url: `${origin}/?view=inbox&access_token=fictional-secret#thread=fictional&token=fragment-secret`, logs: [{ time: new Date().toISOString(), level: 'warn', message: 'access_token=fictional-secret Authorization: Bearer fake-token https://user:pass@localhost:5178/?api_key=secret' }] })
+    const response = await h.put(input)
+    expect(response.status).toBe(200)
+    const receipt = await response.json() as IssueSummary, bundle = join(h.issueDir, input.id)
+    expect(receipt).toMatchObject({ id: input.id, scope: h.scope, revision: 1, storage: 'repo', status: 'new', timingCount: 0, logCount: 1, image: { contentType: 'image/png', width: 1, height: 1, bytes: png.length } })
+    expect(Object.keys(receipt)).not.toContain('lastFingerprint')
+    expect(receipt.url).toContain('view=inbox'); expect(receipt.url).toContain('thread=fictional'); expect(receipt.url).not.toContain('fictional-secret'); expect(receipt.url).not.toContain('fragment-secret')
+    expect((await readdir(bundle)).sort()).toEqual(['browser-logs.jsonl', 'report.json', 'screenshot.png', 'timings.jsonl'])
+    for (const path of [h.issueDir, bundle]) expect((await lstat(path)).mode & 0o777).toBe(0o700)
+    const before = new Map<string, Buffer>()
+    for (const name of await readdir(bundle)) { const path = join(bundle, name); expect((await lstat(path)).mode & 0o777).toBe(0o600); before.set(name, await readFile(path)) }
+    expect(before.get('timings.jsonl')!.length).toBe(0)
+    expect(before.get('browser-logs.jsonl')!.toString()).not.toMatch(/fictional-secret|fake-token|user:pass|api_key=secret/)
+    const retry = await h.put({ ...input, updatedAt: new Date(Date.now() + 100).toISOString() })
+    expect(retry.status).toBe(200); expect(await retry.json()).toEqual(receipt)
+    const newer = { ...input, prompt: 'Updated description', revision: 1 }
+    const edit = await h.put(newer)
+    expect(edit.status).toBe(200); const edited = await edit.json() as IssueSummary; expect(edited.revision).toBe(2)
+    expect((await h.put({ ...input, prompt: 'Conflicting old description', revision: 1 })).status).toBe(412)
+    expect((await h.put(input)).status).toBe(412)
+    expect((await h.put({ ...newer, title: 'Replacement capture', revision: 2 })).status).toBe(409)
+    expect((await h.put({ ...newer, revision: 2 }, jpeg, 'image/jpeg')).status).toBe(409)
+    const detail = await (await h.request(`/host/issues/${input.id}`)).json() as IssueDetail
+    expect(detail.prompt).toBe('Updated description'); expect(detail.logs).toHaveLength(1)
+    expect(detail.logs).toEqual(before.get('browser-logs.jsonl')!.toString().trim().split('\n').map(line => JSON.parse(line)))
+    const rehydrated = { ...newer, url: detail.url, logs: detail.logs, updatedAt: detail.updatedAt }
+    const detailRetry = await h.put(rehydrated)
+    expect(detailRetry.status).toBe(200); expect(await detailRetry.json()).toEqual(edited)
+    for (const name of ['screenshot.png', 'browser-logs.jsonl', 'timings.jsonl']) expect(Buffer.compare(await readFile(join(bundle, name)), before.get(name)!)).toBe(0)
+    await h.restart()
+    expect((await (await h.request('/host/config')).json() as { issueScope: string }).issueScope).toBe(h.scope)
+    const afterRestart = await h.put({ ...newer, updatedAt: new Date().toISOString() })
+    expect(afterRestart.status).toBe(200); expect(await afterRestart.json()).toEqual(edited)
+    const image = await h.request(`/host/issues/${input.id}/screenshot`)
+    expect(image.headers.get('content-type')).toBe('image/png'); expect(image.headers.get('x-content-type-options')).toBe('nosniff'); expect(image.headers.get('cache-control')).toBe('no-store'); expect(image.headers.get('cross-origin-resource-policy')).toBe('same-origin')
+    expect(image.headers.get('content-disposition')).toBe('inline; filename="screenshot.png"'); expect(Buffer.from(await image.arrayBuffer())).toEqual(png)
+    // A host/agent status update remains intact; the browser never controls status.
+    const reportPath = join(bundle, 'report.json'), local = JSON.parse(await readFile(reportPath, 'utf8'))
+    await writeFile(reportPath, JSON.stringify({ ...local, status: 'in-progress' }))
+    const next = await h.put({ ...rehydrated, revision: 2, prompt: 'One more detail' })
+    expect(next.status).toBe(200); expect(await next.json()).toMatchObject({ status: 'in-progress', revision: 3 })
+  })
+
+  test('metadata-only paging binds cursors to scope and never reads images or browser logs', async () => {
+    const h = await issueHost()
+    const inputs = [h.input(), h.input(), h.input()]
+    for (const input of inputs) expect((await h.put(input)).status).toBe(200)
+    // Unreadable diagnostics still cannot be traversed/read by metadata paging.
+    for (const input of inputs) {
+      await writeFile(join(h.issueDir, input.id, 'screenshot.png'), 'not an image')
+      await writeFile(join(h.issueDir, input.id, 'browser-logs.jsonl'), 'not JSON')
+    }
+    const page = await (await h.request('/host/issues?limit=2')).json() as IssuePage
+    expect(page.items).toHaveLength(2); expect(page.nextCursor).not.toBeNull()
+    for (const report of page.items) { expect(report).not.toHaveProperty('logs'); expect(report).not.toHaveProperty('screenshot'); expect(report).not.toHaveProperty('captureFingerprint') }
+    const next = await (await h.request(`/host/issues?limit=2&cursor=${page.nextCursor}`)).json() as IssuePage
+    expect(next.items).toHaveLength(1); expect(next.nextCursor).toBeNull(); expect(new Set([...page.items, ...next.items].map(report => report.id)).size).toBe(3)
+    const other = await issueHost()
+    expect((await other.request(`/host/issues?cursor=${page.nextCursor}`)).status).toBe(400)
+    for (const query of ['limit=0', 'limit=51', 'limit=1&limit=2', 'cursor=bad', 'owner=other', 'limit=1e1']) expect((await h.request(`/host/issues?${query}`)).status).toBe(400)
+    expect((await h.request(`/host/issues/${inputs[0]!.id}/screenshot`)).status).toBe(409)
+  })
+
+  test('strict multipart, media, metadata, path, and size validation rejects unsafe captures', async () => {
+    const h = await issueHost(), input = h.input()
+    const bad: unknown[] = [
+      { ...input, id: randomUUID() }, { ...input, status: 'fixed' }, { ...input, directory: '/tmp/escape' }, { ...input, logs: [{ time: input.capturedAt, level: 'fatal', message: 'bad' }] },
+      { ...input, viewport: { ...input.viewport, width: 0 } }, { ...input, viewport: { ...input.viewport, extra: 1 } },
+      { ...input, rendering: [{ width: 1, height: 1, scale: -1 }] }, { ...input, title: 'x'.repeat(513) }, { ...input, capturedAt: '2026-99-99' },
+      { ...input, url: 'https://evil.example.test/path' }, { ...input, url: 'javascript:alert(1)' },
+      { ...input, build: { mode: 'optimized', assets: ['/assets/../private.js'] } }, { ...input, build: { mode: 'optimized', assets: ['https://evil.example.test/file.js'] } },
+      { ...input, build: { mode: 'optimized', assets: ['/assets/file.js?token=x'] } }, { ...input, prompt: 'x'.repeat(ISSUE_LIMITS.promptCharacters + 1) },
+    ]
+    for (const value of bad) expect((await h.request(`/host/issues/${input.id}`, { method: 'PUT', headers: { origin }, body: h.form(value) })).status).toBe(400)
+    for (const path of [input.id.toUpperCase(), '..%2fescape', '%2e%2e%2fescape', `${input.id}?path=escape`, `${input.id}/unknown`]) expect((await h.request(`/host/issues/${path}`, { method: 'PUT', headers: { origin }, body: h.form(input) })).status).toBe(400)
+    const duplicate = h.form(input); duplicate.append('report', JSON.stringify(input))
+    expect((await h.request(`/host/issues/${input.id}`, { method: 'PUT', headers: { origin }, body: duplicate })).status).toBe(400)
+    const extra = h.form(input); extra.append('headers', 'cookie=private')
+    expect((await h.request(`/host/issues/${input.id}`, { method: 'PUT', headers: { origin }, body: extra })).status).toBe(400)
+    expect((await h.put(input, Buffer.from('<svg onload="alert(1)"></svg>'), 'image/svg+xml')).status).toBe(415)
+    expect((await h.put(input, Buffer.from('<html>bad</html>'), 'image/png')).status).toBe(415)
+    expect((await h.put(input, png, 'image/jpeg')).status).toBe(415)
+    const oversized = Buffer.from(png); oversized.writeUInt32BE(16385, 16)
+    expect((await h.put(input, oversized)).status).toBe(415)
+    expect((await h.put(input, Buffer.alloc(ISSUE_LIMITS.screenshotBytes + 1))).status).toBe(413)
+    const metadata = new FormData(); metadata.append('report', ' '.repeat(ISSUE_LIMITS.metadataBytes + 1)); metadata.append('screenshot', new File([png], 'x.png', { type: 'image/png' }))
+    expect((await h.request(`/host/issues/${input.id}`, { method: 'PUT', headers: { origin }, body: metadata })).status).toBe(413)
+    expect((await h.request(`/host/issues/${input.id}`, { method: 'PUT', headers: { origin, 'content-type': 'multipart/form-data; boundary=x', 'content-length': String(ISSUE_LIMITS.requestBytes + 1) }, body: 'x' })).status).toBe(413)
+    expect((await h.put(input, jpeg, 'image/jpeg')).status).toBe(200)
+    expect((await h.request(`/host/issues/${input.id}/screenshot`)).headers.get('content-type')).toBe('image/jpeg')
+  })
+
+  test('storage rejects symlinks, hardlinks, non-private files and scope path redirection without affecting mail', async () => {
+    const h = await issueHost(), input = h.input()
+    expect((await h.put(input)).status).toBe(200)
+    const image = join(h.issueDir, input.id, 'screenshot.png'), report = join(h.issueDir, input.id, 'report.json')
+    const outside = join(h.config.dataDir, 'fictional-outside.png'); await writeFile(outside, png, { mode: 0o600 })
+    await unlink(image); await symlink(outside, image)
+    expect((await h.request(`/host/issues/${input.id}/screenshot`)).status).toBeGreaterThanOrEqual(400)
+    expect((await h.put({ ...input, revision: 1, prompt: 'Unsafe update' })).status).toBe(409)
+    await unlink(image); await link(outside, image)
+    expect((await h.request(`/host/issues/${input.id}/screenshot`)).status).toBe(409)
+    await unlink(image); await writeFile(image, png, { mode: 0o600 })
+    await chmod(report, 0o644)
+    expect((await h.request(`/host/issues/${input.id}`)).status).toBe(409)
+    await chmod(report, 0o600)
+    expect((await h.request('/v1/connections')).status).toBe(200)
+    const other = await issueHost(); const scopeParent = join(ROOT_DIR, 'data', 'issues', other.config.instanceId)
+    await mkdir(scopeParent, { mode: 0o700 }); await symlink(h.issueDir, other.issueDir)
+    expect((await other.put(other.input())).status).toBe(409)
+    expect(await readFile(outside)).toEqual(png)
+  })
+
+  test('recent timing tails are optional, bounded, filtered, and frozen at first save', async () => {
+    const h = await issueHost(), input = h.input(), at = Date.parse(input.capturedAt)
+    const row = { kind: 'action', at, durationMs: 12, outcome: 'ok', action: 'done', mode: 'mock', receivedAt: at, id: randomUUID(), tab: randomUUID(), arbitrary: SECRET, url: 'https://private.example.test/' }
+    const runtime = join(h.config.dataDir, 'mock')
+    await writeFile(join(runtime, 'performance.jsonl.1'), JSON.stringify({ ...row, at: at - 59_000 }) + '\n', { mode: 0o600 })
+    await writeFile(join(runtime, 'performance.jsonl'), [row, { ...row, at: at - 61_000 }, { ...row, at: at + 1001 }, { ...row, mode: 'real' }, { ...row, action: SECRET }, { ...row, durationMs: -1 }].map(value => JSON.stringify(value)).join('\n') + '\nnot JSON\n', { mode: 0o600 })
+    const response = await h.put(input)
+    expect(response.status).toBe(200); expect(await response.json()).toMatchObject({ timingCount: 2 })
+    const filename = join(h.issueDir, input.id, 'timings.jsonl'), snapshot = await readFile(filename, 'utf8')
+    expect(snapshot).not.toContain(SECRET); expect(snapshot).not.toContain('private.example'); expect(snapshot).not.toContain(row.id)
+    expect(snapshot.trim().split('\n').map(line => JSON.parse(line))).toEqual([expect.objectContaining({ at: at - 59_000, action: 'done' }), expect.objectContaining({ at, durationMs: 12 })])
+    const repeated = Array.from({ length: 4000 }, () => JSON.stringify(row)).join('\n') + '\n'
+    await writeFile(join(runtime, 'performance.jsonl'), repeated)
+    const nextInput = h.input(), nextResponse = await h.put(nextInput)
+    expect(nextResponse.status).toBe(200)
+    expect((await lstat(join(h.issueDir, nextInput.id, 'timings.jsonl'))).size).toBeLessThanOrEqual(256 * 1024)
+    expect((await h.put({ ...input, revision: 1, prompt: 'Add context without recapture' })).status).toBe(200)
+    expect(await readFile(filename, 'utf8')).toBe(snapshot)
+  })
+
+  test('advisory locking rejects cross-process contention and releases after SIGKILL without stale locks or report data', async () => {
+    const h = await issueHost(), input = h.input()
+    expect((await h.put(input)).status).toBe(200)
+    const lock = join(h.issueDir, '.write-lock.sqlite'), original = await lstat(lock)
+    expect(original.isFile()).toBe(true); expect(original.mode & 0o777).toBe(0o600); expect(original.nlink).toBe(1); expect(original.size).toBe(0)
+    const child = Bun.spawn([process.execPath, '--no-env-file', '-e', `
+      import { Database } from 'bun:sqlite';
+      const db = new Database(${JSON.stringify(lock)}, {readwrite:true, create:false});
+      db.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE;');
+      await Bun.write(Bun.stdout, 'locked\\n');
+      setInterval(() => {}, 1000);
+    `], { env: { INBOX_TEST_LIVE: 'false' }, stdout: 'pipe', stderr: 'pipe' })
+    const reader = child.stdout.getReader()
+    try {
+      const signal = await bounded(reader.read(), 'cross-process advisory lock acquisition')
+      expect(new TextDecoder().decode(signal.value)).toBe('locked\n')
+      expect((await readdir(h.issueDir)).filter(name => name.startsWith('.write-lock')).sort()).toEqual(['.write-lock.sqlite', '.write-lock.sqlite-journal'])
+      const journal = await lstat(`${lock}-journal`)
+      expect(journal.mode & 0o777).toBe(0o600); expect(journal.nlink).toBe(1); expect(journal.size).toBe(512)
+      expect((await h.put({ ...input, revision: 1, prompt: 'During another writer' })).status).toBe(503)
+      expect((await h.request(`/host/issues/${input.id}`)).status).toBe(200)
+      expect((await h.request('/v1/connections')).status).toBe(200)
+      child.kill('SIGKILL')
+      await bounded(child.exited, 'killed advisory lock holder')
+      expect((await lstat(`${lock}-journal`)).size).toBe(512)
+      const update = await h.put({ ...input, revision: 1, prompt: 'After the writer died' })
+      expect(update.status).toBe(200); expect(await update.json()).toMatchObject({ revision: 2, prompt: 'After the writer died' })
+      expect((await readdir(h.issueDir)).filter(name => name.startsWith('.write-lock'))).toEqual(['.write-lock.sqlite'])
+      const released = await lstat(lock)
+      expect(released.ino).toBe(original.ino); expect(released.size).toBe(0)
+      await h.restart()
+      expect((await h.put({ ...input, revision: 2, prompt: 'After restart' })).status).toBe(200)
+      expect((await lstat(lock)).ino).toBe(original.ino)
+      // Only the empty sentinel is admitted; SQLite must never follow links or recover injected journals.
+      await chmod(lock, 0o644)
+      expect((await h.put(h.input())).status).toBe(409)
+      await chmod(lock, 0o600)
+      const alias = join(h.config.dataDir, 'lock-hardlink')
+      await link(lock, alias)
+      expect((await h.put(h.input())).status).toBe(409)
+      await unlink(alias)
+      const companion = `${lock}-journal`
+      await writeFile(companion, 'fictional unexpected journal', { mode: 0o600 })
+      expect((await h.put(h.input())).status).toBe(409)
+      expect(await readFile(companion, 'utf8')).toBe('fictional unexpected journal')
+      await unlink(companion)
+      const outside = join(h.config.dataDir, 'empty-lock-target')
+      await writeFile(outside, '', { mode: 0o600 }); await unlink(lock); await symlink(outside, lock)
+      expect((await h.put(h.input())).status).toBe(409)
+      expect((await lstat(outside)).size).toBe(0)
+    } finally { child.kill('SIGKILL'); await child.exited; reader.releaseLock() }
+  })
+
+  test('bounded inflight uploads and report/byte quotas reject work without deleting existing captures', async () => {
+    const h = await issueHost(), input = h.input()
+    const streams: ReadableStreamDefaultController<Uint8Array>[] = []
+    const pending = Array.from({ length: 4 }, () => h.request(`/host/issues/${input.id}`, { method: 'PUT', headers: { origin, 'content-type': 'multipart/form-data; boundary=x' }, body: new ReadableStream<Uint8Array>({ start(controller) { streams.push(controller) } }) }))
+    expect((await h.put(input)).status).toBe(503)
+    expect((await h.request('/health')).status).toBe(200)
+    for (const stream of streams) stream.close()
+    expect((await Promise.all(pending)).every(response => response.status === 400)).toBe(true)
+    expect((await h.put(input)).status).toBe(200)
+    const original = await readFile(join(h.issueDir, input.id, 'report.json'))
+    const sparse = join(h.issueDir, input.id, 'timings.jsonl'); await truncate(sparse, ISSUE_LIMITS.totalBytes)
+    expect((await h.put(h.input())).status).toBe(507)
+    expect(await readFile(join(h.issueDir, input.id, 'report.json'))).toEqual(original)
+    await truncate(sparse, 0)
+    for (let index = 1; index < ISSUE_LIMITS.maxReports; index++) await mkdir(join(h.issueDir, randomUUID()), { mode: 0o700 })
+    expect((await h.put(h.input())).status).toBe(507)
+    expect(await readFile(join(h.issueDir, input.id, 'report.json'))).toEqual(original)
+    expect((await readdir(h.issueDir)).filter(name => !name.startsWith('.'))).toHaveLength(ISSUE_LIMITS.maxReports)
+  })
+})
 
 describe('mail HTTP ownership and provider lifecycle', () => {
   test('authentication is the host seam; query, body, and unrelated headers cannot choose the owner', async () => {

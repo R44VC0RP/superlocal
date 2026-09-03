@@ -5,6 +5,7 @@ import { createInbox, InboxError, type Inbox } from 'inbox-sdk'
 import { createInboxApi } from 'inbox-sdk/http'
 import { loadLocalConfig, object, type LocalConfig } from './config'
 import { createInboxViewPreferencesStore, INBOX_PREFERENCES_BODY_LIMIT } from './inbox-preferences'
+import { createIssueReports } from './issue-reports'
 import { createRealRegistrations, type HostProvider, type HostProviderRegistration } from './providers'
 import { openLocalRuntime } from './runtime'
 
@@ -83,6 +84,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     inboxPreferences = createInboxViewPreferencesStore(runtime.database, inbox, owner)
   } catch (error) { try { if (mock) await mock.close(); else await inbox?.close() } finally { runtime.database.close() }; throw error }
   const liveInbox = inbox
+  const issueReports = createIssueReports(config, runtime, owner)
   const origins = new Set(config.web.allowedOrigins)
   const hosts = new Set([`127.0.0.1:${config.backend.port}`, `localhost:${config.backend.port}`, ...config.web.allowedOrigins.map(value => new URL(value).host)])
   const cookieName = `superlocal_${config.instanceId.replaceAll('-', '')}_${config.mode}`
@@ -135,6 +137,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       return problem(401, 'UNAUTHENTICATED', 'Initialize a local browser session first.')
     }
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
+    if (url.pathname === '/host/issues' || url.pathname.startsWith('/host/issues/')) return issueReports.fetch(request)
     if (url.pathname === '/host/inbox-preferences') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Inbox preferences take no query parameters.')
       if (request.method === 'GET') return Response.json(await inboxPreferences.read(), { headers: safeHeaders })
@@ -147,7 +150,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       const descriptors: Array<Omit<HostProvider, 'connectionIds'>> = config.mode === 'mock'
         ? [{ id: 'mock', name: 'Offline mock', connection: 'none', enabled: true, ready: true }]
         : registrations.map(registration => registration.onboarding)
-      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites,
+      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, issueScope: issueReports.scope,
         providers: descriptors.map(provider => ({ ...provider, connectionIds: connections.filter(connection => connection.providerId === provider.id).map(connection => connection.id) })) }, { headers: safeHeaders })
     }
     const connect = /^\/host\/providers\/([a-z][a-z0-9-]*)\/connect$/.exec(url.pathname)
