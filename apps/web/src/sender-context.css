@@ -47,9 +47,10 @@
 .sender-history-scope button[aria-pressed="true"] { color: var(--text); }
 .sender-history-scope button[aria-pressed="true"]::after { content: ""; height: 1px; background: currentColor; position: absolute; inset-inline: 0; bottom: 3px; }
 .sender-level-details { margin-block: 6px 12px; }
-.sender-level-details summary { gap: 8px; flex-wrap: wrap; font-variant-numeric: tabular-nums; color: var(--text); }
-.sender-level-scale { display: flex; align-items: center; gap: 3px; height: 16px; flex-shrink: 0; }
-.sender-level-scale i { width: 4px; height: 12px; border-radius: 1px; background: var(--border); }
+.sender-level-details summary { gap: 8px; flex-wrap: wrap; font-variant-numeric: tabular-nums; color: var(--text); align-items: baseline; align-content: center; }
+.sender-level-details summary > .icon:last-child { align-self: center; }
+.sender-level-scale { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
+.sender-level-scale i { width: 4px; height: 0.72em; height: 1cap; border-radius: 1px; background: var(--border); }
 .sender-level-scale i.is-filled { background: var(--accent); }
 .sender-level-name { color: var(--muted); }
 .sender-counts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
@@ -67,7 +68,7 @@
 .sender-chart-caption > span:last-child { display: inline-flex; align-items: center; gap: 5px; }
 .sender-chart-caption i { width: 6px; height: 6px; background: var(--accent); border-radius: 1px; }
 .sender-conversations { margin-top: 28px; }
-.sender-conversations h3 { margin-bottom: 10px; }
+.sender-conversations h3 { margin-bottom: 6px; }
 .sender-conversation { display: flex; flex-direction: column; gap: 2px; min-height: 40px; width: 100%; margin-block: 4px; padding-block: 8px; text-align: start; }
 .sender-conversation > span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
 .sender-conversation time { color: var(--muted); font-variant-numeric: tabular-nums; }
