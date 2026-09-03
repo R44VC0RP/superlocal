@@ -42,6 +42,33 @@ export interface ConnectionAuthorization {
   generation: number
 }
 
+export interface MediaTarget {
+  /** Private source URL. Never log it or forward caller credentials/headers. */
+  url: string
+  address: string
+  family: 4 | 6
+  headers: Readonly<Record<string, string>>
+}
+
+export interface MediaNetwork {
+  resolve(hostname: string, signal: AbortSignal): Promise<readonly string[]>
+  /** Trusted host transport: connect ONLY to address, with the URL's Host/SNI and normal TLS verification. No redirects or automatic decompression. */
+  request(target: Readonly<MediaTarget>, signal: AbortSignal): Promise<Response>
+}
+
+export interface MediaOptions {
+  /** Explicit pinned transport for hosts with an injected fetch. Otherwise custom fetch makes uncached media fail closed. */
+  network?: MediaNetwork
+  timeoutMs?: number
+  maxBytes?: number
+  concurrency?: number
+  cacheBytes?: number
+  cacheEntries?: number
+  cacheTtlMs?: number
+}
+
+export interface MediaContent { contentType: string; content: Uint8Array; noStore?: boolean }
+
 export interface ProviderDefinition {
   id: string
   name: string
@@ -61,6 +88,7 @@ export interface InboxOptions {
   providers: readonly ProviderDefinition[]
   now?: () => number
   fetch?: typeof fetch
+  media?: MediaOptions
   syncIntervalMs?: number
   eventRetention?: number
   leaseMs?: number
@@ -358,6 +386,8 @@ export interface Inbox {
   createFolder(owner: string, accountId: string, name: string): Promise<Folder>
   messages(owner: string, query?: Query): Promise<Page<MessageSummary>>
   message(owner: string, id: string): Promise<Message>
+  /** Fetch an eligible image referenced by the current owned message, subject to current image policy. */
+  media(owner: string, messageId: string, resource: string): Promise<MediaContent>
   threads(owner: string, query?: Query): Promise<Page<ThreadSummary>>
   thread(owner: string, id: string, query?: Pick<Query, 'cursor' | 'limit'>): Promise<Page<MessageSummary>>
   labels(owner: string, accountId?: string): Promise<Label[]>

@@ -418,6 +418,7 @@ export function createInboxApi(options: InboxApiOptions) {
     if (method === 'get' && !doc.noStore && !doc.mediaType) responses['304'] = { description: 'Authenticated representation has not changed.' }
     if (doc.conditional) { responses['412'] = errorResponse; responses['428'] = errorResponse }
     if (path === '/v1/blobs/:id') { responses['206'] = success; responses['304'] = { description: 'Not modified' }; responses['416'] = errorResponse }
+    if (path === '/v1/messages/:id/media/:resource') responses['304'] = { description: 'Current policy and message authorization checked before the validator.' }
     const openapiPath = path.replace(/:([A-Za-z]+)/g, '{$1}')
     paths[openapiPath] ??= {}
     paths[openapiPath][method] = {
@@ -465,7 +466,7 @@ export function createInboxApi(options: InboxApiOptions) {
   })
   route('get', '/v1/mailboxes/:id/messages/:messageId', { summary: 'Read a message in an owned mailbox', output: 'MailboxMessage' }, async (c) => {
     const policy = await inbox.policy(c.get('owner'))
-    c.header('Content-Security-Policy', `default-src 'none'; img-src 'self' data:${policy.remoteImages ? ' https: http:' : ''}; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`)
+    c.header('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
     c.header('Referrer-Policy', 'no-referrer')
     return json(c, validate(schemas.MailboxMessage, await inbox.mailboxMessage(c.get('owner'), pathId(c), c.req.param('messageId')!)), 200, policy)
   })
@@ -493,9 +494,25 @@ export function createInboxApi(options: InboxApiOptions) {
   route('get', '/v1/messages', { summary: 'Query messages', query: querySchema, output: 'MessagePage' }, async (c) => json(c, await inbox.messages(c.get('owner'), query(c, querySchema))))
   route('get', '/v1/messages/:id', { summary: 'Read a message without marking it read', output: 'Message' }, async (c) => {
     const policy = await inbox.policy(c.get('owner'))
-    c.header('Content-Security-Policy', `default-src 'none'; img-src 'self' data:${policy.remoteImages ? ' https: http:' : ''}; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`)
+    c.header('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
     c.header('Referrer-Policy', 'no-referrer')
     return json(c, await inbox.message(c.get('owner'), pathId(c)), 200, policy)
+  })
+  route('get', '/v1/messages/:id/media/:resource', { summary: 'Read an authorized remote email image', mediaType: 'application/octet-stream',
+    description: 'Opaque references from sanitized message output only; no URL parameters. Current ownership, original message and image policy are checked before cache/validators/network. PNG, JPEG, GIF, WebP and rebuilt static UTF-8 SVG. Active XML, external SVG resources, animation and filters are rejected. Private caches must revalidate.' }, async c => {
+    const result = await inbox.media(c.get('owner'), pathId(c), c.req.param('resource')!)
+    const tag = await etag(c.get('owner'), `${pathId(c)}\n${c.req.param('resource')}\n${result.contentType}`, result.content)
+    if (!result.noStore) c.header('ETag', tag)
+    c.header('Cache-Control', result.noStore ? 'no-store' : 'private, no-cache, must-revalidate')
+    c.header('Content-Security-Policy', `sandbox; default-src 'none'; ${result.contentType === 'image/svg+xml' ? "style-src 'unsafe-inline'; " : ''}base-uri 'none'; frame-ancestors 'none'; form-action 'none'`)
+    c.header('Cross-Origin-Resource-Policy', 'same-origin')
+    c.header('X-Frame-Options', 'DENY')
+    c.header('Referrer-Policy', 'no-referrer')
+    c.header('Content-Disposition', 'inline; filename="image"')
+    c.header('Content-Type', result.contentType)
+    if (!result.noStore && matches(c.req.header('if-none-match'), tag, true)) return c.newResponse(null, 304)
+    c.header('Content-Length', String(result.content.byteLength))
+    return c.newResponse(new Uint8Array(result.content), 200)
   })
   route('get', '/v1/threads', { summary: 'Query threads', query: querySchema, output: 'ThreadPage' }, async (c) => json(c, await inbox.threads(c.get('owner'), query(c, querySchema))))
   route('get', '/v1/threads/:id', { summary: 'Page through a thread', query: pageQuery, output: 'MessagePage' }, async (c) => json(c, await inbox.thread(c.get('owner'), pathId(c), query(c, pageQuery))))

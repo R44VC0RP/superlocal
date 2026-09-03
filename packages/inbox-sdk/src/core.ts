@@ -5,6 +5,7 @@ import { dirname } from 'node:path'
 import { Context, Effect, Either, Fiber, Layer, ManagedRuntime, Schedule } from 'effect'
 import { createCredentialCrypto } from '../server/crypto'
 import { sanitizeEmailBody } from '../server/sanitize'
+import { createMediaStore } from './media'
 import { ProviderError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
 import { CredentialError, InboxError, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
   type DraftInput, type Folder, type Inbox, type InboxOptions, type Label, type Message,
@@ -125,6 +126,9 @@ export function createInbox(options: InboxOptions): Inbox {
     }
     db.query("INSERT OR REPLACE INTO sdk_meta(key,value) VALUES ('connection-pilot-schema','1')").run()
   }).immediate()
+  let media: ReturnType<typeof createMediaStore>
+  try { media = createMediaStore({ database: db, now, options: options.media, injectedFetch: options.fetch !== undefined, log: options.log }) }
+  catch (error) { if (ownsDatabase) db.close(); throw error }
   const instances = new Map<string, Promise<InboxProvider>>()
   const instanceVersions = new Map<string, number>()
   const controllers = new Map<string, AbortController>()
@@ -693,6 +697,21 @@ export function createInbox(options: InboxOptions): Inbox {
     const row = db.query<MessageRow, [string, string]>('SELECT * FROM sdk_messages WHERE owner=? AND id=? AND deleted=0').get(owner, id)
     if (!row) throw new InboxError('NOT_FOUND', 'Message not found.', 404)
     return row
+  }
+
+  function messagePresentation(row: MessageRow, remoteImages: boolean, resource?: string) {
+    const body = JSON.parse(row.body)
+    const bodyText = typeof body.bodyText === 'string' ? body.bodyText : ''
+    // A stable, opaque binding to the owner, source, current original body and exact eligible URL.
+    // No URL registry, provider call, revision, or event is created by reading message JSON.
+    const binding = JSON.stringify(['email-media-v1', epoch, row.owner, row.account, row.id, createHash('sha256').update(row.body).digest('hex')])
+    let source: string | undefined
+    const presentation = sanitizeEmailBody(body.bodyHtml, bodyText, remoteImages, true, body.attachments, url => {
+      const reference = createHmac('sha256', options.encryptionKey).update(binding).update('\0').update(url).digest('base64url')
+      if (resource && timingSafeEqual(Buffer.from(resource), Buffer.from(reference))) source = url
+      return `/v1/messages/${encodeURIComponent(row.id)}/media/${reference}`
+    })
+    return { body, bodyText, presentation, source }
   }
 
   function project(id: string): void {
@@ -1559,11 +1578,22 @@ export function createInbox(options: InboxOptions): Inbox {
       return { items: rows.map(summary), total, state: page.state, nextCursor: page.offset + rows.length < total ? token(owner, sequence(owner), `${page.hash}:${page.offset + rows.length}`) : null }
     }),
     message: (owner, id) => run(() => {
-      const row = messageRow(owner, id); const body = JSON.parse(row.body)
-      const policy = getPolicy(owner)
-      const bodyText = typeof body.bodyText === 'string' ? body.bodyText : ''
-      const presentation = sanitizeEmailBody(body.bodyHtml, bodyText, policy.remoteImages, true, body.attachments)
+      const row = messageRow(owner, id)
+      const { body, bodyText, presentation } = messagePresentation(row, getPolicy(owner).remoteImages)
       return { ...summary(row), bcc: body.bcc, bodyText, ...presentation, attachments: body.attachments, ...(body.replyTo ? { replyTo: body.replyTo } : {}) }
+    }),
+    media: (owner, id, resource) => run(async () => {
+      const row = messageRow(owner, id)
+      const authorize = () => {
+        if (!getPolicy(owner).remoteImages) throw new InboxError('MEDIA_IMAGES_DISABLED', 'Remote images are disabled.', 403)
+        const current = messageRow(owner, id)
+        if (current.account !== row.account || current.body !== row.body) throw new InboxError('NOT_FOUND', 'Image not found.', 404)
+      }
+      authorize()
+      if (!/^[A-Za-z\d_-]{43}$/.test(resource)) throw new InboxError('NOT_FOUND', 'Image not found.', 404)
+      const { source } = messagePresentation(row, true, resource)
+      if (!source) throw new InboxError('NOT_FOUND', 'Image not found.', 404)
+      return media.get(owner, id, resource, source, authorize)
     }),
     threads: (owner, query = {}) => run(() => {
       const condition = where(owner, query); const page = pagination(owner, query, 'threads')
@@ -1832,6 +1862,7 @@ export function createInbox(options: InboxOptions): Inbox {
       if (input.undoSendSeconds !== undefined && (!Number.isInteger(input.undoSendSeconds) || input.undoSendSeconds < 0 || input.undoSendSeconds > 120)) throw new InboxError('VALIDATION', 'Undo send must be between 0 and 120 seconds.')
       const policy = { ...getPolicy(owner), ...input }
       transaction(() => { db.query('INSERT INTO sdk_policy VALUES (?,?) ON CONFLICT(owner) DO UPDATE SET data=excluded.data').run(owner, JSON.stringify(policy)); event(owner, 'policy.updated', null, owner) })
+      if (!policy.remoteImages) media.block(owner)
       return policy
     }),
     changes: (owner, input = {}) => run(() => {
@@ -1892,6 +1923,7 @@ export function createInbox(options: InboxOptions): Inbox {
     close: async () => {
       if (closed || stopping) return
       stopping = true
+      await media.close()
       for (const controller of controllers.values()) controller.abort()
       await Effect.runPromise(Fiber.interruptAll(background))
       await Promise.allSettled([due, polling, ...syncing.values(), ...refreshes.values(), ...credentialUpdates].filter(Boolean))

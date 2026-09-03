@@ -4,9 +4,12 @@ import { Hono } from 'hono'
 import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
+import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib'
+import { SaxesParser } from 'saxes'
 import { createInbox } from '../src/core'
 import { createInboxApi } from '../src/http'
 import { createInboxClient } from '../src/client'
+import { pinnedMediaNetwork } from '../src/media'
 import { CredentialError, InboxError } from '../src/contracts'
 import { createGoogleOAuthHost, type GoogleOAuthConfig, type OAuthAttempt } from '../server/google-oauth'
 import { createGoogleOAuthApi } from '../server/google-oauth-api'
@@ -15,7 +18,7 @@ import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
   Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, Message,
   MessageSummary, Operation, Page, Policy, ProviderDefinition, Query,
-  ThreadSummary,
+  ThreadSummary, MediaNetwork,
 } from '../src/contracts'
 import {
   ProviderAuthenticationError, ProviderCursorExpiredError, ProviderError,
@@ -1363,7 +1366,8 @@ describe('blob privacy and draft editing', () => {
     await h.inbox.setPolicy('alice', { remoteImages: true })
     const allowed = await (await h.request('alice', `/mailboxes/${mailbox.id}/messages/${id}`)).json() as Message
     const allowedImages = allowed.bodyDocument!.html.match(/<img\b[^>]*>/g)!
-    expect(allowedImages[0]).toContain('src="https://assets.example.test/hero.png"')
+    expect(allowedImages[0]).toMatch(new RegExp(`src="/v1/messages/${id}/media/[A-Za-z\\d_-]{43}"`))
+    expect(allowedImages[0]).not.toContain('https://assets.example.test/hero.png')
     expect(allowedImages[1]).toContain('data-inbox-tracking="true"')
     expect(allowedImages[1]).not.toMatch(/\ssrc=/)
     expect(box.calls.mutate).toEqual([])
@@ -1399,9 +1403,9 @@ describe('blob privacy and draft editing', () => {
     expect(blocked.bodyDocument!.html).toContain(`/v1/blobs/${blob.id}`)
     await h.inbox.setPolicy('alice', { remoteImages: true })
     const message = await (await h.request('alice', `/messages/${id}`)).json() as Message
-    expect(message.bodyDocument!.styles).toContain('https://assets.example.test/hero.png')
+    expect(message.bodyDocument!.styles).toContain(`url("/v1/messages/${id}/media/`)
     expect(message.bodyDocument!.styles).toContain('cover')
-    expect(message.bodyDocument!.html).toContain('https://assets.example.test/table.png')
+    expect(message.bodyDocument!.html).toContain(`background="/v1/messages/${id}/media/`)
     expect(message.bodyDocument!.html).toContain(`/v1/blobs/${blob.id}`)
     expect(JSON.stringify(message.bodyDocument)).not.toContain('tracker.example.test')
     expect(JSON.stringify(message.bodyDocument)).not.toContain('javascript:')
@@ -1409,7 +1413,7 @@ describe('blob privacy and draft editing', () => {
     expect(message.isRead).toBe(false)
     const poster = await h.inbox.message('alice', rows.find(row => row.subject === 'Subject background-only')!.id)
     expect(poster.bodyFormat).toBe('html')
-    expect(poster.bodyDocument!.styles).toContain('https://assets.example.test/poster.png')
+    expect(poster.bodyDocument!.styles).toContain(`url("/v1/messages/${poster.id}/media/`)
   })
 
   test('plain email reads preserve exact text and use it when HTML is empty or noncontent', async () => {
@@ -2097,7 +2101,8 @@ describe('policy privacy and replayable changes', () => {
     await h.json<Policy>('alice', '/policy', { remoteImages: true }, 'PATCH')
     const allowed = await h.request('alice', `/messages/${message.id}`)
     const allowedPolicy = allowed.headers.get('content-security-policy') ?? ''
-    expect(allowedPolicy.split(';').find(directive => directive.trim().startsWith('img-src'))).toContain('https:')
+    expect(allowedPolicy.split(';').find(directive => directive.trim().startsWith('img-src'))).toContain("'self' data:")
+    expect(allowedPolicy.split(';').find(directive => directive.trim().startsWith('img-src'))).not.toContain('https:')
     expect((await allowed.json() as Message).bodyHtml).toBe(blockedBody.bodyHtml)
     expect((await h.inbox.message('alice', message.id)).revision).toBe(message.revision)
     expect((await h.inbox.policy('bob')).remoteImages).not.toBe((await h.inbox.policy('alice')).remoteImages)
@@ -4582,5 +4587,757 @@ describe('provider-neutral host credential contract', () => {
     expect(box.calls.create.at(-1)).toMatchObject({ accessToken: `${SECRET}-fresh`, refreshToken: 'host-owned-reference' })
     expect(box.calls.create.at(-1)).not.toHaveProperty('expiresAt')
     expect(await h.inbox.credentialState('alice', connection.id)).toMatchObject({ status: 'connected', version: 2, generation: 1 })
+  })
+})
+
+describe('authenticated message media', () => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRzQAAAAASUVORK5CYII=', 'base64')
+  const source = `https://images.example.test/photo.png?signature=${SECRET}&variant=2`
+  const html = `<img src="${source}" width="200" height="100">`
+  const response = () => new Response(png, { headers: { 'content-type': 'image/png', 'cache-control': 'max-age=3600' } })
+  const network = (request: MediaNetwork['request'] = async () => response()): MediaNetwork => ({ resolve: async () => ['93.184.216.34'], request })
+  const resources = (message: Message) => [...new Set([message.bodyHtml, message.bodyDocument?.html ?? '', message.bodyDocument?.styles ?? '']
+    .flatMap(value => [...value.matchAll(/\/v1\/messages\/[^/\s"<>]+\/media\/[A-Za-z\d_-]{43}/g)].map(match => match[0].slice(3))))]
+
+  test('rewrites image and background output, serves exact controlled bytes lazily, and preserves original mail, links and CIDs', async () => {
+    const urls = [source, 'https://images.example.test/hero.png', 'https://images.example.test/body.png',
+      'https://images.example.test/table.png', 'https://images.example.test/cell.png', 'https://images.example.test/heading.png']
+    const requested: string[] = []
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async target => { requested.push(target.url); return response() }) } })
+    const inline: Attachment = { id: 'inline-native-part', filename: 'inline.png', contentType: 'image/png', size: png.length,
+      url: `https://provider.example.test/private?token=${SECRET}`, inline: true, contentId: 'verified@example.test' }
+    const original = `<html><head><style>
+      .hero { background: #123456 url("${urls[1]}") center / cover no-repeat; }
+      .tiny { width:1px; height:1px; background-image:url("https://images.example.test/hidden.png"); }
+      </style></head><body background="${urls[2]}">
+      <table background="${urls[3]}"><tr><th background="${urls[5]}">Heading</th><td class="hero" background="${urls[4]}">Content</td></tr></table>
+      <div style="background-image:url('${urls[1]}')">Same artwork</div><span class="tiny"></span>
+      <img src="${source}" width="200" height="100" data-openmail-src="https://evil.example.test/alternate.png" data-inbox-tracking="true">
+      <img src="https://images.example.test/pixel" width="1" height="1"><img src="https://awstrack.me/asset.png" width="200">
+      <img src="cid:verified@example.test"><img src="cid:missing-native-mapping"><img src="data:image/png;base64,${png.toString('base64')}">
+      <a href="https://clicked.example.test/page">Clicked link</a></body></html>`
+    const { account, box } = await h.connect('alice', 'media-content', [native('original', { bodyHtml: original, attachments: [inline] })])
+    box.attachment('original', inline, png)
+    await h.sync('alice', account.id)
+    const id = (await h.page()).items[0]!.id
+    const database = new Database(h.database, { readonly: true })
+    try {
+      const before = database.query('SELECT * FROM sdk_messages WHERE id=?').get(id)
+      const events = await h.inbox.changes('alice')
+      const initial = await h.request('alice', `/messages/${id}`)
+      const tag = initial.headers.get('etag')
+      const message = await initial.json() as Message
+      const paths = resources(message)
+      expect(paths).toHaveLength(urls.length)
+      expect(requested).toEqual([])
+      expect(message.bodyHtml).toContain('href="https://clicked.example.test/page"')
+      expect(message.bodyHtml).toContain(`/v1/blobs/${message.attachments[0]!.id}`)
+      expect(message.bodyDocument!.html).toContain('cid:missing-native-mapping')
+      expect(message.bodyDocument!.html).toContain('src="data:image/png;base64,')
+      expect(message.bodyDocument!.styles).toContain('#123456')
+      expect(message.bodyDocument!.styles).not.toContain('hidden.png')
+      expect(message.bodyDocument!.html).not.toContain('evil.example.test')
+      expect(message.bodyDocument!.html).not.toContain('awstrack.me')
+      expect(message.bodyDocument!.html).not.toContain(SECRET)
+      expect(message.bodyHtml).toContain(paths[0])
+      for (const path of paths) {
+        const image = await h.request('alice', path)
+        expect(image.status).toBe(200)
+        expect(image.headers.get('content-type')).toBe('image/png')
+        expect(new Uint8Array(await image.arrayBuffer())).toEqual(new Uint8Array(png))
+      }
+      expect([...requested].sort()).toEqual([...urls].sort())
+      expect((await h.request('alice', `/messages/${id}`, { headers: { 'if-none-match': tag! } })).status).toBe(304)
+      expect(resources(await h.inbox.mailboxMessage('alice', account.id, id))).toEqual(paths)
+      expect(database.query('SELECT * FROM sdk_messages WHERE id=?').get(id)).toEqual(before)
+      expect((await h.inbox.changes('alice', { since: events.state })).events).toEqual([])
+      expect(box.calls.mutate).toEqual([])
+      expect(box.calls.getMessage).toEqual([])
+      expect(box.calls.attachment).toEqual([])
+      expect(JSON.stringify(h.logs)).not.toContain(SECRET)
+      expect(JSON.stringify(h.logs)).not.toContain('https:')
+    } finally { database.close() }
+  })
+
+  test('authorizes opaque references before network, cache and validators, without forwarding caller headers', async () => {
+    const requests: Parameters<MediaNetwork['request']>[0][] = []
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async target => { requests.push(target); return response() }) } })
+    await h.seed('alice', 'media-auth', [native('a', { bodyHtml: html }), native('b', { bodyHtml: html })])
+    await h.seed('bob', 'media-other-owner', [native('c', { bodyHtml: html })])
+    const [a, b] = (await h.page()).items
+    const first = await h.inbox.message('alice', a!.id)
+    const path = resources(first)[0]!
+    const otherPath = resources(await h.inbox.message('alice', b!.id))[0]!
+    expect(path).not.toBe(otherPath)
+    await invalid(await h.request(null, path, { headers: { 'if-none-match': '*' } }), 401)
+    await invalid(await h.request('bob', path), 404)
+    await invalid(await h.request('alice', path.replace(a!.id, b!.id)), 404)
+    await invalid(await h.request('alice', `/messages/${a!.id}/media/${'A'.repeat(43)}`), 404)
+    await invalid(await h.request('alice', `${path}?url=${encodeURIComponent('http://127.0.0.1/private')}`), 400)
+    expect(requests).toHaveLength(0)
+    const good = await h.request('alice', path, { headers: { cookie: `session=${SECRET}`, referer: 'https://app.example.test/private',
+      'x-provider-token': SECRET, 'user-agent': SECRET, range: 'bytes=0-1', 'if-range': SECRET } })
+    expect(good.status).toBe(200)
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ url: source, address: '93.184.216.34', family: 4 })
+    expect(Object.keys(requests[0]!.headers).sort()).toEqual(['Accept', 'Accept-Encoding'])
+    expect(JSON.stringify(requests[0]!.headers)).not.toContain(SECRET)
+    expect(good.headers.get('cache-control')).toBe('private, no-cache, must-revalidate')
+    expect(good.headers.get('content-security-policy')).toContain("sandbox; default-src 'none'")
+    expect(good.headers.get('x-content-type-options')).toBe('nosniff')
+    expect(good.headers.get('cross-origin-resource-policy')).toBe('same-origin')
+    expect(good.headers.get('referrer-policy')).toBe('no-referrer')
+    expect(good.headers.get('set-cookie')).toBeNull()
+    const tag = good.headers.get('etag')!
+    expect((await h.request('alice', path, { headers: { 'if-none-match': tag } })).status).toBe(304)
+    expect((await h.request('alice', path, { method: 'HEAD' })).status).toBe(200)
+    const foreign = await h.request('bob', path, { headers: { 'if-none-match': tag } })
+    await invalid(foreign, 404)
+    expect(foreign.headers.get('etag')).toBeNull()
+    expect(requests).toHaveLength(1)
+    await h.inbox.setPolicy('alice', { remoteImages: false })
+    for (const method of ['GET', 'HEAD']) {
+      const blocked = await h.request('alice', path, { method, headers: { 'if-none-match': tag } })
+      expect(blocked.status).toBe(403)
+      expect(blocked.headers.get('etag')).toBeNull()
+      expect(blocked.headers.get('cache-control')).toBe('no-store')
+    }
+    expect(resources(await h.inbox.message('alice', a!.id))).toEqual([])
+    expect(requests).toHaveLength(1)
+    await h.inbox.setPolicy('alice', { remoteImages: true })
+    expect(resources(await h.inbox.message('alice', a!.id))[0]).toBe(path)
+    expect((await h.request('alice', path)).status).toBe(200)
+    expect(requests).toHaveLength(2)
+  })
+
+  test('an injected legacy fetch without an explicit pinned media network fails closed', async () => {
+    let calls = 0
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, fetch: Object.assign(async () => { calls++; throw new Error(SECRET) }, { preconnect() { calls++ } }) as typeof fetch })
+    await h.seed('alice', 'media-offline', [native('a', { bodyHtml: html })])
+    const message = await h.inbox.message('alice', (await h.page()).items[0]!.id)
+    expect(calls).toBe(0)
+    const result = await h.request('alice', resources(message)[0]!)
+    expect(result.status).toBe(503)
+    expect(await result.json()).toMatchObject({ code: 'MEDIA_NETWORK_DISABLED' })
+    expect(calls).toBe(0)
+  })
+
+  test('browser-normalized HTTP schemes cannot bypass proxying, tracker filtering or disabled image policy', async () => {
+    const requested: string[] = []
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async target => { requested.push(target.url); return response() }) } })
+    await h.seed('alice', 'media-schemes', [
+      native('loose', { bodyHtml: '<img src="https:images.example.test/art.png" width="200">' }),
+      native('tiny', { bodyHtml: '<img src="https:images.example.test/tiny.png" width="1">' }),
+      native('known', { bodyHtml: '<img src="https:awstrack.me/art.png" width="200">' }),
+      native('control', { bodyHtml: '<img src="h&#9;ttps://images.example.test/art.png">' }),
+      native('slashes', { bodyHtml: '<img src="\\\\images.example.test/art.png">' }),
+      native('relative', { bodyHtml: '<img src="//images.example.test/art.png">' }),
+      native('ftp', { bodyHtml: '<img src="ftp://images.example.test/art.png">' }),
+      native('data', { bodyHtml: `<img src="data:image/png;base64,${png.toString('base64').slice(0, 20)}\n${png.toString('base64').slice(20)}">` }),
+    ])
+    const rows = (await h.page()).items
+    for (const row of rows) {
+      const message = await h.inbox.message('alice', row.id)
+      const paths = resources(message)
+      if (row.subject === 'Subject loose') {
+        expect(paths).toHaveLength(1)
+        expect((await h.request('alice', paths[0]!)).status).toBe(200)
+      } else expect(paths).toEqual([])
+      if (row.subject === 'Subject data') expect(message.bodyDocument!.html).toContain('data:image/png;base64,')
+    }
+    expect(requested).toEqual(['https://images.example.test/art.png'])
+    await h.inbox.setPolicy('alice', { remoteImages: false })
+    const blocked = await h.inbox.message('alice', rows.find(row => row.subject === 'Subject loose')!.id)
+    expect(resources(blocked)).toEqual([])
+    expect(blocked.bodyDocument!.html).not.toMatch(/\ssrc=/)
+  })
+
+  test('rejects unsafe URL encodings, ports and credentials before DNS or transport', async () => {
+    let dns = 0, requests = 0
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: {
+      resolve: async () => { dns++; return ['93.184.216.34'] }, request: async () => { requests++; return response() },
+    } } })
+    const bad = ['http://127.1/a.png', 'http://2130706433/a.png', 'http://0x7f000001/a.png', 'http://0177.0.0.1/a.png',
+      'http://0.0.0.0/a.png', 'http://169.254.169.254/a.png', 'http://10.1.2.3/a.png', 'http://172.16.0.1/a.png',
+      'http://192.168.0.1/a.png', 'http://100.64.0.1/a.png', 'http://198.18.0.1/a.png', 'http://224.0.0.1/a.png',
+      'http://[::1]/a.png', 'http://[::ffff:127.0.0.1]/a.png', 'http://[fc00::1]/a.png', 'http://[fe80::1]/a.png',
+      'http://[2002:7f00:1::]/a.png', 'http://[2001:db8::1]/a.png', 'http://[3fff::1]/a.png',
+      'https://images.example.test:444/a.png', `https://user:${SECRET}@images.example.test/a.png`,
+      'https://localhost./a.png', 'https://service.local./a.png', 'https://service.internal/a.png']
+    await h.seed('alice', 'media-unsafe', bad.map((url, i) => native(`u-${i}`, { bodyHtml: `<img src="${url}">` })))
+    for (const row of (await h.page()).items) {
+      const path = resources(await h.inbox.message('alice', row.id))[0]!
+      expect(path).toBeDefined()
+      const result = await h.request('alice', path)
+      expect(result.status).toBe(403)
+      expect(await result.json()).toMatchObject({ code: 'MEDIA_DESTINATION_BLOCKED' })
+    }
+    expect(dns).toBe(0)
+    expect(requests).toBe(0)
+  })
+
+  test('validates every DNS answer and pins the accepted address instead of resolving it again', async () => {
+    const answers: Record<string, string[]> = {
+      'mixed.example.test': ['93.184.216.34', '127.0.0.1'], 'local.example.test': ['169.254.169.254'],
+      'reserved.example.test': ['192.0.2.1'], 'v6-private.example.test': ['::ffff:8.8.8.8'],
+      'valid.example.test': ['2606:4700:4700::1111'],
+    }
+    const requests: Parameters<MediaNetwork['request']>[0][] = []
+    const resolutions: string[] = []
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: {
+      resolve: async host => { resolutions.push(host); return answers[host] ?? [] },
+      request: async target => { requests.push(target); answers['valid.example.test'] = ['127.0.0.1']; return response() },
+    } } })
+    await h.seed('alice', 'media-dns', Object.keys(answers).map(host => native(host, { bodyHtml: `<img src="https://${host}/art.png">` })))
+    for (const row of (await h.page()).items) {
+      const result = await h.request('alice', resources(await h.inbox.message('alice', row.id))[0]!)
+      expect(result.status).toBe(row.subject.includes('valid.example.test') ? 200 : 403)
+    }
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ address: '2606:4700:4700::1111', family: 6, url: 'https://valid.example.test/art.png' })
+    expect(resolutions.filter(host => host === 'valid.example.test')).toHaveLength(1)
+  })
+
+  test('the default transport really connects to its pinned address and retains Host on a controlled socket', async () => {
+    const received: Headers[] = []
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) { received.push(request.headers); return response() } })
+    cleanup.push(async () => { await server.stop(true) })
+    const result = await pinnedMediaNetwork.request({ url: `http://deliberately-unresolvable.invalid:${server.port}/art.png`, address: '127.0.0.1', family: 4,
+      headers: { Accept: 'image/png', 'Accept-Encoding': 'identity' } }, AbortSignal.timeout(1500))
+    expect(result.status).toBe(200)
+    expect(new Uint8Array(await result.arrayBuffer())).toEqual(new Uint8Array(png))
+    expect(received).toHaveLength(1)
+    expect(received[0]!.get('host')).toBe(`deliberately-unresolvable.invalid:${server.port}`)
+    for (const header of ['authorization', 'cookie', 'referer', 'proxy-authorization']) expect(received[0]!.has(header)).toBe(false)
+  })
+
+  test('redirects revalidate DNS and destination, never fetch a private/tracker target, and have a finite hop limit', async () => {
+    const requests: string[] = [], dns: string[] = []
+    let answer = ['93.184.216.34']
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: {
+      resolve: async host => { dns.push(host); return answer },
+      request: async target => {
+        requests.push(target.url)
+        const url = new URL(target.url)
+        if (url.pathname === '/private.png') return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/a.png' } })
+        if (url.pathname === '/tracking.png') return new Response(null, { status: 307, headers: { location: 'https://awstrack.me/a.png' } })
+        if (url.pathname === '/rebind.png') { answer = ['127.0.0.1']; return new Response(null, { status: 302, headers: { location: '/final.png' } }) }
+        if (url.pathname === '/loop.png') return new Response(null, { status: 301, headers: { location: '/loop.png' } })
+        if (url.pathname === '/valid.png') return new Response(null, { status: 308, headers: { location: 'https://other.example.test/final.png' } })
+        return response()
+      },
+    } } })
+    await h.seed('alice', 'media-redirect', ['private', 'tracking', 'rebind', 'loop', 'valid'].map(name => native(name, { bodyHtml: `<img src="https://images.example.test/${name}.png">` })))
+    const rows = (await h.page()).items
+    for (const [name, expected, count] of [['private', 403, 1], ['tracking', 403, 1], ['rebind', 403, 1], ['loop', 502, 4], ['valid', 200, 2]] as const) {
+      answer = ['93.184.216.34']; requests.length = 0; dns.length = 0
+      const row = rows.find(row => row.subject === `Subject ${name}`)!
+      const result = await h.request('alice', resources(await h.inbox.message('alice', row.id))[0]!)
+      expect(result.status).toBe(expected)
+      expect(requests).toHaveLength(count)
+      expect(requests.some(url => /127\.0\.0\.1|awstrack/.test(url))).toBe(false)
+      expect(dns).toHaveLength(name === 'rebind' ? 2 : count)
+    }
+  })
+
+  test('deduplicates misses, bounds concurrent fetches, persists the cache and evicts/refreshes finite entries', async () => {
+    let active = 0, maximum = 0, calls = 0
+    const first = deferred<void>(), entered = deferred<void>()
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { concurrency: 1, cacheEntries: 3, cacheBytes: png.length * 2, cacheTtlMs: 1000,
+      network: network(async () => { calls++; active++; maximum = Math.max(active, maximum); if (calls === 1) { entered.resolve(); await first.promise } active--; return response() }),
+    } })
+    await h.seed('alice', 'media-cache', ['a', 'b', 'c'].map(name => native(name, { bodyHtml: `<img src="https://images.example.test/${name}.png">` })))
+    const paths = await Promise.all((await h.page()).items.map(async row => resources(await h.inbox.message('alice', row.id))[0]!))
+    const a = h.pending(Promise.resolve(h.request('alice', paths[0]!)))
+    await bounded(entered.promise, 'first media fetch')
+    const duplicate = h.pending(Promise.resolve(h.request('alice', paths[0]!))), b = h.pending(Promise.resolve(h.request('alice', paths[1]!)))
+    first.resolve()
+    expect((await a).status).toBe(200); expect((await duplicate).status).toBe(200); expect((await b).status).toBe(200)
+    expect(calls).toBe(2); expect(maximum).toBe(1)
+    h.clock.value++
+    await h.request('alice', paths[0]!)
+    h.clock.value++
+    await h.request('alice', paths[2]!)
+    expect(calls).toBe(3)
+    await h.restart()
+    expect((await h.request('alice', paths[0]!)).status).toBe(200)
+    expect(calls).toBe(3)
+    await h.request('alice', paths[1]!)
+    expect(calls).toBe(4)
+    const database = new Database(h.database, { readonly: true })
+    try { expect(database.query<{ count: number; bytes: number }, []>('SELECT count(*) count,sum(length(content)) bytes FROM sdk_media_cache').get()).toEqual({ count: 2, bytes: png.length * 2 }) }
+    finally { database.close() }
+    h.clock.value += 1001
+    await h.request('alice', paths[1]!)
+    expect(calls).toBe(5)
+  })
+
+  test('entry limits also bound tiny cached resources independently of the byte budget', async () => {
+    let calls = 0
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { cacheEntries: 1, cacheBytes: 4096,
+      network: network(async () => { calls++; return response() }),
+    } })
+    await h.seed('alice', 'media-entry-limit', ['a', 'b'].map(name => native(name, { bodyHtml: `<img src="https://images.example.test/${name}.png">` })))
+    const paths = await Promise.all((await h.page()).items.map(async row => resources(await h.inbox.message('alice', row.id))[0]!))
+    await h.request('alice', paths[0]!); h.clock.value++
+    await h.request('alice', paths[1]!); h.clock.value++
+    await h.request('alice', paths[0]!)
+    expect(calls).toBe(3)
+    const db = new Database(h.database, { readonly: true })
+    try { expect(db.query<{ count: number }, []>('SELECT count(*) count FROM sdk_media_cache').get()!.count).toBe(1) }
+    finally { db.close() }
+  })
+
+  test('a recoverable failure is explicit and negatively cached only briefly; upstream no-store is honored', async () => {
+    let calls = 0, missing = true
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async () => {
+      calls++
+      return missing ? new Response(`<html>${SECRET}</html>`, { status: 404, headers: { 'content-type': 'text/html' } })
+        : new Response(png, { headers: { 'content-type': 'image/png', 'cache-control': 'no-store' } })
+    }) } })
+    await h.seed('alice', 'media-retry', [native('a', { bodyHtml: html })])
+    const path = resources(await h.inbox.message('alice', (await h.page()).items[0]!.id))[0]!
+    const failed = await h.request('alice', path)
+    expect(failed.status).toBe(404)
+    expect(await failed.json()).toMatchObject({ code: 'MEDIA_UPSTREAM_404' })
+    expect(failed.headers.get('etag')).toBeNull()
+    missing = false
+    expect((await h.request('alice', path)).status).toBe(404)
+    expect(calls).toBe(1)
+    h.clock.value += 30_001
+    const fresh = await h.request('alice', path)
+    expect(fresh.status).toBe(200)
+    expect(fresh.headers.get('cache-control')).toBe('no-store')
+    expect(fresh.headers.get('etag')).toBeNull()
+    expect((await h.request('alice', path)).status).toBe(200)
+    expect(calls).toBe(3)
+    expect(JSON.stringify(h.logs)).not.toContain(SECRET)
+    expect(JSON.stringify(h.logs)).not.toContain('https:')
+  })
+
+  test('policy changes and changed original bodies revoke in-flight and cached resources', async () => {
+    const pending = deferred<Response>(), entered = deferred<void>()
+    let slow = true, aborted = false
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async (_target, signal) => {
+      if (!slow) return response()
+      signal.addEventListener('abort', () => { aborted = true }, { once: true })
+      entered.resolve(); return pending.promise
+    }) } })
+    const { account, box } = await h.seed('alice', 'media-revoke', [native('a', { bodyHtml: html })])
+    const id = (await h.page()).items[0]!.id, path = resources(await h.inbox.message('alice', id))[0]!
+    const loading = h.pending(Promise.resolve(h.request('alice', path)))
+    await bounded(entered.promise, 'in-flight media')
+    await h.inbox.setPolicy('alice', { remoteImages: false })
+    expect((await bounded(loading, 'media revocation')).status).toBe(403)
+    expect(aborted).toBe(true)
+    pending.resolve(response()); slow = false
+    await h.inbox.setPolicy('alice', { remoteImages: true })
+    expect((await h.request('alice', path)).status).toBe(200)
+    box.put(native('a', { bodyHtml: `${html}<p>Changed original</p>` }))
+    await h.sync('alice', account.id)
+    expect((await h.request('alice', path, { headers: { 'if-none-match': '*' } })).status).toBe(404)
+    const replacement = resources(await h.inbox.message('alice', id))[0]!
+    expect(replacement).not.toBe(path)
+    expect((await h.request('alice', replacement)).status).toBe(200)
+    expect(box.calls.mutate).toEqual([])
+  })
+
+  test('bounds DNS and response time, cancels stalled work and does not expose transport errors', async () => {
+    for (const stall of ['dns', 'body', 'error'] as const) {
+      let cancelled = false
+      const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { timeoutMs: 40, network: {
+        resolve: async (_host, signal) => {
+          if (stall !== 'dns') return ['93.184.216.34']
+          signal.addEventListener('abort', () => { cancelled = true }, { once: true })
+          return new Promise<string[]>(() => {})
+        },
+        request: async () => {
+          if (stall === 'error') throw new Error(`${source} ${SECRET}`)
+          return new Response(new ReadableStream<Uint8Array>({ cancel() { cancelled = true } }), { headers: { 'content-type': 'image/png' } })
+        },
+      } } })
+      await h.seed('alice', `media-${stall}`, [native('a', { bodyHtml: html })])
+      const result = await bounded(Promise.resolve(h.request('alice', resources(await h.inbox.message('alice', (await h.page()).items[0]!.id))[0]!)), 'bounded media')
+      expect(result.status).toBe(stall === 'error' ? 502 : 504)
+      const body = await result.json()
+      expect(body.code).toBe(stall === 'error' ? 'MEDIA_NETWORK' : 'MEDIA_TIMEOUT')
+      expect(JSON.stringify(body)).not.toContain(SECRET)
+      if (stall !== 'error') expect(cancelled).toBe(true)
+      expect(JSON.stringify(h.logs)).not.toContain(source)
+      expect(JSON.stringify(h.logs)).not.toContain(SECRET)
+    }
+  })
+
+  test('bounds declared, streamed and decompressed bytes and rejects HTML, active SVG, spoofed and oversized raster content', async () => {
+    const huge = Buffer.from(png); huge.writeUInt32BE(0x7fffffff, 16)
+    const cases: Array<{ name: string; make: () => Response; status: number; code: string }> = [
+      { name: 'length', make: () => new Response(png, { headers: { 'content-type': 'image/png', 'content-length': '129' } }), status: 413, code: 'MEDIA_TOO_LARGE' },
+      { name: 'stream', make: () => new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(100)); c.enqueue(new Uint8Array(100)); c.close() } }), { headers: { 'content-type': 'image/png' } }), status: 413, code: 'MEDIA_TOO_LARGE' },
+      { name: 'gzip', make: () => new Response(gzipSync(Buffer.alloc(4096)), { headers: { 'content-type': 'image/png', 'content-encoding': 'gzip' } }), status: 413, code: 'MEDIA_TOO_LARGE' },
+      { name: 'deflate', make: () => new Response(deflateSync(Buffer.alloc(4096)), { headers: { 'content-type': 'image/png', 'content-encoding': 'deflate' } }), status: 413, code: 'MEDIA_TOO_LARGE' },
+      { name: 'brotli', make: () => new Response(brotliCompressSync(Buffer.alloc(4096)), { headers: { 'content-type': 'image/png', 'content-encoding': 'br' } }), status: 413, code: 'MEDIA_TOO_LARGE' },
+      { name: 'html', make: () => new Response('<html>not an image</html>', { headers: { 'content-type': 'text/html' } }), status: 415, code: 'MEDIA_TYPE_UNSUPPORTED' },
+      { name: 'svg', make: () => new Response('<svg xmlns="http://www.w3.org/2000/svg" onload="unsafe()"/>', { headers: { 'content-type': 'image/svg+xml' } }), status: 415, code: 'MEDIA_INVALID_SVG' },
+      { name: 'spoof', make: () => new Response('<html>not a png</html>', { headers: { 'content-type': 'image/png' } }), status: 415, code: 'MEDIA_INVALID_IMAGE' },
+      { name: 'truncated', make: () => new Response(png.subarray(0, 30), { headers: { 'content-type': 'image/png' } }), status: 415, code: 'MEDIA_INVALID_IMAGE' },
+      { name: 'canvas', make: () => new Response(huge, { headers: { 'content-type': 'image/png' } }), status: 415, code: 'MEDIA_INVALID_IMAGE' },
+    ]
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { maxBytes: 128, network: network(async target => cases.find(item => new URL(target.url).pathname === `/${item.name}.png`)!.make()) } })
+    await h.seed('alice', 'media-validation', cases.map(item => native(item.name, { bodyHtml: `<img src="https://images.example.test/${item.name}.png">` })))
+    for (const row of (await h.page()).items) {
+      const expected = cases.find(item => row.subject === `Subject ${item.name}`)!
+      const result = await h.request('alice', resources(await h.inbox.message('alice', row.id))[0]!)
+      expect(result.status).toBe(expected.status)
+      expect(await result.json()).toMatchObject({ code: expected.code })
+      expect(result.headers.get('cache-control')).toBe('no-store')
+      expect(result.headers.get('etag')).toBeNull()
+    }
+  })
+
+  test('accepts bounded PNG/JPEG/GIF/WebP containers and decompresses supported HTTP encodings before validation', async () => {
+    const jpeg = Buffer.from('/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjI4LjEwMgD/2wBDAAgEBAQEBAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABLAAEBAAAAAAAAAAAAAAAAAAAABgEBAAAAAAAAAAAAAAAAAAAABRABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIAAIAAgMBIgACEQADEQD/2gAMAwEAAhEDEQA/AIYA8Ff/2Q==', 'base64')
+    const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64')
+    const webp = Buffer.from('UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA', 'base64')
+    const cases = [
+      { name: 'png', type: 'image/png', data: png, expected: png, encoding: 'identity' },
+      { name: 'jpeg', type: 'image/jpeg', data: jpeg, expected: jpeg, encoding: 'identity' },
+      { name: 'gif', type: 'image/gif', data: gif, expected: gif, encoding: 'identity' },
+      { name: 'webp', type: 'image/webp', data: webp, expected: webp, encoding: 'identity' },
+      { name: 'gzip', type: 'image/png', data: gzipSync(png), expected: png, encoding: 'gzip' },
+      { name: 'deflate', type: 'image/png', data: deflateSync(png), expected: png, encoding: 'deflate' },
+      { name: 'brotli', type: 'image/png', data: brotliCompressSync(png), expected: png, encoding: 'br' },
+    ]
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { maxBytes: 1024, network: network(async target => {
+      const item = cases.find(item => new URL(target.url).pathname === `/${item.name}`)!
+      return new Response(item.data, { headers: { 'content-type': item.type, 'content-encoding': item.encoding } })
+    }) } })
+    await h.seed('alice', 'media-formats', cases.map(item => native(item.name, { bodyHtml: `<img src="https://images.example.test/${item.name}">` })))
+    for (const row of (await h.page()).items) {
+      const item = cases.find(item => row.subject === `Subject ${item.name}`)!
+      const result = await h.request('alice', resources(await h.inbox.message('alice', row.id))[0]!)
+      expect(result.status).toBe(200)
+      expect(result.headers.get('content-type')).toBe(item.type)
+      expect(result.headers.get('content-encoding')).toBeNull()
+      expect(new Uint8Array(await result.arrayBuffer())).toEqual(new Uint8Array(item.expected))
+    }
+  })
+
+  test('SVG preserves static artwork, clipping, gradients, inline styles and internal use under document-safe headers', async () => {
+    const pathData = 'M2 2h100v20H2z'
+    const svg = `<?xml version="1.0" encoding="UTF-8"?>
+      <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="320" height="37" viewBox="0 0 320 37" role="img" aria-label="Example mark" xml:space="preserve" style="enable-background:new 0 0 320 37">
+      <title id="title">Example &amp; mark</title>
+      <style type="text/css"><![CDATA[.ink { fill: url(#shade); stroke:#234567; stroke-width:2; }]]></style>
+      <defs><clipPath id="crop"><path d="M0 0h320v37H0z"/></clipPath>
+      <linearGradient id="shade" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="320" y2="37"><stop offset="0" style="stop-color:#123456;stop-opacity:1"/><stop offset="100%" style="stop-color:#abcdef"/></linearGradient>
+      <symbol id="mark" viewBox="0 0 12 12"><path d="M0 0h12v12H0z" fill="#123456"/></symbol></defs>
+      <g clip-path="url(#crop)"><path class="ink" fill-rule="evenodd" d="${pathData}"/><use xlink:href="#mark" x="105" y="2" width="12" height="12"/></g>
+      <text x="120" y="12" style="font-family:Helvetica Neue;font-size:8px;fill:#123456">SVG</text></svg>`
+    const requested: string[] = []
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async target => {
+      requested.push(target.url)
+      return new Response(svg, { headers: { 'content-type': 'image/svg+xml; charset=utf-8' } })
+    }) } })
+    const { box } = await h.seed('alice', 'svg-artwork', [native('svg', { bodyHtml: '<img src="https://images.example.test/artwork.svg" width="320" height="37">' })])
+    const original = (await h.page()).items[0]!
+    const before = await h.inbox.changes('alice')
+    const path = resources(await h.inbox.message('alice', original.id))[0]!
+    const response = await h.request('alice', path, { headers: { 'sec-fetch-dest': 'document' } })
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-type')).toBe('image/svg+xml')
+    const csp = response.headers.get('content-security-policy')!
+    expect(csp).toContain("sandbox; default-src 'none'; style-src 'unsafe-inline'")
+    expect(csp).toContain("base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+    expect(csp).not.toMatch(/allow-scripts|allow-same-origin|https?:|data:/)
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff')
+    expect(response.headers.get('cross-origin-resource-policy')).toBe('same-origin')
+    expect(response.headers.get('x-frame-options')).toBe('DENY')
+    const output = await response.text()
+    const elements: Array<{ name: string; namespace: string; attributes: Record<string, string> }> = []
+    const parser = new SaxesParser({ xmlns: true })
+    parser.on('opentag', tag => elements.push({ name: tag.local, namespace: tag.uri,
+      attributes: Object.fromEntries(Object.values(tag.attributes).map(attr => [attr.name, attr.value])) }))
+    parser.write(output).close()
+    expect(elements.every(element => element.namespace === 'http://www.w3.org/2000/svg')).toBe(true)
+    expect(elements[0]!.attributes).toMatchObject({ width: '320', height: '37', viewBox: '0 0 320 37', 'aria-label': 'Example mark', 'xml:space': 'preserve' })
+    expect(elements.filter(element => element.name === 'path').map(element => element.attributes.d)).toContain(pathData)
+    expect(elements.find(element => element.name === 'g')!.attributes['clip-path']).toBe('url("#crop")')
+    expect(elements.find(element => element.name === 'use')!.attributes.href).toBe('#mark')
+    expect(elements.filter(element => element.name === 'stop').map(element => element.attributes.style)).toEqual(['stop-color:#123456;stop-opacity:1', 'stop-color:#abcdef'])
+    expect(output).toContain('fill:url("#shade")')
+    expect(output).toContain('Example &amp; mark')
+    expect(output).not.toContain('enable-background')
+    expect(output).not.toContain('https://images.example.test')
+    expect(output).not.toContain('<?xml')
+    const tag = response.headers.get('etag')!
+    const hit = await h.request('alice', path)
+    expect(await hit.text()).toBe(output)
+    expect(hit.headers.get('etag')).toBe(tag)
+    expect((await h.request('alice', path, { headers: { 'if-none-match': tag } })).status).toBe(304)
+    expect(requested).toEqual(['https://images.example.test/artwork.svg'])
+    await invalid(await h.request('bob', path, { headers: { 'if-none-match': tag } }), 404)
+    expect((await h.inbox.message('alice', original.id)).revision).toBe(original.revision)
+    expect((await h.inbox.changes('alice', { since: before.state })).events).toEqual([])
+    expect(box.calls.mutate).toEqual([])
+    await h.inbox.setPolicy('alice', { remoteImages: false })
+    const disabled = await h.request('alice', path, { headers: { 'if-none-match': tag } })
+    expect(disabled.status).toBe(403)
+    expect(disabled.headers.get('etag')).toBeNull()
+    expect(requested).toHaveLength(1)
+  })
+
+  test('font-family rejection remains bounded for hostile HTML and SVG font lists', async () => {
+    const module = new URL('../server/sanitize.ts', import.meta.url).href
+    const code = `import { sanitizeSvgImage, sanitizeEmailBody } from ${JSON.stringify(module)};
+      const bad = "a ,".repeat(680) + "!";
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><text font-family="' + bad + '">x</text></svg>';
+      const sheet = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><style>text{font-family:' + bad + '}</style><text>x</text></svg>';
+      const html = sanitizeEmailBody('<p style="font-family:' + "a ,".repeat(330) + '!">Readable content</p>', 'Readable content', true);
+      const valid = sanitizeSvgImage('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><text font-family="Helvetica Neue, Arial, &quot;Times New Roman&quot;, serif">x</text></svg>');
+      console.log(JSON.stringify({ svg: sanitizeSvgImage(svg) === null, sheet: sanitizeSvgImage(sheet) === null, readable: (html.bodyHtml + html.bodyText).includes('Readable content'), valid: !!valid }));`
+    const child = Bun.spawn([process.execPath, '--no-env-file', '-e', code], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' })
+    const deadline = setTimeout(() => child.kill('SIGKILL'), 3000)
+    try {
+      const [exit, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+      expect(exit).toBe(0)
+      expect(error).toBe('')
+      expect(JSON.parse(output)).toEqual({ svg: true, sheet: true, readable: true, valid: true })
+    } finally { clearTimeout(deadline); if (child.exitCode === null) child.kill('SIGKILL') }
+  })
+
+  test('SVG canonical output survives repeated cache reads at stylesheet and attribute bounds', async () => {
+    const cases = [
+      `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><style>${Array.from({ length: 100 }, (_, i) => `.c${i}{${'fill:#123456;'.repeat(19)}}`).join('')}</style><path class="c0" d="M0 0h10v10z"/></svg>`,
+      `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path style="${'fill:#123456;'.repeat(619)}" d="M0 0h10v10z"/></svg>`,
+      '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><g id="a&#10;b"/><g id="a b"/><polygon points="10,20 30-40 5,5" fill="#123456"/><text>a&#13;b</text><style>.a&#13;>.b{fill:#123456}</style></svg>',
+    ]
+    const requested: string[] = []
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async target => {
+      requested.push(target.url)
+      return new Response(cases[Number(new URL(target.url).pathname.slice(1))], { headers: { 'content-type': 'image/svg+xml' } })
+    }) } })
+    await h.seed('alice', 'svg-stable', cases.map((_svg, i) => native(`stable-${i}`, { bodyHtml: `<img src="https://images.example.test/${i}" width="32" height="32">` })))
+    for (const row of (await h.page()).items) {
+      const path = resources(await h.inbox.message('alice', row.id))[0]!
+      const first = await h.request('alice', path)
+      expect(first.status).toBe(200)
+      const body = await first.text(), tag = first.headers.get('etag')!
+      for (let count = 0; count < 3; count++) {
+        const cached = await h.request('alice', path)
+        expect(cached.status).toBe(200)
+        expect(await cached.text()).toBe(body)
+        expect(cached.headers.get('etag')).toBe(tag)
+      }
+      expect((await h.request('alice', path, { headers: { 'if-none-match': tag } })).status).toBe(304)
+      if (row.subject === 'Subject stable-2') {
+        expect(body).toContain('id="a&#10;b"')
+        expect(body).toContain('points="10,20 30-40 5,5"')
+        expect(body).toContain('a&#13;b')
+      }
+    }
+    expect(requested).toHaveLength(cases.length)
+  })
+
+  test('SVG normalization that exceeds canonical bounds fails before any successful cache entry', async () => {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><defs><linearGradient id="a"><stop offset="0" stop-color="#123456"/></linearGradient></defs><path style="${'fill:url(#a);'.repeat(580)}" d="M0 0h10v10z"/></svg>`
+    let requests = 0
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async () => {
+      requests++; return new Response(svg, { headers: { 'content-type': 'image/svg+xml' } })
+    }) } })
+    await h.seed('alice', 'svg-canonical-bound', [native('over-limit', { bodyHtml: '<img src="https://images.example.test/bound.svg" width="32" height="32">' })])
+    const path = resources(await h.inbox.message('alice', (await h.page()).items[0]!.id))[0]!
+    for (let count = 0; count < 3; count++) {
+      const response = await h.request('alice', path)
+      expect(response.status).toBe(415)
+      expect((await response.json()).code).toBe('MEDIA_INVALID_SVG')
+      expect(response.headers.get('etag')).toBeNull()
+    }
+    expect(requests).toBe(1)
+  })
+
+  test('SVG rejects active XML and every external subresource path without fetching nested resources', async () => {
+    const outer = 'https://images.example.test'
+    const nested = `https://nested.example.test/${SECRET}`
+    const wrap = (inside: string, attributes = '') => `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="32" height="32" ${attributes}>${inside}</svg>`
+    const cases = [
+      wrap('<path d="M0 0h8v8z"/>', `onload="${SECRET}"`),
+      wrap(`<script>${SECRET}</script>`),
+      wrap(`<foreignObject><div xmlns="http://www.w3.org/1999/xhtml">${SECRET}</div></foreignObject>`),
+      wrap(`<animate attributeName="href" values="${nested}"/>`),
+      wrap(`<set attributeName="fill" to="url(${nested})"/>`),
+      wrap(`<a href="${nested}"><path d="M0 0h8v8z"/></a>`),
+      wrap(`<image href="${nested}"/>`),
+      wrap('<image href="data:image/svg+xml;base64,PHN2Zy8+"/>'),
+      wrap(`<use href="${nested}#shape"/>`),
+      wrap('<use xlink:href="javascript&#58;alert(1)"/>'),
+      wrap('<use href="%23shape"/><path id="shape" d="M0 0h8v8z"/>'),
+      wrap(`<linearGradient id="g" href="//nested.example.test/${SECRET}"/>`),
+      wrap(`<path d="M0 0h8v8z" fill="url(${nested})"/>`),
+      wrap(`<style>@import url("${nested}");.ink{fill:red}</style><path class="ink" d="M0 0h8v8z"/>`),
+      wrap(`<style>@font-face{font-family:Brand;src:url("${nested}")}</style><text>Text</text>`),
+      wrap('<style>.ink{fill:u\\72l(https://nested.example.test/image)}</style>'),
+      wrap(`<path style="background-image:url(${nested})" d="M0 0h8v8z"/>`),
+      wrap(`<style>.ink{--image:url(${nested});fill:var(--image)}</style>`),
+      wrap('<filter id="f"><feGaussianBlur stdDeviation="1000"/></filter>'),
+      wrap('<pattern id="p" width="0.000001" height="0.000001"/>'),
+      wrap('<mask id="m"><rect width="100000" height="100000"/></mask>'),
+      wrap('<path d="M0 0h8v8z"/>', `xml:base="${nested}"`),
+      wrap('<path d="M0 0h8v8z"/>', `evil:href="${nested}" xmlns:evil="urn:evil"`),
+      wrap('<style>.ink{constructor:red}</style>'),
+    ]
+    const requested: string[] = []
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async target => {
+      requested.push(target.url)
+      const index = Number(new URL(target.url).pathname.match(/\d+/)![0])
+      return new Response(cases[index]!, { headers: { 'content-type': 'image/svg+xml' } })
+    }) } })
+    await h.seed('alice', 'svg-unsafe', cases.map((_svg, index) => native(`unsafe-${index}`, { bodyHtml: `<img src="${outer}/invalid-${index}.svg">` })))
+    for (const row of (await h.page()).items) {
+      const result = await h.request('alice', resources(await h.inbox.message('alice', row.id))[0]!)
+      expect(result.status).toBe(415)
+      expect(result.headers.get('etag')).toBeNull()
+      expect(result.headers.get('cache-control')).toBe('no-store')
+      const body = await result.json()
+      expect(body.code).toBe('MEDIA_INVALID_SVG')
+      expect(JSON.stringify(body)).not.toContain(SECRET)
+    }
+    expect(requested).toHaveLength(cases.length)
+    expect(requested.every(url => new URL(url).origin === outer)).toBe(true)
+    expect(JSON.stringify(h.logs)).not.toContain(SECRET)
+    expect(JSON.stringify(h.logs)).not.toContain(nested)
+  })
+
+  test('SVG requires well-formed namespace-correct XML and forbids DTDs, entity expansion and processing instructions', async () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M0 0h8v8z"/></svg>'
+    const cases: Array<string | Uint8Array> = [
+      '<html xmlns="http://www.w3.org/1999/xhtml"><svg/></html>',
+      '<svg xmlns="urn:not-svg"/>', '<svg/>',
+      '<svg xmlns="http://www.w3.org/2000/svg"><g></svg>',
+      '<svg xmlns="http://www.w3.org/2000/svg" width="1" width="2"/>',
+      '<svg xmlns="http://www.w3.org/2000/svg"><bad:path/></svg>',
+      '<svg xmlns="http://www.w3.org/2000/svg"><text>&unknown;</text></svg>',
+      svg + svg, svg.slice(0, -6),
+      `<!DOCTYPE svg SYSTEM "https://nested.example.test/${SECRET}">${svg}`,
+      `<!DOCTYPE svg [<!ENTITY x SYSTEM "file:///private/${SECRET}">]><svg xmlns="http://www.w3.org/2000/svg"><text>&x;</text></svg>`,
+      '<!DOCTYPE svg [<!ENTITY a "ha"><!ENTITY b "&a;&a;&a;"><!ENTITY c "&b;&b;&b;">]><svg xmlns="http://www.w3.org/2000/svg"><text>&c;</text></svg>',
+      `<?xml-stylesheet href="https://nested.example.test/${SECRET}" type="text/css"?>${svg}`,
+      `<?xml version="1.1"?>${svg}`, `<?xml version="1.0" encoding="UTF-16"?>${svg}`,
+      new Uint8Array([0xff, 0xfe, 0x3c, 0, 0x73, 0]),
+    ]
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async target => {
+      const index = Number(new URL(target.url).pathname.match(/\d+/)![0])
+      const value = cases[index]!
+      return new Response(typeof value === 'string' ? value : new Uint8Array(value), { headers: { 'content-type': 'image/svg+xml' } })
+    }) } })
+    await h.seed('alice', 'svg-xml', cases.map((_svg, index) => native(`xml-${index}`, { bodyHtml: `<img src="https://images.example.test/xml-${index}.svg">` })))
+    for (const row of (await h.page()).items) {
+      const result = await h.request('alice', resources(await h.inbox.message('alice', row.id))[0]!)
+      expect(result.status).toBe(415)
+      expect(await result.json()).toMatchObject({ code: 'MEDIA_INVALID_SVG' })
+    }
+    expect(JSON.stringify(h.logs)).not.toContain(SECRET)
+  })
+
+  test('SVG escapes CDATA/text during reconstruction and never promotes text or comments into active markup', async () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><!-- <script>ignored</script> -->'
+      + '<title><![CDATA[</title><script>not executable</script>]]></title><path d="M0 0h8v8z" fill="#123456"/></svg>'
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async () => new Response(svg, { headers: { 'content-type': 'image/svg+xml' } })) } })
+    await h.seed('alice', 'svg-text', [native('text', { bodyHtml: '<img src="https://images.example.test/text.svg">' })])
+    const result = await h.request('alice', resources(await h.inbox.message('alice', (await h.page()).items[0]!.id))[0]!)
+    expect(result.status).toBe(200)
+    const output = await result.text()
+    expect(output).not.toContain('<script')
+    expect(output).not.toContain('<!--')
+    expect(output).toContain('&lt;script&gt;not executable&lt;/script&gt;')
+    const names: string[] = [], text: string[] = []
+    const parser = new SaxesParser({ xmlns: true })
+    parser.on('opentag', tag => names.push(tag.local))
+    parser.on('text', value => text.push(value))
+    parser.write(output).close()
+    expect(names).toEqual(['svg', 'title', 'path'])
+    expect(text).toContain('</title><script>not executable</script>')
+  })
+
+  test('SVG preserves non-ASCII exporter IDs as inert escaped metadata without relaxing URI references', async () => {
+    const layerId = '图层_1 & " onload="not code'
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" id="图层_1 &amp; &quot; onload=&quot;not code" viewBox="0 0 1024 867">'
+      + '<style>.paint{fill:url(#shade)}</style><linearGradient id="shade"><stop offset="0" style="stop-color:#123456"/><stop offset="1" style="stop-color:#abcdef"/></linearGradient>'
+      + '<path class="paint" d="M0 0h100v100H0z"/></svg>'
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async () => new Response(svg, { headers: { 'content-type': 'image/svg+xml' } })) } })
+    await h.seed('alice', 'svg-layer-id', [native('layer', { bodyHtml: '<img src="https://images.example.test/layer.svg">' })])
+    const result = await h.request('alice', resources(await h.inbox.message('alice', (await h.page()).items[0]!.id))[0]!)
+    expect(result.status).toBe(200)
+    const nodes: Array<Record<string, string>> = []
+    const parser = new SaxesParser({ xmlns: true })
+    parser.on('opentag', tag => nodes.push(Object.fromEntries(Object.values(tag.attributes).map(attr => [attr.name, attr.value]))))
+    parser.write(await result.text()).close()
+    expect(nodes[0]!.id).toBe(layerId)
+    expect(nodes[0]!.viewBox).toBe('0 0 1024 867')
+    expect(nodes.every(attributes => !Object.hasOwn(attributes, 'onload'))).toBe(true)
+  })
+
+  test('SVG bounds source/decompressed size, dimensions, nesting, styles, geometry and internal reference expansion', async () => {
+    const wrap = (inside: string, attributes = 'width="32" height="32"') => `<svg xmlns="http://www.w3.org/2000/svg" ${attributes}>${inside}</svg>`
+    let expansion = '<defs><g id="g0"><path d="M0 0h8v8z"/></g>'
+    for (let i = 1; i < 15; i++) expansion += `<g id="g${i}"><use href="#g${i - 1}"/><use href="#g${i - 1}"/></g>`
+    expansion += '</defs><use href="#g14"/>'
+    const cases = [
+      wrap('<path d="M0 0h8v8z"/>', 'width="20000" height="1"'),
+      wrap('', 'width="10000" height="10000"'), wrap('', 'width="0" height="1"'),
+      wrap('', 'width="16384" viewBox="0 0 1 10"'), wrap('', 'viewBox="0 0 1e300 10"'),
+      wrap('<g>'.repeat(40) + '<path d="M0 0h8v8z"/>' + '</g>'.repeat(40)),
+      wrap('<path d="M0 0h8v8z"/>'.repeat(1025)),
+      wrap('', Array.from({ length: 33 }, (_, index) => `data-a${index}="x"`).join(' ')),
+      wrap('<style>' + Array.from({ length: 129 }, (_, index) => `.c${index}{fill:#123456}`).join('') + '</style>'),
+      wrap(`<style>/*${'x'.repeat(33 * 1024)}*/</style>`),
+      wrap(`<path d="M0 0${'L1 1'.repeat(17_000)}"/>`),
+      wrap('<path d="M0 0h8v8z" style="stroke-dasharray:0.000001"/>'),
+      wrap('<text style="font-size:10000%">Huge</text>'),
+      wrap('<use id="a" href="#a"/>'), wrap('<use href="#missing"/>'),
+      wrap('<g id="wrong"/><path d="M0 0h8v8z" fill="url(#wrong)"/>'),
+      wrap(expansion),
+    ]
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async target => {
+      const index = Number(new URL(target.url).pathname.match(/\d+/)![0])
+      return new Response(cases[index]!, { headers: { 'content-type': 'image/svg+xml' } })
+    }) } })
+    await h.seed('alice', 'svg-limits', cases.map((_svg, index) => native(`limit-${index}`, { bodyHtml: `<img src="https://images.example.test/limit-${index}.svg">` })))
+    for (const row of (await h.page()).items) {
+      const result = await h.request('alice', resources(await h.inbox.message('alice', row.id))[0]!)
+      expect(result.status).toBe(415)
+      expect(await result.json()).toMatchObject({ code: 'MEDIA_INVALID_SVG' })
+    }
+    for (const compressed of [false, true]) {
+      const huge = wrap(`<!--${'x'.repeat(256 * 1024)}-->`)
+      const large = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async () => new Response(compressed ? gzipSync(huge) : huge,
+        { headers: { 'content-type': 'image/svg+xml', ...(compressed ? { 'content-encoding': 'gzip' } : {}) } })) } })
+      await large.seed('alice', 'svg-byte-limit', [native('bytes', { bodyHtml: '<img src="https://images.example.test/bytes.svg">' })])
+      const result = await large.request('alice', resources(await large.inbox.message('alice', (await large.page()).items[0]!.id))[0]!)
+      expect(result.status).toBe(413)
+      expect(await result.json()).toMatchObject({ code: 'MEDIA_TOO_LARGE' })
+    }
+  })
+
+  test('SVG cache entries are rechecked before validators and unsafe cached XML is evicted, not served', async () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M0 0h8v8z"/></svg>'
+    let requests = 0
+    const h = await fixture({ defaultPolicy: { remoteImages: true }, media: { network: network(async () => { requests++; return new Response(svg, { headers: { 'content-type': 'image/svg+xml' } }) }) } })
+    await h.seed('alice', 'svg-cache', [native('cached', { bodyHtml: '<img src="https://images.example.test/cached.svg">' })])
+    const path = resources(await h.inbox.message('alice', (await h.page()).items[0]!.id))[0]!
+    const initial = await h.request('alice', path)
+    expect(initial.status).toBe(200)
+    const tag = initial.headers.get('etag')!
+    const db = new Database(h.database)
+    try {
+      const unsafe = '<svg xmlns="http://www.w3.org/2000/svg" onload="unsafe()"/>'
+      db.query("UPDATE sdk_media_cache SET content=? WHERE type='image/svg+xml'").run(Buffer.from(unsafe))
+    } finally { db.close() }
+    const invalidated = await h.request('alice', path, { headers: { 'if-none-match': tag } })
+    expect(invalidated.status).toBe(415)
+    expect(invalidated.headers.get('etag')).toBeNull()
+    expect(await invalidated.json()).toMatchObject({ code: 'MEDIA_INVALID_SVG' })
+    expect(requests).toBe(1)
+    expect((await h.request('alice', path)).status).toBe(200)
+    expect(requests).toBe(2)
   })
 })
