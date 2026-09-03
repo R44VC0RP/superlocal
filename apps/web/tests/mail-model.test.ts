@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { accounts, seedMail, defaultPreferences, type Draft, type Mail } from "../src/data.ts";
 import { matchesSearch, splitRuleError } from "../src/mail-search.ts";
 import { selectMailView } from "../src/mail-view.ts";
@@ -25,6 +26,350 @@ const inbox = seedMail().find(
     mail.messages.every((message) => message.email !== mail.account),
 )!;
 const deadline = "2026-10-01T12:00:00.000Z";
+test("SDK-backed optimistic flags retain conditional intent through latency, failures and overlapping views", async () => {
+  // The ordinary web runner is Node; the actual SDK intentionally uses
+  // bun:sqlite. Run this same existing test in an isolated Bun process rather
+  // than replacing SDK operations with mock acknowledgements or adding files.
+  if (!process.versions.bun) {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "SDK-backed optimistic flags", "--timeout", "90000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output);
+    return;
+  }
+  const [{ createMockHost }, { MockInboxProvider }, { ProviderError }, { InboxStore, InboxActionError }, fs, { tmpdir }, { join }, { Database }, { createAttentionFeedbackStore }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("../../mock-api/src/provider.ts"), import("../../../packages/inbox-sdk/server/sdk/types.ts"),
+    import("../src/inbox.ts"), import("node:fs/promises"), import("node:os"), import("node:path"), import("bun:sqlite"), import("../../local-host/src/attention-feedback.ts"),
+  ]);
+  const root = await fs.mkdtemp(join(tmpdir(), "optimistic-flags-"));
+  const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
+  const originalMutate = MockInboxProvider.prototype.mutate;
+  const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 29).toString("base64"), token: "fictional-optimistic-client-token", allowProviderWrites: true });
+  const feedbackDatabase = new Database(":memory:");
+  const feedback = createAttentionFeedbackStore(feedbackDatabase, host.inbox, host.owner);
+  let stop: (() => void) | undefined;
+  let providerFailures = 0, providerCalls = 0;
+  let providerGate: Promise<void> | undefined, providerGateAt: number | undefined, releaseProvider: (() => void) | undefined, providerWork: Promise<void> | undefined;
+  MockInboxProvider.prototype.mutate = async function (id, changes) {
+    providerCalls++;
+    if (providerGate && (providerGateAt === undefined || providerCalls >= providerGateAt)) await providerGate;
+    if (providerFailures > 0) { providerFailures--; throw new ProviderError("superlocal-mock", "UPSTREAM", "The controlled provider rejected this flag.", { retryable: false }); }
+    return originalMutate.call(this, id, changes);
+  };
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  const until = async (check: () => boolean, message: string, timeout = 8000) => {
+    const deadline = Date.now() + timeout;
+    while (!check() && Date.now() < deadline) await sleep(10);
+    assert.ok(check(), message);
+  };
+  let releaseResponse: (() => void) | undefined;
+  let snapshotGate: Promise<void> | undefined, releaseSnapshot: (() => void) | undefined;
+  let gate: Promise<void> | undefined, loseResponses = 0, replayAuthFailures = 0, snapshotFailures = 0, bodyReads = 0, operationReads = 0;
+  const posted: Array<{ input: import("inbox-sdk/types").MutationInput; operation: import("inbox-sdk/types").Operation }> = [];
+  const flagRequests: import("inbox-sdk/types").MutationInput[] = [];
+  const feedbackRequests: Array<{ id: string; targets: import("../src/host.ts").AttentionFeedbackTarget[] }> = [];
+  let loseFeedbackResponses = 0, denyFlagRequests = 0;
+  try {
+    console.info = () => {}; console.warn = () => {};
+    const nativeBoxes = host.store.mailboxes(host.owner);
+    const scopes = nativeBoxes.slice(0, 2).map(box => ({ owner: host.owner, storeId: box.id, accountId: host.store.link(host.owner, box.id)!.accountId }));
+    const source = scopes[0];
+    const native = host.store.receive(source, { from: { name: "Fictional sender", email: "sender@example.test" }, to: nativeBoxes[0].email,
+      subject: "Optimistic client fixture", text: "Fictional unread message.", isRead: false, rfcMessageId: "<same-fixture@example.test>" });
+    host.store.receive(scopes[1], { from: { name: "Fictional sender", email: "sender@example.test" }, to: nativeBoxes[1].email,
+      subject: "Optimistic client fixture", text: "Separate source fixture.", isRead: false, rfcMessageId: "<same-fixture@example.test>" });
+    for (const scope of scopes) await host.inbox.sync(host.owner, scope.accountId, { folder: "all", lane: "latest", limit: 100 });
+    const boxes = await host.inbox.mailboxes(host.owner);
+    const primary = boxes.find(box => box.sourceId === source.accountId)!;
+    const candidate = (await host.inbox.mailboxCandidates(host.owner, primary.connectionId)).find(candidate => candidate.sourceId === source.accountId && candidate.selector.kind === "domain")!;
+    const overlap = await host.inbox.createMailbox(host.owner, { sourceId: source.accountId, name: "Fictional overlap", selector: candidate.selector });
+    const storage = new Map<string, string>();
+    Object.assign(globalThis, {
+      location: new URL("http://localhost:41999"), window: new EventTarget(),
+      document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
+      localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+    });
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+      if (url.pathname === "/host/config") {
+        if (snapshotFailures > 0) { snapshotFailures--; throw new TypeError("Controlled snapshot interruption"); }
+        if (snapshotGate) await snapshotGate;
+        init?.signal?.throwIfAborted();
+        return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], preferenceScope: "fictional-optimistic-client" });
+      }
+      if (url.pathname === "/host/inbox-preferences") return Response.json({ revision: 1, unifiedMode: "all", includedMailboxIds: [], pinnedMailboxIds: [] });
+      if (url.pathname === "/host/split-preferences") return Response.json({ ...normalizeSplits({}), revision: 1 });
+      if (url.pathname === "/host/attention-feedback") {
+        if (init?.method !== "POST") return Response.json(await feedback.list());
+        const input = JSON.parse(String(init.body)); feedbackRequests.push(input);
+        const event = await feedback.record(input);
+        if (loseFeedbackResponses > 0) { loseFeedbackResponses--; throw new TypeError("Controlled lost feedback response"); }
+        return Response.json(event);
+      }
+      if (/^\/host\/attention-feedback\/[^/]+\/undo$/.test(url.pathname)) return Response.json(await feedback.undo(url.pathname.split("/")[3]));
+      if (url.pathname === "/v1/events") return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("Request cancelled", "AbortError"));
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      if (/\/mailboxes\/[^/]+\/messages\/[^/]+$/.test(url.pathname)) bodyReads++;
+      if (/\/operations\/[^/]+$/.test(url.pathname)) operationReads++;
+      const headers = new Headers(init?.headers); headers.set("Authorization", "Bearer fictional-optimistic-client-token");
+      if (url.pathname === "/v1/operations" && init?.method === "POST") {
+        flagRequests.push({ ...JSON.parse(String(init.body)), idempotencyKey: headers.get("Idempotency-Key") });
+        if (denyFlagRequests > 0) { denyFlagRequests--; headers.set("Authorization", "Bearer deliberately-invalid-fictional-token"); }
+        if (!loseResponses && replayAuthFailures > 0) {
+          replayAuthFailures--;
+          return Response.json({ code: "UNAUTHENTICATED", error: "The controlled session needs to reconnect." }, { status: 401 });
+        }
+      }
+      const response = await host.fetch(new Request(url, { ...init, headers }));
+      if (url.pathname === "/v1/operations" && init?.method === "POST" && response.ok) {
+        posted.push({ input: { ...JSON.parse(String(init!.body)), idempotencyKey: headers.get("Idempotency-Key") }, operation: await response.clone().json() });
+        const held = gate; if (held) await held;
+        init?.signal?.throwIfAborted();
+        if (loseResponses > 0) { loseResponses--; throw new TypeError("Controlled lost acknowledgement"); }
+      }
+      return response;
+    }) as typeof fetch;
+    const store = new InboxStore(); stop = store.start();
+    await until(() => store.getSnapshot().loaded, "real SDK snapshot loaded");
+    const view = (boxId = primary.id) => store.getSnapshot().mail.find(mail => mail.account === boxId && mail.sourceId === source.accountId && mail.subject === "Optimistic client fixture")!;
+    const other = () => store.getSnapshot().mail.find(mail => mail.account === UNIFIED_ACCOUNT && mail.sourceId === scopes[1].accountId && mail.subject === "Optimistic client fixture")!;
+    const selected = view(), id = selected.messages[0].id;
+    assert.ok(selected.unread && view(overlap.id).unread && other().unread);
+
+    gate = new Promise(resolve => { releaseResponse = resolve; });
+    const first = store.action([selected], "read"), duplicate = store.action([selected], "read");
+    assert.equal(view().unread, false, "open/back is read synchronously, before any HTTP acknowledgement");
+    assert.equal(view(overlap.id).unread, false, "overlapping receiving view shares the native flag immediately");
+    assert.equal(view(UNIFIED_ACCOUNT).unread, false, "Unified shares the native flag immediately");
+    assert.equal(other().unread, true, "same subject and RFC ID on another source are isolated");
+    await until(() => posted.length === 1, "SDK accepted exactly one coalesced read");
+    assert.equal(bodyReads, 0, "native flags need no body or attachment hydration");
+    const arrival = host.store.receive(source, { from: "sender@example.test", to: nativeBoxes[0].email, subject: "Optimistic client fixture",
+      text: "Fictional later arrival.", isRead: false, threadId: native.threadId });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    await store.refresh();
+    assert.equal(view().messages.find(message => message.id === id)!.isRead, true, "a pre-ack snapshot cannot erase the local intent");
+    assert.ok(view().messages.some(message => message.id !== id && message.isRead === false), "later arrival is not implicitly included");
+    assert.deepEqual(posted[0].input.messageIds, [id]);
+    releaseResponse!(); gate = undefined;
+    await Promise.all([first, duplicate]);
+    const pendingId = posted[0].operation.id;
+    providerGate = new Promise(resolve => { releaseProvider = resolve; });
+    providerWork = host.inbox.runDue();
+    await until(() => providerCalls > 0, "real SDK worker claimed the controlled slow provider command");
+    await sleep(20_250);
+    assert.equal((await host.inbox.operation(host.owner, pendingId)).status, "processing", "real durable SDK operation stayed processing beyond the former deadline");
+    assert.equal(store.getSnapshot().issues.filter(issue => ["action", "thread"].includes(issue.scope)).length, 0, "accepted pending is quiet, not a conversation error or toast");
+    releaseProvider!(); providerGate = undefined; await providerWork; providerWork = undefined;
+    await until(() => !store.getSnapshot().refreshing, "settlement refresh idle");
+    await store.refresh(true);
+    assert.equal(view().messages.find(message => message.id === id)!.isRead, true);
+
+    // All three intentions happen before their predecessor is acknowledged.
+    const beforeRapid = posted.length;
+    const read = store.action([view()], "read");
+    const unread = store.action([view()], "unread");
+    const reread = store.action([view()], "unread");
+    assert.equal(view().unread, false, "latest rapid opposite wins synchronously");
+    await Promise.all([read, unread, reread]);
+    assert.equal(posted.length - beforeRapid, 3, "each intentional toggle has one accepted SDK operation");
+    await host.inbox.runDue(); await host.inbox.runDue(); await host.inbox.runDue();
+    await store.refresh(true);
+    assert.equal(view().unread, false, "SDK projection retains final rapid toggle");
+    assert.equal(bodyReads, 0);
+
+    // Read -> Back -> W freezes the clicked memberships, then waits only for
+    // the read's SDK acknowledgement. Own receipt edges advance its message
+    // preconditions; the provider operation itself remains pending throughout.
+    await store.action([view()], "unread"); await host.inbox.runDue(); await store.refresh(true);
+    gate = new Promise(resolve => { releaseResponse = resolve; });
+    const readBeforeW = store.action([view()], "read");
+    const wSelection = view(UNIFIED_ACCOUNT);
+    const capturedW = wSelection.messages.flatMap(message => message.memberships!.map(membership => ({ sourceId: wSelection.sourceId!, mailboxId: membership.mailboxId,
+      messageId: message.id, messageRevision: message.revision!, revision: membership.revision })));
+    const wRequestCount = feedbackRequests.length, readRequestCount = posted.length;
+    loseFeedbackResponses = 1;
+    const recordW = store.action([wSelection], "not-important");
+    await until(() => posted.length > readRequestCount, "read before W accepted with acknowledgement held");
+    await sleep(20);
+    assert.equal(feedbackRequests.length, wRequestCount, "W does not post stale message revisions before relevant flag acknowledgement");
+    const readReceipt = posted.at(-1)!.operation;
+    releaseResponse!(); gate = undefined; await readBeforeW;
+    const undoW = await recordW;
+    assert.equal((await host.inbox.operation(host.owner, readReceipt.id)).status, "pending", "W does not wait for provider settlement");
+    assert.equal(feedbackRequests.length - wRequestCount, 2, "ambiguous W response replays once");
+    assert.deepEqual(feedbackRequests[wRequestCount], feedbackRequests[wRequestCount + 1], "feedback payload and ID remain frozen after its first POST");
+    assert.deepEqual(feedbackRequests[wRequestCount].targets.map(target => ({ ...target, messageRevision: undefined })), capturedW.map(target => ({ ...target, messageRevision: undefined })), "W preserves exact clicked membership scope and revisions");
+    for (const target of feedbackRequests[wRequestCount].targets) {
+      const edge = readReceipt.mutationRevisions!.find(edge => edge.messageId === target.messageId)!;
+      assert.equal(target.messageRevision, edge.after, "W advances only the accepted read's exact revision edge");
+    }
+    assert.ok(view().messages.every(message => message.memberships!.every(state => state.done)));
+    assert.ok(view(overlap.id).messages.every(message => message.memberships!.every(state => state.done)));
+    await undoW();
+    assert.ok(view().messages.every(message => message.memberships!.every(state => !state.done)));
+    assert.equal((await feedback.list())[0].status, "retracted");
+    await host.inbox.runDue(); await store.refresh(true);
+
+    denyFlagRequests = 1;
+    const rejectedRead = store.action([view()], "unread");
+    const wAfterRejectedFlag = store.action([view(UNIFIED_ACCOUNT)], "not-important");
+    await assert.rejects(rejectedRead, InboxActionError);
+    const undoAfterRejectedFlag = await wAfterRejectedFlag;
+    assert.ok(view().messages.every(message => message.memberships!.every(state => state.done)), "definite flag rejection does not block local W");
+    await undoAfterRejectedFlag();
+
+    // The older read is accepted but its post-ack snapshot is held. A newer
+    // unread rejects on a real unrelated SDK revision; it must reveal that
+    // older still-active intent, not the raw unread snapshot underneath both.
+    await store.action([view()], "unread"); await host.inbox.runDue(); await store.refresh(true);
+    assert.equal(view().unread, true);
+    snapshotGate = new Promise(resolve => { releaseSnapshot = resolve; });
+    await store.action([view()], "read");
+    const newerBase = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [primary.id], limit: 100 })).items.find(row => row.id === id)!;
+    await host.inbox.mutate(host.owner, { messageIds: [id], viaMailboxId: primary.id, changes: { isStarred: true }, ifRevisions: { [id]: newerBase.revision }, idempotencyKey: "external-between-opposites" });
+    const rejectedOpposite = store.action([view()], "unread");
+    assert.equal(view().unread, true, "newer opposite is initially projected");
+    await assert.rejects(rejectedOpposite, InboxActionError);
+    assert.equal(view().unread, false, "newer rejection restores older unreflected read intent");
+    assert.equal(view(overlap.id).unread, false);
+    releaseSnapshot!(); snapshotGate = undefined;
+    await host.inbox.runDue(); await host.inbox.runDue(); await store.refresh(true);
+    assert.equal(view().unread, false);
+
+    const beforeLost = posted.length, beforeLostRequests = flagRequests.length;
+    loseResponses = 1; replayAuthFailures = 1;
+    await store.action([view()], "star");
+    assert.equal(posted.length - beforeLost, 2, "lost acknowledgement was retried");
+    assert.deepEqual(posted[beforeLost].input, posted[beforeLost + 1].input, "lost acknowledgement replays the exact key and payload");
+    assert.equal(posted[beforeLost].operation.id, posted[beforeLost + 1].operation.id, "replay did not create a second SDK job");
+    assert.equal(flagRequests.length - beforeLostRequests, 3, "an interrupted auth replay is not mistaken for rejection of the original write");
+    assert.ok(flagRequests.slice(beforeLostRequests).every(input => JSON.stringify(input) === JSON.stringify(flagRequests[beforeLostRequests])), "even the interrupted auth replay retains the exact request");
+    await host.inbox.runDue(); await store.refresh(true);
+
+    // A definite SDK concurrency rejection must preserve unrelated current
+    // state, rather than silently rebasing over another writer's change.
+    const externalRow = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [primary.id], limit: 100 })).items.find(row => row.id === id)!;
+    await host.inbox.mutate(host.owner, { messageIds: [id], viaMailboxId: primary.id, changes: { isStarred: false }, ifRevisions: { [id]: externalRow.revision }, idempotencyKey: "external-fictional-star" });
+    await assert.rejects(store.action([view()], "unread"), InboxActionError);
+    await store.refresh(true);
+    assert.equal(view().unread, false, "rejected read intent rolls back to latest authoritative flags");
+    assert.equal(view().messages.find(message => message.id === id)!.isStarred, false, "unrelated star change survives read rejection");
+    assert.equal(store.getSnapshot().issues.filter(issue => issue.scope === "action").length, 1);
+    assert.equal(store.getSnapshot().issues.filter(issue => issue.scope === "thread").length, 0);
+    await host.inbox.runDue(); await store.refresh(true);
+
+    // A provider failure from an older star cannot overwrite a newer opposite.
+    if (view().starred) { await store.action([view()], "star"); await host.inbox.runDue(); await store.refresh(true); }
+    await store.action([view()], "star");
+    const off = store.action([view()], "star");
+    assert.equal(view().starred, false);
+    await off;
+    const previousIssueCount = store.getSnapshot().issues.find(issue => issue.scope === "action")?.count ?? 0;
+    providerFailures = 1;
+    await host.inbox.runDue(); await host.inbox.runDue();
+    await until(() => store.getSnapshot().issues.some(issue => issue.scope === "action" && issue.count > previousIssueCount), "terminal provider failure reported once in the action scope");
+    await store.refresh(true);
+    assert.equal(view().starred, false, "older failure cannot restore its stale previous flag");
+    assert.equal(view(overlap.id).starred, false);
+    assert.equal(store.getSnapshot().issues.filter(issue => issue.scope === "thread").length, 0);
+
+    // Partial success keeps the successful message; no blanket compensation.
+    providerFailures = 1;
+    await store.action([view()], "star");
+    const partialId = posted.at(-1)!.operation.id;
+    await host.inbox.runDue();
+    assert.equal((await host.inbox.operation(host.owner, partialId)).status, "partial");
+    await sleep(5200); await store.refresh(true);
+    assert.equal(view().messages.filter(message => message.isStarred).length, 1);
+    assert.equal(view().messages.filter(message => !message.isStarred).length, 1);
+
+    if (view().starred) { await store.action([view()], "star"); await host.inbox.runDue(); await store.refresh(true); }
+    const undoStar = await store.action([view()], "star");
+    await undoStar();
+    assert.equal(view().starred, false, "flag Undo is immediate even before the original provider command executes");
+    await host.inbox.runDue(); await host.inbox.runDue(); await store.refresh(true);
+    assert.equal(view().starred, false);
+    const obsoleteUndo = await store.action([view()], "star");
+    await store.action([view()], "star");
+    await assert.rejects(obsoleteUndo(), /newer change/, "Undo cannot override a newer opposite intent");
+    await host.inbox.runDue(); await host.inbox.runDue(); await store.refresh(true);
+
+    // Accepted local membership changes are not failed writes when rereading
+    // the snapshot is interrupted; Done and Undo retain their real SDK scope.
+    snapshotFailures = 1;
+    const undoDone = await store.action([view(UNIFIED_ACCOUNT)], "done");
+    await store.retry();
+    assert.ok(view().messages.every(message => message.memberships!.every(state => state.done)));
+    assert.ok(view(overlap.id).messages.every(message => message.memberships!.every(state => state.done)));
+    await undoDone();
+    assert.ok(view().messages.every(message => message.memberships!.every(state => !state.done)));
+
+    // Scheduled sends remain genuinely pending and cancellable, not optimistic
+    // flag operations masquerading as delivery; the draft is restored on Undo.
+    const draft = await store.newDraft(primary.id, { mode: "new", to: "recipient@example.test", subject: "Fictional scheduled draft" });
+    const send = await store.submit({ ...draft, body: "<p>Fictional scheduled content</p>" }, new Date(Date.now() + 60_000).toISOString());
+    assert.equal(send.status, "pending");
+    assert.ok(store.getSnapshot().mail.some(mail => mail.operationId === send.id && mail.folder === "Scheduled"));
+    assert.ok(!store.getSnapshot().mail.some(mail => mail.operationId === send.id && mail.folder === "Sent"));
+    await store.undoSend(send.id);
+    assert.ok(store.getSnapshot().drafts.some(saved => saved.id === draft.id));
+
+    // Release a second acknowledgement exactly as the previous operation's
+    // terminal snapshot publishes. The reconciler may be finishing its last
+    // loop; the newly accepted operation must still be polled to its outcome.
+    await store.action([view()], "star");
+    await store.refresh(true); await sleep(120); await store.refresh(true);
+    gate = new Promise(resolve => { releaseResponse = resolve; });
+    const finishingBoundary = store.action([view()], "star");
+    const boundaryPostCount = posted.length;
+    await until(() => posted.length > boundaryPostCount, "second boundary operation accepted with its response held");
+    const boundaryId = posted.at(-1)!.operation.id;
+    let wasRefreshing = false, boundaryReleased = false;
+    const unsubscribe = store.subscribe(() => {
+      const refreshing = store.getSnapshot().refreshing;
+      if (wasRefreshing && !refreshing && !boundaryReleased) { boundaryReleased = true; releaseResponse!(); gate = undefined; }
+      wasRefreshing = refreshing;
+    });
+    providerGateAt = providerCalls + view().messages.length + 1;
+    providerGate = new Promise(resolve => { releaseProvider = resolve; });
+    providerWork = host.inbox.runDue();
+    await until(() => boundaryReleased, "older operation's terminal refresh releases the new acknowledgement");
+    unsubscribe(); await finishingBoundary;
+    const boundaryIssueCount = store.getSnapshot().issues.find(issue => issue.scope === "action")?.count ?? 0;
+    providerFailures = 1; releaseProvider!(); providerGate = undefined; providerGateAt = undefined;
+    await providerWork; providerWork = undefined;
+    assert.equal((await host.inbox.operation(host.owner, boundaryId)).status, "partial");
+    await until(() => store.getSnapshot().issues.some(issue => issue.scope === "action" && issue.count > boundaryIssueCount), "new acceptance during finalization is reconciled, not stranded");
+    await store.refresh(true);
+
+    await store.action([view()], "star");
+    const lastAccepted = posted.at(-1)!.operation.id, writesBeforeStop = posted.length;
+    assert.equal((await host.inbox.operation(host.owner, lastAccepted)).status, "pending");
+    assert.ok(providerCalls > 0 && arrival.id);
+    stop(); stop = undefined;
+    await sleep(20);
+    const readsAfterStop = operationReads;
+    await sleep(600);
+    assert.equal(operationReads, readsAfterStop, "unmount cancels operation pollers and queued requests");
+    assert.equal((await host.inbox.operation(host.owner, lastAccepted)).status, "pending", "unmount does not cancel accepted durable work");
+    stop = store.start(); await store.refresh(true);
+    assert.equal(posted.length, writesBeforeStop, "remount tracks the existing operation without submitting again");
+    await host.inbox.runDue(); await store.refresh(true);
+  } finally {
+    releaseResponse?.(); releaseSnapshot?.(); releaseProvider?.(); stop?.(); await providerWork;
+    MockInboxProvider.prototype.mutate = originalMutate;
+    feedbackDatabase.close(); await host.close(); await fs.rm(root, { recursive: true, force: true });
+    globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+  }
+});
 test("custom filters implement exact sender addresses, OR, parentheses, negation, and stable cached-only matches", () => {
   const john = { ...inbox, from: "John", email: "john@doe.com", subject: "Planning", messages: [] };
   assert.equal(matchesSearch(john, "(from:john@doe.com OR from:jane@doe.com) subject:Planning", false), true);

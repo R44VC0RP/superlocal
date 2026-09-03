@@ -1,7 +1,7 @@
 import { ApiError, createInboxClient, type InboxClient } from "inbox-sdk/client";
 import type {
   Account, BlobInfo, Changes, Draft as SdkDraft, DraftInput, Folder, Label,
-  Mailbox, MailboxMessageSummary, Message as SdkMessage, Operation, Participant, Policy,
+  Mailbox, MailboxMessageSummary, Message as SdkMessage, MutationInput, Operation, Participant, Policy,
 } from "inbox-sdk/types";
 import type { Attachment, Draft, Mail, MailboxOption, Message } from "./data";
 import { escapeHTML, plainText } from "./mail-text";
@@ -18,10 +18,20 @@ import { normalizeSplits, type SplitPreferences } from "../../shared/splits";
 type Edit = { draft: Draft; revision: number; version: number; error?: string };
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
 type Sending = { ref: SendReference; operation: Operation; draft: SdkDraft };
+type Flag = "isRead" | "isStarred";
+type FlagTarget = { sourceId: string; mailboxId: string; messageId: string; revision: number; before: boolean };
+type FlagIntent = { sequence: number; field: Flag; value: boolean; target: FlagTarget; write: FlagWrite; retired?: boolean };
+type FlagWrite = {
+  action: string; field: Flag; value: boolean; targets: FlagTarget[]; intents: FlagIntent[];
+  input?: MutationInput; operation?: Operation; accepted?: number; terminal?: number;
+  promise?: Promise<void>; reported?: boolean;
+};
+/** Already shown by the store; callers must not add a second toast. */
+export class InboxActionError extends Error {}
 /** A coalesced background problem. Repeats of the same key update one issue instead of adding another notice. */
 export type InboxIssue = {
   key: string;
-  scope: "snapshot" | "live" | "thread" | "draft" | "storage";
+  scope: "snapshot" | "live" | "thread" | "action" | "draft" | "storage";
   code: string;
   title: string;
   detail?: string;
@@ -67,6 +77,9 @@ const DISMISSAL_MEMORY_MS = 5 * 60_000;
 /** Change-history polling cadence while the event stream is unavailable. */
 const POLL_MS = 30_000;
 const MAX_BACKOFF_MS = 60_000;
+const nativeKey = (sourceId: string, messageId: string) => `${sourceId}\0${messageId}`;
+const flagKey = (target: FlagTarget, field: Flag) => `${nativeKey(target.sourceId, target.messageId)}\0${field}`;
+const definitive = (error: unknown) => error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
 /** A stream counts as healthy only after staying open this long; ready/close flapping neither refreshes nor recovers. */
 const STREAM_HEALTHY_MS = 5000;
 const recoveryKey = "sdk-draft-recovery";
@@ -143,6 +156,14 @@ export class InboxStore {
   private started = false;
   private refreshPromise?: Promise<void>;
   private actionQueue: Promise<unknown> = Promise.resolve();
+  private flagQueues = new Map<string, Promise<unknown>>();
+  private flagSequence = 0;
+  private flagEpoch = 0;
+  private flagIntents = new Map<string, FlagIntent>();
+  private flagVersions = new Map<string, number>();
+  private flagRevisions = new Map<string, Map<number, number>>();
+  private flagWrites = new Set<FlagWrite>();
+  private flagReconciler?: Promise<void>;
   private draftEpoch = 0;
   private refreshTimer?: ReturnType<typeof setTimeout>;
   private sourceAccounts: Account[] = [];
@@ -198,7 +219,7 @@ export class InboxStore {
     if (action === "connect" || action === "refresh" || action === "retry") {
       this.publish({ loading: false, refreshing: false, error: detail });
       this.raise({ scope: "snapshot", code, title: this.state.loaded ? "Couldn't refresh the inbox" : "Couldn't open the inbox", detail, retry: true });
-    } else if (action === "read") this.raise({ scope: "thread", code, title: "Couldn't load this conversation", detail, retry: true });
+    } else if (action === "load-thread") this.raise({ scope: "thread", code, title: "Couldn't load this conversation", detail, retry: true });
     else if (action === "save-draft") this.raise({ scope: "draft", code, title: "Draft not saved", detail, retry: false });
     // Other actions are user-initiated: their caller shows the failure once, so no persistent notice is added.
   }
@@ -345,6 +366,11 @@ export class InboxStore {
   start = () => {
     this.controller = new AbortController(); this.started = true;
     const generation = ++this.generation;
+    // Strict-mode remounts resume accepted IDs or the same unacknowledged
+    // payload; stopping a view never cancels the durable SDK operation.
+    this.flagQueues.clear(); this.flagReconciler = undefined;
+    for (const write of this.flagWrites) if (!write.operation) void this.queueFlags(write).catch(() => {});
+    this.watchFlags();
     const onFocus = () => { if (this.started && !this.state.loading && generation === this.generation) void this.retry(); };
     window.addEventListener("focus", onFocus);
     void (async () => {
@@ -462,6 +488,7 @@ export class InboxStore {
     if (this.refreshPromise) return force ? this.refreshPromise.then(() => this.refresh()) : this.refreshPromise;
     const generation = this.generation, options = this.requestOptions();
     const draftEpoch = this.draftEpoch;
+    const flagEpoch = this.flagEpoch;
     this.publish({ refreshing: true });
     const work = (async () => {
       const [accounts, boxes, labels, drafts, policy, host, viewPreferences] = await Promise.all([
@@ -552,6 +579,7 @@ export class InboxStore {
       }
       this.operations = operations;
       this.sourceAccounts = accounts; this.boxes = selected; this.labels = labels; this.summaries = summaries; this.sending = sending;
+      this.reconcileFlagSnapshot(flagEpoch);
       if (this.draftEpoch === draftEpoch) this.rawDrafts = new Map(drafts.map(draft => [draft.id, draft]));
       else this.scheduleRefresh();
       for (const raw of drafts) {
@@ -611,7 +639,10 @@ export class InboxStore {
       const labels = this.labels.filter(label => label.accountId === source.id);
       labelNames[box.id] = [...new Set([...labels.map(label => label.name), ...nativeFolders.filter(folder => folder.kind === "label").map(folder => folder.name)])];
       const groups = new Map<string, MailboxMessageSummary[]>();
-      for (const row of this.summaries.get(box.id) ?? []) {
+      for (const summary of this.summaries.get(box.id) ?? []) {
+        // Only the changed native fields are local. Fresh subjects, bodies,
+        // memberships and arrivals continue to come from the SDK snapshot.
+        const row = this.projectFlags(summary);
         // Reuse normalized, body-free SDK facts. Overlapping views contribute
         // memberships, never extra exchanges; different sources stay separate.
         const key = `${source.id}\0${row.id}`, previous = senderHistory.get(key);
@@ -712,7 +743,7 @@ export class InboxStore {
         this.details.set(message.id, detail);
       }
       this.rebuild(); this.resolve("thread");
-    })().catch(error => { this.fail(error, "read"); throw error; }).finally(() => {
+    })().catch(error => { this.fail(error, "load-thread"); throw error; }).finally(() => {
       this.loadingThreads.delete(id);
       if (generation === this.generation && bodyEpoch !== this.bodyEpoch) void this.loadThread(id).catch(() => {});
     });
@@ -847,10 +878,12 @@ export class InboxStore {
   };
 
   private async settled(operation: Operation): Promise<Operation> {
-    const deadline = Date.now() + 20_000;
+    let delay = 200;
     while (["pending", "processing"].includes(operation.status)) {
-      if (Date.now() >= deadline) throw new Error("This action is still pending in the SDK. Its status will update automatically.");
-      await pause(200, this.controller.signal); operation = await this.client.operation(operation.id, this.requestOptions());
+      await pause(delay, this.controller.signal);
+      try { operation = await this.client.operation(operation.id, this.requestOptions()); }
+      catch (error) { if (this.controller.signal.aborted || definitive(error)) throw error; }
+      delay = Math.min(2000, delay * 2);
     }
     if (operation.status !== "succeeded") throw new Error(operation.problem?.message || `The SDK operation ${operation.status}.`);
     return operation;
@@ -862,6 +895,235 @@ export class InboxStore {
     const rows = await Promise.all(ids.map(id => this.client.mailboxMessage(boxId, id, this.requestOptions())));
     const operation = await this.client.mutate({ messageIds: ids, viaMailboxId: boxId, changes, ifRevisions: Object.fromEntries(rows.map(row => [row.id, row.revision])), idempotencyKey: crypto.randomUUID() }, this.requestOptions());
     this.scheduleRefresh(); return this.settled(operation);
+  }
+  private projectFlags(row: MailboxMessageSummary): MailboxMessageSummary {
+    const key = nativeKey(row.sourceId, row.id);
+    const read = this.flagIntents.get(`${key}\0isRead`), star = this.flagIntents.get(`${key}\0isStarred`);
+    return read || star ? { ...row, ...(read ? { isRead: read.value } : {}), ...(star ? { isStarred: star.value } : {}) } : row;
+  }
+  private flagSummary(target: Pick<FlagTarget, "sourceId" | "mailboxId" | "messageId">): MailboxMessageSummary {
+    const row = this.summaries.get(target.mailboxId)?.find(row => row.id === target.messageId && row.sourceId === target.sourceId);
+    if (!row) throw new Error("This message is no longer in the selected mailbox. Refresh before trying again.");
+    return row;
+  }
+  private clearFlagIntents(write: FlagWrite) {
+    for (const intent of write.intents) {
+      intent.retired = true;
+      const key = flagKey(intent.target, intent.field);
+      if (this.flagIntents.get(key) !== intent) continue;
+      // A rejected newer opposite must reveal the previous intent until ITS
+      // acknowledgement has reached a snapshot, not the stale raw flag.
+      const previous = [...this.flagWrites].flatMap(write => write.intents).filter(other => !other.retired && flagKey(other.target, other.field) === key)
+        .sort((a, b) => b.sequence - a.sequence)[0];
+      if (previous) this.flagIntents.set(key, previous); else this.flagIntents.delete(key);
+    }
+  }
+  private flagProblem(write: Pick<FlagWrite, "action" | "value" | "field">, error: unknown): InboxActionError {
+    const verb = write.field === "isStarred" ? (write.value ? "star" : "unstar") : (write.value ? "mark read" : "mark unread");
+    this.raise({ scope: "action", code: failureCode(error), title: `Couldn't ${verb}`, detail: failureMessage(error), retry: true });
+    return new InboxActionError(failureMessage(error));
+  }
+  private reconcileFlagSnapshot(epoch: number) {
+    for (const write of this.flagWrites) {
+      // This read must have STARTED after acceptance/outcome, not just ended
+      // after it. Then the SDK's durable optimistic projection takes over.
+      if (write.accepted !== undefined && epoch >= write.accepted) this.clearFlagIntents(write);
+      if (write.terminal !== undefined && epoch >= write.terminal) this.flagWrites.delete(write);
+    }
+    if (!this.flagWrites.size) this.flagRevisions.clear();
+  }
+  private acceptFlagRevisions(write: FlagWrite, operation: Operation) {
+    if (operation.type !== "mutation" || operation.accountId !== write.targets[0].sourceId) return;
+    for (const edge of operation.mutationRevisions ?? []) {
+      if (!write.targets.some(target => target.messageId === edge.messageId) || edge.after <= edge.before) continue;
+      const key = nativeKey(operation.accountId, edge.messageId);
+      const links = this.flagRevisions.get(key) ?? new Map<number, number>();
+      links.set(edge.before, edge.after); this.flagRevisions.set(key, links);
+    }
+  }
+  private observeFlags(write: FlagWrite, operation: Operation): InboxActionError | undefined {
+    write.operation = operation; this.acceptFlagRevisions(write, operation);
+    if (["pending", "processing"].includes(operation.status) || write.terminal !== undefined) return;
+    write.terminal = ++this.flagEpoch;
+    if (operation.status === "succeeded") return;
+    write.reported = true;
+    return this.flagProblem(write, new Error(operation.problem?.message || (operation.status === "partial"
+      ? "Some messages could not be changed. Successful changes were kept. Refresh and check the selection."
+      : operation.status === "uncertain" ? "The result is unconfirmed. Refresh and check the messages before trying again."
+      : operation.status === "cancelled" ? "The change was cancelled. Check the current message state." : "The change was rejected. Refresh and try again.")));
+  }
+  private flagPreconditions(write: FlagWrite): Record<string, number> {
+    const revisions: Record<string, number> = {};
+    for (const target of write.targets) {
+      let revision = target.revision;
+      const links = this.flagRevisions.get(nativeKey(target.sourceId, target.messageId));
+      while (links?.has(revision)) revision = links.get(revision)!;
+      revisions[target.messageId] = revision;
+    }
+    return revisions;
+  }
+  private async submitFlags(write: FlagWrite, signal: AbortSignal) {
+    signal.throwIfAborted();
+    if (!write.input) {
+      write.input = { messageIds: write.targets.map(target => target.messageId), viaMailboxId: write.targets[0].mailboxId,
+        changes: { [write.field]: write.value }, ifRevisions: this.flagPreconditions(write), idempotencyKey: crypto.randomUUID() };
+    }
+    let attempt = 0, conflicts = 0;
+    for (;;) {
+      try {
+        // Never create a new key or rebase this payload after a lost response.
+        const operation = await this.client.mutate(write.input, { signal });
+        signal.throwIfAborted();
+        write.accepted = ++this.flagEpoch;
+        if (write.reported && this.state.issues.some(issue => issue.scope === "action" && issue.code === "ACKNOWLEDGEMENT_PENDING")) this.resolve("action");
+        const failure = this.observeFlags(write, operation);
+        this.watchFlags(); this.scheduleRefresh();
+        if (failure) throw failure;
+        return;
+      } catch (error) {
+        if (signal.aborted) throw error;
+        if (error instanceof InboxActionError) throw error;
+        if (!attempt && conflicts++ < 3 && error instanceof ApiError && error.code === "PRECONDITION_FAILED") {
+          // An explicit rejection can race our preceding operation's own
+          // settlement. Only its durable revision edges authorize advancing.
+          // Once any response was lost, however, the payload stays frozen.
+          for (const previous of this.flagWrites) if (previous !== write && previous.operation && previous.targets[0].sourceId === write.targets[0].sourceId) {
+            try { this.acceptFlagRevisions(previous, await this.client.operation(previous.operation.id, { signal })); }
+            catch { signal.throwIfAborted(); }
+          }
+          const revisions = this.flagPreconditions(write);
+          if (write.targets.some(target => revisions[target.messageId] !== write.input!.ifRevisions![target.messageId])) {
+            write.input = { ...write.input, ifRevisions: revisions, idempotencyKey: crypto.randomUUID() }; continue;
+          }
+        }
+        // Authentication/authorization failures after a lost response do not
+        // establish whether the ORIGINAL request was accepted. Keep its exact
+        // identity until the SDK can replay it or definitively reject input.
+        if (definitive(error) && (!attempt || error instanceof ApiError && ["PRECONDITION_FAILED", "VALIDATION", "INVALID_INPUT"].includes(error.code))) {
+          this.clearFlagIntents(write); this.flagWrites.delete(write); this.rebuild();
+          throw this.flagProblem(write, error);
+        }
+        // Transport failure is not rejection. The one frozen SDK request is
+        // replayed automatically; generic Retry remains strictly read-only.
+        if (++attempt === 2) {
+          write.reported = true;
+          this.raise({ scope: "action", code: "ACKNOWLEDGEMENT_PENDING", title: "Checking the mail change", detail: "The connection was interrupted. Checking the existing request automatically; do not repeat it.", retry: true });
+        }
+        await pause(Math.max(retryAfter(error), Math.min(30_000, 500 * 2 ** Math.min(attempt - 1, 6))), signal);
+      }
+    }
+  }
+  private queueFlags(write: FlagWrite): Promise<void> {
+    const sourceId = write.targets[0].sourceId, signal = this.controller.signal;
+    const previous = this.flagQueues.get(sourceId) ?? Promise.resolve();
+    const work = previous.catch(() => {}).then(() => this.submitFlags(write, signal));
+    this.flagQueues.set(sourceId, work); write.promise = work;
+    void work.finally(() => { if (this.flagQueues.get(sourceId) === work) this.flagQueues.delete(sourceId); }).catch(() => {});
+    return work;
+  }
+  private watchFlags() {
+    if (this.flagReconciler || this.controller.signal.aborted) return;
+    const signal = this.controller.signal, generation = this.generation;
+    const work = (async () => {
+      let delay = 250;
+      while (!signal.aborted && [...this.flagWrites].some(write => write.operation)) {
+        let refresh = false;
+        for (const write of this.flagWrites) {
+          if (!write.operation) continue;
+          if (write.terminal !== undefined) { refresh = true; continue; }
+          try {
+            const operation = await this.client.operation(write.operation.id, { signal });
+            signal.throwIfAborted();
+            this.observeFlags(write, operation);
+            if (write.terminal !== undefined) refresh = true;
+          } catch (error) {
+            if (signal.aborted) return;
+            // Polling only reads the durable operation. Network loss cannot
+            // roll back a write or cause a second provider job.
+            if (definitive(error) && !write.reported) {
+              write.reported = true;
+              this.raise({ scope: "action", code: failureCode(error), title: "Couldn't check the mail change", detail: "Refresh and check the messages before trying the action again.", retry: true });
+            }
+            if (error instanceof ApiError && error.status === 404) { write.terminal = ++this.flagEpoch; refresh = true; }
+          }
+        }
+        if (refresh && !signal.aborted) await this.refresh(true).catch(error => this.fail(error, "refresh"));
+        if (![...this.flagWrites].some(write => write.operation)) break;
+        await pause(delay, signal); delay = Math.min(5000, delay * 2);
+      }
+    })().catch(error => { if (!signal.aborted) this.fail(error, "refresh"); }).finally(() => {
+      if (this.flagReconciler !== work) return;
+      this.flagReconciler = undefined;
+      // Acceptance can land between the loop's last check and this finalizer.
+      // Do not strand that operation, or resurrect a stopped generation.
+      if (!signal.aborted && generation === this.generation && [...this.flagWrites].some(write => write.operation)) this.watchFlags();
+    });
+    this.flagReconciler = work;
+  }
+  private flagAction(selected: Mail[], action: string): Promise<() => Promise<void>> {
+    const field: Flag = action === "star" ? "isStarred" : "isRead";
+    const value = action === "star" ? selected.some(mail => !mail.starred) : action === "read" || !selected.some(mail => !mail.unread);
+    try {
+      const targets = new Map<string, FlagTarget>();
+      for (const mail of selected) {
+        if (mail.operationId) throw new Error("Cancel the queued send before changing it.");
+        for (const [mailboxId, ids] of this.mailboxTargets(mail)) {
+          const { source } = this.account(mailboxId);
+          if (!this.supports(field === "isStarred" ? "star" : value ? "read" : "unread", mailboxId)) throw new Error(`A selected source does not support ${action}.`);
+          for (const messageId of ids) {
+            const row = this.flagSummary({ sourceId: source.id, mailboxId, messageId });
+            const projected = this.projectFlags(row);
+            targets.set(nativeKey(source.id, messageId), { sourceId: source.id, mailboxId, messageId, revision: row.revision, before: projected[field] });
+          }
+        }
+      }
+      return this.changeFlags([...targets.values()], action, field, value);
+    } catch (error) { return Promise.reject(this.flagProblem({ action, field, value }, error)); }
+  }
+  private changeFlags(targets: FlagTarget[], action: string, field: Flag, value: boolean): Promise<() => Promise<void>> {
+    const writes = new Map<string, FlagWrite>(), batches: FlagWrite[] = [], duplicates = new Set<Promise<void>>();
+    for (const target of targets) {
+      const current = this.flagIntents.get(flagKey(target, field));
+      if (current?.value === value) { if (current.write.promise) duplicates.add(current.write.promise); continue; }
+      if (target.before === value) continue;
+      // SDK mutations have one source and one receiving scope per request.
+      const key = `${target.sourceId}\0${target.mailboxId}`;
+      let write = writes.get(key);
+      if (!write || write.targets.length === 500) {
+        write = { action, field, value, targets: [], intents: [] };
+        batches.push(write); writes.set(key, write);
+      }
+      const intent: FlagIntent = { sequence: ++this.flagSequence, field, value, target, write };
+      write.targets.push(target); write.intents.push(intent);
+      this.flagIntents.set(flagKey(target, field), intent); this.flagVersions.set(flagKey(target, field), intent.sequence);
+    }
+    for (const write of batches) this.flagWrites.add(write);
+    // This publish happens before queueing, before the first await and before
+    // App navigates. All individual and overlapping Unified views rebuild.
+    if (batches.length) this.rebuild();
+    return Promise.allSettled([...batches.map(write => this.queueFlags(write)), ...duplicates]).then(results => {
+      const failed = results.find(result => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+      return async () => {
+        for (const write of batches) for (const intent of write.intents) {
+          if (this.flagVersions.get(flagKey(intent.target, field)) !== intent.sequence) throw new Error("A newer change prevents this undo. Check the current message state.");
+        }
+        // Undo is another conditional flag intent, so it works while the
+        // original provider command is still processing, without blind cancel.
+        const groups = new Map<boolean, FlagTarget[]>();
+        for (const write of batches) for (const intent of write.intents) {
+          const row = this.flagSummary(intent.target), before = this.projectFlags(row)[field];
+          const group = groups.get(intent.target.before) ?? [];
+          // Only this operation's receipt authorizes Undo's baseline. A newer
+          // unrelated snapshot revision must not silently permit overwriting
+          // another writer's edit, even after the local overlay has retired.
+          const revision = Math.max(write.input!.ifRevisions![intent.target.messageId],
+            ...(write.operation?.mutationRevisions ?? []).filter(edge => edge.messageId === intent.target.messageId).map(edge => edge.after));
+          group.push({ ...intent.target, revision, before }); groups.set(intent.target.before, group);
+        }
+        await Promise.all([...groups].map(([restore, selected]) => this.changeFlags(selected, "undo", field, restore)));
+      };
+    });
   }
   private mailboxTargets(mail: Mail, allMemberships = false): Map<string, string[]> {
     const result = new Map<string, string[]>();
@@ -885,8 +1147,13 @@ export class InboxStore {
     this.actionQueue = new Promise<void>(resolve => { release = resolve; });
     this.publish({ pending: this.state.pending + 1 });
     await previous;
-    try { const result = await work(); await this.refresh(true); return result; }
-    catch (error) { await this.refresh().catch(() => {}); this.fail(error, action); throw error; }
+    try {
+      const result = await work();
+      // A failed reread does not turn an accepted write into a failed write.
+      await this.refresh(true).catch(error => this.fail(error, "refresh"));
+      return result;
+    }
+    catch (error) { this.scheduleRefresh(); this.fail(error, action); throw error; }
     finally { release(); this.publish({ pending: Math.max(0, this.state.pending - 1) }); }
   }
   canRecordFeedback = (selected: Mail[]): boolean => !!this.state.host?.preferenceScope && selected.length > 0 && selected.every(mail => !mail.operationId && !!mail.sourceId && mail.messages.some(message => !message.pending && !message.outgoing && message.nativeFolder === "inbox"
@@ -903,10 +1170,33 @@ export class InboxStore {
         captured.set(key, { sourceId: mail.sourceId!, mailboxId: state.mailboxId, messageId: message.id, messageRevision: message.revision, revision: state.revision });
       }
     }
-    // Freeze the clicked IDs and revisions before entering the action queue.
-    const input = { id: crypto.randomUUID(), targets: [...captured.values()] };
+    // Freeze IDs and membership revisions at the W click. Only preceding flag
+    // submissions for these canonical messages may advance message revisions;
+    // a later reply, mailbox change or unrelated writer is never rebased in.
+    const targets = [...captured.values()], id = crypto.randomUUID(), signal = this.controller.signal;
+    const keys = new Set(targets.map(target => nativeKey(target.sourceId, target.messageId)));
+    const flags = [...this.flagWrites].filter(write => write.targets.some(target => keys.has(nativeKey(target.sourceId, target.messageId))));
+    const edges = new Map([...keys].map(key => [key, new Map(this.flagRevisions.get(key))]));
     return this.act("not-important", async () => {
-      const event = await recordAttentionFeedback(input, this.controller.signal);
+      // Rejection of a flag is not rejection of local feedback. Abort still
+      // stops this generation, and an ambiguous flag keeps its frozen request.
+      await Promise.allSettled(flags.flatMap(write => write.promise ? [write.promise] : []));
+      signal.throwIfAborted();
+      for (const write of flags) if (write.operation?.accountId === write.targets[0].sourceId) {
+        for (const edge of write.operation.mutationRevisions ?? []) {
+          const key = nativeKey(write.operation.accountId, edge.messageId);
+          if (write.targets.some(target => target.messageId === edge.messageId) && edge.after > edge.before) edges.get(key)?.set(edge.before, edge.after);
+        }
+      }
+      // This is the first and only payload preparation. The host helper may
+      // replay after a lost response, always with this same ID and payload.
+      const input = { id, targets: targets.map(target => {
+        let messageRevision = target.messageRevision;
+        const links = edges.get(nativeKey(target.sourceId, target.messageId));
+        while (links?.has(messageRevision)) messageRevision = links.get(messageRevision)!;
+        return { ...target, messageRevision };
+      }) };
+      const event = await recordAttentionFeedback(input, signal);
       if (event.status !== "active") throw new Error(event.problem ?? "This feedback action is no longer active.");
       return () => this.undoFeedback(event.id);
     });
@@ -915,7 +1205,7 @@ export class InboxStore {
     const event = await retractAttentionFeedback(id, this.controller.signal);
     if (event.problem) throw new Error(event.problem);
   });
-  action = (selected: Mail[], action: string, value?: string): Promise<() => Promise<void>> => action === "not-important" ? this.notImportant(selected) : this.act(action, async () => {
+  action = (selected: Mail[], action: string, value?: string): Promise<() => Promise<void>> => ["read", "unread", "star"].includes(action) ? this.flagAction(selected, action) : action === "not-important" ? this.notImportant(selected) : this.act(action, async () => {
     // Keep the clicked message/membership scope: a queued action must not absorb
     // a newly arrived reply or a later change to Unified inbox configuration.
     const undo: Array<() => Promise<unknown>> = [];

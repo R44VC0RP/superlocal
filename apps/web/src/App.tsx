@@ -44,7 +44,7 @@ import { resolveMailShortcut } from "./mail-shortcuts";
 import MailCommandDialog, { type CommandItem } from "./MailCommandDialog";
 import IssueReporter from "./IssueReporter";
 import Notices, { Notice } from "./Notices";
-import type { InboxIssue } from "./inbox";
+import { InboxActionError, type InboxIssue } from "./inbox";
 import { captureIssueReport, type IssueReport } from "./issue-reports";
 import SenderContext from "./SenderContext";
 import { senderContact } from "./sender-context";
@@ -526,6 +526,7 @@ export default function App() {
       }));
   }
   function actionError(error: unknown) {
+    if (error instanceof InboxActionError) return;
     setNotice({ text: error instanceof Error ? error.message : "The inbox action failed. Your data has not been replaced with simulated state." });
   }
   // Retry for background problems only rereads: refresh the snapshot, reconnect live updates, reload the open conversation.
