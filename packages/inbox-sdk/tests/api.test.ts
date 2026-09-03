@@ -30,7 +30,7 @@ import type {
 } from '../src/contracts'
 import {
   ProviderAuthenticationError, ProviderCursorExpiredError, ProviderError,
-  ProviderNotFoundError, ProviderRateLimitError, UnsupportedOperationError,
+  ProviderNotFoundError, ProviderRateLimitError, ProviderMutationError, UnsupportedOperationError,
 } from '../server/sdk/types'
 import type { ConnectionSources } from '../server/sdk/mail-sources'
 import type {
@@ -888,6 +888,233 @@ function sse(response: Response) {
     },
   }
 }
+
+describe('mutation revision receipts', () => {
+  test('acceptance and HTTP/client reads expose exact stored revisions without leaking mail or rebasing idempotent replay', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'revision-receipts')
+    const wire = transport(h)
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' } })
+    const message = (await client.messages()).items[0]!
+    const input = { messageIds: [message.id], changes: { isRead: true }, ifRevisions: { [message.id]: message.revision }, idempotencyKey: 'revision-read' }
+    const accepted = await client.mutate(input)
+    const projected = await client.message(message.id)
+    expect(accepted.mutationRevisions).toEqual([{ messageId: message.id, before: message.revision, after: projected.revision }])
+    expect((await client.operation(accepted.id)).mutationRevisions).toEqual(accepted.mutationRevisions)
+    await h.inbox.runDue()
+    const settled = await client.operation(accepted.id)
+    expect(settled.mutationRevisions?.at(-1)?.after).toBe((await client.message(message.id)).revision)
+    const opposite = await client.mutate({ messageIds: [message.id], changes: { isRead: false }, idempotencyKey: 'revision-unread' })
+    await h.inbox.runDue()
+    expect(await client.mutate(input)).toEqual(settled)
+    expect((await client.operation(opposite.id)).status).toBe('succeeded')
+    await invalid(await h.request('bob', `/operations/${accepted.id}`), 404)
+    const encoded = JSON.stringify(settled.mutationRevisions)
+    expect(encoded).not.toContain(SECRET)
+    expect(encoded).not.toContain(BODY_SECRET)
+    expect(encoded).not.toContain('body')
+    const schema = await h.json<any>('alice', '/openapi.json')
+    expect(schema.components.schemas.Operation.properties.mutationRevisions.maxItems).toBe(2000)
+  })
+
+  test('queued opposite intents produce contiguous own edges even when the first native receipt settles later', async () => {
+    const h = await fixture()
+    const { box } = await h.seed('alice', 'revision-opposites')
+    const message = (await h.page()).items[0]!
+    const barrier = h.gate(native('same', { isRead: true }))
+    box.nextMutation('same', barrier.wait)
+    const first = await h.inbox.mutate('alice', { messageIds: [message.id], changes: { isRead: true }, ifRevisions: { [message.id]: message.revision }, idempotencyKey: 'first-read' })
+    const running = h.pending(h.inbox.runDue())
+    await bounded(barrier.entered, 'first native mutation')
+    const second = await h.inbox.mutate('alice', { messageIds: [message.id], changes: { isRead: false }, ifRevisions: { [message.id]: first.mutationRevisions![0]!.after }, idempotencyKey: 'second-unread' })
+    barrier.release()
+    await bounded(running, 'opposite intent settlement')
+    const one = await h.inbox.operation('alice', first.id)
+    const two = await h.inbox.operation('alice', second.id)
+    const edges = [...one.mutationRevisions!, ...two.mutationRevisions!].sort((a, b) => a.before - b.before)
+    expect(edges).toHaveLength(4)
+    let revision = message.revision
+    for (const edge of edges) { expect(edge.before).toBe(revision); expect(edge.after).toBeGreaterThan(edge.before); revision = edge.after }
+    expect((await h.inbox.message('alice', message.id)).revision).toBe(revision)
+    expect((await h.inbox.message('alice', message.id)).isRead).toBe(false)
+  })
+
+  test('an unrelated sync during native I/O leaves a real gap rather than a fabricated revision bridge', async () => {
+    const h = await fixture()
+    const { account, box } = await h.seed('alice', 'revision-gap')
+    const message = (await h.page()).items[0]!
+    const barrier = h.gate(native('same', { isRead: true }))
+    box.nextMutation('same', barrier.wait)
+    const operation = await h.mutate('alice', [message.id], { isRead: true }, 'gap-read')
+    const running = h.pending(h.inbox.runDue())
+    await bounded(barrier.entered, 'native I/O before unrelated change')
+    box.nextSync(receipt([native('same', { isStarred: true })], 'unrelated'))
+    await h.sync('alice', account.id)
+    const unrelatedRevision = (await h.inbox.message('alice', message.id)).revision
+    expect(unrelatedRevision).toBeGreaterThan(operation.mutationRevisions![0]!.after)
+    barrier.release()
+    await bounded(running, 'receipt after unrelated change')
+    const finished = await h.inbox.operation('alice', operation.id)
+    expect(finished.mutationRevisions).toHaveLength(2)
+    expect(finished.mutationRevisions![1]!.before).toBe(unrelatedRevision)
+    expect(finished.mutationRevisions![1]!.before).not.toBe(finished.mutationRevisions![0]!.after)
+    await expect(h.inbox.mutate('alice', { messageIds: [message.id], changes: { isRead: false }, ifRevisions: { [message.id]: operation.mutationRevisions![0]!.after }, idempotencyKey: 'stale-opposite' })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' })
+  })
+
+  for (const partial of [false, true]) test(`${partial ? 'partially confirmed' : 'definitively failed'} settlement records only its actual rollback/projection transition`, async () => {
+    const h = await fixture()
+    const { box } = await h.seed('alice', `revision-failure-${partial}`)
+    const message = (await h.page()).items[0]!
+    box.nextMutation('same', partial ? (_changes, current) => { throw new ProviderMutationError(FULL, { ...current, isRead: true }) } : new ProviderError(FULL, 'AUTHORIZATION', 'Rejected', { status: 403 }))
+    const accepted = await h.mutate('alice', [message.id], { isRead: true }, 'failure-read')
+    await h.inbox.runDue()
+    const finished = await h.inbox.operation('alice', accepted.id)
+    expect(finished.status).toBe(partial ? 'partial' : 'failed')
+    expect(finished.mutationRevisions).toHaveLength(2)
+    expect(finished.mutationRevisions![1]).toEqual({ messageId: message.id, before: accepted.mutationRevisions![0]!.after, after: (await h.inbox.message('alice', message.id)).revision })
+  })
+
+  test('cancel and compensating Undo have persisted acceptance/settlement edges; retries invent no edges', async () => {
+    const h = await fixture()
+    const { box } = await h.seed('alice', 'revision-cancel-undo')
+    const message = (await h.page()).items[0]!
+    const pending = await h.mutate('alice', [message.id], { isRead: true }, 'cancel-read')
+    const cancelled = await h.inbox.cancel('alice', pending.id)
+    expect(cancelled.mutationRevisions).toHaveLength(2)
+    expect(cancelled.mutationRevisions![1]).toEqual({ messageId: message.id, before: pending.mutationRevisions![0]!.after, after: (await h.inbox.message('alice', message.id)).revision })
+    expect(await h.inbox.cancel('alice', pending.id)).toEqual(cancelled)
+    box.nextMutation('same', new ProviderRateLimitError(FULL, 'Wait', { retryAfter: 1 }))
+    const retried = await h.mutate('alice', [message.id], { isRead: true }, 'retry-read')
+    await h.inbox.runDue()
+    expect((await h.inbox.operation('alice', retried.id)).mutationRevisions).toEqual(retried.mutationRevisions)
+    h.clock.value += 2001
+    await h.inbox.runDue()
+    const finished = await h.inbox.operation('alice', retried.id)
+    expect(finished.status).toBe('succeeded')
+    expect(finished.mutationRevisions).toHaveLength(2)
+    const beforeUndo = (await h.inbox.message('alice', message.id)).revision
+    const undo = await h.inbox.undo('alice', finished.id)
+    expect(undo.mutationRevisions).toEqual([{ messageId: message.id, before: beforeUndo, after: (await h.inbox.message('alice', message.id)).revision }])
+    await h.inbox.runDue()
+    const undone = await h.inbox.operation('alice', undo.id)
+    expect(undone.status).toBe('succeeded')
+    expect(undone.mutationRevisions).toHaveLength(2)
+    expect(undone.mutationRevisions![1]!.after).toBe((await h.inbox.message('alice', message.id)).revision)
+    expect((await h.inbox.operation('alice', finished.id)).mutationRevisions).toEqual(finished.mutationRevisions)
+  })
+
+  test('bulk cancellation stays bounded and historical operations remain without invented lineage', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'revision-bulk', Array.from({ length: 500 }, (_, index) => native(`bulk-${index}`)))
+    const messages: MessageSummary[] = []
+    let cursor: string | undefined
+    do {
+      const page = await h.page('alice', { limit: 100, ...(cursor ? { cursor } : {}) })
+      messages.push(...page.items)
+      cursor = page.nextCursor ?? undefined
+    } while (cursor)
+    const accepted = await h.mutate('alice', messages.map(message => message.id), { isRead: true }, 'bulk-receipts')
+    expect(accepted.mutationRevisions).toHaveLength(500)
+    const cancelled = await h.inbox.cancel('alice', accepted.id)
+    expect(cancelled.mutationRevisions).toHaveLength(1000)
+    for (const edge of cancelled.mutationRevisions!) expect(edge.after).toBeGreaterThan(edge.before)
+    const historical = await h.mutate('alice', [messages[0]!.id], { isRead: true }, 'historical-read')
+    const database = new Database(h.database)
+    try { database.query("UPDATE sdk_operations SET data=json_remove(data,'$.mutationRevisions') WHERE id=?").run(historical.id) } finally { database.close() }
+    expect((await h.inbox.cancel('alice', historical.id)).mutationRevisions).toBeUndefined()
+  })
+
+  test('cancelling a partially completed retry appends only actual per-message cleanup edges', async () => {
+    const h = await fixture()
+    const { box } = await h.seed('alice', 'revision-partial-retry', [native('ok'), native('wait')])
+    const messages = (await h.page()).items
+    const ok = messages.find(message => message.subject === 'Subject ok')!
+    const waiting = messages.find(message => message.subject === 'Subject wait')!
+    box.nextMutation('wait', new ProviderRateLimitError(FULL, 'Wait', { retryAfter: 60 }))
+    const accepted = await h.mutate('alice', [ok.id, waiting.id], { isRead: true }, 'partial-retry')
+    await h.inbox.runDue()
+    const pending = await h.inbox.operation('alice', accepted.id)
+    expect(pending.status).toBe('pending')
+    expect(pending.mutationRevisions).toHaveLength(3)
+    const before = new Map(await Promise.all(messages.map(async message => [message.id, (await h.inbox.message('alice', message.id)).revision] as const)))
+    const cancelled = await h.inbox.cancel('alice', accepted.id)
+    expect(cancelled.mutationRevisions).toHaveLength(5)
+    expect(cancelled.mutationRevisions!.slice(0, 3)).toEqual(pending.mutationRevisions!)
+    for (const edge of cancelled.mutationRevisions!.slice(3)) {
+      expect(edge.before).toBe(before.get(edge.messageId)!)
+      expect(edge.after).toBe((await h.inbox.message('alice', edge.messageId)).revision)
+    }
+  })
+
+  test('terminal failure before provider execution records the actual cleanup revision', async () => {
+    const h = await fixture()
+    const { box } = await h.seed('alice', 'revision-terminal')
+    const message = (await h.page()).items[0]!
+    const accepted = await h.mutate('alice', [message.id], { isRead: true }, 'terminal-read')
+    const database = new Database(h.database)
+    try {
+      // Lose the connected account between the durable claim and execution.
+      database.exec("CREATE TRIGGER receipt_claim_failure AFTER UPDATE OF status ON sdk_operations WHEN NEW.status='processing' BEGIN UPDATE sdk_accounts SET status='disconnected' WHERE id=NEW.account; END")
+      await h.inbox.runDue()
+      const finished = await h.inbox.operation('alice', accepted.id)
+      expect(finished.status).toBe('failed')
+      expect(finished.mutationRevisions).toHaveLength(2)
+      expect(finished.mutationRevisions![1]).toEqual({ messageId: message.id, before: accepted.mutationRevisions![0]!.after, after: (await h.inbox.message('alice', message.id)).revision })
+      expect(box.calls.mutate).toHaveLength(0)
+    } finally { database.close() }
+  })
+
+  for (const stage of ['successful-result', 'failed-result', 'successful-result-recovery-failure', 'delete-result', 'delete-result-recovery-failure']) test(`SQL rollback of a staged ${stage} does not persist phantom results or revision edges`, async () => {
+    const h = await fixture()
+    const { box } = await h.seed('alice', `revision-rollback-${stage}`)
+    const message = (await h.page()).items[0]!
+    const returned = stage !== 'failed-result'
+    const deleting = stage.startsWith('delete-')
+    const recoveryFails = stage.endsWith('recovery-failure')
+    if (!returned) box.nextMutation('same', new ProviderError(FULL, 'AUTHORIZATION', 'Rejected', { status: 403 }))
+    const input = { messageIds: [message.id], changes: deleting ? { deletePermanently: true } : { isRead: true }, idempotencyKey: `rollback-${stage}` }
+    const accepted = await h.inbox.mutate('alice', input)
+    const database = new Database(h.database)
+    try {
+      if (returned) {
+        // Fail after persist, result insertion, projection and receipt staging,
+        // but before the result transaction commits its payload revision.
+        database.exec("CREATE TRIGGER receipt_payload_failure BEFORE UPDATE OF payload ON sdk_operations WHEN json_extract(NEW.payload,'$.afterRevisions') IS NOT NULL BEGIN SELECT RAISE(ABORT,'Synthetic receipt payload failure'); END")
+      }
+      if (!returned || recoveryFails) {
+        // Fail the per-message failure transaction after its result and edge
+        // were staged; the outer terminal handler must reload persisted state.
+        database.exec("CREATE TRIGGER receipt_failure_event BEFORE INSERT ON sdk_events WHEN json_extract(NEW.data,'$.type')='mail.changed' AND EXISTS(SELECT 1 FROM sdk_operations WHERE status='processing' AND json_extract(data,'$.results[0].status')='failed') BEGIN SELECT RAISE(ABORT,'Synthetic receipt event failure'); END")
+      }
+      await h.inbox.runDue()
+      const finished = await h.inbox.operation('alice', accepted.id)
+      const stored = database.query<{ revision: number; deleted: number; confirmedRead: number }, [string]>("SELECT revision,deleted,json_extract(confirmed,'$.isRead') confirmedRead FROM sdk_messages WHERE id=?").get(message.id)!
+      expect(finished.status).toBe(returned ? 'partial' : 'failed')
+      if (returned) expect(finished.problem).toMatchObject({ code: 'PARTIAL_MUTATION', retryable: false })
+      expect(finished.results.map(result => result.status)).toEqual(returned && !recoveryFails ? ['failed'] : [])
+      expect(finished.mutationRevisions).toEqual(recoveryFails ? accepted.mutationRevisions! : [
+        ...accepted.mutationRevisions!,
+        { messageId: message.id, before: accepted.mutationRevisions![0]!.after, after: stored.revision },
+      ])
+      expect(stored.revision).toBe(accepted.mutationRevisions![0]!.after + (recoveryFails ? 0 : returned && !deleting ? 2 : 1))
+      if (deleting && !recoveryFails) {
+        expect(stored.deleted).toBe(1)
+        await expect(h.inbox.message('alice', message.id)).rejects.toMatchObject({ status: 404 })
+      } else {
+        expect(stored.deleted).toBe(0)
+        expect(stored.confirmedRead).toBe(returned && !recoveryFails ? 1 : 0)
+        // Failed recovery leaves the old projection unconfirmed, not a fabricated
+        // canonical rollback or receipt transition. The partial result says so.
+        expect((await h.inbox.message('alice', message.id)).isRead).toBe(returned && !deleting)
+      }
+      h.clock.value += 60000
+      await h.inbox.runDue()
+      expect(box.calls.mutate).toHaveLength(1)
+      expect(await h.inbox.mutate('alice', input)).toEqual(finished)
+      if (returned) await expect(h.inbox.undo('alice', finished.id)).rejects.toMatchObject({ code: 'CANNOT_UNDO' })
+    } finally { database.close() }
+  })
+})
 
 describe('mail HTTP ownership and provider lifecycle', () => {
   test('authentication is the host seam; query, body, and unrelated headers cannot choose the owner', async () => {

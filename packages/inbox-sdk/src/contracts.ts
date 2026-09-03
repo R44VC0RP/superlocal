@@ -359,6 +359,8 @@ export interface Operation {
   attempts: number
   problem: Problem | null
   results: Array<{ messageId: string; status: 'succeeded' | 'failed'; problem?: Problem }>
+  /** Stored, operation-owned revision transitions; unrelated changes remain gaps. At most 2,000 edges. */
+  mutationRevisions?: Array<{ messageId: string; before: number; after: number }>
 }
 
 export interface ChangeEvent {

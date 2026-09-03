@@ -186,6 +186,7 @@ const schemas = {
     status: z.enum(['pending', 'processing', 'succeeded', 'partial', 'failed', 'cancelled', 'uncertain']),
     createdAt: z.string(), sendAt: z.string().nullable(), attempts: revision, problem: problem.nullable(),
     results: z.array(z.object({ messageId: id, status: z.enum(['succeeded', 'failed']), problem: problem.optional() })),
+    mutationRevisions: z.array(z.object({ messageId: id, before: revision, after: revision }).refine(edge => edge.after > edge.before)).max(2000).optional(),
   }),
   Reschedule: z.strictObject({ sendAt: date }),
   Policy: policy,

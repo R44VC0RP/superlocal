@@ -956,10 +956,32 @@ export function createInbox(options: InboxOptions): Inbox {
   }
 
   function accept(owner: string, account: AccountRow, type: Operation['type'], key: string, intent: unknown, payload: unknown, at: number): Operation {
-    const op: Operation = { id: randomUUID(), accountId: account.id, type, status: 'pending', createdAt: new Date(now()).toISOString(), sendAt: type === 'send' ? new Date(at).toISOString() : null, attempts: 0, problem: null, results: [] }
+    const op: Operation = { id: randomUUID(), accountId: account.id, type, status: 'pending', createdAt: new Date(now()).toISOString(), sendAt: type === 'send' ? new Date(at).toISOString() : null, attempts: 0, problem: null, results: [], ...(type === 'mutation' ? { mutationRevisions: [] } : {}) }
     db.query('INSERT INTO sdk_operations(id,owner,account,generation,status,type,data,payload,fingerprint,key,next_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(op.id, owner, account.id, account.generation, op.status, type, JSON.stringify(op), JSON.stringify(payload), fingerprint(intent), key, at)
     event(owner, 'operation.updated', account.id, op.id, 'created')
     return op
+  }
+
+  function mutationRevision(op: Operation, id: string): number | undefined {
+    return db.query<{ revision: number }, [string, string]>('SELECT revision FROM sdk_messages WHERE id=? AND account=?').get(id, op.accountId)?.revision
+  }
+
+  function recordMutationRevision(op: Operation, id: string, before: number | undefined): void {
+    const after = mutationRevision(op, id)
+    // Historical operations have no acceptance lineage. Never reconstruct it
+    // from today's row, nor bridge a change preceding this transaction.
+    if (!op.mutationRevisions || before === undefined || after === undefined || after <= before) return
+    // Accepted/settled/cancelled paths need at most three edges per selected
+    // message. At the defensive bound, a missing edge fails closed for rebasing.
+    if (op.mutationRevisions.length >= 2000) return
+    op.mutationRevisions.push({ messageId: id, before, after })
+    db.query('UPDATE sdk_operations SET data=? WHERE id=?').run(JSON.stringify(op), op.id)
+  }
+
+  function projectMutation(op: Operation, id: string): void {
+    const before = mutationRevision(op, id)
+    project(id)
+    recordMutationRevision(op, id, before)
   }
 
   function restoreDraft(row: OperationRow): void {
@@ -979,13 +1001,15 @@ export function createInbox(options: InboxOptions): Inbox {
   }
 
   async function executeOperation(row: OperationRow): Promise<void> {
-    const op = JSON.parse(row.data) as Operation
+    let op = JSON.parse(row.data) as Operation
     const heartbeat = setInterval(() => {
       try { db.query("UPDATE sdk_operations SET lease_until=? WHERE id=? AND lease=? AND status='processing'").run(now() + leaseMs, row.id, row.lease) }
       catch { /* Recovery handles a lost database connection. */ }
     }, Math.max(25, Math.floor(leaseMs / 3)))
     heartbeat.unref?.()
     let dispatched = false
+    let returnedMutation: { messageId: string; result: MailMessage | null | undefined; deleted: boolean } | undefined
+    const persistenceProblem: Problem = { code: 'PARTIAL_MUTATION', message: 'The provider confirmed the change, but its local receipt could not be fully saved. Refresh and reconcile before trying again; automatic retry and undo are unavailable.', retryable: false }
     try {
       const account = accountRow(row.owner, row.account, true)
       if (account.generation !== row.generation) throw new InboxError('RECONNECT_REQUIRED', 'Account generation changed.', 409)
@@ -1062,8 +1086,10 @@ export function createInbox(options: InboxOptions): Inbox {
           if (Object.keys(native).length && stored.native_id.startsWith('submission:')) throw new InboxError('RECONCILIATION_PENDING', 'Wait for the provider to identify its sent copy before modifying this message.', 409)
           if (Object.keys(native).length && options.allowProviderWrites === false) throw new InboxError('PROVIDER_WRITES_DISABLED', 'Provider writes are disabled for this deployment.', 403)
           const result = Object.keys(native).length ? await io(account, provider => provider.mutate(stored.native_id, native)) : undefined
+          if (Object.keys(native).length) returnedMutation = { messageId: id, result, deleted: native.deletePermanently === true && result === null }
           transaction(() => {
             if (!ownsLease(row) || !current(account)) return
+            const beforeRevision = mutationRevision(op, id)
             if (result === null && !change.deletePermanently) throw new InboxError('INVALID_PROVIDER', 'Provider did not return the modified message.', 502)
             if (change.deletePermanently && result === null) {
               db.query('UPDATE sdk_messages SET deleted=1,revision=revision+1 WHERE id=?').run(id)
@@ -1082,25 +1108,35 @@ export function createInbox(options: InboxOptions): Inbox {
             project(id)
             payload.afterRevisions ??= {}
             payload.afterRevisions[id] = db.query<{ revision: number }, [string]>('SELECT revision FROM sdk_messages WHERE id=?').get(id)!.revision
+            recordMutationRevision(op, id, beforeRevision)
             db.query('UPDATE sdk_operations SET payload=? WHERE id=?').run(JSON.stringify(payload), op.id)
             event(row.owner, 'mail.changed', row.account, id, change.deletePermanently ? 'deleted' : 'updated')
           })
+          returnedMutation = undefined
         } catch (error) {
+          // Discard every staged result/status/edge if its transaction rolled back.
+          op = JSON.parse(operationRow(row.owner, row.id).data) as Operation
           const issue = failure(error)
-          if (issue.retryable && op.attempts < 5) throw error
+          if (!returnedMutation && issue.retryable && op.attempts < 5) throw error
           transaction(() => {
             if (!ownsLease(row)) return
-            if (error instanceof ProviderMutationError) {
+            const beforeRevision = mutationRevision(op, id)
+            if (returnedMutation) {
+              // Retry only local persistence, never the already-confirmed native call.
+              if (returnedMutation.deleted) db.query('UPDATE sdk_messages SET deleted=1,revision=revision+1 WHERE id=? AND owner=?').run(id, row.owner)
+              else if (returnedMutation.result) persist(account, returnedMutation.result, 'mutation', id)
+            } else if (error instanceof ProviderMutationError) {
               if (error.confirmedMessage) persist(account, error.confirmedMessage, 'mutation', id)
               else if (error.sourceRetired) db.query('UPDATE sdk_messages SET deleted=2,revision=revision+1 WHERE id=? AND owner=?').run(id, row.owner)
             }
-            const problem: Problem = error instanceof ProviderMutationError
+            const problem: Problem = returnedMutation ? persistenceProblem : error instanceof ProviderMutationError
               ? { code: 'PARTIAL_MUTATION', message: 'Some mailbox changes may have succeeded. Synchronize before retrying; automatic undo is unavailable.', retryable: false }
               : { code: issue.code, message: issue.message, retryable: false }
             op.results.push({ messageId: id, status: 'failed', problem }); op.problem = problem
             db.query('UPDATE sdk_operations SET data=? WHERE id=?').run(JSON.stringify(op), op.id)
-            project(id); event(row.owner, 'mail.changed', row.account, id)
+            project(id); recordMutationRevision(op, id, beforeRevision); event(row.owner, 'mail.changed', row.account, id, returnedMutation?.deleted ? 'deleted' : 'updated')
           })
+          returnedMutation = undefined
         }
       }
       transaction(() => {
@@ -1110,19 +1146,25 @@ export function createInbox(options: InboxOptions): Inbox {
         saveOperation(row, op)
       })
     } catch (error) {
+      op = JSON.parse(operationRow(row.owner, row.id).data) as Operation
       const issue = failure(error)
       const definitelyRejected = ['AUTHENTICATION','AUTHORIZATION','VALIDATION','NOT_FOUND','UNSUPPORTED_OPERATION','RATE_LIMITED','CREDENTIALS_UNAVAILABLE','CREDENTIALS_REVOKED'].includes(issue.code)
       transaction(() => {
         if (!ownsLease(row)) return
         const unknownSend = row.type === 'send' && dispatched && !definitelyRejected
-        const retry = !unknownSend && issue.retryable && op.attempts < 5
-        op.status = unknownSend ? 'uncertain' : retry ? 'pending' : 'failed'
-        op.problem = unknownSend
+        const retry = !returnedMutation && !unknownSend && issue.retryable && op.attempts < 5
+        op.status = returnedMutation ? 'partial' : unknownSend ? 'uncertain' : retry ? 'pending' : 'failed'
+        op.problem = returnedMutation ? persistenceProblem : unknownSend
           ? { code: 'SEND_UNCERTAIN', message: 'Provider acceptance is unknown. Do not resend without reconciliation.', retryable: false }
           : { code: issue.code, message: issue.message, retryable: retry }
         const retryAfter = (error instanceof ProviderError || error instanceof CredentialError) && Number.isFinite(error.retryAfter) ? Math.max(0, error.retryAfter!) * 1000 : 0
         saveOperation(row, op, retry ? now() + Math.max(retryAfter, Math.min(300_000, 1000 * 2 ** op.attempts)) : row.next_at)
-        if (row.type === 'mutation' && !retry) for (const id of (JSON.parse(row.payload) as MutationPayload).input.messageIds) { project(id); event(row.owner, 'mail.changed', row.account, id) }
+        if (row.type === 'mutation' && !retry) for (const id of (JSON.parse(row.payload) as MutationPayload).input.messageIds) {
+          // If receipt recovery also failed, keep the cached projection explicitly
+          // unconfirmed. Do not invent a rollback or edge for the known native change.
+          if (id === returnedMutation?.messageId) continue
+          projectMutation(op, id); event(row.owner, 'mail.changed', row.account, id)
+        }
         if (row.type === 'send' && op.status === 'failed') restoreDraft(row)
       })
       options.log?.({ code: issue.code, operation: row.type })
@@ -1484,7 +1526,7 @@ export function createInbox(options: InboxOptions): Inbox {
           const op = JSON.parse(job.data) as Operation
           op.status = job.status === 'processing' && job.type === 'send' ? 'uncertain' : 'cancelled'
           saveOperation(job, op)
-          if (job.type === 'mutation') for (const mid of (JSON.parse(job.payload) as MutationPayload).input.messageIds) project(mid)
+          if (job.type === 'mutation') for (const mid of (JSON.parse(job.payload) as MutationPayload).input.messageIds) projectMutation(op, mid)
           else if (op.status === 'cancelled') restoreDraft(job)
         }
         const remaining = db.query<{ count: number }, [string, string]>(`SELECT COUNT(*) count FROM sdk_source_connections s JOIN sdk_accounts a ON a.id=s.source AND a.owner=s.owner
@@ -1584,7 +1626,7 @@ export function createInbox(options: InboxOptions): Inbox {
             if (operation.status === 'uncertain') operation.problem = { code: 'SEND_UNCERTAIN', message: 'The mailbox was detached during dispatch. Reconcile before retrying.', retryable: false }
             saveOperation(job, operation)
             if (job.type === 'send' && operation.status === 'cancelled') restoreDraft(job)
-            if (job.type === 'mutation') for (const messageId of (JSON.parse(job.payload) as MutationPayload).input.messageIds) project(messageId)
+            if (job.type === 'mutation') for (const messageId of (JSON.parse(job.payload) as MutationPayload).input.messageIds) projectMutation(operation, messageId)
           }
         }
         event(owner, 'mailbox.updated', row.source, id, mailbox.status === 'detached' ? 'deleted' : 'updated', 'mutation', id)
@@ -1918,7 +1960,7 @@ export function createInbox(options: InboxOptions): Inbox {
         const repeated = replay(owner, input.idempotencyKey, intent); if (repeated) return repeated
         if (input.ifRevisions) for (const id of input.messageIds) if (messageRow(owner, id).revision !== input.ifRevisions[id]) throw new InboxError('PRECONDITION_FAILED', 'The selection changed.', 412)
         const op = accept(owner, account, 'mutation', input.idempotencyKey, intent, { input: { ...input, changes }, before } satisfies MutationPayload, now())
-        for (const row of rows) { project(row.id); event(owner, 'mail.changed', account.id, row.id) }
+        for (const row of rows) { projectMutation(op, row.id); event(owner, 'mail.changed', account.id, row.id) }
         return op
       })
     }),
@@ -1928,7 +1970,7 @@ export function createInbox(options: InboxOptions): Inbox {
       if (op.status === 'cancelled') return op
       if (op.status !== 'pending') throw new InboxError('CANNOT_CANCEL', 'The operation has already started.', 409)
       op.status = 'cancelled'; saveOperation(row, op)
-      if (row.type === 'mutation') for (const mid of (JSON.parse(row.payload) as MutationPayload).input.messageIds) { project(mid); event(owner, 'mail.changed', row.account, mid) }
+      if (row.type === 'mutation') for (const mid of (JSON.parse(row.payload) as MutationPayload).input.messageIds) { projectMutation(op, mid); event(owner, 'mail.changed', row.account, mid) }
       else {
         const draft = draftRow(owner, (JSON.parse(row.payload) as SendPayload).draft.id)
         draft.status = 'active'; db.query('UPDATE sdk_drafts SET data=? WHERE id=? AND owner=?').run(JSON.stringify(draft), draft.id, owner); event(owner, 'draft.updated', row.account, draft.id)
@@ -1977,7 +2019,7 @@ export function createInbox(options: InboxOptions): Inbox {
         for (const mid of payload.input.messageIds) if (messageRow(owner, mid).revision !== payload.afterRevisions?.[mid]) throw new InboxError('CONFLICT', 'A newer edit prevents this undo.', 409)
         const result = accept(owner, accountRow(owner, row.account, true), 'mutation', key, intent,
           { input: { messageIds: payload.input.messageIds, changes: {}, idempotencyKey: key }, before, perMessageChanges: reversed } satisfies MutationPayload, now())
-        for (const mid of payload.input.messageIds) { project(mid); event(owner, 'mail.changed', row.account, mid) }
+        for (const mid of payload.input.messageIds) { projectMutation(result, mid); event(owner, 'mail.changed', row.account, mid) }
         return result
       })
     }),
