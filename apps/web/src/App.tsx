@@ -1,5 +1,6 @@
 import {
   useDeferredValue,
+  useCallback,
   useEffect,
   useEffectEvent,
   useLayoutEffect,
@@ -37,7 +38,7 @@ import "./inbox.css";
 import FolderNavigation from "./FolderNavigation";
 import MailRows from "./MailRows";
 import RecentOpens from "./RecentOpens";
-import { selectMailView } from "./mail-view";
+import { selectMailView, mailWindow } from "./mail-view";
 import { UNIFIED_ACCOUNT } from "./mail-model";
 import { plainText } from "./mail-text";
 import { resolveMailShortcut } from "./mail-shortcuts";
@@ -48,7 +49,7 @@ import { InboxActionError, type InboxIssue } from "./inbox";
 import { measureAction } from "./browser-logs";
 import { captureIssueReport, type IssueReport } from "./issue-reports";
 import SenderContext from "./SenderContext";
-import { senderContact } from "./sender-context";
+import { senderContact, senderConversations } from "./sender-context";
 import { normalizeSplits, attentionSplit, type SplitPreferences } from "../../shared/splits";
 
 type Route = {
@@ -215,7 +216,9 @@ export default function App() {
     [mail, route.account],
   );
   const searchKey = `${route.account}\0${resultQuery}`;
-  const searchVersion = accountMail.map(mail => `${mail.id}:${mail.folder}:${mail.unread}:${mail.starred}:${mail.labels.join(",")}:${mail.reminder ?? ""}:${mail.messages.map(message => message.revision).join(",")}`).join("|");
+  const searchVersion = useMemo(() => search && searchSubmitted
+    ? accountMail.map(mail => `${mail.id}:${mail.folder}:${mail.unread}:${mail.starred}:${mail.labels.join(",")}:${mail.reminder ?? ""}:${mail.messages.map(message => message.revision).join(",")}`).join("|")
+    : "", [accountMail, search, searchSubmitted]);
   const serverMatches = useMemo(() => searchSubmitted ? searchResult?.key === searchKey ? searchResult.ids : new Set<string>() : undefined, [searchSubmitted, searchResult, searchKey]);
   useEffect(() => {
     if (!search || !searchSubmitted || !route.account || !resultQuery.trim()) return;
@@ -286,7 +289,8 @@ export default function App() {
     [drafts, route.account, isUnified, unifiedMailboxIds],
   );
   const isDrafts = route.folder === "Drafts" && !search;
-  const currentMail = accountMail.find((m) => m.id === route.thread);
+  const currentMail = useMemo(() => route.thread ? accountMail.find((m) => m.id === route.thread) : undefined, [accountMail, route.thread]);
+  const getSenderConversations = useCallback((keys: readonly string[]) => senderConversations(accountMail, keys), [accountMail]);
   const contextContact = useMemo(() => currentMail && !currentMail.operationId
     ? senderContact(currentMail, inbox.senderHistory, inbox.accounts, senderSelection?.threadId === currentMail.id ? senderSelection.messageId : undefined)
     : null, [currentMail, inbox.senderHistory, inbox.accounts, senderSelection]);
@@ -307,7 +311,12 @@ export default function App() {
       `${preferences.density}:${displayedRows.map((item) => item.id).join("|")}`,
     [preferences.density, displayedRows],
   );
-  const targetIds =
+  const getMailWindow = useCallback((top: number, height: number, windowed: boolean) => {
+    const range = windowed ? mailWindow(entries, top, height, rowHeight) : { start: 0, end: entries.length };
+    return { ...range, entries: entries.slice(range.start, range.end) };
+  }, [entries, rowHeight]);
+  const getHighlightedMail = useCallback((index: number) => entries.find(entry => !entry.group && entry.index === index), [entries]);
+  const targetIds = useMemo(() =>
     commandMode && commandMode !== "accounts" && overlayIds
       ? overlayIds
       : selected.length
@@ -316,8 +325,11 @@ export default function App() {
           ? [currentMail.id]
           : visibleMail[highlight]
             ? [visibleMail[highlight].id]
-            : [];
-  const targets = mail.filter((m) => targetIds.includes(m.id));
+            : [], [commandMode, overlayIds, selected, currentMail, visibleMail, highlight]);
+  const targets = useMemo(() => {
+    const ids = new Set(targetIds);
+    return ids.size ? mail.filter((message) => ids.has(message.id)) : [];
+  }, [mail, targetIds]);
   const dark =
     !["Light", "light"].includes(preferences.theme) &&
     (!["System", "Match System"].includes(preferences.theme) || systemDark);
@@ -367,7 +379,7 @@ export default function App() {
   useEffect(() => {
     if (!currentMail || currentMail.operationId) return;
     void store.loadThread(currentMail.id).catch(() => {});
-  }, [store, currentMail?.id, currentMail?.messages.map(message => `${message.id}:${message.revision}`).join(","), inbox.policy?.remoteImages]);
+  }, [store, currentMail?.id, currentMail?.messages.map(message => `${message.id}:${message.bodyRevision ?? message.revision}:${!!message.loaded}`).join(","), inbox.policy?.remoteImages]);
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     document.documentElement.dataset.style =
@@ -846,7 +858,8 @@ export default function App() {
     if (action === "not-important" && inbox.pending) { timing.finish("ignored"); return; }
     const previousRoute = route;
     const previousHighlight = highlight;
-    const before = mail.filter((m) => ids.includes(m.id));
+    const selectedIds = new Set(ids);
+    const before = mail.filter((m) => selectedIds.has(m.id));
     if (
       action === "done" &&
       before.every((m) => ["Done", "Trash"].includes(m.folder))
@@ -1875,7 +1888,8 @@ export default function App() {
                 ))
               ) : (
                 <MailRows
-                  entries={entries}
+                  getWindow={getMailWindow}
+                  getHighlighted={getHighlightedMail}
                   totalHeight={totalHeight}
                   rowHeight={rowHeight}
                   virtualized={virtualized}
@@ -2000,7 +2014,7 @@ export default function App() {
               contact={contextContact}
               history={inbox.senderHistory}
               mailboxIds={contextMailboxIds}
-              mail={accountMail}
+              getConversations={getSenderConversations}
               currentThreadId={currentMail.id}
               remoteImages={inbox.policy?.remoteImages === true}
               showLogos={preferences.showAvatars !== false}

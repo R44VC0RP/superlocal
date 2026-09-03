@@ -92,7 +92,7 @@ export function measureAction(action: string, conversations = 0) {
 }
 
 export function measureRequest(path: string, method: string) {
-  const route: PerformanceSample["route"] = path === "/v1/mailbox-messages" ? "mailbox-page"
+  const route: PerformanceSample["route"] = ["/v1/mailbox-messages", "/v1/mailbox-snapshot", "/v1/mailbox-changes"].includes(path) ? "mailbox-page"
     : path.includes("/mailbox-actions") || path.endsWith("/state") ? "mailbox-action"
     : path.startsWith("/host/attention-feedback") ? "feedback"
     : path.startsWith("/v1/operations") ? "operation"
@@ -104,7 +104,7 @@ export function measureRequest(path: string, method: string) {
   const start = performance.now();
   return (status: number) => {
     // Refresh summaries retain page/network totals; don't log every fast GET.
-    if (method !== "GET" || status >= 400 || performance.now() - start >= 100) finish({ status, outcome: status && status < 400 ? "ok" : "error" });
+    if (method !== "GET" && route !== "mailbox-page" || status >= 400 || performance.now() - start >= 100) finish({ status, outcome: status && status < 400 ? "ok" : "error" });
   };
 }
 

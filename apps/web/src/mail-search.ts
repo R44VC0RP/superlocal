@@ -55,15 +55,16 @@ export function splitRuleError(query: string): string | null {
     validate(expression); return null;
   } catch (error) { return error instanceof Error ? error.message : "Invalid filter."; }
 }
-export function matchesSearch(m: Mail, query: string, includeBodies = true) {
+export function compileSearch(query: string, includeBodies = true): (mail: Mail) => boolean {
   let expression: SearchExpression | null;
-  try { expression = parseSearch(query); } catch { return false; }
-  function matchesTerm(raw: string): boolean {
+  try { expression = parseSearch(query); } catch { return () => false; }
+  function compileTerm(raw: string): (mail: Mail) => boolean {
     const negative = raw.startsWith("-");
     const term = negative ? raw.slice(1) : raw;
-    const match = () => {
-      const [key, ...rest] = term.split(":");
-      const value = rest.join(":").replaceAll('"', "").toLowerCase();
+    const [key, ...rest] = term.split(":");
+    const value = rest.join(":").replaceAll('"', "").toLowerCase();
+    const text = term.replaceAll('"', "").toLowerCase();
+    const match = (m: Mail) => {
       if (rest.length) {
         if (key === "from") {
           const emails = [m.email, ...m.messages.map(message => message.email)].map(email => email.trim().toLowerCase());
@@ -124,14 +125,22 @@ export function matchesSearch(m: Mail, query: string, includeBodies = true) {
       }
       return `${m.from} ${m.email} ${m.to} ${m.subject} ${m.snippet} ${includeBodies ? m.messages.map((msg) => plainText(msg.body)).join(" ") : ""}`
         .toLowerCase()
-        .includes(term.replaceAll('"', "").toLowerCase());
+        .includes(text);
     };
-    return negative ? !match() : match();
+    return negative ? (mail) => !match(mail) : match;
   }
-  function evaluate(node: SearchExpression): boolean {
-    if ("term" in node) return matchesTerm(node.term);
-    if ("not" in node) return !evaluate(node.not);
-    return node.op === "and" ? evaluate(node.left) && evaluate(node.right) : evaluate(node.left) || evaluate(node.right);
+  function compile(node: SearchExpression): (mail: Mail) => boolean {
+    if ("term" in node) return compileTerm(node.term);
+    if ("not" in node) {
+      const matches = compile(node.not);
+      return (mail) => !matches(mail);
+    }
+    const left = compile(node.left), right = compile(node.right);
+    return node.op === "and" ? (mail) => left(mail) && right(mail) : (mail) => left(mail) || right(mail);
   }
-  return expression ? evaluate(expression) : true;
+  return expression ? compile(expression) : () => true;
+}
+
+export function matchesSearch(m: Mail, query: string, includeBodies = true) {
+  return compileSearch(query, includeBodies)(m);
 }

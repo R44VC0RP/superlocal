@@ -1,6 +1,6 @@
 import type { Mail, Preferences } from "./data.ts";
 import { inFolder } from "./mail-model.ts";
-import { matchesSearch } from "./mail-search.ts";
+import { compileSearch } from "./mail-search.ts";
 import { conversationAttention } from "../../shared/mail-attention.ts";
 import { attentionSplit } from "../../shared/splits.ts";
 
@@ -25,44 +25,51 @@ export function selectMailView(
   serverMatches?: ReadonlySet<string>,
   mobile = false,
 ) {
-  const inbox = accountMail.filter((message) => inFolder(message, "Inbox"));
   const rules = preferences.splitRules as Record<string, string> | undefined;
   const aliases = preferences.splitAliases as
     Record<string, string> | undefined;
-  function inSplit(message: Mail, name: string) {
+  const matchers = new Map([...new Set([...preferences.splits, split])].map(name => {
     const category = attentionSplit({ splitRules: rules ?? {}, splitAliases: aliases ?? {} }, name);
-    if (category) return conversationAttention(message) === category;
-    if (rules && typeof rules[name] === "string" && rules[name].trim()) {
-      return matchesSearch(message, rules[name], false);
+    const query = rules?.[name];
+    return [name, { category, matches: !category && typeof query === "string" && query.trim() ? compileSearch(query, false) : undefined }] as const;
+  }));
+  const splitCounts = Object.fromEntries(preferences.splits.map(name => [name, 0]));
+  const countedSplits = [...new Set(preferences.splits)];
+  const queryMatches = search && !serverMatches ? compileSearch(query) : undefined;
+  const searchHidden = /in:(trash|spam)/i.test(query);
+  const visibleMail: Mail[] = [];
+  let inboxCount = 0;
+  for (const message of accountMail) {
+    const inbox = inFolder(message, "Inbox");
+    const attention = inbox || filter === "Important" ? conversationAttention(message) : undefined;
+    const matchesSplit = (name: string) => {
+      const matcher = matchers.get(name)!;
+      return matcher.category ? attention === matcher.category : matcher.matches?.(message) ?? false;
+    };
+    let selectedSplit = false;
+    if (inbox) {
+      if (attention === "Important") inboxCount++;
+      for (const name of countedSplits) {
+        const matches = matchesSplit(name);
+        if (matches) splitCounts[name]++;
+        if (name === split) selectedSplit = matches;
+      }
+      if (!Object.hasOwn(splitCounts, split)) selectedSplit = matchesSplit(split);
     }
-    return false;
+    if (filter === "Unread" && !message.unread) continue;
+    if (filter === "Starred" && !message.starred) continue;
+    if (filter === "Important" && attention !== "Important") continue;
+    if (filter === "No reply" && !(message.messages.at(-1)?.outgoing ?? message.messages.at(-1)?.email === account)) continue;
+    if (search) {
+      if ((message.folder === "Trash" || message.folder === "Spam") && !searchHidden) continue;
+      if (!(serverMatches ? serverMatches.has(message.id) : queryMatches!(message))) continue;
+    } else if (folder === "Inbox" ? !inbox || !selectedSplit : !inFolder(message, folder)) continue;
+    visibleMail.push(message);
   }
-  const splitCounts = Object.fromEntries(
-    preferences.splits.map((name) => [
-      name,
-      inbox.filter((message) => inSplit(message, name)).length,
-    ]),
-  );
   const shownSplits = preferences.splits.filter(
     (name) =>
       !preferences.hideEmptySplits || name === split || splitCounts[name] > 0,
   );
-  const visibleMail = accountMail.filter((message) => {
-    if (filter === "Unread" && !message.unread) return false;
-    if (filter === "Starred" && !message.starred) return false;
-    if (filter === "Important" && conversationAttention(message) !== "Important") return false;
-    if (filter === "No reply" && !(message.messages.at(-1)?.outgoing ?? message.messages.at(-1)?.email === account))
-      return false;
-    if (search)
-      return (
-        ((message.folder !== "Trash" && message.folder !== "Spam") ||
-          /in:(trash|spam)/i.test(query)) &&
-        (serverMatches ? serverMatches.has(message.id) : matchesSearch(message, query))
-      );
-    return folder === "Inbox"
-      ? inFolder(message, "Inbox") && inSplit(message, split)
-      : inFolder(message, folder);
-  });
   const rowHeight = mobile ? 44 : preferences.density === "Compact" ? 30 : 36;
   const entries: MailListEntry[] = [];
   let totalHeight = 0;
@@ -100,7 +107,7 @@ export function selectMailView(
     entries,
     totalHeight,
     rowHeight,
-    inboxCount: inbox.filter((message) => conversationAttention(message) === "Important").length,
+    inboxCount,
   };
 }
 

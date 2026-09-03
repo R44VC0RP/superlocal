@@ -6,7 +6,7 @@ import { matchesSearch, splitRuleError } from "../src/mail-search.ts";
 import { selectMailView } from "../src/mail-view.ts";
 import { classifyAttention, conversationAttention } from "../../shared/mail-attention.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
-import { senderActivity, senderContact, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
+import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
 import {
   advanceMail,
   appendOutgoing,
@@ -32,7 +32,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
   // than replacing SDK operations with mock acknowledgements or adding files.
   if (!process.versions.bun) {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
-      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "SDK-backed optimistic flags", "--timeout", "90000"], {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "SDK-backed optimistic flags", "--timeout", "180000"], {
         env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
       });
       let output = "";
@@ -49,18 +49,26 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
   const root = await fs.mkdtemp(join(tmpdir(), "optimistic-flags-"));
   const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
   const originalMutate = MockInboxProvider.prototype.mutate;
+  const originalSend = MockInboxProvider.prototype.send;
   const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 29).toString("base64"), token: "fictional-optimistic-client-token", allowProviderWrites: true });
   const feedbackDatabase = new Database(":memory:");
   const feedback = createAttentionFeedbackStore(feedbackDatabase, host.inbox, host.owner);
   let stop: (() => void) | undefined;
   let stopReloaded: (() => void) | undefined;
   let providerFailures = 0, providerCalls = 0;
+  let changedBodyId: string | undefined, uncertainSend = false;
   let providerGate: Promise<void> | undefined, providerGateAt: number | undefined, releaseProvider: (() => void) | undefined, providerWork: Promise<void> | undefined;
   MockInboxProvider.prototype.mutate = async function (id, changes) {
     providerCalls++;
     if (providerGate && (providerGateAt === undefined || providerCalls >= providerGateAt)) await providerGate;
     if (providerFailures > 0) { providerFailures--; throw new ProviderError("superlocal-mock", "UPSTREAM", "The controlled provider rejected this flag.", { retryable: false }); }
-    return originalMutate.call(this, id, changes);
+    const message = await originalMutate.call(this, id, changes);
+    return message && id === changedBodyId ? { ...message, bodyText: "Fictional changed body from the provider." } : message;
+  };
+  MockInboxProvider.prototype.send = async function (input) {
+    const result = await originalSend.call(this, input);
+    if (uncertainSend) throw new ProviderError("superlocal-mock", "NETWORK", "Controlled lost send acknowledgement.", { retryable: false });
+    return result;
   };
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
   const until = async (check: () => boolean, message: string, timeout = 8000) => {
@@ -71,6 +79,8 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
   let releaseResponse: (() => void) | undefined;
   let snapshotGate: Promise<void> | undefined, releaseSnapshot: (() => void) | undefined;
   let finalPageGate: Promise<void> | undefined, releaseFinalPage: (() => void) | undefined, finalPageHeld = false;
+  let deltaGate: Promise<void> | undefined, releaseDelta: (() => void) | undefined, deltaHeld = false;
+  let liveEvents = false, readyEvents = 0, mailEvents = 0, inventoryRequests = 0, deltaRequests = 0;
   let gate: Promise<void> | undefined, loseResponses = 0, replayAuthFailures = 0, snapshotFailures = 0, bodyReads = 0, operationReads = 0;
   const posted: Array<{ input: import("inbox-sdk/types").MutationInput; operation: import("inbox-sdk/types").Operation }> = [];
   const flagRequests: import("inbox-sdk/types").MutationInput[] = [];
@@ -116,7 +126,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
         return Response.json(event);
       }
       if (/^\/host\/attention-feedback\/[^/]+\/undo$/.test(url.pathname)) return Response.json(await feedback.undo(url.pathname.split("/")[3]));
-      if (url.pathname === "/v1/events") return new Promise<Response>((_resolve, reject) => {
+      if (url.pathname === "/v1/events" && !liveEvents) return new Promise<Response>((_resolve, reject) => {
         const abort = () => reject(new DOMException("Request cancelled", "AbortError"));
         if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
       });
@@ -132,11 +142,29 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
         }
       }
       const response = await host.fetch(new Request(url, { ...init, headers }));
+      if (url.pathname === "/v1/mailbox-snapshot") inventoryRequests++;
+      if (url.pathname === "/v1/mailbox-changes") {
+        deltaRequests++;
+        if (deltaGate && response.ok && !(await response.clone().json()).hasMore) { deltaHeld = true; await deltaGate; init?.signal?.throwIfAborted(); }
+      }
+      if (url.pathname === "/v1/events" && liveEvents && response.body) {
+        let pending = ""; const decoder = new TextDecoder();
+        return new Response(response.body.pipeThrough(new TransformStream({ transform(chunk, controller) {
+          pending += decoder.decode(chunk, { stream: true });
+          let end: number;
+          while ((end = pending.indexOf("\n\n")) !== -1) {
+            const frame = pending.slice(0, end); pending = pending.slice(end + 2);
+            if (frame.includes("event: ready\n")) readyEvents++;
+            if (frame.includes("event: mail.changed\n")) mailEvents++;
+          }
+          controller.enqueue(chunk);
+        } })), { status: response.status, headers: response.headers });
+      }
       if (url.pathname === "/v1/mailbox-actions" && init?.method === "POST") {
         membershipRequests.push(JSON.parse(String(init.body)));
         if (response.ok && loseMembershipResponses > 0) { loseMembershipResponses--; throw new TypeError("Controlled lost Done response"); }
       }
-      if (url.pathname === "/v1/mailbox-messages" && response.ok && finalPageGate && !(await response.clone().json()).nextCursor) {
+      if (url.pathname === "/v1/mailbox-snapshot" && response.ok && finalPageGate && !(await response.clone().json()).nextCursor) {
         // Freeze a COMPLETE authoritative snapshot before any local command,
         // avoiding a later page's legitimate STALE_CURSOR restart masking it.
         finalPageHeld = true; await finalPageGate; init?.signal?.throwIfAborted();
@@ -405,17 +433,19 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     // terminal snapshot publishes. The reconciler may be finishing its last
     // loop; the newly accepted operation must still be polled to its outcome.
     await store.action([view()], "star");
+    const precedingBoundaryId = posted.at(-1)!.operation.id;
     await store.refresh(true); await sleep(120); await store.refresh(true);
     gate = new Promise(resolve => { releaseResponse = resolve; });
     const finishingBoundary = store.action([view()], "star");
+    void finishingBoundary.catch(() => {});
     const boundaryPostCount = posted.length;
     await until(() => posted.length > boundaryPostCount, "second boundary operation accepted with its response held");
     const boundaryId = posted.at(-1)!.operation.id;
-    let wasRefreshing = false, boundaryReleased = false;
+    let boundaryReleased = false;
     const unsubscribe = store.subscribe(() => {
-      const refreshing = store.getSnapshot().refreshing;
-      if (wasRefreshing && !refreshing && !boundaryReleased) { boundaryReleased = true; releaseResponse!(); gate = undefined; }
-      wasRefreshing = refreshing;
+      if (!boundaryReleased) void host.inbox.operation(host.owner, precedingBoundaryId).then(operation => {
+        if (operation.status === "succeeded" && !boundaryReleased) { boundaryReleased = true; releaseResponse!(); gate = undefined; }
+      });
     });
     providerGateAt = providerCalls + view().messages.length + 1;
     providerGate = new Promise(resolve => { releaseProvider = resolve; });
@@ -442,9 +472,144 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     stop = store.start(); await store.refresh(true);
     assert.equal(posted.length, writesBeforeStop, "remount tracks the existing operation without submitting again");
     await host.inbox.runDue(); await store.refresh(true);
+
+    // Populate the real offline provider/SDK, not a fabricated InboxSnapshot.
+    // Only this final stage pays for the large initial scan; individual flag
+    // and body interactions must preserve every unrelated Mail reference.
+    let largeNativeId = "";
+    for (let index = 0; index < 6000; index++) {
+      const message = host.store.receive(source, { from: "scale-sender@example.test", to: nativeBoxes[0].email, subject: `Scale fixture ${index}`,
+        text: "Fictional large-cache body.", isRead: false, receivedAt: new Date(Date.now() - index * 1000).toISOString() });
+      if (!index) largeNativeId = message.id;
+    }
+    const calendarToday = new Date(); calendarToday.setHours(10, 15, 0, 0);
+    const calendarYesterday = new Date(calendarToday); calendarYesterday.setDate(calendarYesterday.getDate() - 1);
+    const calendarPreviousYear = new Date(calendarToday); calendarPreviousYear.setFullYear(calendarPreviousYear.getFullYear() - 1);
+    for (const [name, time] of [["today", calendarToday], ["yesterday", calendarYesterday], ["year", calendarPreviousYear]] as const) {
+      host.store.receive(source, { from: "scale-sender@example.test", to: nativeBoxes[0].email, subject: `Calendar fixture ${name}`, text: "Fictional calendar body.", receivedAt: time.toISOString() });
+    }
+    for (;;) { if (!(await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 })).hasMore) break; }
+    await store.refresh(true);
+    assert.ok(store.getSnapshot().mail.length >= 12_000, "large real SDK cache has overlapping projected conversations");
+    const calendarView = (name: string) => store.getSnapshot().mail.find(mail => mail.account === primary.id && mail.subject === `Calendar fixture ${name}`)!;
+    assert.equal(calendarView("today").date, calendarToday.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
+    assert.equal(calendarView("today").group, "Today");
+    assert.equal(calendarView("yesterday").group, "Yesterday");
+    assert.equal(calendarView("year").group, calendarPreviousYear.toLocaleDateString([], { month: "long", year: "numeric" }));
+    await store.loadThread(calendarView("today").id);
+    const RealDate = Date, tomorrow = new Date(calendarToday); tomorrow.setDate(tomorrow.getDate() + 1);
+    try {
+      Object.assign(globalThis, { Date: class extends RealDate {
+        constructor(value?: string | number | Date) { super(value === undefined ? tomorrow.getTime() : value instanceof RealDate ? value.getTime() : value); }
+        static now() { return tomorrow.getTime(); }
+      } });
+      await store.loadThread(calendarView("today").id);
+      assert.equal(calendarView("today").group, "Yesterday", "new calendar day does not retain cached Today label");
+      assert.equal(calendarView("yesterday").date, calendarYesterday.toLocaleDateString([], { month: "short", day: "numeric" }));
+    } finally { Object.assign(globalThis, { Date: RealDate }); }
+    const previousTimezone = process.env.TZ;
+    try {
+      process.env.TZ = "Pacific/Honolulu";
+      await store.loadThread(calendarView("yesterday").id);
+      const changedDay = calendarToday.toDateString() === new Date().toDateString();
+      assert.equal(calendarView("today").date, changedDay ? calendarToday.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : calendarToday.toLocaleDateString([], { month: "short", day: "numeric" }), "default-timezone changes refresh formatter context");
+    } finally { if (previousTimezone === undefined) delete process.env.TZ; else process.env.TZ = previousTimezone; }
+    await store.refresh(true);
+    const large = (account = primary.id) => store.getSnapshot().mail.find(mail => mail.account === account && mail.sourceId === source.accountId && mail.subject === "Scale fixture 0")!;
+    const unrelated = () => store.getSnapshot().mail.find(mail => mail.account === primary.id && mail.subject === "Scale fixture 1")!;
+    const beforeFirstBody = bodyReads, otherBeforeBody = unrelated();
+    await Promise.all([store.loadThread(large().id), store.loadThread(large(UNIFIED_ACCOUNT).id)]);
+    assert.equal(bodyReads - beforeFirstBody, 1, "canonical body load coalesces individual/Unified openings");
+    assert.strictEqual(unrelated(), otherBeforeBody, "body load does not replace unrelated conversations");
+    const cachedSnapshot = store.getSnapshot(), beforeCachedReads = bodyReads, cachedStart = performance.now();
+    for (let index = 0; index < 30; index++) await store.loadThread(large().id);
+    assert.equal(bodyReads, beforeCachedReads, "repeated cached opens perform no body reads");
+    assert.strictEqual(store.getSnapshot(), cachedSnapshot, "cached opens do not publish or recreate Mail arrays");
+    assert.ok(performance.now() - cachedStart < 250, "thirty cached opens avoid full large-mailbox rendering");
+
+    const pendingReply = await store.newDraft(primary.id, { mode: "reply", mail: large() });
+    const queuedReply = await store.submit({ ...pendingReply, body: "<p>Fictional queued reply.</p>" }, new Date(Date.now() + 60_000).toISOString());
+    const queuedView = store.getSnapshot().mail.find(mail => mail.operationId === queuedReply.id)!;
+    const otherBeforeFlag = unrelated(), historyBeforeFlag = store.getSnapshot().senderHistory, draftsBeforeFlag = store.getSnapshot().drafts;
+    const startedFlag = performance.now(), fastRead = store.action([large()], "read");
+    assert.equal(large().unread, false, "large-cache read is still synchronously projected before acknowledgement");
+    assert.ok(performance.now() - startedFlag < 250, "one read does not synchronously rebuild the entire large cache");
+    assert.strictEqual(unrelated(), otherBeforeFlag);
+    assert.strictEqual(store.getSnapshot().senderHistory, historyBeforeFlag);
+    assert.strictEqual(store.getSnapshot().drafts, draftsBeforeFlag);
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.operationId === queuedReply.id), queuedView);
+    assert.ok(large().messages.some(message => message.pending && message.operationId === queuedReply.id), "scoped flag projection keeps queued replies");
+    assert.ok(large(UNIFIED_ACCOUNT).messages.some(message => message.pending && message.operationId === queuedReply.id));
+    await fastRead; await host.inbox.runDue(); await store.refresh(true);
+    await store.loadThread(large().id);
+    assert.equal(bodyReads, beforeCachedReads, "read-only native revision changes reuse immutable body identity");
+    await store.action([large()], "star"); await host.inbox.runDue(); await store.refresh(true);
+    await store.loadThread(large().id);
+    assert.equal(bodyReads, beforeCachedReads, "star-only native revision changes do not hydrate bodies");
+    const previousNeighbor = unrelated(); denyFlagRequests = 1;
+    await assert.rejects(store.action([large()], "unread"), InboxActionError);
+    assert.equal(large().unread, false);
+    assert.strictEqual(unrelated(), previousNeighbor, "rejected flag rollback touches only its affected conversation");
+    await store.undoSend(queuedReply.id);
+
+    changedBodyId = largeNativeId;
+    await store.action([large()], "star"); await host.inbox.runDue(); await store.refresh(true);
+    const beforeChangedBody = bodyReads;
+    await store.loadThread(large().id);
+    assert.equal(bodyReads, beforeChangedBody + 1, "a real changed provider body invalidates the cached body identity");
+    assert.equal(large().messages[0].bodyText, "Fictional changed body from the provider.");
+    const changedSnapshot = store.getSnapshot(); await store.loadThread(large().id);
+    assert.strictEqual(store.getSnapshot(), changedSnapshot);
+    changedBodyId = undefined;
+    await store.setPolicy({ remoteImages: false, undoSendSeconds: 0 });
+    const beforePolicyBody = bodyReads; await store.loadThread(large().id);
+    assert.equal(bodyReads, beforePolicyBody + 1, "policy/body epoch change still invalidates loaded presentations");
+
+    const uncertainDraft = await store.newDraft(primary.id, { mode: "reply", mail: large() });
+    uncertainSend = true;
+    const uncertainOperation = await store.submit({ ...uncertainDraft, body: "<p>Fictional unconfirmed reply.</p>" });
+    await host.inbox.runDue(); await store.refresh(true);
+    assert.equal((await host.inbox.operation(host.owner, uncertainOperation.id)).status, "uncertain");
+    const uncertainFlag = store.action([large()], "star");
+    assert.ok(large().messages.some(message => message.operationId === uncertainOperation.id && message.sendStatus === "uncertain"), "targeted rebuild retains unconfirmed reply, never fake Sent");
+    assert.ok(large(UNIFIED_ACCOUNT).messages.some(message => message.operationId === uncertainOperation.id && message.sendStatus === "uncertain"));
+    await uncertainFlag;
+    await host.inbox.runDue(); await store.refresh();
+
+    // Actual SDK SSE wakes an already-running delta reader. No second mail
+    // notification is sent after release; the dirty pass must catch this one.
+    stop(); liveEvents = true; stop = store.start(); await store.refresh();
+    await until(() => readyEvents > 0, "real SDK event stream is connected");
+    deltaGate = new Promise(resolve => { releaseDelta = resolve; }); deltaHeld = false;
+    window.dispatchEvent(new Event("focus"));
+    await until(() => deltaHeld, "last delta response held after capturing its old head");
+    const scansBeforeDelta = inventoryRequests, readsBeforeDelta = deltaRequests, notificationsBefore = mailEvents, stableNeighbor = unrelated();
+    const lateNative = host.store.receive(source, { from: "delta-sender@example.test", to: nativeBoxes[0].email, subject: "Delta notification fixture", text: "Fictional incremental arrival." });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    await until(() => mailEvents > notificationsBefore, "mail notification arrives while delta request is still held");
+    releaseDelta!(); deltaGate = undefined;
+    await until(() => store.getSnapshot().mail.some(mail => mail.account === primary.id && mail.subject === "Delta notification fixture"), "dirty recheck imports the final arrival without another notification");
+    assert.equal(inventoryRequests, scansBeforeDelta, "routine mail event never scans the full inventory");
+    assert.ok(deltaRequests > readsBeforeDelta, "reader performs another bounded delta after in-flight notification");
+    assert.strictEqual(unrelated(), stableNeighbor, "incremental arrival preserves unaffected Mail identity");
+    const incremental = () => store.getSnapshot().mail.find(mail => mail.account === primary.id && mail.subject === "Delta notification fixture")!;
+    const deletedId = incremental().messages[0].id;
+    host.store.mutate(source, lateNative.id, { deletePermanently: true });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    await until(() => !store.getSnapshot().mail.some(mail => mail.messages.some(message => message.id === deletedId)), "removing a last message removes its thread from individual and Unified views");
+    assert.ok(!store.getSnapshot().senderHistory.some(message => message.id === deletedId), "removed thread also leaves sender history");
+    assert.equal(inventoryRequests, scansBeforeDelta);
+    const beforeScope = inventoryRequests;
+    const currentOverlap = await host.inbox.mailbox(host.owner, overlap.id);
+    await host.inbox.updateMailbox(host.owner, overlap.id, { status: "detached" }, currentOverlap.revision);
+    await until(() => !store.getSnapshot().accounts.some(account => account.id === overlap.id), "scope change resets from authorized mailbox metadata");
+    await until(() => !store.getSnapshot().mail.some(mail => mail.account === overlap.id), "detached view rows disappear after scoped bootstrap");
+    assert.ok(inventoryRequests > beforeScope);
+    assert.ok(large().messages.length > 0, "another receiving view of the same source remains available");
   } finally {
-    releaseResponse?.(); releaseSnapshot?.(); releaseFinalPage?.(); releaseProvider?.(); stopReloaded?.(); stop?.(); await providerWork;
+    releaseResponse?.(); releaseSnapshot?.(); releaseFinalPage?.(); releaseDelta?.(); releaseProvider?.(); stopReloaded?.(); stop?.(); await providerWork;
     MockInboxProvider.prototype.mutate = originalMutate;
+    MockInboxProvider.prototype.send = originalSend;
     feedbackDatabase.close(); await host.close(); await fs.rm(root, { recursive: true, force: true });
     globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
   }
@@ -841,6 +1006,22 @@ test("sender history matches exact addresses or explicit domain boundaries and e
   assert.equal(grouped.sent, 1);
   assert.equal(grouped.twoWay, 1);
   assert.equal(grouped.lastSent, due);
+  assert.equal(senderActivity(history, base.from.email, ["box"], null, due + 1001).received, 2, "a reused index still evaluates the current time");
+  assert.equal(senderActivity(history, base.from.email, [], null, due + 1001).received, 0, "a reused index does not retain another mailbox scope");
+  const changedHistory = history.map(message => message.id === base.id ? { ...message, revision: 2, folder: "trash" } : message);
+  assert.equal(senderActivity(changedHistory, base.from.email, ["box"], null, due).received, 0, "new immutable history invalidates indexed facts");
+});
+
+test("bounded sender conversations preserve rank and the last receiving copy", () => {
+  const conversations: Mail[] = Array.from({ length: 9 }, (_, index) => ({ ...inbox, id: `view-${index}`, sourceId: "source", sdkThreadId: `thread-${index}` }));
+  const duplicate = { ...conversations[3], id: "overlapping-view" };
+  const wrongSource = { ...conversations[0], id: "other-source", sourceId: "other" };
+  const pending = { ...conversations[0], id: "pending", operationId: "pending-operation" };
+  const keys = ["source\0missing", "source\0thread-7", "source\0thread-3", "source\0thread-8", "source\0thread-0", "source\0thread-5", "source\0thread-1"];
+  const selected = senderConversations([...conversations, wrongSource, duplicate, pending], keys);
+  assert.deepEqual(selected.map(mail => mail.id), ["view-7", "overlapping-view", "view-8", "view-0", "view-5"]);
+  assert.strictEqual(selected[1], duplicate);
+  assert.deepEqual(senderConversations(conversations, []), []);
 });
 
 test("sender selection follows the exact message or outgoing recipient, never the latest self reply", () => {

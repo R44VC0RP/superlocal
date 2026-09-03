@@ -29,6 +29,7 @@ export type Message = {
   cancelled?: boolean;
   revision?: number;
   loaded?: boolean;
+  bodyRevision?: string;
   outgoing?: boolean;
   hasAttachments?: boolean;
   operationId?: string;

@@ -6,6 +6,7 @@
   "engines": { "bun": ">=1.4.0" },
   "workspaces": ["packages/*", "apps/*"],
   "scripts": {
+    "start": "bun --no-env-file run --cwd apps/web build && bun --no-env-file scripts/dev.ts --built",
     "dev": "bun --no-env-file scripts/dev.ts",
     "dev:host": "bun --no-env-file apps/local-host/src/index.ts",
     "start:host": "bun --no-env-file apps/local-host/src/index.ts",

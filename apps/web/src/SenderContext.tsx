@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { Mail } from "./data";
 import { Icon } from "./components";
 import {
-  readSenderDomain, senderActivity, senderHostname, senderThreadKey,
+  readSenderDomain, senderActivity, senderHostname,
   type SenderContact, type SenderDomainInfo, type SenderHistoryMessage,
 } from "./sender-context";
 import "./sender-context.css";
@@ -22,11 +22,11 @@ function DomainMark({ src }: { src: string | null }) {
   </span>;
 }
 
-export default function SenderContext({ contact, history, mailboxIds, mail, currentThreadId, remoteImages, showLogos, canCompose, onCompose, onOpen, onImageSettings }: {
+export default function SenderContext({ contact, history, mailboxIds, getConversations, currentThreadId, remoteImages, showLogos, canCompose, onCompose, onOpen, onImageSettings }: {
   contact: SenderContact;
   history: readonly SenderHistoryMessage[];
   mailboxIds: readonly string[];
-  mail: readonly Mail[];
+  getConversations: (threadKeys: readonly string[]) => Mail[];
   currentThreadId: string;
   remoteImages: boolean;
   showLogos: boolean;
@@ -54,11 +54,7 @@ export default function SenderContext({ contact, history, mailboxIds, mail, curr
   const root = info?.rootDomain ?? null;
   const grouped = wholeDomain && info?.kind === "domain" && root ? root : null;
   const activity = useMemo(() => senderActivity(history, contact.email, mailboxIds, grouped), [history, contact.email, mailboxIds, grouped]);
-  const conversations = useMemo(() => {
-    const byThread = new Map(mail.filter(item => !item.operationId && item.sourceId && item.sdkThreadId)
-      .map(item => [senderThreadKey(item.sourceId!, item.sdkThreadId!), item]));
-    return activity.recentThreadKeys.flatMap(key => { const item = byThread.get(key); return item ? [item] : []; }).slice(0, 5);
-  }, [mail, activity]);
+  const conversations = useMemo(() => getConversations(activity.recentThreadKeys), [getConversations, activity]);
   const icon = remoteImages && showLogos && info?.imagePolicy === "allowed" ? info.iconUrl : null;
   const peak = Math.max(1, ...activity.weeks.map(week => week.received + week.sent));
   const levelName = activity.level === 0 ? "No history" : activity.level === 1 ? "One-way mail" : activity.level === 2 ? "In touch"

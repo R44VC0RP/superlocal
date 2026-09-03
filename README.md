@@ -14,11 +14,13 @@ Requires **Bun 1.4+**.
    ```
 2. Start the app:
    ```sh
-   bun --no-env-file run dev
+    bun --no-env-file run start
    ```
 3. Open **http://localhost:5178**.
 
 The first run starts two fictional mailboxes through the real Inbox SDK. No provider credentials, OAuth setup, OpenCan, or machine-specific services are needed. **Ctrl-C stops both the client and local host.**
+
+`start` builds and serves the optimized client locally. Use `bun --no-env-file run dev` for hot-reloading development; development-mode React diagnostics add overhead on large mailboxes. Both commands keep the same local-only host, sessions, and provider configuration.
 
 ## One inbox, separate mailboxes
 

@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
-import { loadLocalConfig, ROOT_DIR } from '../apps/local-host/src/config'
+import { loadLocalConfig, LocalConfigurationError, ROOT_DIR } from '../apps/local-host/src/config'
 import { reportStartupError, startLocalServer } from '../apps/local-host/src/index'
 
 // The host runs here; Vite is the only direct child. No shell/watch supervisor or platform-specific service manager.
@@ -8,6 +8,7 @@ let service: Awaited<ReturnType<typeof startLocalServer>> | undefined
 let web: ReturnType<typeof Bun.spawn> | undefined
 let stopping: Promise<void> | undefined
 let interrupted = false
+const built = process.argv.includes('--built')
 
 function stop(code = 0): Promise<void> {
   interrupted = true
@@ -28,6 +29,9 @@ process.on('SIGTERM', signal)
 try {
   const config = loadLocalConfig()
   const webDir = join(ROOT_DIR, 'apps', 'web')
+  if (built && !await Bun.file(join(webDir, 'dist', 'index.html')).exists()) {
+    throw new LocalConfigurationError('LOCAL_WEB_BUILD_MISSING', 'Build the optimized local client with bun --no-env-file run start.')
+  }
   const require = createRequire(join(webDir, 'package.json'))
   const vite = join(dirname(require.resolve('vite/package.json')), 'bin', 'vite.js')
   service = await startLocalServer(config)
@@ -38,12 +42,12 @@ try {
     for (const name of ['PATH', 'HOME', 'USERPROFILE', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM', 'FORCE_COLOR', 'NO_COLOR']) {
       if (process.env[name] !== undefined) env[name] = process.env[name]!
     }
-    Object.assign(env, { NODE_ENV: 'development', SUPERLOCAL_API_ORIGIN: `http://127.0.0.1:${service.server.port}`,
+    Object.assign(env, { NODE_ENV: built ? 'production' : 'development', SUPERLOCAL_API_ORIGIN: `http://127.0.0.1:${service.server.port}`,
       SUPERLOCAL_WEB_PORT: String(config.web.port), SUPERLOCAL_WEB_ORIGIN: config.web.origin, SUPERLOCAL_CONFIG: config.configPath })
-    web = Bun.spawn([process.execPath, '--no-env-file', vite, '--host', '127.0.0.1', '--port', String(config.web.port), '--strictPort'], {
+    web = Bun.spawn([process.execPath, '--no-env-file', vite, ...(built ? ['preview'] : []), '--host', '127.0.0.1', '--port', String(config.web.port), '--strictPort'], {
       cwd: webDir, env, stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
     })
-    console.info(`Superlocal (${config.mode}): ${config.web.origin}\nConfiguration: ${config.configPath}\nCtrl-C stops the web server and drains the local SDK host.`)
+    console.info(`Superlocal (${config.mode}, ${built ? 'optimized local UI' : 'development UI'}): ${config.web.origin}\nConfiguration: ${config.configPath}\nCtrl-C stops the web server and drains the local SDK host.`)
     const code = await web.exited
     if (!stopping) await stop(code)
     else await stopping

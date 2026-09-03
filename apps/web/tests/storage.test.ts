@@ -112,12 +112,14 @@ test("local timing capture batches bounded metadata without blocking actions or 
     const action = measureAction("private search text must never be logged", 2);
     action.accepted(); action.finish();
     measureRequest("/v1/mailboxes/private-source/messages/private-message", "PATCH")(200);
+    measureRequest("/v1/mailbox-snapshot", "POST")(200);
+    measureRequest("/v1/mailbox-changes", "POST")(200);
     measurePerformance({ kind: "refresh" })({ pages: 66, messages: 6560, networkMs: 1400 });
     assert.equal(requests, 0, "timing capture never sends synchronously in the action");
     const received = await batch;
     const { samples } = JSON.parse(received.body);
     assert.equal(received.url, "/host/performance");
-    assert.equal(samples.length, 3);
+    assert.equal(samples.length, 3, "fast body-free POST reads are not logged as mutations");
     assert.equal(samples[0].action, "other");
     assert.equal(samples[1].route, "message-body");
     assert.equal(samples[2].pages, 66);

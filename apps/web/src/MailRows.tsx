@@ -6,10 +6,11 @@ import {
   type RefObject,
 } from "react";
 import MailRow from "./MailRow";
-import { mailWindow, type MailListEntry } from "./mail-view";
+import type { MailListEntry } from "./mail-view";
 
 type MailRowsProps = {
-  entries: MailListEntry[];
+  getWindow: (top: number, height: number, virtualized: boolean) => { start: number; end: number; entries: MailListEntry[] };
+  getHighlighted: (index: number) => MailListEntry | undefined;
   totalHeight: number;
   rowHeight: number;
   virtualized: boolean;
@@ -24,7 +25,8 @@ type MailRowsProps = {
 };
 
 export default function MailRows({
-  entries,
+  getWindow,
+  getHighlighted,
   totalHeight,
   rowHeight,
   virtualized,
@@ -41,10 +43,8 @@ export default function MailRows({
     top: scrollPosition.current,
     height: innerHeight,
   }));
-  const range = virtualized
-    ? mailWindow(entries, viewport.top, viewport.height, rowHeight)
-    : { start: 0, end: entries.length };
-  const visible = entries.slice(range.start, range.end);
+  const range = getWindow(viewport.top, viewport.height, virtualized);
+  const visible = range.entries;
   const leading = visible[0]?.top || 0;
   const last = visible.at(-1);
   const trailing = Math.max(
@@ -56,13 +56,8 @@ export default function MailRows({
     if (!root || !virtualized) return;
     const next = { top: root.scrollTop, height: root.clientHeight };
     setViewport((previous) => {
-      const before = mailWindow(
-        entries,
-        previous.top,
-        previous.height,
-        rowHeight,
-      );
-      const after = mailWindow(entries, next.top, next.height, rowHeight);
+      const before = getWindow(previous.top, previous.height, true);
+      const after = getWindow(next.top, next.height, true);
       return before.start === after.start && before.end === after.end
         ? previous
         : next;
@@ -84,13 +79,11 @@ export default function MailRows({
   }, [container]);
   useLayoutEffect(() => {
     measure();
-  }, [entries, virtualized, rowHeight]);
+  }, [getWindow, virtualized, rowHeight]);
   const revealHighlight = useEffectEvent(() => {
     const root = container.current;
     if (!root || !virtualized || !scrollToHighlight) return;
-    const item = entries.find(
-      (entry) => !entry.group && entry.index === highlight,
-    );
+    const item = getHighlighted(highlight);
     if (!item) return;
     if (item.top < root.scrollTop) root.scrollTop = item.top;
     else if (item.top + item.height > root.scrollTop + root.clientHeight)
