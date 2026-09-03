@@ -51,13 +51,13 @@ function MailRow({
         <span className="row-subject">{m.subject}</span>
         {showSnippets && <span className="row-snippet">{m.snippet}</span>}
       </span>
+      {m.labels.length > 0 && (
+        <span className="row-label" role="cell" title={m.labels.join(", ")}>
+          {m.labels[0]}
+        </span>
+      )}
       {!!m.mailboxNames?.length && <span className="row-mailbox" role="cell" title={m.mailboxNames.join(", ")}>{m.mailboxNames[0]}{m.mailboxNames.length > 1 ? ` +${m.mailboxNames.length - 1}` : ""}</span>}
       <span className="row-metadata">
-        {m.labels.slice(0, 1).map((l) => (
-          <span className="row-label" key={l}>
-            {l}
-          </span>
-        ))}
         {m.starred && <Icon name="Star" size={13} className="starred-icon" />}
         {m.messages.some((msg) => msg.hasAttachments || msg.attachments?.length) && (
           <Icon name="Paperclip" size={14} />

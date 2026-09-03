@@ -18,7 +18,11 @@
   .inbox-refresh[aria-busy="true"] .icon { animation: none; }
 }
 .row-mailbox { flex: 0 1 130px; max-width: 130px; min-width: 0; margin-inline-start: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-.mail-row.has-mailbox .row-metadata, .mail-row.has-mailbox .row-actions { min-width: 84px; }
+.mail-row.has-mailbox .row-metadata { min-width: 84px; }
+@media (min-width: 701px) {
+  /* Highlight swaps metadata (8 + 84) for actions (84 - 6 right margin); 14px keeps the swap width-neutral. */
+  .mail-row.has-mailbox .row-actions { margin-left: 14px; }
+}
 .thread-mailbox-origin { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font: 13px/20px "Helvetica Neue", sans-serif; }
 .message-body-loading { padding: 16px 0; opacity: 0.7; }
 .inbox-read-only { color: var(--muted); border-bottom: 1px solid var(--border); }

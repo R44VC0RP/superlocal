@@ -535,6 +535,7 @@ kbd {
   color: var(--muted);
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 7px;
   margin-left: 8px;
 }
@@ -552,6 +553,14 @@ kbd {
   color: #d1b1cf;
 }
 .row-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(160px, 25%);
+  margin-left: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
   font-size: 10px;
   border: 1px solid var(--border);
   border-radius: 3px;
