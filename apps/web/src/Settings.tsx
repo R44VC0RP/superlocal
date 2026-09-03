@@ -17,6 +17,10 @@ export type SettingsProps = {
   accounts: string[];
   host: HostConfiguration | null;
   store: InboxStore;
+  /** Set when the page reloaded after an OAuth redirect; Add Accounts resumes onboarding for this connection. */
+  onboardingReturn?: { providerId: string; connectionId: string | null } | null;
+  /** Called when onboarding finished and the user should land back in the inbox. */
+  onOnboardingDone?: () => void;
 };
 
 const sections = [
@@ -111,6 +115,8 @@ export function Settings({
   accounts,
   host,
   store,
+  onboardingReturn = null,
+  onOnboardingDone,
 }: SettingsProps) {
   const findPage = (value = "") =>
     [
@@ -133,6 +139,7 @@ export function Settings({
   const [splitHelp, setSplitHelp] = useState(false);
   const [mailboxEditState, setMailboxEditState] = useState({ dirty: false, saving: false });
   const [confirmMailboxClose, setConfirmMailboxClose] = useState(false);
+  const [onboarding, setOnboarding] = useState<{ title: string; back: (() => void) | null; busy: boolean }>({ title: "Add account", back: null, busy: false });
   const sidebar = useRef<HTMLDivElement>(null);
   const openShortcuts = useRef(onOpenShortcuts);
   openShortcuts.current = onOpenShortcuts;
@@ -142,6 +149,7 @@ export function Settings({
       if (mailboxEditState.saving) return;
       if (mailboxEditState.dirty) { setConfirmMailboxClose(true); return; }
     }
+    if (page === "Add Accounts" && onboarding.busy) return;
     setPage("");
   };
 
@@ -1330,7 +1338,7 @@ export function Settings({
       content = <MailboxSettings host={host} store={store} onEditStateChange={setMailboxEditState} />;
       break;
     case "Add Accounts":
-      content = <ProviderConnections host={host} store={store} />;
+      content = <ProviderConnections host={host} store={store} resume={onboardingReturn} onStepChange={setOnboarding} onDone={onOnboardingDone ?? onClose} />;
       break;
     case "Calendar Settings":
     case "Calendar Accounts":
@@ -1400,7 +1408,7 @@ export function Settings({
         : splitEditor
           ? "Edit Split Inbox"
           : "Add Split Inbox"
-      : page === "Add Accounts" ? "Provider connections" : page;
+      : page === "Add Accounts" ? onboarding.title : page;
 
   return (
     <div
@@ -1497,11 +1505,14 @@ export function Settings({
           className={`settings-dialog settings-${page.toLowerCase().replaceAll(" ", "-")}-dialog ${page === "Split Inbox" ? "settings-split-dialog" : ""}`}
         >
           <header className="settings-dialog-header">
+            {page === "Add Accounts" && onboarding.back && (
+              <IconButton name="Back" title="Back" className="settings-dialog-back" disabled={onboarding.busy} onClick={onboarding.back} />
+            )}
             <h2>{dialogTitle}</h2>
             <IconButton
               name="Close"
               title={`Close ${page}`}
-              disabled={page === "Mailboxes" && mailboxEditState.saving}
+              disabled={page === "Mailboxes" && mailboxEditState.saving || page === "Add Accounts" && onboarding.busy}
               onClick={closeDetail}
             />
           </header>

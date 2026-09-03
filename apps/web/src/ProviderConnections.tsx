@@ -1,429 +1,344 @@
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
-import type { Mailbox, MailboxCandidate, MailboxSelector } from "inbox-sdk/types";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type RefObject } from "react";
+import type { Account, MailboxCandidate, MailboxSelector } from "inbox-sdk/types";
+import { Icon } from "./components";
 import type { HostConfiguration, HostProvider } from "./host";
 import { connectHostProvider } from "./host";
 import type { InboxStore } from "./inbox";
 
-type Choice = { candidate: MailboxCandidate; key: string; added: boolean; error?: string };
-type ChoiceList = { providerId: string; items: Choice[]; failedConnections: number };
-type Busy = { providerId: string; action: "connect" | "discover" | "add" };
-type AddProgress = { phase: "checking" | "creating" | "syncing" | "refreshing"; total: number; added: number; sources: number; finishedSources: number };
-type SyncIssue = { sourceId: string; message: string };
+type Phase = "connecting" | "finding" | "adding" | "syncing" | "refreshing" | "connected" | "failed";
+type Progress = { kind: "progress"; providerId: string; phase: Phase; failedAt: Phase | null; connectionIds: string[]; added: string[]; error: string | null; note: string | null };
+type Step = { kind: "pick" } | { kind: "connect"; providerId: string; reconnectId: string | null } | Progress;
+type Field = NonNullable<HostProvider["fields"]>[number];
 
 // Compare selector values, not object property order. Do not infer receiving scopes from names or senders.
 const mailboxKey = (sourceId: string, selector: MailboxSelector) => JSON.stringify([sourceId, selector.kind, selector.kind === "all" ? null : selector.value]);
-const eligible = (candidate: MailboxCandidate) => candidate.canReceive && candidate.canFilter;
 const problem = (cause: unknown, fallback: string) => cause instanceof Error ? cause.message : fallback;
+const scopeLabel = (selector: MailboxSelector) => selector.kind === "all" ? "All mail" : selector.value;
+const RETURN_DELAY = 1800;
 
-export default function ProviderConnections({ host, store }: { host: HostConfiguration | null; store: InboxStore }) {
+/**
+ * Coverage without duplicates: every eligible "all mail" scope, every eligible domain, and every eligible
+ * address whose domain is not already covered. The user can prune or pin later in Mailboxes.
+ */
+function coverage(candidates: MailboxCandidate[]): MailboxCandidate[] {
+  const eligible = candidates.filter(candidate => candidate.canReceive && candidate.canFilter);
+  const domains = new Set(eligible.flatMap(candidate => candidate.selector.kind === "domain" ? [candidate.selector.value] : []));
+  return eligible.filter(candidate => candidate.selector.kind !== "address" || !domains.has(candidate.selector.value.split("@").at(-1) ?? ""));
+}
+
+const method = (provider: HostProvider) =>
+  provider.connection === "oauth" ? "Sign in with your Google account"
+  : provider.fields?.some(field => field.name === "apiKey") ? "Paste an API key"
+  : provider.fields?.some(field => field.type === "password") ? "Email and app-specific password"
+  : "";
+
+const statusLabel = (source: Account) =>
+  source.status === "reconnect_required" ? "Sign-in required" : source.status === "disconnected" ? "Disconnected" : "Connected";
+
+export default function ProviderConnections({ host, store, resume, onStepChange, onDone }: {
+  host: HostConfiguration | null;
+  store: InboxStore;
+  /** Present after an OAuth redirect: finish onboarding for this provider/connection immediately. */
+  resume: { providerId: string; connectionId: string | null } | null;
+  onStepChange: (state: { title: string; back: (() => void) | null; busy: boolean }) => void;
+  onDone: () => void;
+}) {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot);
   const configuration = snapshot.host ?? host;
-  const [busy, setBusy] = useState<Busy | null>(null);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [choices, setChoices] = useState<ChoiceList | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(() => new Set());
-  const [query, setQuery] = useState("");
-  const [progress, setProgress] = useState<AddProgress | null>(null);
-  const [syncIssues, setSyncIssues] = useState<SyncIssue[]>([]);
-  const [stopping, setStopping] = useState(false);
-  const [recheckRequired, setRecheckRequired] = useState(false);
-  const [reconnectTargets, setReconnectTargets] = useState<Record<string, string>>({});
-  const [serverPresets, setServerPresets] = useState<Record<string, string>>({});
+  const [step, setStep] = useState<Step>({ kind: "pick" });
+  const [preset, setPreset] = useState("");
   const controller = useRef<AbortController | null>(null);
-  const recheckController = useRef<AbortController | null>(null);
   const mounted = useRef(false);
+  const resumed = useRef<"idle" | "running" | "handled">("idle");
+  const root = useRef<HTMLDivElement | null>(null);
+
+  // The control that advanced the step unmounts with it; keep focus inside the dialog without drawing a ring.
+  useEffect(() => {
+    if (document.activeElement === document.body || document.activeElement === null) root.current?.focus({ preventScroll: true });
+  }, [step.kind]);
 
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; controller.current?.abort(); recheckController.current?.abort(); };
+    return () => { mounted.current = false; controller.current?.abort(); };
   }, []);
 
-  const sourceNames = useMemo(() => new Map(snapshot.sources.map(source => [source.id, source.name || source.email])), [snapshot.sources]);
-  const visible = useMemo(() => {
-    const search = query.trim().toLocaleLowerCase();
-    return (choices?.items ?? []).filter(({ candidate }) => [candidate.name,
-      candidate.selector.kind === "all" ? "All mail" : candidate.selector.value,
-      sourceNames.get(candidate.sourceId), ...candidate.identities,
-    ].filter(Boolean).join(" ").toLocaleLowerCase().includes(search));
-  }, [choices, query, sourceNames]);
-  const visibleGroups = useMemo(() => {
-    const groups = new Map<string, Choice[]>();
-    for (const item of visible) {
-      const group = groups.get(item.candidate.sourceId) ?? [];
-      group.push(item);
-      groups.set(item.candidate.sourceId, group);
-    }
-    return [...groups.entries()].map(([sourceId, items]) => ({ sourceId, items }));
-  }, [visible]);
+  const providers = useMemo(() => (configuration?.providers ?? []).filter(provider => provider.enabled), [configuration]);
+  const provider = step.kind === "pick" ? null : providers.find(item => item.id === step.providerId) ?? null;
+  const busy = step.kind === "progress" && step.phase !== "connected" && step.phase !== "failed";
 
-  function begin(providerId: string, action: Busy["action"]) {
-    if (controller.current || !mounted.current) return null;
+  useEffect(() => {
+    const toPick = () => {
+      controller.current?.abort();
+      controller.current = null;
+      if (resumed.current === "running") resumed.current = "handled";
+      setStep({ kind: "pick" });
+    };
+    onStepChange(step.kind === "pick" ? { title: "Add account", back: null, busy: false }
+      : step.kind === "connect" ? { title: step.reconnectId ? `Reconnect ${provider?.name ?? "account"}` : `Add ${provider?.name ?? "account"}`, back: toPick, busy: false }
+      : { title: provider?.name ?? "Connecting", back: step.phase === "failed" ? toPick : null, busy });
+  }, [step, provider, busy, onStepChange]);
+
+  // Show "Connected" briefly, then land back in the refreshed inbox.
+  useEffect(() => {
+    if (step.kind !== "progress" || step.phase !== "connected") return;
+    const timer = setTimeout(onDone, RETURN_DELAY);
+    return () => clearTimeout(timer);
+  }, [step, onDone]);
+
+  const report = (patch: Partial<Progress>) => {
+    if (!mounted.current) return;
+    setStep(current => current.kind === "progress" ? { ...current, ...patch } : current);
+  };
+
+  /** After a connection exists: discover its mailboxes, add coverage, sync, refresh. */
+  async function finalize(target: HostProvider, connectionIds: string[], signal: AbortSignal) {
+    const added: string[] = [];
+    const push = (label: string) => { added.push(label); report({ added: [...added] }); };
+    let note: string | null = null;
+    report({ phase: "finding", connectionIds });
+    await store.refresh(true);
+    if (signal.aborted) return;
+    const syncs: Array<[string, "latest" | "backfill", number]> = [];
+    if (target.mailboxSelection === "automatic") {
+      const boxes = store.getSnapshot().mailboxes.filter(box => connectionIds.includes(box.connectionId) && box.status === "active");
+      for (const box of boxes) { push(box.name || scopeLabel(box.selector)); syncs.push([box.id, "latest", 25]); }
+      if (!boxes.length) note = "Its mailbox is paused. Resume it in Mailboxes to load mail.";
+    } else {
+      const existing = new Set(store.getSnapshot().mailboxes.filter(box => box.status !== "detached").map(box => mailboxKey(box.sourceId, box.selector)));
+      const wanted: MailboxCandidate[] = [];
+      for (const id of connectionIds) {
+        if (signal.aborted) return;
+        for (const candidate of coverage(await store.client.mailboxCandidates(id, { signal }))) {
+          if (!existing.has(mailboxKey(candidate.sourceId, candidate.selector))) wanted.push(candidate);
+        }
+      }
+      report({ phase: "adding" });
+      const sources = new Set<string>();
+      for (const candidate of wanted) {
+        if (signal.aborted) return;
+        // One in-flight create at a time; only eligible, uncovered scopes reach this call.
+        const box = await store.client.createMailbox({
+          sourceId: candidate.sourceId, name: candidate.name, selector: candidate.selector,
+          defaultSender: candidate.canSend ? candidate.identities[0] ?? null : null,
+        }, { signal });
+        push(candidate.name);
+        // syncMailbox synchronizes a source, not a single scope: one sync per source.
+        if (!sources.has(candidate.sourceId)) { sources.add(candidate.sourceId); syncs.push([box.id, "backfill", 50]); }
+      }
+    }
+    report({ phase: "syncing" });
+    let syncFailures = 0;
+    for (const [boxId, lane, limit] of syncs) {
+      if (signal.aborted) return;
+      try { await store.client.syncMailbox(boxId, { lane, limit }, { signal }); }
+      catch { if (signal.aborted) return; syncFailures++; }
+    }
+    if (syncFailures) note = "Recent mail could not be loaded yet. It will sync when the connection is available.";
+    report({ phase: "refreshing" });
+    await store.refresh(true);
+    if (signal.aborted) return;
+    report({ phase: "connected", note });
+  }
+
+  function begin(providerId: string, connectionIds: string[] = []): AbortController | null {
+    if (controller.current) return null;
     const operation = new AbortController();
     controller.current = operation;
-    setBusy({ providerId, action });
-    setError("");
-    setNotice("");
-    setProgress(null);
-    setSyncIssues([]);
-    setStopping(false);
+    setStep({ kind: "progress", providerId, phase: "connecting", failedAt: null, connectionIds, added: [], error: null, note: null });
     return operation;
   }
 
-  function finish() {
-    if (!mounted.current) return;
-    controller.current = null;
-    setBusy(null);
-    setStopping(false);
-  }
-
-  function markAdded(keys: Set<string>) {
-    if (!mounted.current) return;
-    setChoices(current => current && ({ ...current, items: current.items.map(item => keys.has(item.key) ? { ...item, added: true, error: undefined } : item) }));
-    setSelected(previous => new Set([...previous].filter(key => !keys.has(key))));
-  }
-
-  async function discover(providerId: string, connectionIds: string[], signal: AbortSignal) {
-    const sameProvider = choices?.providerId === providerId;
-    if (!sameProvider) { setChoices(null); setSelected(new Set()); setQuery(""); }
-    const mailboxes = await store.client.mailboxes({ signal });
-    const added = new Set(mailboxes.filter(box => box.status !== "detached").map(box => mailboxKey(box.sourceId, box.selector)));
-    const found = new Map<string, Choice>();
-    const connections = [...new Set(connectionIds)];
-    let failedConnections = 0;
-    // Connections are few; their candidate lists may be large. Keep discovery requests bounded too.
-    for (const id of connections) {
-      if (signal.aborted) return;
-      try {
-        for (const candidate of await store.client.mailboxCandidates(id, { signal })) {
-          const key = mailboxKey(candidate.sourceId, candidate.selector);
-          if (!found.has(key)) found.set(key, { candidate, key, added: added.has(key) });
-        }
-      } catch (cause) {
-        if (signal.aborted) return;
-        failedConnections++;
-        if (connections.length === 1) throw cause;
+  async function run(target: HostProvider, operation: AbortController, work: (signal: AbortSignal) => Promise<void>) {
+    try {
+      await work(operation.signal);
+    } catch (cause) {
+      if (mounted.current && !operation.signal.aborted) {
+        const error = problem(cause, `Could not connect ${target.name}.`);
+        setStep(current => current.kind === "progress" ? { ...current, phase: "failed", failedAt: current.phase, error } : current);
       }
+    } finally {
+      if (controller.current === operation) controller.current = null;
     }
-    if (!mounted.current || signal.aborted) return;
-    if (failedConnections && sameProvider) {
-      markAdded(added);
-      setRecheckRequired(true);
-      setError(`Could not refresh ${failedConnections} of ${connections.length} connections. Your selection is retained. Recheck mailboxes before adding.`);
-      return;
-    }
-    const items = [...found.values()];
-    setChoices({ providerId, items, failedConnections });
-    setSelected(previous => new Set(sameProvider ? [...previous].filter(key => {
-      const item = found.get(key);
-      return item && !item.added && eligible(item.candidate);
-    }) : []));
-    setRecheckRequired(false);
-    if (failedConnections) setError(`Could not discover mailboxes from ${failedConnections} of ${connections.length} connections. Choose mailboxes again to retry those connections.`);
   }
 
-  async function connect(event: FormEvent<HTMLFormElement>, provider: HostProvider) {
+  function setUp(target: HostProvider, connectionIds: string[]) {
+    const operation = begin(target.id, connectionIds);
+    if (operation) void run(target, operation, signal => finalize(target, connectionIds, signal));
+  }
+
+  async function connect(event: FormEvent<HTMLFormElement>, target: HostProvider, reconnectId: string | null) {
     event.preventDefault();
-    const operation = begin(provider.id, "connect");
-    if (!operation) return;
-    const signal = operation.signal;
     const form = event.currentTarget;
     const credentials = Object.fromEntries([...new FormData(form)].filter((entry): entry is [string, string] => typeof entry[1] === "string"));
-    // Credentials exist only in this submission. Clear password controls on failure too;
+    // Credentials exist only in this submission. Clear password controls immediately;
     // never put mail passwords in React state, draft recovery, storage, or URLs.
     for (const input of form.querySelectorAll<HTMLInputElement>('input[type="password"]')) input.value = "";
-    try {
-      const result = await connectHostProvider(provider.id, credentials, signal, reconnectTargets[provider.id] || undefined);
-      form.reset();
-      if (result.authorizeUrl) {
-        const url = new URL(result.authorizeUrl, location.origin);
-        if (url.origin !== location.origin) throw new Error("The host returned an unexpected authorization address.");
-        location.assign(url.href);
-        return;
+    const operation = begin(target.id);
+    if (!operation) return;
+    await run(target, operation, async signal => {
+      try {
+        const result = await connectHostProvider(target.id, credentials, signal, reconnectId ?? undefined);
+        if (result.authorizeUrl) {
+          const url = new URL(result.authorizeUrl, location.origin);
+          if (url.origin !== location.origin) throw new Error("The host returned an unexpected authorization address.");
+          location.assign(url.href);
+          return;
+        }
+        if (!result.connectionId) throw new Error("The host did not return a connection.");
+        await finalize(target, [result.connectionId], signal);
+      } finally {
+        for (const key of Object.keys(credentials)) credentials[key] = "";
       }
-      if (!result.connectionId) throw new Error("The host did not return a connection.");
+    });
+  }
+
+  // OAuth return: the page reloaded, so pick up the new connection and finish here.
+  // Runs once per resume request; an aborted attempt (StrictMode remount, unmount) may start again.
+  const ready = configuration !== null;
+  useEffect(() => {
+    if (!resume || !ready || resumed.current !== "idle") return;
+    const target = (store.getSnapshot().host ?? host)?.providers.find(item => item.enabled && item.id === resume.providerId);
+    if (!target) return;
+    const operation = begin(target.id);
+    if (!operation) return;
+    resumed.current = "running";
+    void run(target, operation, async signal => {
       await store.refresh(true);
       if (signal.aborted) return;
-      if (provider.mailboxSelection === "automatic") {
-        const mailbox = store.getSnapshot().mailboxes.find(box => box.connectionId === result.connectionId && box.status === "active");
-        if (!mailbox) { setNotice("Mailbox connected. Resume its mailbox in settings to load mail."); return; }
-        await store.client.syncMailbox(mailbox.id, { lane: "latest", limit: 25 }, { signal });
-        await store.refresh(true);
-        setNotice("Mailbox connected. Recent mail is available; your Unified inbox selection and pins are unchanged.");
-        return;
-      }
-      setNotice(`${provider.name} connected. Choose which mailboxes to add.`);
-      await discover(provider.id, [result.connectionId], signal);
-    } catch (cause) {
-      if (mounted.current && !signal.aborted) setError(problem(cause, "Could not connect this account."));
-    } finally {
-      for (const field of provider.fields ?? []) if (field.type === "password") credentials[field.name] = "";
-      finish();
-    }
-  }
-
-  async function showMailboxes(provider: HostProvider) {
-    const operation = begin(provider.id, "discover");
-    if (!operation) return;
-    try { await discover(provider.id, provider.connectionIds, operation.signal); }
-    catch (cause) {
-      if (mounted.current && !operation.signal.aborted) {
-        if (choices?.providerId === provider.id) setRecheckRequired(true);
-        setError(problem(cause, "Could not load mailboxes."));
-      }
-    }
-    finally { finish(); }
-  }
-
-  async function addMailboxes() {
-    if (!choices || recheckRequired) return;
-    const requested = choices.items.filter(item => !item.added && eligible(item.candidate) && selected.has(item.key));
-    if (!requested.length) return;
-    const operation = begin(choices.providerId, "add");
-    if (!operation) return;
-    const signal = operation.signal;
-    const requestedKeys = new Set(requested.map(item => item.key));
-    const confirmed = new Set<string>();
-    const attempted = new Set<string>();
-    const before = new Set<string>();
-    const backfill = new Map<string, string>();
-    const failures: SyncIssue[] = [];
-    const work: AddProgress = { phase: "checking", total: requested.length, added: 0, sources: 0, finishedSources: 0 };
-    const report = () => { if (mounted.current) setProgress({ ...work }); };
-    const accept = (mailboxes: Mailbox[]) => {
-      const keys = new Set<string>();
-      for (const box of mailboxes) {
-        if (box.status === "detached") continue;
-        const key = mailboxKey(box.sourceId, box.selector);
-        keys.add(key);
-        if (!requestedKeys.has(key)) continue;
-        confirmed.add(key);
-        if (attempted.has(key) && !before.has(key)) backfill.set(box.sourceId, box.id);
-      }
-      markAdded(keys);
-      work.added = confirmed.size;
-      report();
+      const known = store.getSnapshot().host?.providers.find(item => item.id === target.id)?.connectionIds ?? target.connectionIds;
+      const ids = resume.connectionId && known.includes(resume.connectionId) ? [resume.connectionId] : known;
+      if (!ids.length) throw new Error("The connection could not be found after signing in.");
+      await finalize(target, ids, signal);
+    }).then(() => { if (!operation.signal.aborted) resumed.current = "handled"; });
+    return () => {
+      if (resumed.current !== "running") return;
+      operation.abort();
+      if (controller.current === operation) controller.current = null;
+      resumed.current = "idle";
     };
-    let creationFailed = false;
-    let refreshed = false;
-    let initialCheckPassed = false;
-    let successfulSyncs = 0;
-    let needsRecheck = false;
-    const errors: string[] = [];
-    report();
-    try {
-      const existing = await store.client.mailboxes({ signal });
-      initialCheckPassed = true;
-      for (const box of existing) if (box.status !== "detached") before.add(mailboxKey(box.sourceId, box.selector));
-      accept(existing);
-      work.phase = "creating";
-      report();
-      for (const choice of requested) {
-        if (signal.aborted) break;
-        if (confirmed.has(choice.key)) continue;
-        attempted.add(choice.key);
-        const candidate = choice.candidate;
-        try {
-          // One in-flight create at a time; only explicit, eligible selections reach this call.
-          const mailbox = await store.client.createMailbox({
-            sourceId: candidate.sourceId, name: candidate.name, selector: candidate.selector,
-            defaultSender: candidate.canSend ? candidate.identities[0] ?? null : null,
-          }, { signal });
-          accept([mailbox]);
-        } catch (cause) {
-          if (!signal.aborted) {
-            creationFailed = true;
-            const message = problem(cause, "Could not create this mailbox.");
-            if (mounted.current) setChoices(current => current && ({ ...current, items: current.items.map(item => item.key === choice.key ? { ...item, error: message } : item) }));
-          }
-          // A failed request may already have committed. Stop scheduling creates and reconcile before retrying.
-          break;
-        }
-      }
-      if (!mounted.current) return;
-      if (creationFailed || signal.aborted) {
-        work.phase = "checking";
-        report();
-        const recheck = new AbortController();
-        recheckController.current = recheck;
-        try { accept(await store.client.mailboxes({ signal: recheck.signal })); }
-        catch { needsRecheck = true; errors.push("Could not confirm the last request. Recheck mailboxes before retrying."); }
-        finally { recheckController.current = null; }
-      }
-      // syncMailbox synchronizes a source, not a single domain. Create the views first, then sync each source once.
-      work.sources = backfill.size;
-      if (!signal.aborted && mounted.current) {
-        work.phase = "syncing";
-        report();
-        for (const [sourceId, mailboxId] of backfill) {
-          if (signal.aborted) break;
-          try {
-            await store.client.syncMailbox(mailboxId, { lane: "backfill", limit: 50 }, { signal });
-            successfulSyncs++;
-          } catch (cause) {
-            if (signal.aborted) break;
-            failures.push({ sourceId, message: problem(cause, "Initial sync failed.") });
-            if (mounted.current) setSyncIssues([...failures]);
-          }
-          work.finishedSources++;
-          report();
-        }
-      }
-    } catch (cause) {
-      if (!signal.aborted) errors.push(initialCheckPassed ? problem(cause, "Could not finish mailbox setup.") : "Could not check existing mailboxes. No new mailbox requests were started.");
-    } finally {
-      if (mounted.current) {
-        if (attempted.size || confirmed.size) {
-          work.phase = "refreshing";
-          report();
-          try { await store.refresh(true); refreshed = true; }
-          catch { errors.push("The inbox could not refresh. Added mailboxes are retained; refresh the inbox to reload them."); }
-          if (refreshed) accept(store.getSnapshot().mailboxes);
-        }
-        if (mounted.current) {
-          const cancelled = signal.aborted;
-          setRecheckRequired(needsRecheck || cancelled && attempted.size > 0);
-          if (creationFailed && confirmed.size < requested.length) errors.unshift("Adding stopped after a request failed. The unadded mailboxes are still selected; retry when ready.");
-          setError(errors.join(" "));
-          const summary = `${confirmed.size} of ${requested.length} selected mailboxes are added.`;
-          setNotice(cancelled
-            ? `Stopped. ${summary} ${attempted.size ? "Added mailboxes remain; an in-flight request may still finish. Recheck mailboxes before retrying." : "No new mailbox requests were started."}`
-            : initialCheckPassed ? `${summary}${backfill.size ? ` Initial sync completed for ${successfulSyncs} of ${backfill.size} sources (up to 50 messages per source).` : ""}` : "");
-          finish();
-        }
-      }
-    }
-  }
+  }, [resume, ready]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!configuration) return <p className="settings-note" role="status">Loading provider setup…</p>;
-  const providers = configuration.providers.filter(provider => provider.enabled);
-  const available = (choices?.items ?? []).filter(item => !item.added && eligible(item.candidate));
-  const visibleAvailable = visible.filter(item => !item.added && eligible(item.candidate));
-  const selectedVisible = visibleAvailable.filter(item => selected.has(item.key)).length;
-  const addedCount = choices?.items.filter(item => item.added).length ?? 0;
-  const selectedCount = available.filter(item => selected.has(item.key)).length;
-  const progressLabel = !progress ? "" : progress.phase === "checking" ? "Checking selected mailboxes…"
-    : progress.phase === "creating" ? `${progress.added} of ${progress.total} selected mailboxes added`
-    : progress.phase === "syncing" ? `Initial sync: ${progress.finishedSources} of ${progress.sources} sources finished`
-    : "Refreshing the inbox…";
+
+  if (step.kind === "pick") {
+    const addable = providers.filter(item => item.connection !== "none");
+    const covered = new Set(snapshot.mailboxes.filter(box => box.status !== "detached").map(box => box.connectionId));
+    const sources = snapshot.sources.filter(source => source.connectionId && providers.some(item => item.connectionIds.includes(source.connectionId!)));
+    return (
+      <div className="provider-flow" ref={root} tabIndex={-1}>
+        {configuration.mode === "mock" && <p className="settings-note">Offline mock: explore the fictional sources below. Enable real providers in the local host configuration to add accounts.</p>}
+        {!configuration.allowProviderWrites && configuration.mode !== "mock" && <p className="settings-note">Real accounts are read-only. Provider changes are disabled.</p>}
+        {addable.length > 0 && <div className="provider-options">
+          {addable.map(item => {
+            const disabled = !item.ready || !configuration.allowProviderWrites;
+            return <button key={item.id} type="button" className="provider-option" disabled={disabled}
+              title={!item.ready ? item.setupMessage || "Configure this provider in your local host before connecting." : undefined}
+              onClick={() => { setPreset(item.fields?.find(field => field.type === "select")?.defaultValue ?? ""); setStep({ kind: "connect", providerId: item.id, reconnectId: null }); }}>
+              <span className="mailbox-row-label"><span>{item.name}</span><small>{!item.ready ? "Setup required" : method(item)}</small></span>
+              <Icon name="ChevronRight" size={14} />
+            </button>;
+          })}
+        </div>}
+        {addable.length === 0 && configuration.mode !== "mock" && <p className="settings-note">No providers are enabled in the local host configuration.</p>}
+        {sources.length > 0 && <section className="provider-connected" aria-label="Connected accounts">
+          <h3>Connected</h3>
+          <ul>
+            {sources.map(source => {
+              const connectionId = source.connectionId!;
+              const owner = providers.find(item => item.connectionIds.includes(connectionId))!;
+              const attention = source.status !== "connected";
+              const incomplete = source.status === "connected" && owner.mailboxSelection !== "automatic" && !covered.has(connectionId);
+              const writable = configuration.allowProviderWrites;
+              return <li key={source.id}>
+                <span className="mailbox-row-label" title={`${source.email || source.name} · ${owner.name}`}>
+                  <span>{source.email || source.name}</span>
+                  <small className={attention || incomplete ? "provider-attention" : ""}>{owner.name} · {incomplete ? "Setup not finished" : statusLabel(source)}</small>
+                </span>
+                {writable && incomplete && <button type="button" className="settings-text-button" onClick={() => setUp(owner, [connectionId])}>Finish setup</button>}
+                {writable && owner.reconnect && <button type="button" className="settings-text-button" onClick={() => {
+                  setPreset(owner.fields?.find(field => field.type === "select")?.defaultValue ?? "");
+                  setStep({ kind: "connect", providerId: owner.id, reconnectId: connectionId });
+                }}>Reconnect</button>}
+                {writable && owner.connection === "oauth" && attention && <button type="button" className="settings-text-button" onClick={() => setStep({ kind: "connect", providerId: owner.id, reconnectId: null })}>Sign in again</button>}
+              </li>;
+            })}
+          </ul>
+        </section>}
+      </div>
+    );
+  }
+
+  if (!provider) return <p className="settings-note" role="alert">This provider is no longer available.</p>;
+
+  if (step.kind === "connect") {
+    const reconnecting = snapshot.sources.find(source => source.connectionId === step.reconnectId);
+    const hasPreset = provider.fields?.some(field => field.type === "select") ?? false;
+    const currentPreset = preset || provider.fields?.find(field => field.type === "select")?.defaultValue || "icloud";
+    const isIcloud = !hasPreset || currentPreset === "icloud";
+    const fieldInput = (field: Field) => <label className="settings-field" key={field.name}>
+      <span>{field.type === "password" && provider.id === "imap" && !isIcloud ? "Mail password" : field.label}</span>
+      {field.type === "select" ? <select name={field.name} required={field.required} value={currentPreset} onChange={event => setPreset(event.target.value)}>
+        {field.options?.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select> : <input name={field.name} type={field.type} required={field.required} maxLength={4096}
+        defaultValue={field.name === "email" ? reconnecting?.email : field.defaultValue} readOnly={field.name === "email" && !!reconnecting}
+        autoComplete={field.type === "email" ? "email" : "off"} autoCapitalize="none" spellCheck={false} />}
+    </label>;
+    return (
+      <form className="provider-flow provider-connect" ref={root as unknown as RefObject<HTMLFormElement>} tabIndex={-1} key={`${provider.id}:${step.reconnectId ?? ""}`} onSubmit={event => void connect(event, provider, step.reconnectId)}>
+        {provider.connection === "oauth" ? <>
+          <p className="settings-note">You will be sent to Google to approve access, then brought back here while your mail loads.</p>
+          <button className="settings-button" type="submit">{provider.actionLabel || `Sign in with ${provider.name}`}</button>
+        </> : <>
+          {reconnecting && <p className="settings-note">Enter a new password for {reconnecting.email || reconnecting.name}. Server settings stay the same.</p>}
+          {(provider.fields ?? []).filter(field => !field.advanced).map(fieldInput)}
+          {!isIcloud && provider.fields?.some(field => field.advanced) && <details className="provider-advanced">
+            <summary>Advanced server settings</summary>
+            <p className="settings-note">Server endpoints and required TLS are set by the selected host preset. Change presets in the local host configuration.</p>
+            {provider.fields.filter(field => field.advanced).map(fieldInput)}
+          </details>}
+          {provider.credentialHelp && isIcloud && <p className="settings-note">{provider.credentialHelp.text} <a href={provider.credentialHelp.url} target="_blank" rel="noopener noreferrer">Create an app-specific password</a></p>}
+          <button className="settings-button" type="submit">{step.reconnectId ? "Reconnect" : provider.actionLabel || `Connect ${provider.name}`}</button>
+        </>}
+      </form>
+    );
+  }
+
+  const automatic = provider.mailboxSelection === "automatic";
+  const phases: Array<{ id: Phase; label: string }> = [
+    { id: "connecting", label: "Connecting" },
+    { id: "finding", label: automatic ? "Checking mailbox" : "Finding mailboxes" },
+    ...(automatic ? [] : [{ id: "adding" as Phase, label: "Adding mailboxes" }]),
+    { id: "syncing", label: "Loading recent mail" },
+    { id: "refreshing", label: "Refreshing inbox" },
+  ];
+  const order: Phase[] = ["connecting", "finding", "adding", "syncing", "refreshing", "connected"];
+  const position = order.indexOf(step.phase === "failed" ? step.failedAt ?? "connecting" : step.phase);
+  const failedAfterConnect = step.phase === "failed" && step.connectionIds.length > 0;
   return (
-    <div className="provider-connections">
-      <p className="settings-note">
-        {configuration.mode === "mock"
-          ? "Explore the fictional sources below. To connect real accounts, enable their providers in the local host configuration."
-          : configuration.allowProviderWrites ? "A connection supplies credentials. Choose mailboxes to add the domains or addresses you want in the inbox." : "Real accounts are read-only. Sending and provider changes are disabled."}
-      </p>
-      {providers.length === 0 && <p className="settings-note">No providers are enabled in the local host configuration.</p>}
-      {providers.map(provider => {
-        const target = reconnectTargets[provider.id] || "";
-        const source = snapshot.sources.find(source => source.connectionId === target);
-        const preset = serverPresets[provider.id] || "icloud";
-        const fieldInput = (field: NonNullable<HostProvider["fields"]>[number]) => <label className="settings-field" key={field.name}>
-          <span>{field.type === "password" && provider.id === "imap" && preset !== "icloud" ? "Mail password" : field.label}</span>
-          {field.type === "select" ? <select name={field.name} required={field.required} value={serverPresets[provider.id] || field.defaultValue}
-            disabled={busy !== null} onChange={event => setServerPresets(previous => ({ ...previous, [provider.id]: event.target.value }))}>
-            {field.options?.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-          </select> : <input name={field.name} type={field.type} required={field.required} maxLength={4096}
-            defaultValue={field.name === "email" ? source?.email : field.defaultValue} readOnly={field.name === "email" && !!source}
-            autoComplete="off" autoCapitalize="none" spellCheck={false} disabled={busy !== null} />}
-        </label>;
-        return (
-        <section className="provider-connection" key={provider.id} aria-label={`${provider.name} connection`}>
-          <div className="provider-connection-heading">
-            <h3>{provider.name}</h3>
-            <span className="mailbox-count">{provider.connectionIds.length ? `${provider.connectionIds.length} ${provider.connectionIds.length === 1 ? "connection" : "connections"}` : provider.ready ? "Not connected" : "Setup required"}</span>
-          </div>
-          {!provider.ready ? <p className="settings-note">{provider.setupMessage || "Configure this provider in your local host before connecting."}</p> : provider.connection !== "none" && (
-            <form key={`${provider.id}:${target}:${preset}`} onSubmit={event => void connect(event, provider)}>
-              {provider.reconnect && provider.connectionIds.length > 0 && <label className="settings-field">
-                <span>Connection</span>
-                <select value={target} disabled={busy !== null} onChange={event => setReconnectTargets(previous => ({ ...previous, [provider.id]: event.target.value }))}>
-                  <option value="">New mailbox</option>
-                  {provider.connectionIds.map(id => {
-                    const account = snapshot.sources.find(source => source.connectionId === id);
-                    return <option key={id} value={id}>Reconnect {account?.email || account?.name || "mailbox"}{account?.status === "reconnect_required" ? " · Sign-in required" : ""}</option>;
-                  })}
-                </select>
-              </label>}
-              {(provider.fields ?? []).filter(field => !field.advanced).map(fieldInput)}
-              {preset !== "icloud" && provider.fields?.some(field => field.advanced) && <details>
-                <summary>Advanced server settings</summary>
-                <p className="settings-note">Server endpoints and required TLS are set by the selected host preset. Change presets in the local host configuration.</p>
-                {provider.fields.filter(field => field.advanced).map(fieldInput)}
-              </details>}
-              {provider.credentialHelp && preset === "icloud" && <p className="settings-note">{provider.credentialHelp.text} <a href={provider.credentialHelp.url} target="_blank" rel="noopener noreferrer">Create an app-specific password</a></p>}
-              <button className="settings-button" type="submit" disabled={busy !== null}>
-                {busy?.providerId === provider.id && busy.action === "connect" ? "Connecting…" : target ? "Reconnect mailbox" : provider.actionLabel || `Connect ${provider.name}`}
-              </button>
-            </form>
-          )}
-          {provider.ready && provider.connectionIds.length > 0 && provider.mailboxSelection !== "automatic" && (
-            <button className="settings-text-button" type="button" disabled={busy !== null} onClick={() => void showMailboxes(provider)}>
-              {busy?.providerId === provider.id && busy.action === "discover" ? "Finding mailboxes…" : choices?.providerId === provider.id && recheckRequired ? "Recheck mailboxes" : "Choose mailboxes"}
-            </button>
-          )}
-          {choices?.providerId === provider.id && (
-            <div className="provider-mailboxes">
-              <h4>Choose mailboxes</h4>
-              <input type="search" aria-label={`Search ${provider.name} mailboxes`} placeholder="Search domains, addresses or sources" value={query} onChange={event => setQuery(event.target.value)} />
-              <div className="provider-mailbox-counts" role="status">
-                <span>{selectedCount} selected</span><span>{available.length} available</span><span>{addedCount} added</span>
-              </div>
-              <div className="mailbox-list-toolbar">
-                <span className="mailbox-count">{visible.length} shown</span>
-                <div className="mailbox-bulk-actions">
-                  <button className="settings-text-button" type="button" disabled={busy !== null || visibleAvailable.length === selectedVisible} onClick={() => setSelected(previous => new Set([...previous, ...visibleAvailable.map(item => item.key)]))}>Select visible ({visibleAvailable.length})</button>
-                  <button className="settings-text-button" type="button" disabled={busy !== null || !selectedVisible} onClick={() => {
-                    const keys = new Set(visibleAvailable.map(item => item.key));
-                    setSelected(previous => new Set([...previous].filter(key => !keys.has(key))));
-                  }}>Clear visible ({selectedVisible})</button>
-                </div>
-              </div>
-              <div className="mailbox-bulk-actions provider-all-actions">
-                <button className="settings-text-button" type="button" disabled={busy !== null || selectedCount === available.length} onClick={() => setSelected(new Set(available.map(item => item.key)))}>Select all available ({available.length})</button>
-                <button className="settings-text-button" type="button" disabled={busy !== null || !selectedCount} onClick={() => setSelected(new Set())}>Clear all selected ({selectedCount})</button>
-              </div>
-              <div className="provider-mailbox-list" tabIndex={0} aria-label={`${provider.name} mailbox candidates`}>
-                {visibleGroups.map(group => (
-                  <section className="mailbox-source-group" key={group.sourceId} aria-label={sourceNames.get(group.sourceId) || "Connected source"}>
-                    {sourceNames.get(group.sourceId) && <h5 title={sourceNames.get(group.sourceId)}>{sourceNames.get(group.sourceId)}</h5>}
-                    {group.items.map(({ candidate, key, added, error }) => {
-                      const available = eligible(candidate);
-                      const scope = candidate.selector.kind === "all" ? "All mail" : candidate.selector.value;
-                      const detail = error ? error : !available && !added ? candidate.unavailableReason || (candidate.canReceive ? "This connection cannot verify the receiving scope." : "Receiving is not available for this mailbox.")
-                        : candidate.name !== scope ? scope : candidate.selector.kind === "domain" ? "Domain" : candidate.selector.kind === "address" ? "Address" : "All mail";
-                      return <label className="provider-mailbox" key={key} title={`${candidate.name} · ${detail}${added ? " · Added" : ""}`}>
-                        <input type="checkbox" aria-label={candidate.name} checked={added || selected.has(key)} disabled={added || !available || busy !== null} onChange={event => setSelected(previous => {
-                          const next = new Set(previous);
-                          if (event.target.checked) next.add(key); else next.delete(key);
-                          return next;
-                        })} />
-                        <span className="mailbox-row-label"><span>{candidate.name}</span><small className={error ? "provider-choice-error" : ""}>{detail}</small></span>
-                        <span className="provider-mailbox-status">{added ? "Added" : !available ? "Unavailable" : ""}</span>
-                      </label>;
-                    })}
-                  </section>
-                ))}
-                {visible.length === 0 && <p className="settings-note">{choices.items.length ? "No mailboxes match this search." : choices.failedConnections ? "No candidates loaded. Retry discovery to check the unavailable connections." : "No mailboxes are available for this connection."}</p>}
-              </div>
-              <div className="provider-mailbox-actions">
-                <button className="settings-button" type="button" disabled={!selectedCount || busy !== null || recheckRequired} onClick={() => void addMailboxes()}>Add selected ({selectedCount})</button>
-                {busy?.providerId === provider.id && busy.action === "add" && progress?.phase !== "refreshing" && <button className="settings-text-button" type="button" disabled={stopping} onClick={() => { setStopping(true); controller.current?.abort(); recheckController.current?.abort(); }}>{stopping ? "Stopping…" : "Stop"}</button>}
-              </div>
-              {busy?.providerId === provider.id && busy.action === "add" && progress && <div className="provider-add-progress">
-                <p role="status">{progressLabel}</p>
-                <progress aria-label={progressLabel} max={progress.phase === "syncing" ? Math.max(1, progress.sources) : progress.total} value={progress.phase === "checking" || progress.phase === "refreshing" ? undefined : progress.phase === "syncing" ? progress.finishedSources : progress.added} />
-              </div>}
-            </div>
-          )}
-        </section>
-      ); })}
-      {syncIssues.length > 0 && <div className="provider-sync-issues" role="alert">
-        <p>Mailboxes were added, but initial sync failed for {syncIssues.length} {syncIssues.length === 1 ? "source" : "sources"}. Sync again from the inbox when the connection is available.</p>
-        <ul>{syncIssues.map(issue => <li key={issue.sourceId}><span title={sourceNames.get(issue.sourceId)}>{sourceNames.get(issue.sourceId) || "Connected source"}</span><span>{issue.message}</span></li>)}</ul>
+    <div className="provider-flow provider-progress" ref={root} tabIndex={-1} role="status" aria-live="polite">
+      <ol className="provider-phases">
+        {phases.map(phase => {
+          const index = order.indexOf(phase.id);
+          const state = step.phase === "connected" || index < position ? "done" : index === position ? step.phase === "failed" ? "failed" : "active" : "pending";
+          return <li key={phase.id} data-state={state}>
+            <span className="provider-phase-mark" aria-hidden="true">{state === "done" ? <Icon name="Check" size={12} /> : state === "failed" ? <Icon name="Close" size={12} /> : state === "active" ? <i /> : null}</span>
+            <span>{phase.label}</span>
+          </li>;
+        })}
+      </ol>
+      {step.phase === "connected" && <p className="provider-result">
+        <strong>Connected.</strong> {step.added.length ? `Added ${step.added.length === 1 ? step.added[0] : `${step.added.length} mailboxes`}.` : step.note ?? "Mailbox is up to date."}
+        {step.added.length > 0 && step.note && ` ${step.note}`}
+      </p>}
+      {step.added.length > 1 && step.phase !== "failed" && <ul className="provider-added">{step.added.map(name => <li key={name}>{name}</li>)}</ul>}
+      {step.phase === "failed" && <p className="provider-connection-error" role="alert">{step.error}</p>}
+      {step.phase === "connected" && <button type="button" className="settings-button" onClick={onDone}>Open inbox</button>}
+      {step.phase === "failed" && <div className="mailbox-bulk-actions">
+        {failedAfterConnect
+          ? <button type="button" className="settings-text-button" onClick={() => setUp(provider, step.connectionIds)}>Retry setup</button>
+          : <button type="button" className="settings-text-button" onClick={() => setStep({ kind: "connect", providerId: provider.id, reconnectId: null })}>Try again</button>}
+        <button type="button" className="settings-text-button" onClick={() => setStep({ kind: "pick" })}>Choose another provider</button>
       </div>}
-      {error && <p className="provider-connection-error" role="alert">{error}</p>}
-      {notice && <p className="settings-note" role="status">{notice}</p>}
     </div>
   );
 }

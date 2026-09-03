@@ -156,13 +156,24 @@ export default function App() {
   } | null>(null);
   const [noticeFading, setNoticeFading] = useState(false);
   const [noticeHovered, setNoticeHovered] = useState(false);
+  const [onboardingReturn, setOnboardingReturn] = useState<{ providerId: string; connectionId: string | null } | null>(null);
   useEffect(() => {
     const url = new URL(location.href);
     const connection = url.searchParams.get("connection");
     if (connection !== "connected" && connection !== "failed") return;
-    setNotice({ text: connection === "connected" ? "Account connected." : "Account connection could not be completed. Try again in Add Accounts." });
-    url.searchParams.delete("connection");
+    const providerId = url.searchParams.get("provider") || "gmail";
+    const connectionId = url.searchParams.get("connectionId");
+    for (const key of ["connection", "provider", "connectionId"]) url.searchParams.delete(key);
     history.replaceState(null, "", url);
+    if (connection === "connected") {
+      // Resume onboarding in Add Accounts so the user sees connecting → connected, then lands back in the inbox.
+      setOnboardingReturn({ providerId, connectionId: /^[A-Za-z0-9_-]{1,128}$/.test(connectionId ?? "") ? connectionId : null });
+      setSettingsPage("Add Accounts");
+      setSettings(true);
+      setMobileSidebar(true);
+    } else {
+      setNotice({ text: "Account connection could not be completed. Try again in Add Accounts." });
+    }
   }, []);
   const [senderSelection, setSenderSelection] = useState<{ threadId: string; messageId: string } | null>(null);
   const [mobileSidebar, setMobileSidebar] = useState(false);
@@ -1889,6 +1900,13 @@ export default function App() {
               accounts={inbox.accounts.map(account => account.email)}
               host={inbox.host}
               store={store}
+              onboardingReturn={onboardingReturn}
+              onOnboardingDone={() => {
+                setOnboardingReturn(null);
+                setSettings(false);
+                setMobileSidebar(false);
+                void store.refresh(true);
+              }}
             />
           ) : search && !currentMail ? (
             <section className="search-sidebar">

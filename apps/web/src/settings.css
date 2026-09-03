@@ -326,19 +326,48 @@ button.settings-menu-row,
   font-size: var(--ui-small);
   line-height: 20px;
 }
-.provider-connections { display: grid; gap: 20px; min-width: 0; font-family: "Helvetica Neue", sans-serif; }
-.provider-connection { display: grid; gap: 12px; border-top: 1px solid var(--border); padding-top: 16px; }
-.provider-connection-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-.provider-connection-heading h3, .provider-mailboxes h4 { margin: 0; font-size: 14px; line-height: 20px; font-weight: 500; }
-.provider-connection-heading > span { color: var(--muted); }
-.provider-connection form { display: grid; gap: 12px; justify-items: start; }
-.provider-connection .settings-field { width: 100%; }
-.provider-connection .settings-text-button { justify-self: start; }
-.provider-mailboxes { display: grid; gap: 8px; min-width: 0; }
-.provider-mailbox-list { max-height: 320px; overflow: auto; }
-.provider-mailbox { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 6px 4px; cursor: pointer; }
-.provider-mailbox small { color: var(--muted); font: inherit; }
+/* Add account: pick a provider → connect → progress. One column, generous rows. */
+.provider-flow { display: grid; gap: 16px; min-width: 0; align-content: start; }
+.provider-flow:focus { outline: none; }
+.provider-flow > .settings-note { margin: 0; }
+.provider-options { display: grid; margin-inline: -8px; }
+.provider-option {
+  display: flex; align-items: center; gap: 12px; min-height: 56px; padding: 8px;
+  border: 0; border-radius: 6px; background: transparent; color: var(--text); font: inherit; text-align: start; cursor: pointer;
+}
+.provider-option:hover:not(:disabled) { background: var(--hover); }
+.provider-option:disabled { cursor: default; }
+.provider-option:disabled .mailbox-row-label { opacity: 0.5; }
+.provider-option .icon { color: var(--icon); }
+.provider-connected { display: grid; gap: 4px; padding-top: 12px; border-top: 1px solid var(--border); }
+.provider-connected h3 { margin: 0; font-size: 14px; font-weight: 500; line-height: 20px; }
+.provider-connected ul { margin: 0; padding: 0; list-style: none; }
+.provider-connected li { display: flex; align-items: center; gap: 16px; min-height: 48px; }
+.provider-attention { color: var(--danger); }
+.provider-connect { justify-items: start; }
+.provider-connect .settings-field { width: 100%; }
+.provider-connect .settings-field > span { color: var(--muted); }
+.provider-connect .settings-button { margin-top: 4px; }
+.provider-advanced { width: 100%; display: grid; gap: 12px; }
+.provider-advanced summary { cursor: pointer; color: var(--muted); }
+.provider-progress { padding-top: 8px; justify-items: start; }
+.provider-phases { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.provider-phases li { display: flex; align-items: center; gap: 12px; min-height: 32px; color: var(--muted); }
+.provider-phases li[data-state="active"] { color: var(--text); }
+.provider-phases li[data-state="done"] { color: var(--muted); }
+.provider-phases li[data-state="failed"] { color: var(--danger); }
+.provider-phase-mark { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 16px; width: 16px; height: 16px; }
+.provider-phase-mark i {
+  width: 12px; height: 12px; border-radius: 50%; border: 1.5px solid currentColor; border-right-color: transparent;
+  animation: provider-spin 900ms linear infinite;
+}
+@keyframes provider-spin { to { transform: rotate(360deg); } }
+.provider-result { margin: 0; color: var(--muted); }
+.provider-result strong { color: var(--text); font-weight: 500; }
+.provider-added { margin: -8px 0 0; padding-inline-start: 28px; color: var(--muted); }
 .provider-connection-error { margin: 0; color: var(--danger); line-height: 20px; }
+.settings-dialog-header .settings-dialog-back { margin-inline: -12px 4px; }
+.settings-dialog-header .settings-dialog-back + h2 { flex: 1; }
 .settings-dialog-body > .settings-note:first-child {
   margin-top: 0;
 }
@@ -969,8 +998,7 @@ button.settings-menu-row,
 .mailbox-list-toolbar > .mailbox-count {
   text-align: start;
 }
-.mailbox-bulk-actions,
-.provider-mailbox-actions {
+.mailbox-bulk-actions {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -978,13 +1006,13 @@ button.settings-menu-row,
   font-variant-numeric: tabular-nums;
 }
 .settings-mailboxes-dialog .settings-text-button,
-.provider-connections .settings-text-button {
+.provider-flow .settings-text-button {
   min-height: 40px;
   color: var(--text);
   text-align: start;
 }
 .mailbox-settings .settings-button,
-.provider-connections .settings-button {
+.provider-flow .settings-button {
   min-height: 40px;
   background: var(--text);
   color: var(--bg);
@@ -992,25 +1020,22 @@ button.settings-menu-row,
   font-variant-numeric: tabular-nums;
 }
 .mailbox-settings .settings-button:hover:not(:disabled),
-.provider-connections .settings-button:hover:not(:disabled) {
+.provider-flow .settings-button:hover:not(:disabled) {
   filter: none;
   opacity: 0.85;
 }
-.settings-dialog .mailbox-settings input[type="search"],
-.settings-dialog .provider-mailboxes input[type="search"] {
+.settings-dialog .mailbox-settings input[type="search"] {
   min-height: 40px;
   font-size: 14px;
 }
-.settings-dialog .mailbox-settings input[type="checkbox"],
-.settings-dialog .provider-mailbox input[type="checkbox"] {
+.settings-dialog .mailbox-settings input[type="checkbox"] {
   flex: 0 0 16px;
   width: 16px;
   height: 16px;
   margin: 0;
   accent-color: var(--text);
 }
-.mailbox-settings-list,
-.provider-mailbox-list {
+.mailbox-settings-list {
   min-height: 60px;
   overscroll-behavior: contain;
   scrollbar-width: thin;
@@ -1020,8 +1045,7 @@ button.settings-menu-row,
   max-height: 288px;
   overflow: auto;
 }
-.mailbox-settings-list:focus-visible,
-.provider-mailbox-list:focus-visible {
+.mailbox-settings-list:focus-visible {
   outline: 2px solid var(--text);
   outline-offset: 2px;
 }
@@ -1061,12 +1085,10 @@ button.settings-menu-row,
   min-height: 48px;
   cursor: pointer;
 }
-.mailbox-inclusion-choice:has(input:disabled),
-.provider-mailbox:has(input:disabled) {
+.mailbox-inclusion-choice:has(input:disabled) {
   cursor: default;
 }
-.mailbox-settings-row:hover,
-.provider-mailbox:hover:has(input:not(:disabled)) {
+.mailbox-settings-row:hover {
   background: var(--hover);
 }
 .mailbox-row-label {
@@ -1149,9 +1171,7 @@ button.settings-menu-row,
 }
 .mailbox-empty-selection,
 .mailbox-save-conflict p,
-.mailbox-close-confirm p,
-.provider-add-progress p,
-.provider-sync-issues p {
+.mailbox-close-confirm p {
   margin: 0;
 }
 .mailbox-empty-selection {
@@ -1166,55 +1186,6 @@ button.settings-menu-row,
 .mailbox-close-confirm {
   margin-top: 12px;
 }
-.provider-mailbox-counts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 12px;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
-.provider-mailbox-counts > span {
-  min-inline-size: 12ch;
-}
-.provider-all-actions {
-  margin-top: -8px;
-}
-.provider-mailbox-status {
-  flex: 0 0 76px;
-  color: var(--muted);
-  text-align: end;
-  font-size: 13px;
-}
-.provider-mailbox small.provider-choice-error,
-.provider-sync-issues {
-  color: var(--danger);
-}
-.provider-add-progress {
-  display: grid;
-  gap: 8px;
-  font-variant-numeric: tabular-nums;
-}
-.provider-add-progress progress {
-  width: 100%;
-  height: 4px;
-  border: 0;
-  accent-color: var(--text);
-}
-.provider-add-progress progress::-webkit-progress-bar {
-  background: var(--border);
-}
-.provider-add-progress progress::-webkit-progress-value {
-  background: var(--text);
-}
-.provider-sync-issues ul {
-  margin: 8px 0 0;
-  padding-inline-start: 16px;
-}
-.provider-sync-issues li > span {
-  display: block;
-  overflow-wrap: anywhere;
-}
-
 @media (max-width: 600px) {
   .settings-close {
     opacity: 1;
@@ -1260,8 +1231,7 @@ button.settings-menu-row,
   .settings-mailboxes-dialog.modal {
     height: calc(100dvh - 32px);
   }
-  .settings-dialog .mailbox-settings input[type="search"],
-  .settings-dialog .provider-mailboxes input[type="search"] {
+  .settings-dialog .mailbox-settings input[type="search"] {
     font-size: 16px;
   }
   .mailbox-pin-actions {

@@ -83,7 +83,13 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
             const headers = new Headers(response.headers)
             headers.delete('Content-Type')
             headers.delete('Content-Length')
-            headers.set('Location', `${config.web.origin}/?connection=${response.ok ? 'connected' : 'failed'}`)
+            // Tell the web app which provider finished so it can resume onboarding for that connection.
+            const params = new URLSearchParams({ connection: response.ok ? 'connected' : 'failed', provider: 'gmail' })
+            if (response.ok) {
+              const body = await response.clone().json().catch(() => null) as { id?: unknown } | null
+              if (typeof body?.id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(body.id)) params.set('connectionId', body.id)
+            }
+            headers.set('Location', `${config.web.origin}/?${params}`)
             return new Response(null, { status: 303, headers })
           },
         }
