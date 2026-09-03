@@ -665,7 +665,9 @@ export class InboxStore {
       try { const draft = await this.client.draft(id, { signal }); if (draft.status === "active") drafts.set(id, draft); else drafts.delete(id); }
       catch (error) { if (error instanceof ApiError && error.status === 404) drafts.delete(id); else throw error; }
     }
-    for (const ref of this.references.filter(ref => force || events.some(event => event.type === "operation.updated" && event.entityId === ref.id))) {
+    const trackedSources = new Set(this.sourceAccounts.map(account => account.id));
+    const changedOperations = new Set(events.filter(event => event.type === "operation.updated").map(event => event.entityId));
+    for (const ref of this.references.filter(ref => trackedSources.has(ref.accountId) && (force || changedOperations.has(ref.id)))) {
       try {
         const before = this.operations.get(ref.id);
         const operation = await this.client.operation(ref.id, { signal });
