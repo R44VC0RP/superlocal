@@ -840,7 +840,7 @@ export class ImapProvider implements InboxProvider {
       return { selected, uidValidity, deletedMessageIds: [], removedMessageIds: [...retired], retiredMessageIds: [...retired],
         cursor: next, hasMore, fullSync: snapshot, snapshotComplete: snapshot && !hasMore,
         // A partial delta must retain its continuation; advancing MODSEQ here would lose later pages.
-        recentCursor: snapshot ? { provider: 'imap', kind: 'uid', value: String(watermark), folder,
+        recentCursor: snapshot ? { provider: 'imap', kind: 'uid' as const, value: String(watermark), folder,
           metadata: { accountId: this.accountId, mailbox: path, uidValidity, ...(modseq ? { highestModseq: modseq } : {}) } } : next,
       }
     })
