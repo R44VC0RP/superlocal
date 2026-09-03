@@ -1,0 +1,188 @@
+# Apple / iCloud Mail provider
+
+Research date: 2026-09-02
+Status: deferred implementation; no iCloud connection or live qualification performed.
+
+This note concerns **iCloud Mail**, including eligible `icloud.com`, `me.com`,
+and `mac.com` accounts. It does not mean the Apple Mail application, which can
+display accounts hosted by other providers. Recheck the linked documentation
+before implementation: authorization availability and enrollment may change.
+
+## Recommendation
+
+Pursue Apple's official **iCloud OAuth 2.0 developer-interest route**. Real
+mailbox authorization exists, but public specifications and automatic enrollment
+sufficient to implement Superlocal's connection have not been established.
+
+Keep **IMAP/SMTP with an app-specific password** as the documented fallback,
+subject to qualifying our adapter. Do not describe the existing generic IMAP
+adapter as production-ready Apple support.
+
+OAuth and IMAP are not competing alternatives: OAuth handles authorization;
+IMAP handles mailbox access. Apple's supported token transport still needs to
+be confirmed. Do not assume that an approved OAuth grant necessarily uses IMAP.
+
+## What the research established
+
+1. **Apple supports genuine third-party mailbox authorization.** Its
+   [October 7, 2025 guidance](https://support.apple.com/en-us/121539) describes
+   entering an Apple Account address and selecting Allow in supported apps.
+   Access is revoked under Apple Account > Sign-In and Security > Account Data
+   Sharing > Remove access. Unsupported apps can use app-specific passwords.
+2. **Developers can express interest.** In
+   [Developer Forums thread 825772](https://developer.apple.com/forums/thread/825772),
+   an Apple DTS response in May 2026 directs an independent developer to
+   [Express interest in iCloud OAuth 2.0](https://developer.apple.com/contact/request/icloud-oauth2/).
+   Research stopped at the sign-in boundary. The intake establishes an
+   Apple-mediated application route, not automatic acceptance or confirmed
+   eligibility for Superlocal.
+3. **Outlook demonstrates a deployed OAuth integration.** Microsoft's
+   [October 30, 2025 announcement](https://techcommunity.microsoft.com/blog/outlook/it%E2%80%99s-now-easier-to-access-icloud-mail-calendar-and-contacts-in-outlook/4465707)
+   covers iCloud Mail, Calendar, and Contacts in new Outlook for Windows,
+   Outlook for Mac, and Outlook for iOS/Android. It does not establish a public
+   registration process for other applications or include classic Outlook in
+   that new flow.
+4. **Ordinary Sign in with Apple is not mailbox authorization.** Its
+   [identity-login documentation](https://developer.apple.com/documentation/signinwithapple/authenticating-users-with-sign-in-with-apple)
+   is not an iCloud Mail grant specification. Do not repurpose its scopes,
+   endpoints, another application's registration, or private iCloud web cookies.
+5. **An aggregator's OAuth can conceal an app-password upstream connection.**
+   For example, [Nylas's iCloud guide](https://developer.nylas.com/docs/provider-guides/icloud/)
+   requires a manually generated app-specific password, including its hosted
+   authentication flow. A grant to an aggregator is not proof of Apple-issued
+   mailbox OAuth.
+
+## Questions Apple must answer before OAuth implementation
+
+- Enrollment eligibility, approval requirements, and support for Superlocal's
+  portable local-host/desktop architecture, including regional restrictions.
+- Mail-only permissions, available operations, and whether mail access uses
+  IMAP/SMTP, another API, or another transport. XOAUTH2/OAUTHBEARER support is
+  not established by the existence of OAuth authorization alone.
+- Authorization/token endpoints, scopes, redirect rules, PKCE, and client
+  authentication requirements. No iCloud-mail-specific values were verified.
+- Access-token lifetime, refresh/rotation, revocation notifications, and the
+  effect of Apple Account password changes on OAuth grants.
+- Stable account/mailbox/message identities, alias discovery, authorized From
+  identities, and migration from an existing password connection.
+
+Absence of public details in this research is not proof that the integration
+is impossible or Microsoft-exclusive. Obtain Apple's documentation rather
+than implementing against guessed or reverse-engineered endpoints.
+
+## Documented password fallback
+
+Apple's [server settings, February 3, 2026](https://support.apple.com/en-us/102525):
+
+| Service | Server | Secure connection | Credentials |
+| --- | --- | --- | --- |
+| Incoming mail | `imap.mail.me.com:993` | Implicit TLS; validate certificates | iCloud mailbox username and app-specific password |
+| Outgoing mail | `smtp.mail.me.com:587` | Require STARTTLS; validate certificates | Full iCloud Mail address and the same app-specific password |
+
+Apple documents the IMAP username as usually the mailbox's local part, with
+the full address as an alternative. SMTP requires the full iCloud Mail
+address. POP is unsupported. The server-settings page does not specify a
+particular SASL password mechanism; qualify actual protocol behavior without
+downgrading encryption.
+
+### Credential lifecycle and onboarding
+
+- [Apple's app-password guidance](https://support.apple.com/en-us/102654)
+  requires two-factor authentication and permits up to 25 active passwords.
+  These are reusable credentials, not one-time codes. No fixed expiry,
+  refresh protocol, or read-only/folder-level/send-only scope controls are
+  documented by this workflow.
+- Request a dedicated, clearly labeled Superlocal app password, never the
+  ordinary Apple Account password, MFA codes, or disabling two-factor
+  authentication. Distinguish the iCloud mailbox address from an Apple Account
+  login that might itself be an address at another provider.
+- Submit credentials only to the authenticated host, clear transient UI state,
+  and store them encrypted through the SDK. Do not persist them in browser
+  storage, URLs, logs, telemetry, or deployment configuration.
+- Individual passwords or all passwords can be revoked. Changing or resetting
+  the primary Apple Account password revokes every app-specific password.
+  Authentication failures require reconnection; outages, TLS failures, and
+  quota errors need distinct handling and bounded retries.
+- Disconnect must close sessions and remove local credentials. Explain that
+  Apple-side password revocation is a separate user action; local deletion
+  alone does not revoke Apple's credential.
+
+## Superlocal integration boundaries
+
+| Layer | Responsibility |
+| --- | --- |
+| Client | Connection/settings UI, capabilities, and status; no provider tokens or persisted passwords |
+| Application host | Onboarding, Apple client registration/consent if approved, refresh/revocation coordination, and trusted endpoint configuration |
+| Inbox SDK | Opaque encrypted owner/connection credentials, normalized contracts, storage, synchronization/workflow mechanics, and API behavior |
+| Provider adapter | IMAP/SMTP or approved Apple protocol behavior, upstream translation, and evidenced capabilities |
+
+Inbox splits remain client-owned views. Adding Apple support must not turn
+Important/Other classification into provider label, folder, or flag changes.
+
+### Existing code and qualification gaps
+
+`packages/inbox-sdk/server/sdk/imap.ts` has separate IMAP/SMTP password or
+access-token inputs and TLS controls. Native message identifiers incorporate
+mailbox path, UIDVALIDITY, and UID. The adapter currently advertises
+`drafts: false` and `pushNotifications: false`.
+
+These are code facts, not proof of iCloud compatibility. A later, explicitly
+authorized qualification should cover:
+
+1. Authentication, certificate validation, password revocation, reconnects,
+   bounded retries, and connection cleanup.
+2. Initial/incremental synchronization, IDLE behavior and reconciliation,
+   folders/special-use attributes, flags, moves/expunges, and UIDVALIDITY
+   changes. Do not assume QRESYNC, CONDSTORE, UIDPLUS, or Apple push support.
+3. SMTP delivery, replies, MIME and inline attachments, and exactly one Sent
+   copy. SMTP acceptance does not itself establish Sent-folder persistence;
+   draft capability must be reported honestly.
+4. Primary addresses, eligible legacy addresses, aliases, custom domains, and
+   verified From identities. Separate login identity from sending identity.
+5. Stable message/source identity, threading, restart/recovery, and any
+   password-to-OAuth migration, without duplicating previously synchronized mail.
+
+## Address and service limitations
+
+- [Eligible legacy addresses](https://support.apple.com/en-us/118230) and
+  [iCloud aliases](https://support.apple.com/guide/icloud/what-are-email-aliases-in-icloud-mail-mm074af79454/icloud)
+  are not automatically separate accounts/mailboxes. Apple ordinarily permits
+  up to three aliases; qualify sending rather than assuming every alias is a
+  valid login.
+- [Custom email domains](https://support.apple.com/en-us/102540) require iCloud+.
+  [Hide My Email](https://support.apple.com/guide/icloud/use-hide-my-email-in-mail-mmca4d729d79/icloud)
+  provides forwarding/privacy addresses, not independent IMAP accounts. Do not
+  promise arbitrary SMTP send-as or address creation/management through IMAP.
+- Apple's [published mail limits](https://support.apple.com/en-us/102198)
+  list 1,000 messages/day, 1,000 recipients/day, 500 recipients/message, and
+  20 MB messages. Mail Drop's separate 5 GB facility is not a generic SMTP
+  attachment allowance. Recheck limits before implementation.
+- Full shared iCloud storage prevents sending/receiving. No authoritative
+  concurrent-IMAP-connection or detailed synchronization-rate limit was found.
+  Do not infer unlimited access or invent a provider-specific cap.
+- IMAP access does not imply Apple Mail scheduling, undo-send, categorization,
+  privacy features, or complete parity with Apple's native clients.
+
+## Deferred next steps
+
+1. Open [Apple's OAuth interest form](https://developer.apple.com/contact/request/icloud-oauth2/)
+   and, with authorization, describe Superlocal's local-host architecture and
+   mail-only requirements. Obtain eligibility and technical documentation.
+2. Select the supported authentication path using Apple's response. Retain
+   app-specific-password IMAP/SMTP as the fallback; do not expose an OAuth
+   option before it is actually usable.
+3. Implement onboarding and adapter support within the boundaries above,
+   preserving encrypted credentials, secure transport, and honest capabilities.
+4. Obtain separate authorization for dedicated-account qualification before
+   running live reads/writes or connecting a personal account.
+5. If migrating an existing connection to OAuth, preserve connection identity
+   and provider namespace. Replace credentials in place when transport/native
+   identities remain compatible. Otherwise reconcile explicitly: RFC
+   Message-ID is useful evidence, not a guaranteed globally unique replacement
+   key. Revoke the old app password only after the new connection succeeds,
+   as Apple's authorization guidance recommends.
+
+This note records research and a proposed future plan. It does not authorize
+an Apple application submission, account connection, implementation, or live
+mail tests. No accounts, credentials, or provider state were changed by the
+research.
