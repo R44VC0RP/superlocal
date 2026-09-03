@@ -72,7 +72,7 @@ interface ContractHarness {
   nativeUidReset?: () => void
   imapPeer?: {
     capabilities: Map<string, boolean>
-    configure(input: { noCopyUid?: boolean; failFlag?: string; readOnly?: boolean; failAppend?: boolean }): void
+    configure(input: { noCopyUid?: boolean; failFlag?: string; readOnly?: boolean; failAppend?: boolean; beforeDownload?: (uid: string) => Promise<void> }): void
     edit(uid: number, update: (message: Wire) => void): void
     commands: Array<{ method: string; uid?: string; readOnly?: boolean }>
   }
@@ -518,7 +518,7 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
   let transports = 0
   let nextFault: Fault | undefined
   const capabilities = new Map(['IMAP4rev1', 'UIDPLUS', 'MOVE', 'CONDSTORE'].map(value => [value, true]))
-  let behavior: { noCopyUid?: boolean; failFlag?: string; readOnly?: boolean; failAppend?: boolean } = {}
+  let behavior: { noCopyUid?: boolean; failFlag?: string; readOnly?: boolean; failAppend?: boolean; beforeDownload?: (uid: string) => Promise<void> } = {}
   const commands: Array<{ method: string; uid?: string; readOnly?: boolean }> = []
   const nativeId = (uid: number, path = 'INBOX', account = 'primary') => `imap:${account}:${encodeURIComponent(path)}:${uidValidity}:${uid}`
   let enteredResolve: (() => void) | undefined
@@ -582,6 +582,7 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
   }
   class NativeImap extends EventEmitter {
     usable = false
+    private lock = Promise.resolve()
     capabilities = capabilities
     get enabled() { return new Set(capabilities.keys()) }
     mailbox: Wire | false = false
@@ -614,13 +615,18 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
     async getMailboxLock(path: string, options: Wire = {}) {
       rejectFault()
       if (!accounts.get(this.account)!.has(path)) throw new Error('Native mailbox missing')
+      commands.push({ method: 'lockRequested', readOnly: options.readOnly })
+      const previous = this.lock
+      let release!: () => void
+      this.lock = new Promise<void>(resolve => { release = resolve })
+      await previous
       commands.push({ method: 'open', readOnly: options.readOnly })
       this.mailbox = { path, uidValidity, ...(capabilities.has('CONDSTORE') ? { highestModseq: modseq } : {}),
         exists: accounts.get(this.account)!.get(path)!.size, readOnly: behavior.readOnly ?? options.readOnly,
         permanentFlags: new Set(['\\Seen', '\\Flagged', '\\Deleted']) }
       locks++
       let released = false
-      return { release() { if (!released) { locks--; released = true } } }
+      return { release: () => { if (!released) { locks--; released = true; release() } } }
     }
     async search(query: Wire) {
       rejectFault()
@@ -646,6 +652,7 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
     }
     async fetchOne(uid: string) { rejectFault(); return accounts.get(this.account)!.get(this.mailbox && this.mailbox.path)!.get(Number(uid)) ?? false }
     async download(uid: string, part: string) {
+      await behavior.beforeDownload?.(uid)
       const message = await this.fetchOne(uid)
       if (!message) throw new Error('Native UID missing')
       const bytes = message.parts.get(part) as Buffer | undefined
@@ -1633,6 +1640,102 @@ describe('imap capability boundaries and SDK integration', () => {
   let h: ContractHarness
   beforeEach(async () => { h = await imapHarness(true) })
   afterEach(async () => { await h.close() })
+
+  test('sync yields between message bodies so a queued foreground flag change precedes the remaining import', async () => {
+    let firstUid: string | undefined
+    let enteredFirst!: () => void, enteredSecond!: () => void
+    let releaseFirst!: () => void, releaseSecond!: () => void
+    const firstEntered = new Promise<void>(resolve => { enteredFirst = resolve })
+    const secondEntered = new Promise<void>(resolve => { enteredSecond = resolve })
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+    const secondGate = new Promise<void>(resolve => { releaseSecond = resolve })
+    h.imapPeer!.configure({ beforeDownload: async uid => {
+      firstUid ??= uid
+      if (uid === firstUid) { enteredFirst(); await firstGate }
+      else { enteredSecond(); await secondGate }
+    } })
+    const importing = h.provider.sync(null, { limit: 25 })
+    let action: Promise<MailMessage | null> | undefined
+    try {
+      await firstEntered
+      let acknowledged = false
+      action = h.provider.mutate(h.ids.find(id => id.endsWith(`:${firstUid}`))!, { isRead: true }).then(result => { acknowledged = true; return result })
+      while (!h.imapPeer!.commands.some(command => command.method === 'lockRequested' && command.readOnly === false)) await Bun.sleep(0)
+      releaseFirst()
+      await secondEntered
+      expect(acknowledged).toBe(true)
+      expect((await action)?.isRead).toBe(true)
+      releaseSecond()
+      const page = await importing
+      expect(page.messages).toHaveLength(3)
+      expect(new Set(page.messages.map(message => message.id)).size).toBe(3)
+      expect(page.cursor).toMatchObject({ kind: 'uid', value: '3' })
+      expect(page.hasMore).toBe(false)
+      expect(h.resources!().locks).toBe(0)
+      expect(h.resources!().connections).toBe(1)
+    } finally {
+      releaseFirst(); releaseSecond()
+      await Promise.allSettled([importing, ...(action ? [action] : [])])
+    }
+  })
+
+  test('a UIDVALIDITY change between sync messages rejects the old page rather than mixing mailbox epochs', async () => {
+    let entered!: () => void, release!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    h.imapPeer!.configure({ beforeDownload: async () => { entered(); await gate } })
+    const importing = h.provider.sync(null, { limit: 25 })
+    try {
+      await started
+      h.nativeUidReset!()
+      release()
+      await failure(() => importing, 'INVALID_CURSOR')
+      expect(h.resources!().locks).toBe(0)
+    } finally { release(); await importing.catch(() => {}) }
+  })
+
+  test('arrivals and expunges between sync messages survive the frozen page watermark and reach the next poll', async () => {
+    let entered!: () => void, release!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    h.imapPeer!.configure({ beforeDownload: async () => { entered(); await gate } })
+    const importing = h.provider.sync(null, { limit: 25 })
+    try {
+      await started
+      const arrived = await h.nativeArrival!()
+      await h.nativeRemove!(h.ids[1]!)
+      release()
+      const page = await importing
+      expect(page.messages.map(message => message.id).sort()).toEqual([h.ids[0]!, h.ids[2]!].sort())
+      expect(page.cursor).toMatchObject({ kind: 'uid', value: '3' })
+      h.imapPeer!.configure({ beforeDownload: undefined })
+      const next = await h.provider.sync(page.cursor, { knownMessageIds: h.ids })
+      expect(next.messages.map(message => message.id)).toContain(arrived)
+      expect(next.retiredMessageIds).toContain(h.ids[1]!)
+      expect(next.deletedMessageIds).toEqual([])
+      expect(h.resources!().locks).toBe(0)
+    } finally { release(); await importing.catch(() => {}) }
+  })
+
+  for (const limit of [1, 25]) for (const cancellation of ['abort', 'disconnect']) test(`${cancellation} during a ${limit}-message sync stops without returning a successful page or reconnecting`, async () => {
+    const controller = new AbortController()
+    const provider = await h.definition.create({ ...h.credentials, signal: controller.signal })
+    let entered!: () => void, release!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    h.imapPeer!.configure({ beforeDownload: async () => { entered(); await gate } })
+    const importing = provider.sync(null, { limit })
+    try {
+      await started
+      const connects = h.imapPeer!.commands.filter(command => command.method === 'connect').length
+      if (cancellation === 'abort') controller.abort()
+      else await provider.disconnect()
+      release()
+      await failure(() => importing, 'NETWORK', true)
+      expect(h.imapPeer!.commands.filter(command => command.method === 'connect')).toHaveLength(connects)
+      expect(h.resources!().locks).toBe(0)
+    } finally { release(); await importing.catch(() => {}); await provider.disconnect() }
+  })
 
   test('reads use EXAMINE, and ordinary attachments are fetched only on explicit download', async () => {
     await h.provider.listMessages({ limit: 2 })

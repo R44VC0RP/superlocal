@@ -756,6 +756,7 @@ export class ImapProvider implements InboxProvider {
   }
 
   async sync(cursor?: SyncCursor | string | null, options: SyncOptions = {}, context?: SyncContext): Promise<SyncResult> {
+    const generation = this.connectionGeneration
     const current = normalizeCursor('imap', cursor, 'uid')
     if (current && (current.kind !== 'uid' && current.kind !== 'page' ||
       !/^\d+$/.test(current.value) || !Number.isSafeInteger(Number(current.value)))) {
@@ -770,7 +771,7 @@ export class ImapProvider implements InboxProvider {
     }
     const path = await this.mailboxPath(folder)
     if (current?.metadata?.mailbox && current.metadata.mailbox !== path) throw new ProviderCursorExpiredError('imap', 'IMAP sync cursors are scoped to one mailbox path')
-    return this.withMailbox(path, async (client, uidValidity) => {
+    const { selected, uidValidity, ...result } = await this.withMailbox(path, async (client, uidValidity) => {
       const mailbox = client.mailbox
       if (!mailbox) throw new ProviderError('imap', 'UPSTREAM', 'IMAP mailbox is no longer selected')
       const valid = current?.metadata?.uidValidity === uidValidity
@@ -824,7 +825,8 @@ export class ImapProvider implements InboxProvider {
       }
       const selected = candidates.slice(0, limit)
       const hasMore = candidates.length > limit
-      const messages = await this.fetchMessages(client, selected, path, uidValidity, folder)
+      // Consume only the inventory's expunges here. New notifications received
+      // while individual bodies yield the lock must remain for the next poll.
       this.expunged.delete(knownKey)
       for (const uid of known) if (!present.has(uid)) this.known.get(knownKey)?.delete(uid)
       const targetModseq = deltaPage ? current!.metadata?.targetModseq : highestModseq
@@ -835,13 +837,34 @@ export class ImapProvider implements InboxProvider {
           ...(!snapshot ? { afterUid: current?.metadata?.afterUid ?? current!.value, ...(targetModseq ? { targetModseq } : {}) } : {}) } : {}),
       }
       const next: SyncCursor = { provider: 'imap', kind: hasMore ? 'page' : 'uid', value: String(watermark), folder, metadata }
-      return { messages, threads: buildThreads(messages), deletedMessageIds: [], removedMessageIds: [...retired], retiredMessageIds: [...retired],
+      return { selected, uidValidity, deletedMessageIds: [], removedMessageIds: [...retired], retiredMessageIds: [...retired],
         cursor: next, hasMore, fullSync: snapshot, snapshotComplete: snapshot && !hasMore,
         // A partial delta must retain its continuation; advancing MODSEQ here would lose later pages.
         recentCursor: snapshot ? { provider: 'imap', kind: 'uid', value: String(watermark), folder,
           metadata: { accountId: this.accountId, mailbox: path, uidValidity, ...(modseq ? { highestModseq: modseq } : {}) } } : next,
       }
     })
+    if (generation !== this.connectionGeneration || this.credentials.signal?.aborted) throw new ProviderError('imap', 'NETWORK', 'IMAP synchronization was cancelled', { retryable: true })
+    const messages: MailMessage[] = []
+    let bytes = 0
+    for (const uid of selected) {
+      if (generation !== this.connectionGeneration) throw new ProviderError('imap', 'NETWORK', 'IMAP synchronization was cancelled', { retryable: true })
+      // A page can require 25 messages' worth of MIME round trips. Keep one
+      // connection, but let already-queued foreground operations run between
+      // messages instead of monopolizing its mailbox lock for the entire page.
+      const fetched = await this.withMailbox(path, async (client, currentValidity) => {
+        if (currentValidity !== uidValidity) throw new ProviderCursorExpiredError('imap', 'UIDVALIDITY changed during synchronization')
+        return this.fetchMessages(client, [uid], path, uidValidity, folder)
+      })
+      for (const message of fetched) {
+        bytes += Buffer.byteLength(message.bodyText) + Buffer.byteLength(message.bodyHtml)
+        if (bytes > MAX_BATCH_BODY_BYTES) throw new ProviderError('imap', 'UPSTREAM', 'Message batch exceeds the supported body size limit; request a smaller page')
+        messages.push(message)
+      }
+    }
+    if (generation !== this.connectionGeneration || this.credentials.signal?.aborted) throw new ProviderError('imap', 'NETWORK', 'IMAP synchronization was cancelled', { retryable: true })
+    messages.sort((left, right) => right.receivedAt.localeCompare(left.receivedAt))
+    return { ...result, messages, threads: buildThreads(messages) }
   }
 
   private smtpTransport() {
