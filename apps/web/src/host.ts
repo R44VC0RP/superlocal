@@ -1,6 +1,7 @@
 import type { SplitPreferences } from "../../shared/splits";
+import type { MailboxMembership } from "inbox-sdk/types";
 export type SavedSplitPreferences = SplitPreferences & { revision: number };
-export type AttentionFeedback = { id: string; createdAt: string; status: "pending" | "active" | "retracting" | "retracted" | "failed"; count: number; problem?: string };
+export type AttentionFeedback = { id: string; createdAt: string; status: "pending" | "active" | "retracting" | "retracted" | "failed"; count: number; problem?: string; states?: MailboxMembership[] };
 export type AttentionFeedbackTarget = { sourceId: string; messageId: string; mailboxId: string; messageRevision: number; revision: number };
 
 export type HostProvider = {

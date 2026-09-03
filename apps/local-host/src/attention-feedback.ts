@@ -1,5 +1,5 @@
 import type { Database } from 'bun:sqlite'
-import { InboxError, type Inbox, type MailboxStateTarget } from 'inbox-sdk'
+import { InboxError, type Inbox, type MailboxMembership, type MailboxStateTarget } from 'inbox-sdk'
 import { classifyAttention } from '../../shared/mail-attention'
 import { object } from './config'
 
@@ -9,9 +9,11 @@ type Feedback = {
   id: string; createdAt: string; status: 'pending' | 'active' | 'retracting' | 'retracted' | 'failed';
   targets: Target[]; context: Array<{ sourceId: string; messageId: string; threadId: string; revision: number; decision: ReturnType<typeof classifyAttention> }>;
   retractedAt?: string; problem?: string;
+  states?: MailboxMembership[];
 }
-const publicEvent = (event: Feedback) => ({ id: event.id, createdAt: event.createdAt, status: event.status,
-  count: event.context.length, ...(event.retractedAt ? { retractedAt: event.retractedAt } : {}), ...(event.problem ? { problem: event.problem } : {}) })
+const publicEvent = (event: Feedback, command = false) => ({ id: event.id, createdAt: event.createdAt, status: event.status,
+  count: event.context.length, ...(event.retractedAt ? { retractedAt: event.retractedAt } : {}), ...(event.problem ? { problem: event.problem } : {}),
+  ...(command && event.states ? { states: event.states } : {}) })
 const definitive = (error: unknown) => error instanceof InboxError && error.status >= 400 && error.status < 500
 
 /** Collection only. Nothing in categorization reads this ledger. SDK owns the local state transaction. */
@@ -30,6 +32,7 @@ export function createAttentionFeedbackStore(database: Database, inbox: Inbox, o
     if (event.status === 'pending') {
       try {
         const receipt = await inbox.setMailboxStates(owner, { id: `attention:${event.id}`, targets: event.targets.map(({ mailboxId, messageId, revision, messageRevision }) => ({ mailboxId, messageId, revision, messageRevision })), done: true })
+        event.states = receipt.states
         event.status = receipt.retracted ? 'retracted' : 'active'; save(event)
       } catch (error) {
         if (definitive(error)) { event.status = 'failed'; event.problem = 'Mailbox state changed; no feedback was recorded.'; save(event) }
@@ -37,10 +40,11 @@ export function createAttentionFeedbackStore(database: Database, inbox: Inbox, o
       }
     }
     if (event.status === 'retracting') {
-      try { await inbox.undoMailboxStates(owner, `attention:${event.id}`) }
+      try { event.states = (await inbox.undoMailboxStates(owner, `attention:${event.id}`)).states }
       catch (error) {
         if (!definitive(error)) throw error
         // A newer user action wins. The requested retraction still takes effect.
+        delete event.states
         event.problem = 'Feedback retracted. Newer mailbox changes were not overwritten.'
       }
       event.status = 'retracted'; event.retractedAt = new Date().toISOString(); save(event)
@@ -58,7 +62,7 @@ export function createAttentionFeedbackStore(database: Database, inbox: Inbox, o
       const previous = read(input.id)
       if (previous) {
         if (JSON.stringify(previous.targets) !== JSON.stringify(targets)) throw new InboxError('HOST_FEEDBACK_CONFLICT', 'This feedback ID already describes another selection.', 409)
-        return publicEvent(await settle(previous))
+        return publicEvent(await settle(previous), true)
       }
       const context = new Map<string, Feedback['context'][number]>()
       for (const target of targets) {
@@ -72,14 +76,14 @@ export function createAttentionFeedbackStore(database: Database, inbox: Inbox, o
       if (!context.size) throw new InboxError('HOST_FEEDBACK_INVALID', 'Select incoming inbox mail before recording attention feedback.', 400)
       const event: Feedback = { version: 1, label: 'not-important-to-me', id: input.id, createdAt: new Date().toISOString(), status: 'pending', targets, context: [...context.values()] }
       database.query('INSERT INTO local_attention_feedback VALUES (?,?,?)').run(owner, event.id, JSON.stringify(event))
-      return publicEvent(await settle(event))
+      return publicEvent(await settle(event), true)
     }) },
     undo(id: string) { return serialized(async () => {
       let event = read(id)
       if (!event) throw new InboxError('HOST_FEEDBACK_NOT_FOUND', 'Feedback not found.', 404)
       event = await settle(event)
       if (event.status === 'active') { event.status = 'retracting'; save(event); await settle(event) }
-      return publicEvent(event)
+      return publicEvent(event, true)
     }) },
     list() { return serialized(async () => {
       const rows = database.query<{ data: string }, [string]>(`SELECT data FROM local_attention_feedback WHERE owner=? AND json_extract(data,'$.status') IN ('pending','retracting') LIMIT 100`).all(owner)

@@ -53,6 +53,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
   const feedbackDatabase = new Database(":memory:");
   const feedback = createAttentionFeedbackStore(feedbackDatabase, host.inbox, host.owner);
   let stop: (() => void) | undefined;
+  let stopReloaded: (() => void) | undefined;
   let providerFailures = 0, providerCalls = 0;
   let providerGate: Promise<void> | undefined, providerGateAt: number | undefined, releaseProvider: (() => void) | undefined, providerWork: Promise<void> | undefined;
   MockInboxProvider.prototype.mutate = async function (id, changes) {
@@ -69,9 +70,12 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
   };
   let releaseResponse: (() => void) | undefined;
   let snapshotGate: Promise<void> | undefined, releaseSnapshot: (() => void) | undefined;
+  let finalPageGate: Promise<void> | undefined, releaseFinalPage: (() => void) | undefined, finalPageHeld = false;
   let gate: Promise<void> | undefined, loseResponses = 0, replayAuthFailures = 0, snapshotFailures = 0, bodyReads = 0, operationReads = 0;
   const posted: Array<{ input: import("inbox-sdk/types").MutationInput; operation: import("inbox-sdk/types").Operation }> = [];
   const flagRequests: import("inbox-sdk/types").MutationInput[] = [];
+  const membershipRequests: Array<Parameters<import("inbox-sdk/types").Inbox["setMailboxStates"]>[1]> = [];
+  let loseMembershipResponses = 0;
   const feedbackRequests: Array<{ id: string; targets: import("../src/host.ts").AttentionFeedbackTarget[] }> = [];
   let loseFeedbackResponses = 0, denyFlagRequests = 0;
   try {
@@ -128,6 +132,15 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
         }
       }
       const response = await host.fetch(new Request(url, { ...init, headers }));
+      if (url.pathname === "/v1/mailbox-actions" && init?.method === "POST") {
+        membershipRequests.push(JSON.parse(String(init.body)));
+        if (response.ok && loseMembershipResponses > 0) { loseMembershipResponses--; throw new TypeError("Controlled lost Done response"); }
+      }
+      if (url.pathname === "/v1/mailbox-messages" && response.ok && finalPageGate && !(await response.clone().json()).nextCursor) {
+        // Freeze a COMPLETE authoritative snapshot before any local command,
+        // avoiding a later page's legitimate STALE_CURSOR restart masking it.
+        finalPageHeld = true; await finalPageGate; init?.signal?.throwIfAborted();
+      }
       if (url.pathname === "/v1/operations" && init?.method === "POST" && response.ok) {
         posted.push({ input: { ...JSON.parse(String(init!.body)), idempotencyKey: headers.get("Idempotency-Key") }, operation: await response.clone().json() });
         const held = gate; if (held) await held;
@@ -312,6 +325,72 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     await undoDone();
     assert.ok(view().messages.every(message => message.memberships!.every(state => !state.done)));
 
+    // Hold a real complete pre-action SDK snapshot for more than two seconds.
+    // Durable local receipts, not that scan, must own completion/projection.
+    await store.refresh(true);
+    finalPageHeld = false; finalPageGate = new Promise(resolve => { releaseFinalPage = resolve; });
+    const oldSnapshot = store.refresh();
+    await until(() => finalPageHeld, "old complete SDK snapshot is held before local actions");
+    const heldAt = performance.now(), bodiesBeforeDone = bodyReads;
+    const promptly = async <T>(work: Promise<T>, message: string): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { return await Promise.race([work, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(message)), 750); })]); }
+      finally { clearTimeout(timer); }
+    };
+    const frozenSelection = view(UNIFIED_ACCOUNT);
+    const beforeDoneRequests = membershipRequests.length; loseMembershipResponses = 1;
+    const firstDone = await promptly(store.action([frozenSelection], "done"), "Done waited for the full snapshot rather than its durable receipt");
+    assert.deepEqual(membershipRequests[beforeDoneRequests], membershipRequests[beforeDoneRequests + 1], "lost Done acknowledgement replays the same durable ID and targets");
+    assert.equal(store.getSnapshot().pending, 0, "the next action is not blocked behind the scan");
+    assert.equal(view().folder, "Done"); assert.equal(view(overlap.id).folder, "Done"); assert.equal(view(UNIFIED_ACCOUNT).folder, "Done");
+    assert.ok(!inFolder(view(), "Inbox"));
+    assert.equal(bodyReads, bodiesBeforeDone, "Done performed zero body/ETag hydration reads");
+    await promptly(firstDone(), "Done Undo waited for a scan");
+    assert.equal(view().folder, "Inbox", "newer Undo receipt projects immediately");
+    await assert.rejects(store.action([frozenSelection], "done"), /changed/i, "a stale membership selection conflicts rather than hiding the row");
+    assert.equal(view().folder, "Inbox");
+    const secondDone = await promptly(store.action([view(UNIFIED_ACCOUNT)], "done"), "a successive Done action was blocked behind a scan");
+    assert.equal(view().folder, "Done");
+    await promptly(secondDone(), "successive Undo was blocked behind a scan");
+    const fastW = await promptly(store.action([view(UNIFIED_ACCOUNT)], "not-important"), "W waited for a full scan");
+    assert.equal(view().folder, "Done");
+    assert.ok(store.getSnapshot().attentionFeedback.some(event => event.status === "active"), "W is immediately available to durable Undo");
+    await promptly(fastW(), "W Undo waited for a full scan");
+    assert.equal(view().folder, "Inbox");
+    const retainedW = await promptly(store.action([view(UNIFIED_ACCOUNT)], "not-important"), "a successive W action was blocked behind the scan");
+    void retainedW;
+    const activeW = store.getSnapshot().attentionFeedback.find(event => event.status === "active")!.id;
+    assert.equal(view().folder, "Done");
+    // A later reply belongs to the thread, not to the already-clicked action.
+    const laterReply = host.store.receive(source, { from: "sender@example.test", to: nativeBoxes[0].email, subject: "Optimistic client fixture",
+      text: "Fictional arrival after Done acknowledgement.", threadId: native.threadId, isRead: false });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    await sleep(Math.max(0, 2050 - (performance.now() - heldAt)));
+    assert.ok(finalPageGate, "all E/W actions and Undo completed while the old snapshot was still gated");
+    releaseFinalPage!(); finalPageGate = undefined; await oldSnapshot;
+    assert.equal(view().folder, "Done", "old snapshot cannot resurrect the acknowledged selected messages");
+    assert.equal(store.getSnapshot().attentionFeedback.find(event => event.id === activeW)?.status, "active", "old feedback list cannot erase the current action");
+    await store.refresh(true);
+    assert.equal(view().folder, "Inbox", "fresh later reply legitimately returns this conversation to Inbox");
+    const freshRows = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [primary.id], limit: 100 })).items;
+    const latestNative = host.store.message(source, laterReply.id);
+    const newCanonical = freshRows.find(row => row.threadId === view().sdkThreadId && row.receivedAt === latestNative.receivedAt && !frozenSelection.messages.some(message => message.id === row.id))!;
+    assert.ok(newCanonical && newCanonical.memberships.every(state => !state.done), "later arrival was never implicitly marked Done");
+
+    const reloaded = new InboxStore(); stopReloaded = reloaded.start();
+    await until(() => reloaded.getSnapshot().loaded, "reloaded store reads durable W history");
+    assert.ok(reloaded.getSnapshot().attentionFeedback.some(event => event.id === activeW && event.status === "active"));
+    finalPageHeld = false; finalPageGate = new Promise(resolve => { releaseFinalPage = resolve; });
+    const beforeReloadUndo = reloaded.refresh();
+    await until(() => finalPageHeld, "reload's old snapshot held before Undo");
+    await promptly(reloaded.undoFeedback(activeW), "reloaded W Undo waited for full scan instead of receipt");
+    const reloadedView = () => reloaded.getSnapshot().mail.find(mail => mail.id === frozenSelection.id)!;
+    assert.ok(reloadedView().messages.every(message => message.memberships!.every(state => !state.done)), "reloaded Undo restores only its exact membership receipt");
+    releaseFinalPage!(); finalPageGate = undefined; await beforeReloadUndo;
+    assert.ok(reloadedView().messages.every(message => message.memberships!.every(state => !state.done)), "older Done snapshot cannot override newer Undo");
+    assert.equal(reloaded.getSnapshot().attentionFeedback.find(event => event.id === activeW)?.status, "retracted");
+    stopReloaded(); stopReloaded = undefined; await store.refresh(true);
+
     // Scheduled sends remain genuinely pending and cancellable, not optimistic
     // flag operations masquerading as delivery; the draft is restored on Undo.
     const draft = await store.newDraft(primary.id, { mode: "new", to: "recipient@example.test", subject: "Fictional scheduled draft" });
@@ -364,7 +443,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     assert.equal(posted.length, writesBeforeStop, "remount tracks the existing operation without submitting again");
     await host.inbox.runDue(); await store.refresh(true);
   } finally {
-    releaseResponse?.(); releaseSnapshot?.(); releaseProvider?.(); stop?.(); await providerWork;
+    releaseResponse?.(); releaseSnapshot?.(); releaseFinalPage?.(); releaseProvider?.(); stopReloaded?.(); stop?.(); await providerWork;
     MockInboxProvider.prototype.mutate = originalMutate;
     feedbackDatabase.close(); await host.close(); await fs.rm(root, { recursive: true, force: true });
     globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;

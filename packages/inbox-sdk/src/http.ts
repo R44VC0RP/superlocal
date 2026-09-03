@@ -157,6 +157,10 @@ const schemas = {
     defaultSender: z.string().min(1).max(1024).nullable().optional(),
   }).refine((value) => Object.keys(value).length > 0),
   MailboxState: z.strictObject({ done: z.boolean().optional(), snoozedUntil: date.nullable().optional() }).refine((value) => Object.keys(value).length > 0),
+  MailboxAction: z.strictObject({ id: id.max(128), done: z.boolean(), targets: z.array(z.strictObject({
+    mailboxId: id, messageId: id, revision: revision.min(1), messageRevision: revision.min(1).optional(),
+  })).min(1).max(500) }),
+  MailboxStateReceipt: z.object({ id: id.max(128), retracted: z.boolean(), states: z.array(membership).max(500) }),
   Membership: membership,
   MailboxMessageSummary: mailboxMessageSummary,
   MailboxMessage: message.extend({ sourceId: id, memberships: z.array(membership) }),
@@ -466,6 +470,13 @@ export function createInboxApi(options: InboxApiOptions) {
     return json(c, validate(schemas.Mailbox, await inbox.updateMailbox(c.get('owner'), current.id, input, current.revision)))
   })
   route('post', '/v1/mailboxes/:id/sync', { summary: 'Synchronize an owned mailbox', input: 'SyncRequest', output: 'SyncResult' }, async (c) => json(c, await inbox.syncMailbox(c.get('owner'), pathId(c), body(c, schemas.SyncRequest, true))))
+  route('post', '/v1/mailbox-actions', { summary: 'Apply an atomic mailbox-local Done action', input: 'MailboxAction', output: 'MailboxStateReceipt',
+    description: 'Body-free local state only. Targets carry membership revisions and optional message revisions. id is an owner-scoped idempotency key: the same input returns its stored receipt, not current state; conflicting reuse is rejected.' }, async (c) => json(c, validate(schemas.MailboxStateReceipt, await inbox.setMailboxStates(c.get('owner'), body(c, schemas.MailboxAction)))))
+  route('post', '/v1/mailbox-actions/:id/undo', { summary: 'Undo an owned mailbox-local action', output: 'MailboxStateReceipt',
+    description: 'Restores only unchanged action-owned memberships. Newer revisions conflict; repeated Undo returns the stored retracted receipt without applying it again.' }, async (c) => {
+    body(c, emptyQuery, true)
+    return json(c, validate(schemas.MailboxStateReceipt, await inbox.undoMailboxStates(c.get('owner'), pathId(c))))
+  })
   route('get', '/v1/mailbox-messages', { summary: 'Query messages across selected mailboxes', query: mailboxQuery, output: 'MailboxMessagePage', description: 'mailboxIds is a comma-separated selection of 1 to 50 owned mailbox IDs. All IDs are validated before querying. Membership state is local to each mailbox; accountId is not accepted.' }, async (c) => {
     const owner = c.get('owner')
     const input = query(c, mailboxQuery)

@@ -380,6 +380,8 @@ export function createInboxClient(options: InboxClientOptions = {}) {
       return request<Result<'mailboxMessages'>>(`/mailbox-messages${queryString({ ...input, mailboxIds: [...new Set(input.mailboxIds)].sort().join(',') })}`, requestOptions)
     },
     mailboxMessage: (mailboxId: string, messageId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'mailboxMessage'>>(`/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}`, requestOptions),
+    setMailboxStates: (input: Parameters<Inbox['setMailboxStates']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'setMailboxStates'>>('/mailbox-actions', 'POST', input, requestOptions),
+    undoMailboxStates: (id: string, requestOptions: InboxRequestOptions = {}) => write<Result<'undoMailboxStates'>>(`/mailbox-actions/${resourceId(id)}/undo`, 'POST', undefined, requestOptions),
     setMailboxState: async (mailboxId: string, messageId: string, input: Parameters<Inbox['setMailboxState']>[3], revision: number, requestOptions: InboxRequestOptions = {}): Promise<Result<'setMailboxState'>> => {
       const path = `/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}`
       const signal = AbortSignal.any([credentialsController.signal, ...(requestOptions.signal ? [requestOptions.signal] : [])])

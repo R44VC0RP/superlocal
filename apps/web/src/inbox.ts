@@ -1,7 +1,7 @@
 import { ApiError, createInboxClient, type InboxClient } from "inbox-sdk/client";
 import type {
   Account, BlobInfo, Changes, Draft as SdkDraft, DraftInput, Folder, Label,
-  Mailbox, MailboxMessageSummary, Message as SdkMessage, MutationInput, Operation, Participant, Policy,
+  Mailbox, MailboxMembership, MailboxMessageSummary, MailboxStateTarget, Message as SdkMessage, MutationInput, Operation, Participant, Policy,
 } from "inbox-sdk/types";
 import type { Attachment, Draft, Mail, MailboxOption, Message } from "./data";
 import { escapeHTML, plainText } from "./mail-text";
@@ -78,6 +78,7 @@ const DISMISSAL_MEMORY_MS = 5 * 60_000;
 const POLL_MS = 30_000;
 const MAX_BACKOFF_MS = 60_000;
 const nativeKey = (sourceId: string, messageId: string) => `${sourceId}\0${messageId}`;
+const membershipKey = (sourceId: string, state: Pick<MailboxMembership, "messageId" | "mailboxId">) => `${nativeKey(sourceId, state.messageId)}\0${state.mailboxId}`;
 const flagKey = (target: FlagTarget, field: Flag) => `${nativeKey(target.sourceId, target.messageId)}\0${field}`;
 const definitive = (error: unknown) => error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
 /** A stream counts as healthy only after staying open this long; ready/close flapping neither refreshes nor recovers. */
@@ -164,6 +165,8 @@ export class InboxStore {
   private flagRevisions = new Map<string, Map<number, number>>();
   private flagWrites = new Set<FlagWrite>();
   private flagReconciler?: Promise<void>;
+  private membershipReceipts = new Map<string, { sourceId: string; state: MailboxMembership }>();
+  private feedbackEpoch = 0;
   private draftEpoch = 0;
   private refreshTimer?: ReturnType<typeof setTimeout>;
   private sourceAccounts: Account[] = [];
@@ -489,6 +492,7 @@ export class InboxStore {
     const generation = this.generation, options = this.requestOptions();
     const draftEpoch = this.draftEpoch;
     const flagEpoch = this.flagEpoch;
+    const feedbackEpoch = this.feedbackEpoch;
     this.publish({ refreshing: true });
     const work = (async () => {
       const [accounts, boxes, labels, drafts, policy, host, viewPreferences] = await Promise.all([
@@ -580,6 +584,11 @@ export class InboxStore {
       this.operations = operations;
       this.sourceAccounts = accounts; this.boxes = selected; this.labels = labels; this.summaries = summaries; this.sending = sending;
       this.reconcileFlagSnapshot(flagEpoch);
+      for (const [key, receipt] of this.membershipReceipts) {
+        const row = summaries.get(receipt.state.mailboxId)?.find(row => row.sourceId === receipt.sourceId && row.id === receipt.state.messageId);
+        const state = row?.memberships.find(state => state.mailboxId === receipt.state.mailboxId);
+        if (!state || state.revision >= receipt.state.revision) this.membershipReceipts.delete(key);
+      }
       if (this.draftEpoch === draftEpoch) this.rawDrafts = new Map(drafts.map(draft => [draft.id, draft]));
       else this.scheduleRefresh();
       for (const raw of drafts) {
@@ -594,7 +603,7 @@ export class InboxStore {
         this.bodyEpoch++;
         this.details.clear();
       }
-      this.publish({ policy, host, viewPreferences, splitPreferences, attentionFeedback, mailboxes: selected, sources: accounts, loading: false, loaded: true, refreshing: false, error: null }); this.rebuild();
+      this.publish({ policy, host, viewPreferences, splitPreferences, attentionFeedback: this.feedbackEpoch === feedbackEpoch ? attentionFeedback : this.state.attentionFeedback, mailboxes: selected, sources: accounts, loading: false, loaded: true, refreshing: false, error: null }); this.rebuild();
       this.resolve("snapshot");
     })();
     this.refreshPromise = work.finally(() => { if (this.refreshPromise === finished) this.refreshPromise = undefined; });
@@ -621,7 +630,7 @@ export class InboxStore {
       updated: Date.parse(raw.updatedAt),
     };
   }
-  private rebuild() {
+  private rebuild(onlyThreads?: Set<string>) {
     const accounts: MailboxOption[] = this.boxes.map(box => {
       const source = this.sourceAccounts.find(account => account.id === box.sourceId)!;
       return { id: box.id, sourceId: source.id, name: box.name || source.name, email: box.defaultSender || source.email, selectorKind: box.selector.kind,
@@ -640,6 +649,7 @@ export class InboxStore {
       labelNames[box.id] = [...new Set([...labels.map(label => label.name), ...nativeFolders.filter(folder => folder.kind === "label").map(folder => folder.name)])];
       const groups = new Map<string, MailboxMessageSummary[]>();
       for (const summary of this.summaries.get(box.id) ?? []) {
+        if (onlyThreads && !onlyThreads.has(nativeKey(source.id, summary.threadId))) continue;
         // Only the changed native fields are local. Fresh subjects, bodies,
         // memberships and arrivals continue to come from the SDK snapshot.
         const row = this.projectFlags(summary);
@@ -710,6 +720,7 @@ export class InboxStore {
         if (conversation && !conversation.messages.some(message => message.operationId === operation.id)) conversation.messages.push(pendingMessage);
       }
       if (operation.status === "uncertain") continue;
+      if (onlyThreads) continue;
       mail.push({ id: `operation:${operation.id}`, operationId: operation.id, sourceId: operation.accountId, mailboxId: ref.mailboxId, account: ref.mailboxId,
         accountEmail: draft.from, from: draft.from, email: draft.from, to: addresses(draft.to), subject: draft.subject, snippet: draft.bodyText,
         ...displayTime(date), receivedAt: Date.parse(date), split: "Important", folder: "Scheduled", locations: ["Scheduled"], unread: false, starred: false, labels: [], scheduled: date,
@@ -720,6 +731,13 @@ export class InboxStore {
     labelNames[UNIFIED_ACCOUNT] = [...new Set(included.flatMap(id => labelNames[id] ?? []))];
     mail.push(...unifiedMail(mail, included, accounts));
     for (const conversation of mail) conversation.split = conversationAttention(conversation);
+    if (onlyThreads) {
+      // Membership receipts cannot add/remove messages or change ordering.
+      // Preserve every unaffected conversation and all body/draft references.
+      const updated = new Map(mail.map(conversation => [conversation.id, conversation]));
+      this.publish({ mail: this.state.mail.map(conversation => updated.get(conversation.id) ?? conversation) });
+      return;
+    }
     mail.sort((a, b) => (b.receivedAt ?? 0) - (a.receivedAt ?? 0) || a.id.localeCompare(b.id));
     const drafts = [...this.rawDrafts.values()].map(raw => {
       const edit = this.edits.get(raw.id);
@@ -899,7 +917,38 @@ export class InboxStore {
   private projectFlags(row: MailboxMessageSummary): MailboxMessageSummary {
     const key = nativeKey(row.sourceId, row.id);
     const read = this.flagIntents.get(`${key}\0isRead`), star = this.flagIntents.get(`${key}\0isStarred`);
-    return read || star ? { ...row, ...(read ? { isRead: read.value } : {}), ...(star ? { isStarred: star.value } : {}) } : row;
+    let changed = false;
+    const memberships = row.memberships.map(state => {
+      const receipt = this.membershipReceipts.get(membershipKey(row.sourceId, state));
+      if (!receipt || receipt.state.revision <= state.revision) return state;
+      changed = true; return receipt.state;
+    });
+    return read || star || changed ? { ...row, ...(read ? { isRead: read.value } : {}), ...(star ? { isStarred: star.value } : {}), ...(changed ? { memberships } : {}) } : row;
+  }
+  private receiveMemberships(states: MailboxMembership[]) {
+    const threads = new Set<string>();
+    for (const state of states) {
+      const sourceId = this.boxes.find(box => box.id === state.mailboxId)?.sourceId;
+      if (!sourceId) continue;
+      const row = this.summaries.get(state.mailboxId)?.find(row => row.sourceId === sourceId && row.id === state.messageId);
+      const current = row?.memberships.find(current => current.mailboxId === state.mailboxId);
+      if (!row || !current || state.revision < current.revision) continue;
+      const key = membershipKey(sourceId, state), previous = this.membershipReceipts.get(key);
+      if (previous && previous.state.revision >= state.revision) continue;
+      this.membershipReceipts.set(key, { sourceId, state }); threads.add(nativeKey(sourceId, row.threadId));
+    }
+    if (threads.size) this.rebuild(threads);
+  }
+  private async receiveFeedback(event: AttentionFeedback) {
+    this.feedbackEpoch++;
+    this.publish({ attentionFeedback: [event, ...this.state.attentionFeedback.filter(previous => previous.id !== event.id)].slice(0, 20) });
+    if (event.states) this.receiveMemberships(event.states);
+    else if (event.problem) this.scheduleRefresh();
+    else {
+      // An older host has no authoritative membership receipt. Keep its old
+      // confirmed view until a real reread, rather than inventing Done/Undo.
+      await this.refresh(true).catch(error => this.fail(error, "refresh"));
+    }
   }
   private flagSummary(target: Pick<FlagTarget, "sourceId" | "mailboxId" | "messageId">): MailboxMessageSummary {
     const row = this.summaries.get(target.mailboxId)?.find(row => row.id === target.messageId && row.sourceId === target.sourceId);
@@ -1047,7 +1096,7 @@ export class InboxStore {
             if (error instanceof ApiError && error.status === 404) { write.terminal = ++this.flagEpoch; refresh = true; }
           }
         }
-        if (refresh && !signal.aborted) await this.refresh(true).catch(error => this.fail(error, "refresh"));
+        if (refresh && !signal.aborted) await this.refresh().catch(error => this.fail(error, "refresh"));
         if (![...this.flagWrites].some(write => write.operation)) break;
         await pause(delay, signal); delay = Math.min(5000, delay * 2);
       }
@@ -1141,7 +1190,7 @@ export class InboxStore {
     }
     return result;
   }
-  async act<T>(action: string, work: () => Promise<T>): Promise<T> {
+  async act<T>(action: string, work: () => Promise<T>, refresh = true): Promise<T> {
     const previous = this.actionQueue;
     let release!: () => void;
     this.actionQueue = new Promise<void>(resolve => { release = resolve; });
@@ -1149,12 +1198,53 @@ export class InboxStore {
     await previous;
     try {
       const result = await work();
-      // A failed reread does not turn an accepted write into a failed write.
-      await this.refresh(true).catch(error => this.fail(error, "refresh"));
+      // Durable work, not a whole-inbox scan, owns completion and the queue.
+      // Receipt-aware local commands already published their exact changes.
+      if (refresh) this.scheduleRefresh();
       return result;
     }
     catch (error) { this.scheduleRefresh(); this.fail(error, action); throw error; }
     finally { release(); this.publish({ pending: Math.max(0, this.state.pending - 1) }); }
+  }
+  private done(selected: Mail[], done: boolean): Promise<() => Promise<void>> {
+    const targets = new Map<string, MailboxStateTarget>();
+    try {
+      for (const mail of selected) {
+        if (mail.operationId) throw new Error("Cancel the queued send before changing it.");
+        for (const message of mail.messages) {
+          if (message.pending) continue;
+          if (!message.memberships?.length) throw new Error("This conversation is still loading. Try again after it refreshes.");
+          for (const state of message.memberships) {
+            const { source } = this.account(state.mailboxId);
+            if (source.id !== mail.sourceId) throw new Error("A conversation cannot span unrelated source accounts.");
+            targets.set(membershipKey(source.id, state), { mailboxId: state.mailboxId, messageId: message.id, revision: state.revision });
+          }
+        }
+      }
+      if (!targets.size || targets.size > 500) throw new Error("Select between 1 and 500 message memberships for one Done action.");
+    } catch (error) { return Promise.reject(error); }
+    const input = { id: crypto.randomUUID(), targets: [...targets.values()], done }, signal = this.controller.signal;
+    return this.act(done ? "done" : "inbox", async () => {
+      let receipt;
+      try { receipt = await this.client.setMailboxStates(input, { signal }); }
+      catch (error) {
+        if (signal.aborted || definitive(error)) throw error;
+        receipt = await this.client.setMailboxStates(input, { signal });
+      }
+      signal.throwIfAborted(); this.receiveMemberships(receipt.states);
+      return () => {
+        const signal = this.controller.signal;
+        return this.act("undo-done", async () => {
+          let receipt;
+          try { receipt = await this.client.undoMailboxStates(input.id, { signal }); }
+          catch (error) {
+            if (signal.aborted || definitive(error)) throw error;
+            receipt = await this.client.undoMailboxStates(input.id, { signal });
+          }
+          signal.throwIfAborted(); this.receiveMemberships(receipt.states);
+        }, false);
+      };
+    }, false);
   }
   canRecordFeedback = (selected: Mail[]): boolean => !!this.state.host?.preferenceScope && selected.length > 0 && selected.every(mail => !mail.operationId && !!mail.sourceId && mail.messages.some(message => !message.pending && !message.outgoing && message.nativeFolder === "inbox"
     && message.memberships?.some(state => !state.done && (!state.snoozedUntil || Date.parse(state.snoozedUntil) <= Date.now()))));
@@ -1198,14 +1288,17 @@ export class InboxStore {
       }) };
       const event = await recordAttentionFeedback(input, signal);
       if (event.status !== "active") throw new Error(event.problem ?? "This feedback action is no longer active.");
+      await this.receiveFeedback(event);
       return () => this.undoFeedback(event.id);
-    });
+    }, false);
   }
   undoFeedback = (id: string): Promise<void> => this.act("undo-feedback", async () => {
     const event = await retractAttentionFeedback(id, this.controller.signal);
+    await this.receiveFeedback(event);
     if (event.problem) throw new Error(event.problem);
-  });
-  action = (selected: Mail[], action: string, value?: string): Promise<() => Promise<void>> => ["read", "unread", "star"].includes(action) ? this.flagAction(selected, action) : action === "not-important" ? this.notImportant(selected) : this.act(action, async () => {
+  }, false);
+  action = (selected: Mail[], action: string, value?: string): Promise<() => Promise<void>> => ["read", "unread", "star"].includes(action) ? this.flagAction(selected, action) : action === "not-important" ? this.notImportant(selected)
+    : action === "done" || action === "inbox" && selected.every(mail => !mail.operationId && mail.messages.every(message => message.pending || ["inbox", "sent"].includes(message.nativeFolder ?? ""))) ? this.done(selected, action === "done") : this.act(action, async () => {
     // Keep the clicked message/membership scope: a queued action must not absorb
     // a newly arrived reply or a later change to Unified inbox configuration.
     const undo: Array<() => Promise<unknown>> = [];

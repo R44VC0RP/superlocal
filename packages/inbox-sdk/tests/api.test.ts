@@ -78,13 +78,25 @@ describe('Attention baseline and explicit feedback', () => {
     const decision = classifyAttention(message)
     const response = await route('attention-feedback', 'POST', { id: 'host-negative-feedback-001', targets: [target] })
     expect(response.status).toBe(200)
-    expect(await response.json()).toMatchObject({ status: 'active', count: 1 })
+    const recorded = await response.json()
+    expect(recorded).toMatchObject({ status: 'active', count: 1 })
     const done = await host.inbox.mailboxMessage(host.owner, mailbox.id, message.id)
+    expect(recorded.states).toEqual(done.memberships)
     expect(done.memberships[0]!.done).toBe(true)
     expect(classifyAttention(done)).toEqual(decision)
-    expect((await route('attention-feedback/host-negative-feedback-001/undo', 'POST')).status).toBe(200)
-    expect((await host.inbox.mailboxMessage(host.owner, mailbox.id, message.id)).memberships[0]!.done).toBe(false)
-    expect((await (await route('attention-feedback')).json())[0].status).toBe('retracted')
+    const undoResponse = await route('attention-feedback/host-negative-feedback-001/undo', 'POST')
+    expect(undoResponse.status).toBe(200)
+    const undone = await undoResponse.json()
+    const restored = await host.inbox.mailboxMessage(host.owner, mailbox.id, message.id)
+    expect(restored.memberships[0]!.done).toBe(false)
+    expect(undone.states).toEqual(restored.memberships)
+    const listed = (await (await route('attention-feedback')).json())[0]
+    expect(listed.status).toBe('retracted')
+    expect(listed.states).toBeUndefined()
+    await host.inbox.setMailboxState(host.owner, mailbox.id, message.id, { done: true }, restored.memberships[0]!.revision)
+    expect(await (await route('attention-feedback', 'POST', { id: 'host-negative-feedback-001', targets: [target] })).json()).toEqual(undone)
+    expect(await (await route('attention-feedback/host-negative-feedback-001/undo', 'POST')).json()).toEqual(undone)
+    expect((await host.inbox.mailboxMessage(host.owner, mailbox.id, message.id)).memberships[0]!.done).toBe(true)
   })
 
   test('actual offline mock adapter carries newsletter, transaction, and direct evidence through SDK sync', async () => {
@@ -174,15 +186,19 @@ describe('Attention baseline and explicit feedback', () => {
     await expect(feedback.record({ id, targets: targets.slice(0, 1) })).rejects.toMatchObject({ status: 409 })
     await h.restart()
     feedback = createAttentionFeedbackStore(database, h.inbox, 'alice')
-    expect((await feedback.list())[0]).toEqual(result)
+    const { states: recordedStates, ...listedResult } = result
+    expect(recordedStates).toHaveLength(2)
+    expect((await feedback.list())[0]).toEqual(listedResult)
     expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.every(message => message.memberships[0]!.done)).toBe(true)
     expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.map(classifyAttention)).toEqual(decisions)
     const other = createAttentionFeedbackStore(database, h.inbox, 'bob')
     expect(await other.list()).toEqual([])
     await expect(other.undo(id)).rejects.toMatchObject({ status: 404 })
     await expect(other.record({ id: 'cross-owner-negative-001', targets })).rejects.toMatchObject({ status: 404 })
-    expect((await feedback.undo(id)).status).toBe('retracted')
-    expect((await feedback.undo(id)).status).toBe('retracted')
+    const undone = await feedback.undo(id)
+    expect(undone.status).toBe('retracted')
+    expect(undone.states?.every(state => !state.done)).toBe(true)
+    expect(await feedback.undo(id)).toEqual(undone)
     expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.every(message => !message.memberships[0]!.done)).toBe(true)
     // E remains the existing local Done path and writes no feedback event.
     const current = await h.inbox.mailboxMessage('alice', mailbox.id, rows[0]!.id)
@@ -211,8 +227,42 @@ describe('Attention baseline and explicit feedback', () => {
     expect((await feedback.list())[0]).toMatchObject({ status: 'active', count: 2 })
     const current = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items
     expect(current.every(message => message.memberships[0]!.revision === 2)).toBe(true)
+    expect((await feedback.record({ id: 'lost-response-negative-001', targets })).states).toEqual(current.map(message => message.memberships[0]!).sort((a, b) => a.mailboxId.localeCompare(b.mailboxId) || a.messageId.localeCompare(b.messageId)))
     expect((await feedback.undo('lost-response-negative-001')).status).toBe('retracted')
     expect(box.calls.mutate).toHaveLength(0)
+  })
+
+  test('feedback command receipts preserve replayed revisions and omit unavailable or conflicted Undo states', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account } = await h.seed('alice', 'feedback-receipt-fallback')
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const message = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items[0]!
+    const targets = [{ sourceId: account.id, mailboxId: mailbox.id, messageId: message.id, messageRevision: message.revision, revision: message.memberships[0]!.revision }]
+    const database = new Database(join(h.directory, 'feedback.sqlite'))
+    cleanup.push(async () => { database.close() })
+    const feedback = createAttentionFeedbackStore(database, h.inbox, 'alice')
+    const id = 'old-feedback-receipt-001'
+    const recorded = await feedback.record({ id, targets })
+    expect(recorded.states).toHaveLength(1)
+    database.query("UPDATE local_attention_feedback SET data=json_remove(data,'$.states') WHERE id=?").run(id)
+    const legacyReplay = await feedback.record({ id, targets })
+    expect(legacyReplay.status).toBe('active')
+    expect(legacyReplay.states).toBeUndefined()
+    const changed = await h.inbox.setMailboxState('alice', mailbox.id, message.id, { done: false }, recorded.states![0]!.revision)
+    const conflictedUndo = await feedback.undo(id)
+    expect(conflictedUndo.status).toBe('retracted')
+    expect(conflictedUndo.problem).toBeDefined()
+    expect(conflictedUndo.states).toBeUndefined()
+    expect(await feedback.undo(id)).toEqual(conflictedUndo)
+    expect(await feedback.record({ id, targets })).toEqual(conflictedUndo)
+    expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items[0]!.memberships[0]).toEqual(changed)
+    const freshId = 'current-feedback-receipt-001'
+    const freshTargets = [{ ...targets[0]!, revision: changed.revision }]
+    const fresh = await feedback.record({ id: freshId, targets: freshTargets })
+    const latest = await h.inbox.setMailboxState('alice', mailbox.id, message.id, { done: false }, fresh.states![0]!.revision)
+    expect(await feedback.record({ id: freshId, targets: freshTargets })).toEqual(fresh)
+    expect((await feedback.undo(freshId)).states).toBeUndefined()
+    expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items[0]!.memberships[0]).toEqual(latest)
   })
 
   test('feedback deduplicates overlapping memberships, separates sources, and never absorbs a later reply', async () => {
@@ -888,6 +938,86 @@ function sse(response: Response) {
     },
   }
 }
+
+describe('mailbox action HTTP receipts', () => {
+  test('client Done and Undo return exact body-free memberships without hydration, scans or provider writes', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account, box } = await h.seed('alice', 'http-local-done', [native('one'), native('two')])
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const messages = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items
+    const targets = messages.map(message => ({ mailboxId: mailbox.id, messageId: message.id, revision: message.memberships[0]!.revision, messageRevision: message.revision }))
+    const input = { id: 'client-local-done', targets, done: true }
+    const beforeCalls = structuredClone(box.calls)
+    const wire = transport(h)
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' } })
+    h.inbox.message = async () => { throw new Error('Local Done must not hydrate a message') }
+    h.inbox.mailboxMessage = async () => { throw new Error('Local Done must not hydrate a mailbox message') }
+    const accepted = await client.setMailboxStates(input)
+    expect(accepted).toEqual({ id: input.id, retracted: false, states: targets.map(target => ({ mailboxId: target.mailboxId, messageId: target.messageId, revision: target.revision + 1, done: true, snoozedUntil: null })) })
+    expect(wire.requests.map(request => [request.method, request.path])).toEqual([['POST', '/v1/mailbox-actions']])
+    expect(await client.setMailboxStates(input)).toEqual(accepted)
+    const undone = await client.undoMailboxStates(input.id)
+    expect(undone.retracted).toBe(true)
+    expect(undone.states).toEqual(accepted.states.map(state => ({ ...state, done: false, revision: state.revision + 1 })))
+    const newer = await h.inbox.setMailboxState('alice', mailbox.id, messages[0]!.id, { done: true }, undone.states[0]!.revision)
+    expect(await client.undoMailboxStates(input.id)).toEqual(undone)
+    expect(await client.setMailboxStates(input)).toEqual(undone)
+    const current = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.find(message => message.id === newer.messageId)!
+    expect(current.memberships[0]).toEqual(newer)
+    expect(box.calls).toEqual(beforeCalls)
+    expect(JSON.stringify(accepted)).not.toContain(BODY_SECRET)
+    expect(JSON.stringify(accepted)).not.toContain(SECRET)
+    expect(Object.keys(accepted.states[0]!).sort()).toEqual(['done', 'mailboxId', 'messageId', 'revision', 'snoozedUntil'])
+    const schema = await client.request<any>('/openapi.json')
+    expect(schema.components.schemas.MailboxAction.properties.targets.maxItems).toBe(500)
+    expect(schema.components.schemas.MailboxStateReceipt.properties.states.maxItems).toBe(500)
+  })
+
+  test('HTTP local actions retain owner, membership/message fences, atomicity and idempotency conflicts', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account } = await h.seed('alice', 'http-local-guards', [native('one'), native('two')])
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const messages = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items
+    const targets = messages.map(message => ({ mailboxId: mailbox.id, messageId: message.id, revision: message.memberships[0]!.revision, messageRevision: message.revision }))
+    const post = (owner: string | null, input: unknown) => h.request(owner, '/mailbox-actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) })
+    await invalid(await post(null, { id: 'unauthenticated', targets, done: true }), 401)
+    await invalid(await post('bob', { id: 'foreign-memberships', targets, done: true }), 404)
+    for (const field of ['revision', 'messageRevision']) {
+      await invalid(await post('alice', { id: `stale-${field}`, targets: targets.map((target, index) => index ? { ...target, [field]: 9999 } : target), done: true }), 412)
+    }
+    expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.map(message => message.memberships[0])).toEqual(messages.map(message => message.memberships[0]))
+    const input = { id: 'guarded-action', targets, done: true }
+    expect((await post('alice', input)).status).toBe(200)
+    await invalid(await post('alice', { ...input, done: false }), 409)
+    await invalid(await h.request('bob', '/mailbox-actions/guarded-action/undo', { method: 'POST' }), 404)
+    const current = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items[0]!
+    await h.inbox.setMailboxState('alice', mailbox.id, current.id, { done: false }, current.memberships[0]!.revision)
+    await invalid(await h.request('alice', '/mailbox-actions/guarded-action/undo', { method: 'POST' }), 412)
+  })
+
+  test('HTTP local action requests and receipts support 500 targets and reject oversized or extra input', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account } = await h.seed('alice', 'http-local-bound', Array.from({ length: 500 }, (_, index) => native(`bound-${index}`)))
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const targets: Array<{ mailboxId: string; messageId: string; revision: number }> = []
+    let cursor: string | undefined
+    do {
+      const page = await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id], limit: 100, ...(cursor ? { cursor } : {}) })
+      targets.push(...page.items.map(message => ({ mailboxId: mailbox.id, messageId: message.id, revision: message.memberships[0]!.revision })))
+      cursor = page.nextCursor ?? undefined
+    } while (cursor)
+    const wire = transport(h)
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' } })
+    await expect(client.setMailboxStates({ id: 'too-many', targets: [...targets, targets[0]!], done: true })).rejects.toMatchObject({ status: 400 })
+    await invalid(await h.request('alice', '/mailbox-actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'extra-field', targets: [targets[0]], done: true, force: true }) }), 400)
+    const result = await client.setMailboxStates({ id: 'maximum-targets', targets, done: true })
+    expect(result.states).toHaveLength(500)
+    expect(result.states.every(state => state.done && state.revision === 2)).toBe(true)
+    const undone = await client.undoMailboxStates(result.id)
+    expect(undone.states).toHaveLength(500)
+    expect(undone.states.every(state => !state.done && state.revision === 3)).toBe(true)
+  })
+})
 
 describe('mutation revision receipts', () => {
   test('acceptance and HTTP/client reads expose exact stored revisions without leaking mail or rebasing idempotent replay', async () => {
