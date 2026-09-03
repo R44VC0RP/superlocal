@@ -1807,6 +1807,500 @@ describe('credential capabilities and source discovery', () => {
   })
 })
 
+describe('Inbound bounded multi-source snapshots', () => {
+  const definition = builtInProviders.find(provider => provider.id === 'inbound')!
+  const peer = (count: number) => {
+    const domains = Array.from({ length: count }, (_, index) => ({
+      id: `domain-${index}`, domain: `source-${String(index).padStart(4, '0')}.example.test`,
+      status: 'verified', canReceiveEmails: true,
+    }))
+    const addresses = domains.map(domain => ({ address: `support@${domain.domain}`, domainId: domain.id,
+      isActive: true, isReceiptRuleConfigured: true }))
+    const mail = new Map<string, Wire[]>(domains.map((domain, index) => [domain.domain, [{
+      id: `source-message-${index}`, thread_id: `source-thread-${index}`, type: 'received',
+      from: WRITER, to: ['header-only@unselected.example.test'], cc: [],
+      envelope_recipient: addresses[index]!.address, is_read: index % 2 === 0, is_archived: false,
+      created_at: '2026-01-01T00:00:00.000Z', subject: `Source ${index}`,
+    }]]))
+    const stats = { heads: [] as URL[], listings: [] as URL[], discoveries: [] as URL[], details: 0,
+      activeHeads: 0, maxHeads: 0, settledHeads: 0 }
+    const controls: { head?: (url: URL, signal: AbortSignal) => Promise<Response | void>; envelopeRecipients?: boolean } = {}
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      expect(url.origin).toBe('https://inbound.invalid')
+      expect(init?.method ?? 'GET').toBe('GET')
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer offline-multi-source')
+      if (init?.signal?.aborted) throw init.signal.reason
+      const offset = Number(url.searchParams.get('offset'))
+      const limit = Number(url.searchParams.get('limit'))
+      if (url.pathname.endsWith('/domains') || url.pathname.endsWith('/email-addresses')) {
+        stats.discoveries.push(url)
+        const values = url.pathname.endsWith('/domains') ? domains : addresses
+        return Response.json({ data: values.slice(offset, offset + limit),
+          pagination: { offset, limit, total: values.length, hasMore: offset + limit < values.length },
+          capabilities: { envelopeRecipients: controls.envelopeRecipients ?? true } })
+      }
+      if (url.pathname.endsWith('/emails')) {
+        stats.listings.push(url)
+        const head = offset === 0 && limit === 1
+        if (head) {
+          stats.heads.push(url); stats.activeHeads++
+          stats.maxHeads = Math.max(stats.maxHeads, stats.activeHeads)
+        }
+        try {
+          if (head) {
+            const override = await controls.head?.(url, init!.signal!)
+            if (override) return override
+          }
+          const domain = url.searchParams.get('domain')
+          const type = url.searchParams.get('type')
+          expect(url.searchParams.get('time_range')).toBe('all')
+          if (type === 'received') expect(domain && mail.has(domain)).toBeTruthy()
+          else expect(['sent', 'scheduled']).toContain(type!)
+          let values = domain ? mail.get(domain)! : []
+          const address = url.searchParams.get('address')
+          if (address) values = values.filter(message => message.envelope_recipient === address)
+          if (url.searchParams.get('status') === 'archived') values = values.filter(message => message.is_archived)
+          if (url.searchParams.get('status') === 'unread') values = values.filter(message => !message.is_read)
+          return Response.json({ data: values.slice(offset, offset + limit),
+            pagination: { offset, limit, total: values.length, has_more: offset + limit < values.length } })
+        } finally {
+          if (head) { stats.activeHeads--; stats.settledHeads++ }
+        }
+      }
+      for (const values of mail.values()) {
+        const message = values.find(message => url.pathname.endsWith(`/emails/${message.id}`))
+        if (message) { stats.details++; return Response.json(message) }
+      }
+      if (url.pathname.includes('/mail/threads/')) {
+        const id = url.pathname.split('/').at(-1)!
+        const messages = [...mail.values()].flat().filter(message => message.thread_id === id)
+        return Response.json({ thread: { id, message_count: messages.length }, messages })
+      }
+      throw new Error('Unexpected multi-source Inbound request')
+    }) as typeof fetch
+    return { domains, addresses, mail, stats, controls,
+      create: (scopes?: Array<{ kind: 'domain' | 'address'; value: string }>) => definition.create({
+        accountId: 'multi-source', apiKey: 'offline-multi-source',
+        ...(scopes === undefined ? {} : { sdkMailboxScopes: scopes }),
+        baseUrl: 'https://inbound.invalid/api/e2', fetch: fetcher,
+      }) }
+  }
+
+  for (const count of [101, 1_000]) test(`syncs all ${count} selected sources exactly once across pages`, async () => {
+    const h = peer(count + 1)
+    const scopes = h.domains.slice(0, count).map((domain, index) => index % 2 === 0
+      ? { kind: 'domain' as const, value: domain.domain }
+      : { kind: 'address' as const, value: h.addresses[index]!.address })
+    const provider = await h.create(scopes)
+    const now = Date.now
+    let clock = now()
+    // Advance only the adapter's pacing clock; requests still run through its real transport.
+    Date.now = () => (clock += 111)
+    try {
+      const ids: string[] = []
+      let cursor: SyncCursor | null = null
+      let pages = 0
+      do {
+        const result = await provider.sync(cursor, { limit: 37,
+          mailboxScopes: pages % 2 ? [...scopes].reverse() : scopes })
+        expect(result.fullSync).toBe(true)
+        expect(result.snapshotComplete).toBe(!result.hasMore)
+        expect(result.deletedMessageIds).toEqual([])
+        expect(h.stats.heads).toHaveLength(count)
+        for (const message of result.messages) {
+          const index = Number(message.id.split('-').at(-1))
+          expect(message.sourceDomains).toEqual([h.domains[index]!.domain])
+          expect(message.deliveryRecipients).toEqual([h.addresses[index]!.address])
+          expect(message.isRead).toBe(index % 2 === 0)
+          ids.push(message.id)
+        }
+        cursor = result.cursor
+        pages++
+        expect(pages).toBeLessThanOrEqual(Math.ceil(count / 37))
+      } while (cursor)
+      expect(ids.slice().sort()).toEqual(Array.from({ length: count }, (_, index) => `source-message-${index}`).sort())
+      expect(new Set(ids).size).toBe(count)
+      expect(h.stats.details).toBe(count)
+      expect(new Set(h.stats.heads.map(url => url.searchParams.get('domain'))).size).toBe(count)
+      expect(h.stats.heads.every(url => url.searchParams.get('type') === 'received')).toBe(true)
+      expect(h.stats.heads.filter(url => url.searchParams.has('address'))).toHaveLength(Math.floor(count / 2))
+      expect(h.stats.heads.some(url => url.searchParams.get('domain') === h.domains[count]!.domain)).toBe(false)
+      expect(h.stats.maxHeads).toBe(4)
+      expect(h.stats.activeHeads).toBe(0)
+      expect(h.stats.settledHeads).toBe(count)
+      expect(h.stats.discoveries.some(url => Number(url.searchParams.get('offset')) >= 100)).toBe(true)
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  for (const count of [600, 1_000]) test(`normalizes ${count === 600 ? 1_200 : 5_000} raw selectors into ${count} receiving streams`, async () => {
+    const h = peer(count + 1)
+    const scopes = [
+      ...h.domains.slice(0, count).map(domain => ({ kind: 'domain' as const, value: domain.domain })),
+      ...h.addresses.slice(0, count).map(address => ({ kind: 'address' as const, value: address.address })),
+      ...Array.from({ length: count === 1_000 ? 3_000 : 0 }, (_, index) => ({
+        kind: 'domain' as const, value: ` ${h.domains[index % count]!.domain.toUpperCase()} `,
+      })),
+    ]
+    const provider = await h.create(scopes)
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      const ids: string[] = []
+      let cursor: SyncCursor | null = null
+      do {
+        const page = await provider.sync(cursor, { limit: 100,
+          ...(cursor ? { mailboxScopes: [...scopes].reverse() } : {}) })
+        ids.push(...page.messages.map(message => message.id))
+        expect(page.snapshotComplete).toBe(!page.hasMore)
+        expect(h.stats.heads).toHaveLength(count)
+        cursor = page.cursor
+      } while (cursor)
+      expect(ids.slice().sort()).toEqual(Array.from({ length: count }, (_, index) => `source-message-${index}`).sort())
+      expect(new Set(ids).size).toBe(count)
+      expect(h.stats.details).toBe(count)
+      expect(h.stats.heads.every(url => url.searchParams.get('type') === 'received' &&
+        url.searchParams.has('domain') && !url.searchParams.has('address'))).toBe(true)
+      expect(h.stats.heads.some(url => url.searchParams.get('domain') === h.domains[count]!.domain)).toBe(false)
+      expect(h.stats.maxHeads).toBe(4)
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  for (const scenario of ['unauthorized', 'unfilterable'] as const) test(`rejects ${scenario} covered addresses in more than 1000 raw selectors before mail reads`, async () => {
+    const h = peer(600)
+    const scopes = [
+      ...h.domains.map(domain => ({ kind: 'domain' as const, value: domain.domain })),
+      ...h.addresses.map(address => ({ kind: 'address' as const, value: address.address })),
+      ...(scenario === 'unauthorized' ? [{ kind: 'address' as const, value: `not-discovered@${h.domains[0]!.domain}` }] : []),
+    ]
+    h.controls.envelopeRecipients = scenario !== 'unfilterable'
+    const provider = await h.create(scopes)
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      await failure(() => provider.sync(), scenario === 'unauthorized' ? 'AUTHORIZATION' : 'UNSUPPORTED_OPERATION', false)
+      expect(h.stats.listings).toHaveLength(0)
+      expect(h.stats.details).toBe(0)
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  test('rejects more than 5000 raw selectors before discovery even when they name one effective stream', async () => {
+    const h = peer(1)
+    const provider = await h.create([])
+    const scopes = Array.from({ length: 5_001 }, () => ({ kind: 'domain' as const, value: h.domains[0]!.domain }))
+    try {
+      await failure(async () => h.create(scopes), 'VALIDATION', false)
+      await failure(() => provider.sync(null, { mailboxScopes: scopes }), 'VALIDATION', false)
+      expect(h.stats.discoveries).toHaveLength(0)
+      expect(h.stats.listings).toHaveLength(0)
+      expect(h.stats.details).toBe(0)
+    } finally { await provider.disconnect() }
+  })
+
+  test('unselected connections pin 1000 domains and the two distinct outbound streams', async () => {
+    const h = peer(1_000)
+    const provider = await h.create()
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      const first = await provider.sync(null, { limit: 1 })
+      expect(first).toMatchObject({ hasMore: true, snapshotComplete: false })
+      expect(h.stats.heads).toHaveLength(1_002)
+      expect(h.stats.heads.filter(url => url.searchParams.get('type') === 'received')).toHaveLength(1_000)
+      expect(h.stats.heads.filter(url => !url.searchParams.has('domain')).map(url => url.searchParams.get('type')).sort())
+        .toEqual(['scheduled', 'sent'])
+      expect(h.stats.maxHeads).toBe(4)
+      expect(h.stats.details).toBe(1)
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  test('validates every selected grant before reads, deduplicates covered scopes, and rejects excess input', async () => {
+    const h = peer(1_001)
+    const domains = h.domains.slice(0, 101).map(domain => ({ kind: 'domain' as const, value: domain.domain }))
+    const scopes = [...domains, { kind: 'domain' as const, value: ` ${domains[0]!.value.toUpperCase()} ` },
+      { kind: 'address' as const, value: h.addresses[0]!.address }]
+    const provider = await h.create(scopes)
+    const unselected = await h.create()
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      for (const unknown of [{ kind: 'domain' as const, value: 'unknown.example.test' },
+        { kind: 'address' as const, value: `not-discovered@${domains[0]!.value}` }]) {
+        await failure(() => provider.sync(null, { mailboxScopes: [...scopes, unknown] }), 'AUTHORIZATION', false)
+        expect(h.stats.listings).toHaveLength(0)
+        expect(h.stats.details).toBe(0)
+      }
+      const excess = [
+        ...h.domains.map(domain => ({ kind: 'domain' as const, value: domain.domain })),
+        ...h.addresses.map(address => ({ kind: 'address' as const, value: address.address })),
+      ]
+      const overscoped = await h.create(excess)
+      try { await failure(() => overscoped.sync(), 'VALIDATION', false) }
+      finally { await overscoped.disconnect() }
+      await failure(() => provider.sync(null, { mailboxScopes: excess }), 'VALIDATION', false)
+      await failure(() => unselected.listMessages({ folder: 'inbox' }), 'VALIDATION', false)
+      expect(h.stats.listings).toHaveLength(0)
+      const first = await provider.sync(null, { limit: 1 })
+      expect(h.stats.heads).toHaveLength(101)
+      expect(h.stats.heads.every(url => !url.searchParams.has('address'))).toBe(true)
+      const rest = await provider.sync(first.cursor, { limit: 100, mailboxScopes: [...scopes].reverse() })
+      expect(rest.snapshotComplete).toBe(true)
+      expect(new Set([...first.messages, ...rest.messages].map(message => message.id)).size).toBe(101)
+      expect(h.stats.heads).toHaveLength(101)
+    } finally { Date.now = now; await Promise.all([provider.disconnect(), unselected.disconnect()]) }
+  })
+
+  for (const scenario of ['failed-head', 'disconnect'] as const) test(`${scenario} cancels and settles four active heads without starting the rest`, async () => {
+    const h = peer(101)
+    const provider = await h.create(h.domains.map(domain => ({ kind: 'domain', value: domain.domain })))
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    let entered!: () => void
+    const ready = new Promise<void>(resolve => { entered = resolve })
+    let failHead!: () => void
+    let aborted = 0
+    h.controls.head = async (_url, signal) => new Promise<Response>((resolve, reject) => {
+      const abort = () => { aborted++; reject(signal.reason) }
+      signal.addEventListener('abort', abort, { once: true })
+      if (h.stats.heads.length === 1) failHead = () => {
+        signal.removeEventListener('abort', abort)
+        resolve(Response.json({ error: 'Controlled head throttle' }, { status: 429, headers: { 'Retry-After': '9' } }))
+      }
+      if (h.stats.heads.length === 4) entered()
+    })
+    const operation = provider.sync(null, { limit: 1 }).then(result => ({ result }), error => ({ error }))
+    try {
+      await Promise.race([ready, operation.then(() => { throw new Error('Head pinning finished before four requests entered') })])
+      expect(h.stats.activeHeads).toBe(4)
+      if (scenario === 'failed-head') failHead()
+      else await provider.disconnect()
+      expect(await operation).toMatchObject({ error: scenario === 'failed-head'
+        ? { code: 'RATE_LIMITED', retryable: true, retryAfter: 9 }
+        : { code: 'NETWORK', retryable: true } })
+      expect(h.stats.heads).toHaveLength(4)
+      expect(h.stats.activeHeads).toBe(0)
+      expect(h.stats.settledHeads).toBe(4)
+      expect(h.stats.details).toBe(0)
+      expect(aborted).toBe(scenario === 'failed-head' ? 3 : 4)
+      if (scenario === 'failed-head') {
+        h.controls.head = undefined
+        const retry = await provider.sync(null, { limit: 1 })
+        expect(retry).toMatchObject({ hasMore: true, snapshotComplete: false })
+        expect(retry.messages.map(message => message.id)).toEqual(['source-message-0'])
+        expect(h.stats.heads).toHaveLength(105)
+      } else {
+        await failure(() => provider.sync(), 'NETWORK', true)
+        expect(h.stats.heads).toHaveLength(4)
+      }
+    } finally { Date.now = now; await provider.disconnect(); await operation }
+  })
+
+  test('disconnect cancels paced head timers before they can call the transport', async () => {
+    const h = peer(101)
+    const provider = await h.create(h.domains.map(domain => ({ kind: 'domain', value: domain.domain })))
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    let entered!: () => void
+    const ready = new Promise<void>(resolve => { entered = resolve })
+    h.controls.head = async (_url, signal) => {
+      // The first head is in flight; force the other three workers into real, long pacing waits.
+      const earlier = clock - 5_000
+      Date.now = () => earlier
+      entered()
+      return new Promise<Response>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+    }
+    const operation = provider.sync(null, { limit: 1 }).then(result => ({ result }), error => ({ error }))
+    try {
+      await Promise.race([ready, operation.then(() => { throw new Error('Head pinning did not enter the transport') })])
+      const start = performance.now()
+      await provider.disconnect()
+      expect(await operation).toMatchObject({ error: { code: 'NETWORK', retryable: true } })
+      expect(performance.now() - start).toBeLessThan(500)
+      expect(h.stats.heads).toHaveLength(1)
+      expect(h.stats.activeHeads).toBe(0)
+      expect(h.stats.settledHeads).toBe(1)
+    } finally { Date.now = now; await provider.disconnect(); await operation }
+  })
+
+  test('concurrent snapshot requests share the four-head bound without sharing source state', async () => {
+    const h = peer(101)
+    const provider = await h.create(h.domains.map(domain => ({ kind: 'domain', value: domain.domain })))
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      const results = await Promise.all(['first-query', 'second-query'].map(search => provider.listMessages({ search, limit: 1 })))
+      expect(h.stats.maxHeads).toBe(4)
+      expect(h.stats.heads).toHaveLength(202)
+      expect(results[0]!.nextCursor).not.toBe(results[1]!.nextCursor)
+      for (const [index, search] of ['first-query', 'second-query'].entries()) {
+        const rest = await provider.listMessages({ search, cursor: results[index]!.nextCursor, limit: 100 })
+        expect(rest.hasMore).toBe(false)
+        expect(new Set([...results[index]!.items, ...rest.items].map(message => message.id)).size).toBe(101)
+      }
+      expect(h.stats.heads).toHaveLength(202)
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  test('many-source cursors pin arrivals, retain ordering and invalidate changed scopes or refreshed grants', async () => {
+    const h = peer(102)
+    const scopes = h.domains.slice(0, 101).map(domain => ({ kind: 'domain' as const, value: domain.domain }))
+    const original = h.mail.get(scopes[0]!.value)!
+    original.push({ ...original[0], id: 'older-pinned-message' })
+    const provider = await h.create(scopes)
+    const replacement = await h.create(scopes)
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      const first = await provider.sync(null, { limit: 1 })
+      expect(first.cursor).not.toBeNull()
+      expect(h.stats.heads).toHaveLength(101)
+      const reads = h.stats.listings.length + h.stats.details
+      await failure(() => replacement.sync(first.cursor), 'INVALID_CURSOR', false)
+      await failure(() => provider.sync(first.cursor, { mailboxScopes: [...scopes.slice(0, 100),
+        { kind: 'domain', value: h.domains[101]!.domain }] }), 'INVALID_CURSOR', false)
+      await failure(() => provider.listThreads({ cursor: first.cursor!.value, folder: 'inbox' }), 'INVALID_CURSOR', false)
+      expect(h.stats.listings.length + h.stats.details).toBe(reads)
+      original.unshift({ ...original[0], id: 'new-arrival', created_at: '2026-01-02T00:00:00.000Z' })
+      const ids = first.messages.map(message => message.id)
+      let cursor = first.cursor
+      do {
+        const next = await provider.sync(cursor, { limit: 37, mailboxScopes: [...scopes].reverse() })
+        ids.push(...next.messages.map(message => message.id)); cursor = next.cursor
+      } while (cursor)
+      expect(ids).toHaveLength(102)
+      expect(new Set(ids).size).toBe(102)
+      expect(ids).toContain('older-pinned-message')
+      expect(ids).not.toContain('new-arrival')
+      expect(h.stats.heads).toHaveLength(101)
+      const fresh = await provider.sync(null, { limit: 1 })
+      expect(fresh.messages.map(message => message.id)).toEqual(['new-arrival'])
+      const beforeRevocation = h.stats.listings.length + h.stats.details
+      h.domains[100]!.canReceiveEmails = false
+      clock += 61_000
+      await failure(() => provider.sync(fresh.cursor), 'INVALID_CURSOR', false)
+      expect(h.stats.listings.length + h.stats.details).toBe(beforeRevocation)
+      const restarted = await provider.sync(null, { limit: 1 })
+      expect(restarted.snapshotComplete).toBe(false)
+      expect(h.stats.heads.slice(-100).some(url => url.searchParams.get('domain') === h.domains[100]!.domain)).toBe(false)
+      original.pop()
+      let current = restarted.cursor
+      await failure(async () => {
+        do { current = (await provider.sync(current, { limit: 100 })).cursor } while (current)
+      }, 'INVALID_CURSOR', false)
+    } finally { Date.now = now; await Promise.all([provider.disconnect(), replacement.disconnect()]) }
+  })
+
+  test('complete native threads spanning selected domains retain read/archive state and exclude unchosen delivery', async () => {
+    const h = peer(102)
+    const scopes = h.domains.slice(0, 101).map(domain => ({ kind: 'domain' as const, value: domain.domain }))
+    for (const index of [0, 1, 101]) h.mail.get(h.domains[index]!.domain)![0]!.thread_id = 'shared-source-thread'
+    h.mail.get(h.domains[0]!.domain)![0]!.is_archived = true
+    const provider = await h.create(scopes)
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      const first = await provider.listThreads({ limit: 1 })
+      expect(first.total).toBe(100)
+      expect(first.items[0]!.messages.map(message => message.id).sort()).toEqual(['source-message-0', 'source-message-1'])
+      expect(first.items[0]!.messageCount).toBe(2)
+      expect(first.items[0]!.messages.find(message => message.id === 'source-message-0')).toMatchObject({ folder: 'archive', isRead: true })
+      expect(first.items[0]!.messages.find(message => message.id === 'source-message-1')).toMatchObject({ folder: 'inbox', isRead: false })
+      const rest = await provider.listThreads({ cursor: first.nextCursor, limit: 100 })
+      expect(rest.hasMore).toBe(false)
+      expect(new Set([...first.items, ...rest.items].map(thread => thread.id)).size).toBe(100)
+      expect(h.stats.heads).toHaveLength(101)
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  for (const scenario of ['queries', 'heads', 'entries', 'thread-identities'] as const) test(`${scenario} metadata stays inside the shared 8 MiB snapshot budget`, async () => {
+    const h = peer(1_000)
+    const scopes = h.domains.map(domain => ({ kind: 'domain' as const, value: domain.domain }))
+    if (scenario === 'heads' || scenario === 'entries') {
+      for (const values of h.mail.values()) {
+        const large = { ...values[0], id: `${values[0]!.id}-large`, from_name: 'n'.repeat(2_048),
+          message_id: 'm'.repeat(2_048), thread_id: 't'.repeat(2_048) }
+        if (scenario === 'heads') values[0] = large
+        else values.push(large)
+      }
+    }
+    if (scenario === 'thread-identities') {
+      for (const values of h.mail.values()) Object.assign(values[0]!, { from_name: 'n'.repeat(1_000), thread_id: 't'.repeat(2_048) })
+      h.controls.head = async url => Response.json({
+        data: h.mail.get(url.searchParams.get('domain')!)!.map(message => ({ ...message, thread_id: undefined })),
+        pagination: { offset: 0, limit: 1, total: 1, has_more: false },
+      })
+    }
+    const provider = await h.create(scopes)
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      let completed = false
+      await failure(async () => {
+        if (scenario === 'thread-identities') await provider.listThreads({ limit: 1 })
+        else {
+          let cursor: string | null = null
+          do {
+            const page = await provider.listMessages({ limit: 100, cursor,
+              ...(scenario === 'queries' ? { search: 'q'.repeat(2_100) } : {}) })
+            cursor = page.nextCursor
+          } while (cursor)
+        }
+        completed = true
+      }, 'UPSTREAM', false)
+      expect(completed).toBe(false)
+      expect(h.stats.activeHeads).toBe(0)
+      if (scenario === 'queries') expect(h.stats.heads).toHaveLength(0)
+      if (scenario === 'heads') {
+        expect(h.stats.heads.length).toBeGreaterThan(100)
+        expect(h.stats.heads.length).toBeLessThan(1_000)
+        expect(h.stats.details).toBe(0)
+      }
+      if (scenario === 'entries' || scenario === 'thread-identities') {
+        expect(h.stats.heads).toHaveLength(1_000)
+        expect(h.stats.details).toBeGreaterThan(0)
+      }
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  test('aggregate item totals accept 10000 as incomplete history and fail explicitly above it', async () => {
+    for (const perSource of [10, 11]) {
+      const h = peer(1_000)
+      for (const [domain, values] of h.mail) h.mail.set(domain, Array.from({ length: perSource }, (_, index) => ({
+        ...values[0], id: `${values[0]!.id}-${index}`,
+      })))
+      const provider = await h.create(h.domains.map(domain => ({ kind: 'domain', value: domain.domain })))
+      const now = Date.now
+      let clock = now()
+      Date.now = () => (clock += 111)
+      try {
+        if (perSource === 10) {
+          const first = await provider.sync(null, { limit: 1 })
+          expect(first).toMatchObject({ hasMore: true, snapshotComplete: false })
+          expect(first.cursor).not.toBeNull()
+          expect(first.messages).toHaveLength(1)
+          expect(h.stats.heads).toHaveLength(1_000)
+        } else {
+          await failure(() => provider.sync(null, { limit: 1 }), 'UPSTREAM', false)
+          expect(h.stats.heads.length).toBeLessThan(1_000)
+          expect(h.stats.details).toBe(0)
+        }
+        expect(h.stats.activeHeads).toBe(0)
+        expect(h.stats.maxHeads).toBe(4)
+      } finally { Date.now = now; await provider.disconnect() }
+    }
+  })
+})
+
 describe('Inbound E2 metadata and cursor boundaries', () => {
   test('E2 headers preserve display and RFC metadata without expanding recipients or inventing delivery evidence', async () => {
     const definition = builtInProviders.find(provider => provider.id === 'inbound')!

@@ -85,6 +85,9 @@ const MAX_SNAPSHOTS = 4
 const MAX_SNAPSHOT_ITEMS = 10_000
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 const MAX_SCAN_PAGES = 200
+const MAX_MAILBOX_SCOPE_INPUTS = 5_000
+const MAX_RECEIVING_SOURCES = 1_000
+const SOURCE_HEAD_CONCURRENCY = 4
 
 type MessageEvidence = Pick<InboundEmail, 'is_archived' | 'envelope_recipient' | 'thread_id' | 'message_id' | 'from_name'> & { domain?: string }
 
@@ -198,6 +201,7 @@ export class InboundProvider implements InboxProvider {
   private envelopeRecipients = false
   private readonly requests = new AbortController()
   private readonly snapshots = new Map<string, InboundSnapshot>()
+  private headPin: Promise<void> | undefined
   private readonly evidence = new Map<string, MessageEvidence>()
   private evidenceBytes = 0
 
@@ -206,9 +210,10 @@ export class InboundProvider implements InboxProvider {
       throw new ProviderError('inbound', 'VALIDATION', 'Inbound requires an account ID and API key')
     }
     if (credentials.sdkMailboxScopes !== undefined && (!Array.isArray(credentials.sdkMailboxScopes) ||
+      credentials.sdkMailboxScopes.length > MAX_MAILBOX_SCOPE_INPUTS ||
       credentials.sdkMailboxScopes.some((scope) => !scope || !['domain', 'address'].includes(scope.kind) ||
-        typeof scope.value !== 'string' || !scope.value.trim()))) {
-      throw new ProviderError('inbound', 'VALIDATION', 'Inbound mailbox scopes must be explicit domain or address selectors')
+        typeof scope.value !== 'string' || !scope.value.trim() || scope.value.length > 320))) {
+      throw new ProviderError('inbound', 'VALIDATION', 'Inbound mailbox scopes must contain at most 5000 explicit domain or address selectors')
     }
     this.credentials = {
       ...credentials,
@@ -234,24 +239,34 @@ export class InboundProvider implements InboxProvider {
   }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const signal = init.signal ? AbortSignal.any([init.signal, this.requests.signal]) : this.requests.signal
+    const cancelled = () => new ProviderError('inbound', 'NETWORK', this.requests.signal.aborted
+      ? 'Inbound provider is disconnected' : 'Inbound request was cancelled', { retryable: true })
+    if (signal.aborted) throw cancelled()
     if (this.credentials.connectionMode) {
       // E2 allows ten requests/second per owner; preserve Retry-After for the sync scheduler.
       const now = Date.now()
       const scheduled = Math.max(now, this.nextRequestAt)
       this.nextRequestAt = scheduled + 110
-      if (scheduled > now) await new Promise((resolve) => setTimeout(resolve, scheduled - now))
+      if (scheduled > now) await new Promise<void>((resolve, reject) => {
+        const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(cancelled()) }
+        const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve() }, scheduled - now)
+        signal.addEventListener('abort', abort, { once: true })
+        if (signal.aborted) abort()
+      })
     }
+    if (signal.aborted) throw cancelled()
     const result = await providerJson<T>(
       'inbound',
       this.fetcher,
       `${this.baseUrl}${path}`,
       {
         ...init, headers: this.headers(init),
-        signal: init.signal ? AbortSignal.any([init.signal, this.requests.signal]) : this.requests.signal,
+        signal,
       },
       this.timeoutMs,
     )
-    if (this.requests.signal.aborted) throw new ProviderError('inbound', 'NETWORK', 'Inbound provider is disconnected', { retryable: true })
+    if (signal.aborted) throw cancelled()
     return result
   }
 
@@ -473,8 +488,8 @@ export class InboundProvider implements InboxProvider {
     }
   }
 
-  private async emailPage(path: string, expectedOffset: number): Promise<InboundEmailList> {
-    const result = await this.request<InboundEmailList>(path)
+  private async emailPage(path: string, expectedOffset: number, signal?: AbortSignal): Promise<InboundEmailList> {
+    const result = await this.request<InboundEmailList>(path, { signal })
     if (!result || typeof result !== 'object' || !Array.isArray(result.data) ||
       !result.pagination || typeof result.pagination !== 'object' ||
       typeof result.pagination.has_more !== 'boolean' ||
@@ -553,9 +568,9 @@ export class InboundProvider implements InboxProvider {
   private mailboxScopes(options: ListOptions = {}): MailScope[] | undefined {
     const scopes = options.mailboxScopes ?? this.credentials.sdkMailboxScopes
     if (scopes === undefined) return undefined
-    if (!Array.isArray(scopes) || scopes.length > 100 || scopes.some(scope => !scope ||
+    if (!Array.isArray(scopes) || scopes.length > MAX_MAILBOX_SCOPE_INPUTS || scopes.some(scope => !scope ||
       !['domain', 'address'].includes(scope.kind) || typeof scope.value !== 'string' || !scope.value.trim() || scope.value.length > 320)) {
-      throw new ProviderError('inbound', 'VALIDATION', 'Inbound mailbox scopes must be bounded explicit domain or address selectors')
+      throw new ProviderError('inbound', 'VALIDATION', 'Inbound mailbox scopes must contain at most 5000 explicit domain or address selectors')
     }
     return [...new Map(scopes.map(scope => {
       const value = { kind: scope.kind, value: scope.value.trim().toLowerCase() }
@@ -565,9 +580,10 @@ export class InboundProvider implements InboxProvider {
 
   private async receivingSources(scopes: MailScope[] | undefined): Promise<MailSource[]> {
     const discovery = await this.getMailSources()
+    const grants = new Map(discovery.sources.map(source => [`${source.kind}:${source.value}`, source]))
     const selected = scopes === undefined ? discovery.sources.filter(source => source.kind === 'domain')
       : scopes.map(scope => {
-        const source = discovery.sources.find(source => source.kind === scope.kind && source.value === scope.value)
+        const source = grants.get(`${scope.kind}:${scope.value}`)
         if (!source) throw new ProviderAuthorizationError('inbound', 'The selected mailbox source is no longer authorized')
         if (source.kind === 'address' && source.canFilter !== true) {
           throw new UnsupportedOperationError('inbound', 'exact-address filtering for the selected mailbox')
@@ -575,6 +591,56 @@ export class InboundProvider implements InboxProvider {
         return source
       })
     return selected.filter(source => source.canReceive && source.canFilter !== false)
+  }
+
+  private async pinSnapshotHeads(snapshot: InboundSnapshot): Promise<void> {
+    // Limit heads across concurrent queries too; a failed batch must not poison the next one.
+    while (this.headPin) await this.headPin.catch(() => {})
+    if (this.requests.signal.aborted) throw new ProviderError('inbound', 'NETWORK', 'Inbound provider is disconnected', { retryable: true })
+    const cancel = new AbortController()
+    const signal = AbortSignal.any([cancel.signal, this.requests.signal])
+    let nextSource = 0
+    let total = 0
+    let failure: { error: unknown } | undefined
+    const worker = async () => {
+      while (!signal.aborted) {
+        const source = snapshot.sources[nextSource++]
+        if (!source) return
+        try {
+          const params = new URLSearchParams(source.params)
+          params.set('offset', '0'); params.set('limit', '1')
+          const seed = await this.emailPage(`/emails?${params}`, 0, signal)
+          if (seed.pagination.limit !== 1 || seed.data.length !== Math.min(1, seed.pagination.total) ||
+            seed.pagination.has_more !== (seed.pagination.total > 1)) {
+            throw new ProviderCursorExpiredError('inbound', 'Inbound returned inconsistent snapshot totals')
+          }
+          total += seed.pagination.total
+          if (total > MAX_SNAPSHOT_ITEMS) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeds 10000 records; select a narrower scope')
+          const pinned = { data: seed.data.map(email => this.snapshotSummary(email)), pagination: {
+            offset: 0, limit: 1, total: seed.pagination.total, has_more: seed.pagination.has_more,
+          } }
+          // Reserve head metadata for the snapshot lifetime, even after a seed is consumed.
+          const bytes = JSON.stringify(pinned).length * 2
+          if (snapshot.bytes + bytes > MAX_SNAPSHOT_BYTES) {
+            throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its bounded metadata cache')
+          }
+          snapshot.bytes += bytes
+          source.total = seed.pagination.total
+          source.seed = pinned
+          source.complete = source.total === 0
+        } catch (error) {
+          failure ??= { error }
+          cancel.abort()
+        }
+      }
+    }
+    // Only the fixed worker set is eager, not one promise (or paced timer) per source.
+    const pending = Promise.all(Array.from({ length: Math.min(SOURCE_HEAD_CONCURRENCY, snapshot.sources.length) }, worker)).then(() => {
+      if (failure) throw failure.error
+      if (signal.aborted) throw new ProviderError('inbound', 'NETWORK', 'Inbound provider is disconnected', { retryable: true })
+    })
+    this.headPin = pending
+    try { await pending } finally { if (this.headPin === pending) this.headPin = undefined }
   }
 
   private async snapshotFor(kind: 'messages' | 'threads', options: ListOptions) {
@@ -598,6 +664,7 @@ export class InboundProvider implements InboxProvider {
     const scopes = this.mailboxScopes(options)
     const connectionMode = Boolean(this.credentials.connectionMode || scopes !== undefined)
     const sources: SnapshotSource[] = []
+    let descriptorBytes = 0
     const add = (type?: string, domain?: string, address?: string) => {
       const params = new URLSearchParams({ time_range: 'all' })
       if (type) params.set('type', type)
@@ -607,6 +674,11 @@ export class InboundProvider implements InboxProvider {
       if (options.search) params.set('search', options.search)
       if (options.folder === 'archive') params.set('status', 'archived')
       else if (options.unreadOnly) params.set('status', 'unread')
+      descriptorBytes += JSON.stringify({ params: params.toString(), domain, address, ids: [],
+        total: MAX_SNAPSHOT_ITEMS, complete: false }).length * 2
+      if (descriptorBytes > MAX_SNAPSHOT_BYTES) {
+        throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its bounded metadata cache')
+      }
       sources.push({ params, domain, address, ids: [], complete: false })
     }
     if (connectionMode) {
@@ -614,8 +686,12 @@ export class InboundProvider implements InboxProvider {
       const domains = new Set(receiving.filter(source => source.kind === 'domain').map(source => source.value))
       if (options.folder !== 'sent' && options.folder !== 'scheduled') {
         for (const source of receiving) {
+          if (source.kind === 'address' && domains.has(source.value.split('@')[1]!)) continue
+          if (sources.length >= MAX_RECEIVING_SOURCES) {
+            throw new ProviderError('inbound', 'VALIDATION', 'Select at most 1000 Inbound receiving sources per snapshot')
+          }
           if (source.kind === 'domain') add('received', source.value)
-          else if (!domains.has(source.value.split('@')[1]!)) add('received', source.value.split('@')[1], source.value)
+          else add('received', source.value.split('@')[1], source.value)
         }
       }
       // Receiving selectors never grant membership to an outbound record merely because its sender matches.
@@ -627,31 +703,20 @@ export class InboundProvider implements InboxProvider {
       add(options.folder === 'sent' || options.folder === 'scheduled' ? options.folder : options.folder ? 'received' : undefined)
     }
     sources.sort((a, b) => a.params.toString().localeCompare(b.params.toString()))
-    if (sources.length > 100) throw new ProviderError('inbound', 'VALIDATION', 'Select at most 100 Inbound sources per snapshot')
     const scope = JSON.stringify([this.accountId, kind, connectionMode, scopes ?? null, options.folder ?? null,
       options.search ?? null, options.unreadOnly ?? false, sources.map(source => source.params.toString())])
+    const bytes = descriptorBytes + scope.length * 2
+    if (bytes > MAX_SNAPSHOT_BYTES) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its bounded metadata cache')
     if (snapshot) {
       if (snapshot.scope !== scope) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot query or receiving grants changed')
       snapshot.expiresAt = Date.now() + SNAPSHOT_TTL_MS
     } else {
-      snapshot = { scope, folder: options.folder, connectionMode, sources, entries: [], seen: new Set(), bytes: 0, nextSource: 0,
+      snapshot = { scope, folder: options.folder, connectionMode, sources, entries: [], seen: new Set(), bytes, nextSource: 0,
         expiresAt: Date.now() + SNAPSHOT_TTL_MS }
-      let total = 0
       // Pin every source head before returning the first page, without importing bodies or whole mailboxes.
-      for (const source of sources) {
-        const params = new URLSearchParams(source.params)
-        params.set('offset', '0'); params.set('limit', '1')
-        const seed = await this.emailPage(`/emails?${params}`, 0)
-        if (seed.pagination.limit !== 1 || seed.data.length !== Math.min(1, seed.pagination.total) ||
-          seed.pagination.has_more !== (seed.pagination.total > 1)) {
-          throw new ProviderCursorExpiredError('inbound', 'Inbound returned inconsistent snapshot totals')
-        }
-        source.total = seed.pagination.total
-        source.seed = { ...seed, data: seed.data.map(email => this.snapshotSummary(email)) }
-        source.complete = source.total === 0
-        total += source.total
-        if (total > MAX_SNAPSHOT_ITEMS) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeds 10000 records; select a narrower scope')
-      }
+      await this.pinSnapshotHeads(snapshot)
+      if (this.requests.signal.aborted) throw new ProviderError('inbound', 'NETWORK', 'Inbound provider is disconnected', { retryable: true })
+      snapshot.expiresAt = Date.now() + SNAPSHOT_TTL_MS
       while (this.snapshots.size >= MAX_SNAPSHOTS) this.snapshots.delete(this.snapshots.keys().next().value!)
       this.snapshots.set(token, snapshot)
     }
@@ -831,7 +896,14 @@ export class InboundProvider implements InboxProvider {
       const grouped = new Map<string, SnapshotEntry[]>()
       for (const entry of snapshot.entries) {
         if (!entry) continue
-        if (entry.summary.thread_id === undefined) entry.summary.thread_id = (await this.getRawMessage(entry.summary.id, snapshot.connectionMode)).thread_id ?? null
+        if (entry.summary.thread_id === undefined) {
+          const summary = this.snapshotSummary({ ...entry.summary,
+            thread_id: (await this.getRawMessage(entry.summary.id, snapshot.connectionMode)).thread_id ?? null })
+          const bytes = (JSON.stringify(summary).length - JSON.stringify(entry.summary).length) * 2
+          if (snapshot.bytes + bytes > MAX_SNAPSHOT_BYTES) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its bounded metadata cache')
+          snapshot.bytes += bytes
+          entry.summary = summary
+        }
         const id = entry.summary.thread_id ?? entry.summary.id
         const group = grouped.get(id) ?? []
         group.push(entry); grouped.set(id, group)
@@ -1078,6 +1150,7 @@ export class InboundProvider implements InboxProvider {
 
   async disconnect(): Promise<void> {
     this.requests.abort()
+    await this.headPin?.catch(() => {})
     this.snapshots.clear()
     this.evidence.clear()
     this.evidenceBytes = 0
