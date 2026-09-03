@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { accounts, seedMail, type Draft, type Mail } from "../src/data.ts";
-import { matchesSearch } from "../src/mail-search.ts";
+import { accounts, seedMail, defaultPreferences, type Draft, type Mail } from "../src/data.ts";
+import { matchesSearch, splitRuleError } from "../src/mail-search.ts";
+import { selectMailView } from "../src/mail-view.ts";
+import { classifyAttention, conversationAttention } from "../../shared/mail-attention.ts";
+import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
 import {
   advanceMail,
@@ -22,6 +25,57 @@ const inbox = seedMail().find(
     mail.messages.every((message) => message.email !== mail.account),
 )!;
 const deadline = "2026-10-01T12:00:00.000Z";
+test("custom filters implement exact sender addresses, OR, parentheses, negation, and stable cached-only matches", () => {
+  const john = { ...inbox, from: "John", email: "john@doe.com", subject: "Planning", messages: [] };
+  assert.equal(matchesSearch(john, "(from:john@doe.com OR from:jane@doe.com) subject:Planning", false), true);
+  assert.equal(matchesSearch(john, "(from:jane@doe.com OR subject:nope)", false), false);
+  assert.equal(matchesSearch(john, "-(from:jane@doe.com OR subject:nope)", false), true);
+  assert.equal(matchesSearch({ ...john, email: "john@doe.com.attacker.test" }, "from:john@doe.com"), false);
+  assert.equal(matchesSearch({ ...john, from: "john@doe.com", email: "attacker@evil.test" }, "from:john@doe.com"), false);
+  assert.equal(matchesSearch({ ...john, email: "different@doe.com" }, "from:doe.com"), true);
+  assert.equal(matchesSearch({ ...john, email: "different@notdoe.com" }, "from:doe.com"), false);
+  assert.equal(splitRuleError("(from:john@doe.com OR from:jane@doe.com)"), null);
+  for (const query of ["(from:john@doe.com", "from:john@doe.com OR", "unknown:value", 'subject:"open', ""]) assert.ok(splitRuleError(query));
+  const withBody = { ...john, messages: [{ ...inbox.messages[0], body: "late-body-marker" }] };
+  assert.equal(matchesSearch(withBody, "late-body-marker", false), false);
+});
+
+test("Important and Other partition eligible unified conversations while custom filters intentionally overlap", () => {
+  const other = classifyAttention({ subject: "Weekly digest", preview: "", facts: { version: 1, listId: true, listUnsubscribe: true } });
+  const important = classifyAttention({ subject: "Please reply", preview: "" });
+  const make = (id: string, sourceId: string, box: string, attention = other): Mail => ({ ...inbox, id: `${box}:${id}`, sourceId, sdkThreadId: id, mailboxId: box, account: box,
+    folder: "Inbox", locations: ["Inbox"], split: "Important", email: "john@doe.com", messages: [{ ...inbox.messages[0], id: `${sourceId}:${id}`, email: "john@doe.com", outgoing: false, nativeFolder: "inbox", attention,
+      memberships: [{ mailboxId: box, messageId: `${sourceId}:${id}`, revision: 1, done: false, snoozedUntil: null }] }] });
+  const copies = [make("one", "source-a", "a"), make("one", "source-a", "b"), make("one", "source-b", "c"), make("two", "source-a", "a", important)];
+  const boxes = ["a", "b", "c"].map(id => ({ id, sourceId: id === "c" ? "source-b" : "source-a", name: id, email: `${id}@test.example`, canSend: false }));
+  const unified = unifiedMail(copies, ["a", "b", "c"], boxes);
+  assert.equal(unified.length, 3);
+  const preferences = { ...defaultPreferences, ...normalizeSplits({ splits: ["Focus", "Other", "John"], splitAliases: { Focus: "Important" }, splitRules: { John: "from:john@doe.com" } }) };
+  assert.equal(attentionSplit(preferences, "Focus"), "Important");
+  const view = (split: string, values = unified) => selectMailView(values, UNIFIED_ACCOUNT, "Inbox", split, preferences, false, "", null);
+  assert.deepEqual(view("Focus").splitCounts, { Focus: 1, Other: 2, John: 3 });
+  assert.equal(view("Focus").visibleMail.length + view("Other").visibleMail.length, unified.length);
+  assert.equal(view("John").visibleMail.length, 3);
+  const thread = unified.find(mail => mail.sourceId === "source-a" && mail.sdkThreadId === "one")!;
+  const arrival = { ...thread, messages: [...thread.messages, { ...thread.messages[0], id: "new-reply", attention: undefined }] };
+  assert.equal(conversationAttention(arrival), "Important");
+  assert.equal(view("Other", unified.map(mail => mail.id === thread.id ? arrival : mail)).visibleMail.length, 1);
+  const loaded = { ...thread, messages: thread.messages.map(message => ({ ...message, body: "password receipt please reply", loaded: true })) };
+  assert.equal(conversationAttention(loaded), "Other");
+});
+
+test("seed migration preserves customized names, aliases, filters and ordering", () => {
+  assert.deepEqual(normalizeSplits({ splits: ["Important", "Github", "Inbound", "Calendar", "Other"] }).splits, ["Important", "Other"]);
+  const authored = normalizeSplits({ splits: ["Important", "Github", "Inbound", "Calendar", "Other", "John"], splitRules: { Github: "from:review@example.test", John: "from:john@doe.com" } });
+  assert.deepEqual(authored.splits, ["Important", "Github", "Other", "John"]);
+  assert.equal(authored.splitRules.Github, "from:review@example.test");
+  const renamed = normalizeSplits({ splits: ["Focus", "My Github", "Other"], splitAliases: { Focus: "Important", "My Github": "Github" } });
+  assert.deepEqual(renamed.splits, ["Focus", "My Github", "Other"]);
+  assert.equal(renamed.splitRules["My Github"], "from:notifications@github.com");
+  const reordered = ["Important", "Calendar", "Github", "Inbound", "Other"];
+  assert.deepEqual(normalizeSplits({ splits: reordered }).splits, reordered);
+});
+
 const due = Date.parse(deadline);
 function reply(mail = inbox): Draft {
   return {

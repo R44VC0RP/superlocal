@@ -17,6 +17,16 @@ function resolve(
   );
 }
 
+test("W records a negative-feedback action distinct from E, respecting editing and modal boundaries", () => {
+  assert.deepEqual(resolve("e"), { type: "triage", action: "done" });
+  assert.deepEqual(resolve("w"), { type: "triage", action: "not-important" });
+  assert.deepEqual(resolve("w", { mode: "reader" }), { type: "triage", action: "not-important" });
+  for (const context of [{ editing: true }, { modal: true }, { settings: true }, { mode: "composer" }, { mode: "auxiliary" }, { navigation: true }] as const) assert.equal(resolve("w", context), null);
+  assert.equal(resolve("w", {}, { metaKey: true }), null);
+  assert.deepEqual(resolve("i", { sequence: true }), { type: "goFolder", folder: "Inbox", split: "Important", clearSequence: true });
+  assert.deepEqual(resolve("o", { sequence: true }), { type: "goFolder", folder: "Inbox", split: "Other", clearSequence: true });
+});
+
 test("selection shortcuts distinguish the list, drafts, readers, and text editing", () => {
   for (const modifier of [{ metaKey: true }, { ctrlKey: true }]) {
     assert.deepEqual(resolve("a", {}, modifier), {
@@ -541,7 +551,6 @@ test("ordinary typing and mail shortcuts do not leak from editors, settings, or 
     "q",
     "r",
     "t",
-    "w",
     "1",
     "9",
     "?",

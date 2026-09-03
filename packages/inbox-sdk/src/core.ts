@@ -6,13 +6,14 @@ import { Context, Effect, Either, Fiber, Layer, ManagedRuntime, Schedule } from 
 import { createCredentialCrypto } from '../server/crypto'
 import { sanitizeEmailBody } from '../server/sanitize'
 import { createMediaStore } from './media'
+import { mailFacts } from './mail-facts'
 import { ProviderError, ProviderMutationError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
 import { CredentialError, InboxError, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
   type DraftInput, type Folder, type Inbox, type InboxOptions, type Label, type Message,
   type MessageSummary, type MutationInput, type Operation, type Participant, type Policy,
   type Problem, type Query, type SyncCheckpoint, type SyncRequest, type ThreadSummary, type Connection, type ConnectionIdentity,
   type Mailbox, type MailboxCandidate, type MailboxInput, type MailboxMembership, type MailboxMessageSummary,
-  type MailboxQuery, type MailboxSelector } from './contracts'
+  type MailboxQuery, type MailboxSelector, type MailboxStateReceipt } from './contracts'
 
 type AccountRow = { id: string; owner: string; generation: number; status: Account['status']; data: string; native: string; credentials: string; connection_id: string; connection_generation: number; credential_version: number }
 type ConnectionRow = { id: string; owner: string; generation: number; status: Connection['status']; credential_version: number; data: string; credentials: string }
@@ -70,6 +71,7 @@ export function createInbox(options: InboxOptions): Inbox {
   db.exec(`
     PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;
     CREATE TABLE IF NOT EXISTS sdk_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS sdk_mailbox_actions (owner TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL, data TEXT NOT NULL, before_states TEXT NOT NULL, PRIMARY KEY(owner,id));
     CREATE TABLE IF NOT EXISTS sdk_accounts (id TEXT PRIMARY KEY, owner TEXT NOT NULL, generation INTEGER NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL, native TEXT NOT NULL, credentials TEXT NOT NULL, UNIQUE(id,owner));
     CREATE TABLE IF NOT EXISTS sdk_messages (id TEXT PRIMARY KEY, owner TEXT NOT NULL, account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, thread_id TEXT NOT NULL, confirmed TEXT NOT NULL, visible TEXT NOT NULL, body TEXT NOT NULL, local_labels TEXT NOT NULL DEFAULT '[]', snoozed_until TEXT, revision INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0, last_mutation_seq INTEGER NOT NULL DEFAULT 0, received_at TEXT NOT NULL, folder TEXT NOT NULL, is_read INTEGER NOT NULL, is_starred INTEGER NOT NULL, subject TEXT NOT NULL, search_text TEXT NOT NULL, UNIQUE(account,generation,native_id), FOREIGN KEY(account,owner) REFERENCES sdk_accounts(id,owner));
     CREATE INDEX IF NOT EXISTS sdk_message_query ON sdk_messages(owner,deleted,received_at,id);
@@ -784,7 +786,7 @@ export function createInbox(options: InboxOptions): Inbox {
     const summary: MessageSummary = { id, accountId: row.id, threadId, revision: 1,
       from: mail.from, to: mail.to, cc: mail.cc, subject: mail.subject, preview: mail.preview.slice(0, 256), receivedAt: mail.receivedAt,
       isRead: mail.isRead, isStarred: mail.isStarred, folder: mail.folder, folderIds,
-      labelIds: [], hasAttachments: attachments.length > 0, snoozedUntil: null }
+      labelIds: [], hasAttachments: attachments.length > 0, snoozedUntil: null, facts: mailFacts(mail) }
     const body = JSON.stringify({ bcc: mail.bcc, bodyText: mail.bodyText, bodyHtml: mail.bodyHtml, attachments,
       replyTo: normalized.replyTo, rfcMessageId: normalized.rfcMessageId, references: normalized.references, inReplyTo: normalized.inReplyTo })
     const confirmed = JSON.stringify(summary)
@@ -801,7 +803,28 @@ export function createInbox(options: InboxOptions): Inbox {
     return id
   }
 
-  function summary(row: MessageRow): MessageSummary { return JSON.parse(row.visible) }
+  const cachedFacts = new Map<string, NonNullable<MessageSummary['facts']>>()
+  function summary(row: MessageRow): MessageSummary {
+    const value: MessageSummary = JSON.parse(row.visible)
+    if (!value.facts) {
+      const key = `${value.id}:${value.revision}`
+      let facts = cachedFacts.get(key)
+      if (!facts) {
+        // Existing caches have bodies but predate header facts. Derive only what
+        // is actually retained, locally and per requested page; never hydrate upstream.
+        const stored = db.query<{ body: string }, [string]>('SELECT body FROM sdk_messages WHERE id=?').get(value.id)
+        const body = stored ? JSON.parse(stored.body) : {}
+        const source = db.query<{ data: string }, [string]>('SELECT data FROM sdk_accounts WHERE id=?').get(value.accountId)
+        const categories = source ? definitions.get((JSON.parse(source.data) as Account).providerId)?.nativeCategoryRoles : undefined
+        const nativeFolders = categories ? db.query<{ role: string }, [string, string]>("SELECT json_extract(data,'$.role') role FROM sdk_folders WHERE account=? AND id IN (SELECT value FROM json_each(?))").all(value.accountId, JSON.stringify(value.folderIds)) : []
+        facts = mailFacts({ ...body, nativeCategories: categories ? nativeFolders.flatMap(folder => Object.hasOwn(categories, folder.role) ? [categories[folder.role]!] : []) : undefined })
+        if (cachedFacts.size >= 2000) cachedFacts.delete(cachedFacts.keys().next().value!)
+        cachedFacts.set(key, facts)
+      }
+      value.facts = facts
+    }
+    return value
+  }
 
   function where(owner: string, query: Query, mailboxMode = false): { sql: string; params: Array<string | number> } {
     ownerId(owner)
@@ -1596,6 +1619,60 @@ export function createInbox(options: InboxOptions): Inbox {
       db.query('UPDATE sdk_memberships SET data=? WHERE owner=? AND mailbox=? AND message=?').run(JSON.stringify(state), owner, mailboxId, messageId)
       event(owner, 'membership.updated', box.source, messageId, 'updated', 'mutation', mailboxId)
       return state
+    })),
+    setMailboxStates: (owner, input) => run(() => transaction(() => {
+      ownerId(owner)
+      if (!input || Object.keys(input).some(key => !['id', 'targets', 'done'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox action.')
+      text(input.id, 'Action ID', 128)
+      if (typeof input.done !== 'boolean' || !Array.isArray(input.targets) || !input.targets.length || input.targets.length > 500) throw new InboxError('VALIDATION', 'Use 1–500 mailbox message targets.')
+      for (const target of input.targets) {
+        if (!target || Object.keys(target).some(key => !['mailboxId', 'messageId', 'revision', 'messageRevision'].includes(key)) || !Number.isSafeInteger(target.revision) || target.revision < 1 || target.messageRevision !== undefined && (!Number.isSafeInteger(target.messageRevision) || target.messageRevision < 1)) throw new InboxError('VALIDATION', 'Invalid mailbox message target.')
+        text(target.mailboxId, 'Mailbox ID', 512); text(target.messageId, 'Message ID', 512)
+      }
+      const hash = fingerprint(input)
+      const prior = db.query<{ fingerprint: string; data: string }, [string, string]>('SELECT fingerprint,data FROM sdk_mailbox_actions WHERE owner=? AND id=?').get(owner, input.id)
+      if (prior) {
+        if (prior.fingerprint !== hash) throw new InboxError('IDEMPOTENCY_CONFLICT', 'This action ID already describes different targets.', 409)
+        return JSON.parse(prior.data) as MailboxStateReceipt
+      }
+      const keys = new Set<string>()
+      const before = input.targets.map(target => {
+        const key = `${target.mailboxId}\0${target.messageId}`
+        if (keys.has(key)) throw new InboxError('VALIDATION', 'Duplicate mailbox message target.')
+        keys.add(key); mailboxRow(owner, target.mailboxId, true)
+        const state = membership(owner, target.mailboxId, target.messageId)
+        if (state.revision !== target.revision) throw new InboxError('PRECONDITION_FAILED', 'Mailbox state changed.', 412)
+        if (target.messageRevision !== undefined && summary(messageRow(owner, target.messageId)).revision !== target.messageRevision) throw new InboxError('PRECONDITION_FAILED', 'Message changed.', 412)
+        return state
+      })
+      const states = before.map(state => ({ ...state, done: input.done, snoozedUntil: null, revision: state.revision + 1 }))
+      for (const state of states) {
+        db.query('UPDATE sdk_memberships SET data=? WHERE owner=? AND mailbox=? AND message=?').run(JSON.stringify(state), owner, state.mailboxId, state.messageId)
+        event(owner, 'membership.updated', mailboxRow(owner, state.mailboxId).source, state.messageId, 'updated', 'mutation', state.mailboxId)
+      }
+      const receipt: MailboxStateReceipt = { id: input.id, retracted: false, states }
+      db.query('INSERT INTO sdk_mailbox_actions VALUES (?,?,?,?,?)').run(owner, input.id, hash, JSON.stringify(receipt), JSON.stringify(before))
+      return receipt
+    })),
+    undoMailboxStates: (owner, id) => run(() => transaction(() => {
+      ownerId(owner); text(id, 'Action ID', 128)
+      const row = db.query<{ data: string; before_states: string }, [string, string]>('SELECT data,before_states FROM sdk_mailbox_actions WHERE owner=? AND id=?').get(owner, id)
+      if (!row) throw new InboxError('NOT_FOUND', 'Mailbox action not found.', 404)
+      const receipt = JSON.parse(row.data) as MailboxStateReceipt
+      if (receipt.retracted) return receipt
+      const before = JSON.parse(row.before_states) as MailboxMembership[]
+      const states = receipt.states.map((saved, index) => {
+        const current = membership(owner, saved.mailboxId, saved.messageId)
+        if (current.revision !== saved.revision) throw new InboxError('PRECONDITION_FAILED', 'Mailbox state changed after this action; Undo did not overwrite it.', 412)
+        return { ...before[index], revision: current.revision + 1 }
+      })
+      for (const state of states) {
+        db.query('UPDATE sdk_memberships SET data=? WHERE owner=? AND mailbox=? AND message=?').run(JSON.stringify(state), owner, state.mailboxId, state.messageId)
+        event(owner, 'membership.updated', mailboxRow(owner, state.mailboxId).source, state.messageId, 'updated', 'mutation', state.mailboxId)
+      }
+      const result: MailboxStateReceipt = { id, retracted: true, states }
+      db.query('UPDATE sdk_mailbox_actions SET data=? WHERE owner=? AND id=?').run(JSON.stringify(result), owner, id)
+      return result
     })),
     syncMailbox: (owner, mailboxId, request) => run(async () => {
       const row = mailboxRow(owner, mailboxId, true)

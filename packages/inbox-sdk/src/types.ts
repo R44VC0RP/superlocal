@@ -137,6 +137,8 @@ export interface MailMessage {
   inReplyTo?: string
   references?: string[]
   headers?: Record<string, string>
+  /** Upstream categories only; adapters must not infer application attention categories. */
+  nativeCategories?: string[]
   subject: string
   preview: string
   bodyText: string

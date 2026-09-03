@@ -7,6 +7,8 @@ import { ImapFlow } from 'imapflow'
 import type SMTPTransport from 'nodemailer/lib/smtp-transport'
 import { builtInProviders } from '../src/providers'
 import { createInbox } from '../src/core'
+import { mailFacts } from '../src/mail-facts'
+import { classifyAttention } from '../../../apps/shared/mail-attention'
 import { Database } from 'bun:sqlite'
 import type { ProviderDefinition } from '../src/contracts'
 import { ImapProvider, type ImapCredentials } from '../server/sdk/imap'
@@ -177,6 +179,7 @@ async function httpHarness(id: Exclude<BuiltIn, 'imap'>): Promise<ContractHarnes
       'message-id': suffix === '1' ? rootRfc : `<${suffix}-${token}@example.test>`,
       ...(suffix === '2' ? { 'in-reply-to': rootRfc, references: rootRfc } : {}),
       'reply-to': `"Replies" <${WRITER}>`, 'x-inbox-contract': token,
+      ...(suffix === '1' ? { 'list-id': '<weekly.example.test>', 'list-unsubscribe': '<https://example.test/unsubscribe>' } : {}),
     }
     const leaves = (part: MimePart): MimePart[] => part.parts.length ? part.parts.flatMap(leaves) : [part]
     const parsed = mime ? leaves(mime) : []
@@ -548,7 +551,7 @@ async function imapHarness(smtp: boolean): Promise<ContractHarness> {
       },
       headers: Buffer.from(Object.entries({ 'message-id': options.messageId ?? (uid === 1 ? rootRfc : `<${uid}-${token}@example.test>`),
         ...(options.inReplyTo || uid === 2 ? { 'in-reply-to': options.inReplyTo ?? rootRfc, references: (options.references ?? [rootRfc]).join(' ') } : {}),
-        'x-inbox-contract': token, ...options.headers,
+        'x-inbox-contract': token, ...(uid === 1 ? { 'list-id': '<weekly.example.test>', 'list-unsubscribe': '<https://example.test/unsubscribe>' } : {}), ...options.headers,
       }).map(([key, value]) => `${key}: ${value}`).join('\r\n') + '\r\n\r\n'),
       bodyStructure: { type: 'multipart/mixed', childNodes: [
         { part: '1', type: 'text/plain', size: Buffer.byteLength(text), parameters: { charset: 'utf-8' } },
@@ -879,6 +882,17 @@ function runProviderContract(profile: ContractProfile): void {
         expect((root.replyTo ?? []).map((participant) => participant.email)).toEqual(h.expectedReplyTo)
         expect(reply.inReplyTo).toBe(h.rootRfc)
         expect(reply.references).toContain(h.rootRfc)
+      })
+
+      if (!profile.live) test('source subscription evidence survives native normalization without provider writes or an app category in the adapter', async () => {
+        const writes = h.writes?.()
+        const message = await h.provider.getMessage(h.rootId)
+        const facts = mailFacts(message)
+        expect(facts).toMatchObject({ listId: true, listUnsubscribe: true })
+        expect(classifyAttention({ subject: 'Weekly newsletter', preview: '', facts }).category).toBe('Other')
+        expect(classifyAttention({ subject: 'Password reset', preview: '', facts }).category).toBe('Important')
+        expect(classifyAttention({ subject: 'Receipt', preview: '', facts }).category).toBe('Important')
+        if (h.writes) expect(h.writes()).toBe(writes!)
       })
 
       test('attachments return exact binary bytes, Unicode filenames, empty files and inline CIDs', async () => {

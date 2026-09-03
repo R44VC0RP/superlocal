@@ -59,6 +59,7 @@ export type MailShortcut = (
         | "inbox"
         | "mute"
         | "done"
+        | "not-important"
         | "remind"
         | "star"
         | "unread"
@@ -197,6 +198,7 @@ export function resolveMailShortcut(
     else if (event.key === "l") intent = { type: "labelMode", mode: "toggle" };
     else if (
       event.key === "e" ||
+      event.key === "w" ||
       event.key === "h" ||
       event.key === "s" ||
       event.key === "u" ||
@@ -208,6 +210,7 @@ export function resolveMailShortcut(
         action: (
           {
             e: "done",
+            w: "not-important",
             h: "remind",
             s: "star",
             u: "unread",

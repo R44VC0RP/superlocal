@@ -87,11 +87,18 @@ const blobInfo = z.object({
 })
 const label = z.object({ id, accountId: id, name: z.string(), scope: z.literal('local'), revision })
 const problem = z.object({ code: z.string(), message: z.string(), retryable: z.boolean() })
+const sourceFacts = z.object({
+  version: z.literal(1), listId: z.boolean().optional(), listUnsubscribe: z.boolean().optional(),
+  listPost: z.boolean().optional(), bulk: z.boolean().optional(), automated: z.boolean().optional(),
+  unsubscribeLink: z.boolean().optional(), reply: z.boolean().optional(),
+  nativeCategories: z.array(z.string().regex(/^[a-z_]{1,40}$/)).max(8).optional(),
+  nativeImportant: z.boolean().optional(),
+})
 const messageSummary = z.object({
   id, accountId: id, threadId: id, revision, from: participant, to: z.array(participant), cc: z.array(participant),
   subject: z.string(), preview: z.string(), receivedAt: z.string(), isRead: z.boolean(), isStarred: z.boolean(),
   folder: z.string(), folderIds: z.array(id), labelIds: z.array(id), hasAttachments: z.boolean(),
-  snoozedUntil: z.string().nullable(),
+  snoozedUntil: z.string().nullable(), facts: sourceFacts.optional(),
 })
 const message = messageSummary.extend({
   bcc: z.array(participant), bodyText: z.string(), bodyHtml: z.string(),

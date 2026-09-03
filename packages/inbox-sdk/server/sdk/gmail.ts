@@ -133,6 +133,7 @@ const GMAIL_FOLDER_LABELS: Partial<Record<MailFolder, string>> = {
   spam: 'SPAM',
 }
 
+export const GMAIL_CATEGORY_ROLES: Readonly<Record<string, string>> = Object.freeze({ CATEGORY_PROMOTIONS: 'promotions', CATEGORY_PERSONAL: 'personal', CATEGORY_SOCIAL: 'social', CATEGORY_UPDATES: 'updates', CATEGORY_FORUMS: 'forums' })
 const GMAIL_LABEL_FOLDERS: Record<string, MailFolder> = {
   INBOX: 'inbox', STARRED: 'starred', SENT: 'sent', DRAFT: 'drafts', TRASH: 'trash', SPAM: 'spam', ARCHIVE: 'archive',
 }
@@ -565,6 +566,7 @@ export class GmailProvider implements InboxProvider {
       isRead: !labels.includes('UNREAD'),
       isStarred: labels.includes('STARRED'),
       isImportant: labels.includes('IMPORTANT') || labels.includes('CATEGORY_PERSONAL'),
+      nativeCategories: labels.flatMap(label => Object.hasOwn(GMAIL_CATEGORY_ROLES, label) ? [GMAIL_CATEGORY_ROLES[label]!] : []),
       folder: gmailFolder(labels),
       folderIds: [...new Set([
         ...labels.filter((label) => label !== 'UNREAD').map((label) => GMAIL_LABEL_FOLDERS[label] ?? label),

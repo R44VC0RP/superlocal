@@ -1,4 +1,4 @@
-import { GmailProvider } from '../server/sdk/gmail'
+import { GmailProvider, GMAIL_CATEGORY_ROLES } from '../server/sdk/gmail'
 import { ImapProvider } from '../server/sdk/imap'
 import { InboundProvider } from '../server/sdk/inbound'
 import { OutlookProvider } from '../server/sdk/outlook'
@@ -8,6 +8,7 @@ import { CredentialError, type ProviderDefinition } from './contracts'
 export const builtInProviders: readonly ProviderDefinition[] = Object.freeze([
   {
     id: 'gmail', name: 'Gmail', connection: 'oauth',
+    nativeCategoryRoles: GMAIL_CATEGORY_ROLES,
     scopes: ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/gmail.send'],
     create: (credentials) => {
       if (typeof credentials.accessToken !== 'string' || !credentials.accessToken) {

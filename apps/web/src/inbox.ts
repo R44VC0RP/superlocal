@@ -8,8 +8,12 @@ import { escapeHTML, plainText } from "./mail-text";
 import { readSaved, writeSaved } from "./storage";
 import { matchesSearch } from "./mail-search";
 import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, type HostConfiguration, type InboxViewPreferences } from "./host";
+import { readSplitPreferences, writeSplitPreferences, readAttentionFeedback, recordAttentionFeedback, retractAttentionFeedback, InboxViewPreferencesError,
+  type SavedSplitPreferences, type AttentionFeedback, type AttentionFeedbackTarget } from "./host";
 import { UNIFIED_ACCOUNT, unifiedMail, unifiedThreadId } from "./mail-model";
 import type { SenderHistoryMessage } from "./sender-context";
+import { classifyAttention, conversationAttention } from "../../shared/mail-attention";
+import { normalizeSplits, type SplitPreferences } from "../../shared/splits";
 
 type Edit = { draft: Draft; revision: number; version: number; error?: string };
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
@@ -33,6 +37,8 @@ export type InboxSnapshot = {
   mailboxes: Mailbox[];
   sources: Account[];
   viewPreferences: InboxViewPreferences | null;
+  splitPreferences: SavedSplitPreferences | null;
+  attentionFeedback: AttentionFeedback[];
   mail: Mail[];
   senderHistory: SenderHistoryMessage[];
   drafts: Draft[];
@@ -52,7 +58,7 @@ export type InboxSnapshot = {
   operations: Readonly<Record<string, Operation>>;
 };
 
-const initial: InboxSnapshot = { accounts: [], mailboxes: [], sources: [], viewPreferences: null, mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, loaded: false, refreshing: false, pending: 0, unsaved: false, error: null, issues: [], live: "connecting", policy: null, host: null, operations: {} };
+const initial: InboxSnapshot = { accounts: [], mailboxes: [], sources: [], viewPreferences: null, splitPreferences: null, attentionFeedback: [], mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, loaded: false, refreshing: false, pending: 0, unsaved: false, error: null, issues: [], live: "connecting", policy: null, host: null, operations: {} };
 const MAX_ISSUES = 4;
 /** A problem stays visible until its recovery has held this long, so ready/error flapping never re-announces. */
 const RESOLVE_HOLD_MS = 10_000;
@@ -258,7 +264,7 @@ export class InboxStore {
     }
     try {
       const { source } = this.account(boxId);
-      if (["done", "inbox", "remind", "label", "cancel"].includes(action)) return true;
+      if (["done", "not-important", "inbox", "remind", "label", "cancel"].includes(action)) return true;
       if (source.status !== "connected") return false;
       if (!this.state.host?.allowProviderWrites) return false;
       if (action === "read") return source.capabilities.markRead;
@@ -463,6 +469,26 @@ export class InboxStore {
         readHostConfiguration(options.signal),
         readInboxViewPreferences(options.signal),
       ]);
+      // A running host may lag a hot-reloaded web bundle. Keep cached mail
+      // available, but do not simulate durable settings/feedback on an old host.
+      const [savedSplits, attentionFeedback]: [SavedSplitPreferences | null, AttentionFeedback[]] = host.preferenceScope
+        ? await Promise.all([readSplitPreferences(options.signal), readAttentionFeedback(options.signal)]) : [null, []];
+      let splitPreferences = savedSplits;
+      if (host.preferenceScope && !splitPreferences) {
+        // Legacy browser preferences have no owner. Bind their one-time import
+        // to this host identity; never copy them into a later, unrelated owner.
+        const scope = host.preferenceScope;
+        const bound = readSaved<string | null>("legacy-split-owner", null);
+        const importLegacy = !!scope && (!bound || bound === scope);
+        if (importLegacy && !writeSaved("legacy-split-owner", scope)) throw new Error("Your existing splits could not be bound to this inbox. Browser storage must be available before importing them.");
+        const legacy = importLegacy ? readSaved<Record<string, unknown>>("preferences", {}) : {};
+        try { splitPreferences = await writeSplitPreferences({ ...normalizeSplits({ ...legacy, version: undefined }), revision: 0 }, options.signal); }
+        catch (error) {
+          if (!(error instanceof InboxViewPreferencesError) || error.status !== 412) throw error;
+          splitPreferences = await readSplitPreferences(options.signal);
+          if (!splitPreferences) throw error;
+        }
+      }
       const selected = boxes.filter(box => box.status !== "detached");
       const summaries = new Map<string, MailboxMessageSummary[]>(selected.map(box => [box.id, []]));
       // The SDK deduplicates canonical messages across a bounded mailbox selection.
@@ -540,7 +566,7 @@ export class InboxStore {
         this.bodyEpoch++;
         this.details.clear();
       }
-      this.publish({ policy, host, viewPreferences, mailboxes: selected, sources: accounts, loading: false, loaded: true, refreshing: false, error: null }); this.rebuild();
+      this.publish({ policy, host, viewPreferences, splitPreferences, attentionFeedback, mailboxes: selected, sources: accounts, loading: false, loaded: true, refreshing: false, error: null }); this.rebuild();
       this.resolve("snapshot");
     })();
     this.refreshPromise = work.finally(() => { if (this.refreshPromise === finished) this.refreshPromise = undefined; });
@@ -623,7 +649,7 @@ export class InboxStore {
           const operation = sentMessages.get(row.id);
           return { id: row.id, revision: row.revision, from: row.from.name || row.from.email, email: row.from.email, to: addresses(row.to), cc: addresses(row.cc),
             bcc: detail ? addresses(detail.bcc) : undefined, date: displayTime(row.receivedAt).date, receivedAt: row.receivedAt,
-            body: detail?.bodyHtml ?? "", loaded: !!detail, outgoing: row.folder === "sent", hasAttachments: row.hasAttachments,
+            body: detail?.bodyHtml ?? "", loaded: !!detail, outgoing: row.folder === "sent", hasAttachments: row.hasAttachments, attention: classifyAttention(row),
              bodyText: detail?.bodyText, bodyFormat: detail?.bodyFormat, bodyDocument: detail?.bodyDocument,
              nativeFolder: row.folder, isRead: row.isRead, isStarred: row.isStarred, memberships: row.memberships.filter(state => state.mailboxId === box.id),
             ...(operation?.accountId === source.id ? { operationId: operation.id, sendStatus: operation.status } : {}),
@@ -662,6 +688,7 @@ export class InboxStore {
     const included = this.unifiedMailboxIds();
     labelNames[UNIFIED_ACCOUNT] = [...new Set(included.flatMap(id => labelNames[id] ?? []))];
     mail.push(...unifiedMail(mail, included, accounts));
+    for (const conversation of mail) conversation.split = conversationAttention(conversation);
     mail.sort((a, b) => (b.receivedAt ?? 0) - (a.receivedAt ?? 0) || a.id.localeCompare(b.id));
     const drafts = [...this.rawDrafts.values()].map(raw => {
       const edit = this.edits.get(raw.id);
@@ -862,7 +889,33 @@ export class InboxStore {
     catch (error) { await this.refresh().catch(() => {}); this.fail(error, action); throw error; }
     finally { release(); this.publish({ pending: Math.max(0, this.state.pending - 1) }); }
   }
-  action = (selected: Mail[], action: string, value?: string): Promise<() => Promise<void>> => this.act(action, async () => {
+  canRecordFeedback = (selected: Mail[]): boolean => !!this.state.host?.preferenceScope && selected.length > 0 && selected.every(mail => !mail.operationId && !!mail.sourceId && mail.messages.some(message => !message.pending && !message.outgoing && message.nativeFolder === "inbox"
+    && message.memberships?.some(state => !state.done && (!state.snoozedUntil || Date.parse(state.snoozedUntil) <= Date.now()))));
+  private async notImportant(selected: Mail[]): Promise<() => Promise<void>> {
+    if (!this.state.host?.preferenceScope) throw new Error("The local host must be updated before it can save attention feedback.");
+    if (!this.canRecordFeedback(selected)) throw new Error("Select incoming inbox conversations to record not-important feedback.");
+    const captured = new Map<string, AttentionFeedbackTarget>();
+    for (const mail of selected) for (const message of mail.messages) {
+      if (message.pending) continue;
+      if (!message.revision || !message.memberships?.length) throw new Error("This conversation is still loading. Try again after it refreshes.");
+      for (const state of message.memberships) {
+        const key = `${mail.sourceId}\0${state.mailboxId}\0${message.id}`;
+        captured.set(key, { sourceId: mail.sourceId!, mailboxId: state.mailboxId, messageId: message.id, messageRevision: message.revision, revision: state.revision });
+      }
+    }
+    // Freeze the clicked IDs and revisions before entering the action queue.
+    const input = { id: crypto.randomUUID(), targets: [...captured.values()] };
+    return this.act("not-important", async () => {
+      const event = await recordAttentionFeedback(input, this.controller.signal);
+      if (event.status !== "active") throw new Error(event.problem ?? "This feedback action is no longer active.");
+      return () => this.undoFeedback(event.id);
+    });
+  }
+  undoFeedback = (id: string): Promise<void> => this.act("undo-feedback", async () => {
+    const event = await retractAttentionFeedback(id, this.controller.signal);
+    if (event.problem) throw new Error(event.problem);
+  });
+  action = (selected: Mail[], action: string, value?: string): Promise<() => Promise<void>> => action === "not-important" ? this.notImportant(selected) : this.act(action, async () => {
     // Keep the clicked message/membership scope: a queued action must not absorb
     // a newly arrived reply or a later change to Unified inbox configuration.
     const undo: Array<() => Promise<unknown>> = [];
@@ -972,6 +1025,13 @@ export class InboxStore {
       this.publish({ viewPreferences }); this.rebuild();
     });
   };
+  setSplitPreferences = (patch: Partial<Omit<SplitPreferences, "version">>): Promise<void> => this.act("split-preferences", async () => {
+    if (!this.state.host?.preferenceScope) throw new Error("The local host must be updated before it can save split preferences.");
+    const current = this.state.splitPreferences;
+    if (!current) throw new Error("Split preferences are still loading.");
+    const splitPreferences = await writeSplitPreferences({ ...normalizeSplits({ ...current, ...patch }), revision: current.revision }, this.controller.signal);
+    this.publish({ splitPreferences });
+  });
   sync = async (boxId: string) => this.act("sync", async () => {
     const ids = boxId === UNIFIED_ACCOUNT ? this.unifiedMailboxIds() : [boxId];
     const sources = new Set<string>();

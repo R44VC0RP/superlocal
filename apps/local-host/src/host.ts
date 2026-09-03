@@ -8,6 +8,8 @@ import { createInboxViewPreferencesStore, INBOX_PREFERENCES_BODY_LIMIT } from '.
 import { createRealRegistrations, type HostProvider, type HostProviderRegistration } from './providers'
 import { openLocalRuntime } from './runtime'
 import { createSenderDomainHost } from './sender-domains'
+import { createSplitPreferencesStore } from './split-preferences'
+import { createAttentionFeedbackStore } from './attention-feedback'
 
 const safeHeaders = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', Vary: 'Origin, Cookie' }
 function problem(status: number, code: string, error: string): Response {
@@ -86,6 +88,8 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     inboxPreferences = createInboxViewPreferencesStore(runtime.database, inbox, owner)
   } catch (error) { try { if (mock) await mock.close(); else await inbox?.close() } finally { runtime.database.close() }; throw error }
   const liveInbox = inbox
+  const splitPreferences = createSplitPreferencesStore(runtime.database, owner)
+  const attentionFeedback = createAttentionFeedbackStore(runtime.database, liveInbox, owner)
   const senderDomains = createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' })
   const origins = new Set(config.web.allowedOrigins)
   const hosts = new Set([`127.0.0.1:${config.backend.port}`, `localhost:${config.backend.port}`, ...config.web.allowedOrigins.map(value => new URL(value).host)])
@@ -140,6 +144,19 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     }
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
     if (url.pathname.startsWith('/host/sender-domains/')) return senderDomains.fetch(request)
+    if (url.pathname === '/host/split-preferences') {
+      if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Split preferences take no query parameters.')
+      if (request.method === 'GET') return Response.json(splitPreferences.read(), { headers: safeHeaders })
+      if (request.method === 'PUT') return Response.json(splitPreferences.write(await jsonBody(request, 'preferences')), { headers: safeHeaders })
+      return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use GET or PUT for split preferences.')
+    }
+    if (url.pathname === '/host/attention-feedback' || /^\/host\/attention-feedback\/[a-zA-Z0-9-]{16,80}\/undo$/.test(url.pathname)) {
+      if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Feedback takes no query parameters.')
+      if (request.method === 'GET' && url.pathname === '/host/attention-feedback') return Response.json(await attentionFeedback.list(), { headers: safeHeaders })
+      if (request.method === 'POST' && url.pathname.endsWith('/undo')) return Response.json(await attentionFeedback.undo(url.pathname.split('/')[3]!), { headers: safeHeaders })
+      if (request.method === 'POST') return Response.json(await attentionFeedback.record(await jsonBody(request, 'preferences')), { headers: safeHeaders })
+      return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use GET or POST for feedback.')
+    }
     if (url.pathname === '/host/inbox-preferences') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Inbox preferences take no query parameters.')
       if (request.method === 'GET') return Response.json(await inboxPreferences.read(), { headers: safeHeaders })
@@ -153,6 +170,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         ? [{ id: 'mock', name: 'Offline mock', connection: 'none', enabled: true, ready: true }]
         : registrations.map(registration => registration.onboarding)
       return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites,
+        preferenceScope: createHmac('sha256', runtime.sessionKey).update(`split-preferences:${owner}`).digest('hex'),
         providers: descriptors.map(provider => ({ ...provider, connectionIds: connections.filter(connection => connection.providerId === provider.id).map(connection => connection.id) })) }, { headers: safeHeaders })
     }
     const connect = /^\/host\/providers\/([a-z][a-z0-9-]*)\/(?:connect|connections\/([^/]+)\/reconnect)$/.exec(url.pathname)

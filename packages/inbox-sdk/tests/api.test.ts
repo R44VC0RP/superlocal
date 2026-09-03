@@ -16,6 +16,12 @@ import { createGoogleOAuthApi } from '../server/google-oauth-api'
 import { createGoogleOAuthClient } from '../server/google-client'
 import { createLocalHost } from '../../../apps/local-host/src/host'
 import { loadLocalConfig } from '../../../apps/local-host/src/config'
+import { createAttentionFeedbackStore } from '../../../apps/local-host/src/attention-feedback'
+import { createSplitPreferencesStore } from '../../../apps/local-host/src/split-preferences'
+import { classifyAttention } from '../../../apps/shared/mail-attention'
+import { normalizeSplits } from '../../../apps/shared/splits'
+import { mailFacts } from '../src/mail-facts'
+import { createMockHost } from '../../../apps/mock-api/src/host'
 import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
   Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, Message,
@@ -47,6 +53,217 @@ const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => {
   const tasks = cleanup.splice(0).reverse()
   for (const task of tasks) await task()
+})
+
+describe('Attention baseline and explicit feedback', () => {
+  test('application routes persist filtered splits and W/Undo behind the existing host owner/origin boundary', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'attention-host-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
+    cleanup.push(() => host.close())
+    const base = `http://localhost:${config.backend.port}`, origin = config.web.origin
+    const session = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
+    const headers = { Origin: origin, Cookie: session.headers.get('set-cookie')!.split(';')[0]!, 'Content-Type': 'application/json' }
+    const route = (path: string, method = 'GET', body?: unknown) => host.fetch(new Request(`${base}/host/${path}`, { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) }))
+    expect((await host.fetch(new Request(`${base}/host/attention-feedback`))).status).toBe(401)
+    expect((await host.fetch(new Request(`${base}/host/attention-feedback`, { method: 'POST', headers: { ...headers, Origin: 'https://evil.test' }, body: '{}' }))).status).toBe(403)
+    expect(await (await route('split-preferences')).json()).toBeNull()
+    const saved = await route('split-preferences', 'PUT', { ...normalizeSplits({ splits: ['Important', 'Other', 'John'], splitRules: { John: 'from:john@doe.com' } }), revision: 0 })
+    expect(saved.status).toBe(200)
+    expect(await (await route('split-preferences')).json()).toMatchObject({ revision: 1, splitRules: { John: 'from:john@doe.com' } })
+    const mailbox = (await host.inbox.mailboxes(host.owner))[0]!
+    const message = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [mailbox.id], folder: 'inbox', limit: 1 })).items[0]!
+    const target = { sourceId: message.sourceId, mailboxId: mailbox.id, messageId: message.id, messageRevision: message.revision, revision: message.memberships[0]!.revision }
+    const decision = classifyAttention(message)
+    const response = await route('attention-feedback', 'POST', { id: 'host-negative-feedback-001', targets: [target] })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ status: 'active', count: 1 })
+    const done = await host.inbox.mailboxMessage(host.owner, mailbox.id, message.id)
+    expect(done.memberships[0]!.done).toBe(true)
+    expect(classifyAttention(done)).toEqual(decision)
+    expect((await route('attention-feedback/host-negative-feedback-001/undo', 'POST')).status).toBe(200)
+    expect((await host.inbox.mailboxMessage(host.owner, mailbox.id, message.id)).memberships[0]!.done).toBe(false)
+    expect((await (await route('attention-feedback')).json())[0].status).toBe('retracted')
+  })
+
+  test('actual offline mock adapter carries newsletter, transaction, and direct evidence through SDK sync', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'attention-mock-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const host = await createMockHost({ dataDir: root, encryptionKey: KEY, token: SECRET, allowProviderWrites: false })
+    cleanup.push(() => host.close())
+    const connection = (await host.inbox.connections(host.owner))[0]!
+    const scope = { owner: host.owner, storeId: connection.identity!.subject, accountId: connection.sourceIds[0]! }
+    for (const subject of ['Attention test newsletter', 'Attention test receipt', 'Attention test hello']) host.store.receive(scope, {
+      from: 'john@doe.test', subject, text: 'A synthetic message',
+      ...(subject.endsWith('hello') ? {} : { headers: { 'List-ID': '<updates.example.test>', 'List-Unsubscribe': '<mailto:leave@example.test>' } }),
+    })
+    await host.inbox.sync(host.owner, scope.accountId)
+    const rows = (await host.inbox.messages(host.owner, { accountId: scope.accountId, search: 'subject:"Attention test"' })).items
+    expect(rows).toHaveLength(3)
+    expect(Object.fromEntries(rows.map(message => [message.subject, classifyAttention(message).category]))).toEqual({
+      'Attention test newsletter': 'Other', 'Attention test receipt': 'Important', 'Attention test hello': 'Important',
+    })
+    // Exercise the real HTTP output schemas/client, not just the core: additive
+    // facts must not be stripped before the UI receives its body-free summaries.
+    const client = createInboxClient({ baseUrl: 'http://localhost', headers: { authorization: `Bearer ${SECRET}` },
+      fetch: Object.assign((input: Parameters<typeof fetch>[0], init?: RequestInit) => host.fetch(new Request(input, init)), { preconnect() {} }) })
+    const boxes = (await client.mailboxes()).filter(box => box.sourceId === scope.accountId)
+    const viaMailbox = (await client.mailboxMessages({ mailboxIds: boxes.map(box => box.id), search: 'subject:"Attention test"' })).items
+    const viaMessages = (await client.messages({ accountId: scope.accountId, search: 'subject:"Attention test"' })).items
+    for (const page of [viaMailbox, viaMessages]) {
+      expect(page).toHaveLength(3)
+      expect(Object.fromEntries(page.map(message => [message.subject, classifyAttention(message).category]))).toEqual({
+        'Attention test newsletter': 'Other', 'Attention test receipt': 'Important', 'Attention test hello': 'Important',
+      })
+      expect(page.every(message => message.facts?.version === 1)).toBe(true)
+    }
+    const newsletter = viaMailbox.find(message => message.subject.endsWith('newsletter'))!
+    expect((await client.mailboxMessage(boxes[0]!.id, newsletter.id)).facts).toEqual(newsletter.facts)
+    expect((await client.message(newsletter.id)).facts).toEqual(newsletter.facts)
+  })
+
+  test('normalized facts classify locally before body reads, preserve uncertain and transactional mail, and qualify old cached rows', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account, box } = await h.seed('alice', 'attention-facts', [
+      native('newsletter', { subject: 'Weekly digest', preview: 'The latest news', bodyHtml: '<p>News</p><a href="https://example.test/unsubscribe">Unsubscribe</a>', headers: { 'List-ID': '<weekly.example.test>', 'List-Unsubscribe': '<https://example.test/unsubscribe>' } }),
+      native('receipt', { subject: 'Your receipt', preview: 'Payment received', headers: { 'List-Unsubscribe': '<https://example.test/unsubscribe>', Precedence: 'bulk' }, nativeCategories: ['promotions'] }),
+      native('direct', { subject: 'Can we meet tomorrow?', preview: 'A personal question' }),
+      native('reply', { subject: 'Re: Weekly digest', inReplyTo: '<conversation@example.test>', nativeCategories: ['promotions'] }),
+      native('promotion', { subject: 'Campaign', nativeCategories: ['promotions'], folderIds: ['inbox', 'native-promotions'] }),
+    ])
+    const before = structuredClone(box.calls)
+    const summaries = (await h.inbox.messages('alice', { accountId: account.id })).items
+    const decisions = Object.fromEntries(summaries.map(message => [message.subject, classifyAttention(message).category]))
+    expect(decisions).toEqual({ 'Weekly digest': 'Other', 'Your receipt': 'Important', 'Can we meet tomorrow?': 'Important', 'Re: Weekly digest': 'Important', Campaign: 'Other' })
+    for (const message of summaries) expect(classifyAttention(await h.inbox.message('alice', message.id))).toEqual(classifyAttention(message))
+    expect(JSON.stringify(summaries)).not.toContain('<p>News</p>')
+    const database = new Database(h.database)
+    database.exec("UPDATE sdk_messages SET confirmed=json_remove(confirmed,'$.facts'),visible=json_remove(visible,'$.facts')")
+    database.close()
+    await h.restart()
+    const cached = (await h.inbox.messages('alice', { accountId: account.id })).items
+    expect(classifyAttention(cached.find(message => message.subject === 'Weekly digest')!).category).toBe('Other')
+    expect(cached.find(message => message.subject === 'Weekly digest')!.facts?.listId).toBeUndefined()
+    expect(classifyAttention(cached.find(message => message.subject === 'Campaign')!).category).toBe('Other')
+    expect(box.calls).toEqual({ ...before, disconnect: before.disconnect + 1 })
+    for (const provider of ['gmail', 'inbound', 'imap', 'mock']) {
+      const facts = mailFacts({ headers: { 'list-id': '<news.example.test>', 'list-unsubscribe': '<mailto:leave@example.test>' } })
+      expect(classifyAttention({ subject: `${provider} newsletter`, preview: '', facts }).category).toBe('Other')
+      for (const subject of ['Your password reset', 'Security alert', 'Invoice 123', 'Your order confirmation', 'Please reply today']) expect(classifyAttention({ subject, preview: '', facts }).category).toBe('Important')
+    }
+    expect(classifyAttention({ subject: 'Unsubscribe', preview: 'A lone word', facts: mailFacts({ headers: { 'auto-submitted': 'auto-generated' } }) }).category).toBe('Important')
+    expect(classifyAttention({ subject: 'Discussion', preview: '', facts: mailFacts({ headers: { 'list-id': '<list>', 'list-unsubscribe': '<mailto:leave@test>', 'list-post': '<mailto:post@test>' } }) }).category).toBe('Important')
+  })
+
+  test('W is durable collection only; E is unlabeled; atomic retry, restart, Undo, newer replies and owner isolation', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account, box } = await h.seed('alice', 'feedback-local', [native('one', { subject: 'Weekly newsletter', bodyHtml: '<a href="https://example.test/unsubscribe">Unsubscribe</a>' }), native('two')])
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const rows = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items
+    const database = new Database(join(h.directory, 'feedback.sqlite'))
+    cleanup.push(async () => { database.close() })
+    let feedback = createAttentionFeedbackStore(database, h.inbox, 'alice')
+    const targets = rows.map(message => ({ sourceId: account.id, mailboxId: mailbox.id, messageId: message.id, revision: message.memberships[0]!.revision, messageRevision: message.revision }))
+    const id = 'explicit-negative-event-0001'
+    const decisions = rows.map(classifyAttention)
+    const before = structuredClone(box.calls)
+    const result = await feedback.record({ id, targets })
+    expect(result).toMatchObject({ status: 'active', count: 2 })
+    expect(await feedback.record({ id, targets })).toEqual(result)
+    await expect(feedback.record({ id, targets: targets.slice(0, 1) })).rejects.toMatchObject({ status: 409 })
+    await h.restart()
+    feedback = createAttentionFeedbackStore(database, h.inbox, 'alice')
+    expect((await feedback.list())[0]).toEqual(result)
+    expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.every(message => message.memberships[0]!.done)).toBe(true)
+    expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.map(classifyAttention)).toEqual(decisions)
+    const other = createAttentionFeedbackStore(database, h.inbox, 'bob')
+    expect(await other.list()).toEqual([])
+    await expect(other.undo(id)).rejects.toMatchObject({ status: 404 })
+    await expect(other.record({ id: 'cross-owner-negative-001', targets })).rejects.toMatchObject({ status: 404 })
+    expect((await feedback.undo(id)).status).toBe('retracted')
+    expect((await feedback.undo(id)).status).toBe('retracted')
+    expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.every(message => !message.memberships[0]!.done)).toBe(true)
+    // E remains the existing local Done path and writes no feedback event.
+    const current = await h.inbox.mailboxMessage('alice', mailbox.id, rows[0]!.id)
+    await h.inbox.setMailboxState('alice', mailbox.id, current.id, { done: true }, current.memberships[0]!.revision)
+    expect((await feedback.list())).toHaveLength(1)
+    expect(box.calls).toEqual({ ...before, disconnect: before.disconnect + 1 })
+  })
+
+  test('pending feedback resumes an already committed SDK receipt without duplicate state writes; failed batches are atomic', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account, box } = await h.seed('alice', 'feedback-recovery', [native('one'), native('two')])
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const rows = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items
+    const targets = rows.map(message => ({ sourceId: account.id, mailboxId: mailbox.id, messageId: message.id, revision: message.memberships[0]!.revision, messageRevision: message.revision }))
+    await expect(h.inbox.setMailboxStates('alice', { id: 'bad-atomic-batch', targets: targets.map(({ mailboxId, messageId, revision }, index) => ({ mailboxId, messageId, revision: index ? 999 : revision })), done: true })).rejects.toMatchObject({ status: 412 })
+    expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.every(message => !message.memberships[0]!.done)).toBe(true)
+    const database = new Database(join(h.directory, 'feedback.sqlite'))
+    cleanup.push(async () => { database.close() })
+    let feedback = createAttentionFeedbackStore(database, h.inbox, 'alice')
+    const original = h.inbox.setMailboxStates
+    h.inbox.setMailboxStates = async (...args) => { await original(...args); throw new InboxError('INTERNAL', 'Simulated lost response', 500) }
+    await expect(feedback.record({ id: 'lost-response-negative-001', targets })).rejects.toMatchObject({ status: 500 })
+    h.inbox.setMailboxStates = original
+    await h.restart()
+    feedback = createAttentionFeedbackStore(database, h.inbox, 'alice')
+    expect((await feedback.list())[0]).toMatchObject({ status: 'active', count: 2 })
+    const current = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items
+    expect(current.every(message => message.memberships[0]!.revision === 2)).toBe(true)
+    expect((await feedback.undo('lost-response-negative-001')).status).toBe('retracted')
+    expect(box.calls.mutate).toHaveLength(0)
+  })
+
+  test('feedback deduplicates overlapping memberships, separates sources, and never absorbs a later reply', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    h.discoveries.set('feedback-scoped', { sources: ['alpha.example.test', 'beta.example.test'].map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const scoped = await h.connect('alice', 'feedback-scoped', [native('same', { sourceDomains: ['alpha.example.test', 'beta.example.test'] })], SCOPED)
+    const boxes = await Promise.all(['alpha.example.test', 'beta.example.test'].map(value => h.inbox.createMailbox('alice', { sourceId: scoped.account.id, name: value, selector: { kind: 'domain', value } })))
+    await h.sync('alice', scoped.account.id)
+    const separate = await h.seed('alice', 'feedback-separate', [native('same')])
+    const mailboxIds = (await h.inbox.mailboxes('alice')).map(value => value.id)
+    const rows = (await h.inbox.mailboxMessages('alice', { mailboxIds })).items
+    expect(rows).toHaveLength(2)
+    const targets = rows.flatMap(message => message.memberships.map(state => ({ sourceId: message.sourceId, messageId: message.id, messageRevision: message.revision, mailboxId: state.mailboxId, revision: state.revision })))
+    expect(targets).toHaveLength(3)
+    const database = new Database(':memory:')
+    try {
+      const feedback = createAttentionFeedbackStore(database, h.inbox, 'alice')
+      expect(await feedback.record({ id: 'overlapping-negative-001', targets })).toMatchObject({ count: 2, status: 'active' })
+      scoped.box.put(native('new-reply', { threadId: 'native-thread-same', inReplyTo: '<same@example.test>', sourceDomains: ['alpha.example.test', 'beta.example.test'] }))
+      await h.sync('alice', scoped.account.id)
+      const after = (await h.inbox.mailboxMessages('alice', { mailboxIds: boxes.map(box => box.id) })).items
+      const added = after.find(message => !rows.some(original => original.id === message.id))!
+      expect(added.memberships.every(state => !state.done)).toBe(true)
+      expect(classifyAttention(added).category).toBe('Important')
+      expect((await feedback.list())[0]!.count).toBe(2)
+      await feedback.undo('overlapping-negative-001')
+      expect((await h.inbox.mailboxMessages('alice', { mailboxIds })).items.every(message => message.memberships.every(state => !state.done))).toBe(true)
+      expect(scoped.box.calls.mutate).toHaveLength(0)
+      expect(separate.box.calls.mutate).toHaveLength(0)
+    } finally { database.close() }
+  })
+
+  test('host split preferences preserve authored filters and unrelated preferences, persist reloads, and isolate owners', async () => {
+    const database = new Database(':memory:')
+    try {
+      const store = createSplitPreferencesStore(database, 'alice')
+      const legacy = { splits: ['Important', 'Github', 'Inbound', 'Calendar', 'Other', 'John'], splitRules: { John: 'from:john@doe.com' }, theme: 'custom', pinnedMailboxIds: ['keep'] }
+      const migrated = normalizeSplits(legacy)
+      expect(migrated.splits).toEqual(['Important', 'Other', 'John'])
+      expect(legacy.theme).toBe('custom')
+      expect(legacy.pinnedMailboxIds).toEqual(['keep'])
+      const value = store.write({ ...migrated, revision: 0 })
+      expect(createSplitPreferencesStore(database, 'alice').read()).toEqual(value)
+      expect(createSplitPreferencesStore(database, 'bob').read()).toBeNull()
+      expect(() => store.write({ ...value, revision: 0 })).toThrow()
+      const renamed = store.write({ ...value, splits: ['Important', 'Other', 'Johnny'], splitRules: { Johnny: 'from:john@doe.com' } })
+      expect(renamed.splitRules.Johnny).toBe('from:john@doe.com')
+      expect(store.write({ ...renamed, splits: ['Important', 'Other'], splitRules: {} }).splits).toEqual(['Important', 'Other'])
+      expect(normalizeSplits({ ...legacy, splitRules: { Github: 'from:custom@example.test', John: 'from:john@doe.com' } }).splits).toContain('Github')
+    } finally { database.close() }
+  })
 })
 
 describe('IMAP host onboarding boundary', () => {
@@ -417,6 +634,7 @@ async function fixture(options: Partial<InboxOptions> & { googleOAuth?: GoogleOA
   const controllers: AbortController[] = []
   const definitions: ProviderDefinition[] = [FULL, RESTRICTED, DYNAMIC, SCOPED, ...(options.googleOAuth ? ['gmail'] : [])].map(id => ({
     id, name: id, connection: id === 'gmail' ? 'oauth' : 'credentials', scopes: ['mail'],
+    nativeCategoryRoles: { 'native-promotions': 'promotions' },
     ...(id === SCOPED ? {
       mailboxSelection: 'manual' as const,
       async discover(provider: InboxProvider) {

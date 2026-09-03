@@ -72,6 +72,8 @@ export interface MediaContent { contentType: string; content: Uint8Array; noStor
 export interface ProviderDefinition {
   id: string
   name: string
+  /** Translate retained native folder roles into upstream category facts, without opening a provider connection. */
+  nativeCategoryRoles?: Readonly<Record<string, string>>
   connection?: 'oauth' | 'credentials'
   scopes?: string[]
   /** Runtime cancellation is separate from provider-validated credential fields. */
@@ -196,6 +198,31 @@ export interface BlobInfo {
   contentId?: string
 }
 
+export interface MailFacts {
+  version: 1
+  listId?: boolean
+  listUnsubscribe?: boolean
+  listPost?: boolean
+  bulk?: boolean
+  automated?: boolean
+  unsubscribeLink?: boolean
+  reply?: boolean
+  nativeCategories?: string[]
+  nativeImportant?: boolean
+}
+
+export interface MailboxStateTarget {
+  mailboxId: string
+  messageId: string
+  revision: number
+  messageRevision?: number
+}
+export interface MailboxStateReceipt {
+  id: string
+  retracted: boolean
+  states: MailboxMembership[]
+}
+
 export interface MessageSummary {
   id: string
   accountId: string
@@ -214,6 +241,7 @@ export interface MessageSummary {
   labelIds: string[]
   hasAttachments: boolean
   snoozedUntil: string | null
+  facts?: MailFacts
 }
 
 export interface Message extends MessageSummary {
@@ -382,6 +410,9 @@ export interface Inbox {
   mailboxMessages(owner: string, query: MailboxQuery): Promise<Page<MailboxMessageSummary>>
   mailboxMessage(owner: string, mailboxId: string, messageId: string): Promise<Message & { sourceId: string; memberships: MailboxMembership[] }>
   setMailboxState(owner: string, mailboxId: string, messageId: string, input: { done?: boolean; snoozedUntil?: string | null }, revision: number): Promise<MailboxMembership>
+  /** Atomic local-only state change with a durable idempotency receipt; no provider mutation. */
+  setMailboxStates(owner: string, input: { id: string; targets: MailboxStateTarget[]; done: boolean }): Promise<MailboxStateReceipt>
+  undoMailboxStates(owner: string, id: string): Promise<MailboxStateReceipt>
   syncMailbox(owner: string, mailboxId: string, options?: SyncRequest): Promise<{ synchronized: number; hasMore: boolean; state: string }>
   sync(owner: string, id: string, options?: SyncRequest): Promise<{ synchronized: number; hasMore: boolean; state: string }>
   folders(owner: string, accountId: string): Promise<Folder[]>

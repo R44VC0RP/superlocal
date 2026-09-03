@@ -1,3 +1,8 @@
+import type { SplitPreferences } from "../../shared/splits";
+export type SavedSplitPreferences = SplitPreferences & { revision: number };
+export type AttentionFeedback = { id: string; createdAt: string; status: "pending" | "active" | "retracting" | "retracted" | "failed"; count: number; problem?: string };
+export type AttentionFeedbackTarget = { sourceId: string; messageId: string; mailboxId: string; messageRevision: number; revision: number };
+
 export type HostProvider = {
   id: string;
   name: string;
@@ -16,6 +21,7 @@ export type HostProvider = {
 export type HostConfiguration = {
   mode: "mock" | "real";
   allowProviderWrites: boolean;
+  preferenceScope?: string;
   providers: HostProvider[];
 };
 
@@ -97,3 +103,23 @@ export function readInboxViewPreferences(signal: AbortSignal): Promise<InboxView
 export function writeInboxViewPreferences(input: InboxViewPreferences, signal: AbortSignal): Promise<InboxViewPreferences> {
   return requestInboxViewPreferences(signal, input);
 }
+
+async function appRequest<T>(path: string, signal: AbortSignal, method = "GET", input?: unknown): Promise<T> {
+  const response = await fetch(path, { method, signal, credentials: "include", cache: "no-store",
+    ...(method === "GET" ? {} : { headers: { "Content-Type": "application/json", "X-Superlocal": "1" }, body: JSON.stringify(input ?? {}) }) });
+  const result = await response.json();
+  if (!response.ok) throw new InboxViewPreferencesError(typeof result?.error === "string" ? result.error : "The host could not save this action.", response.status, result?.code ?? "HOST_REQUEST_FAILED");
+  return result as T;
+}
+export const readSplitPreferences = (signal: AbortSignal) => appRequest<SavedSplitPreferences | null>("/host/split-preferences", signal);
+export const writeSplitPreferences = (input: SavedSplitPreferences, signal: AbortSignal) => appRequest<SavedSplitPreferences>("/host/split-preferences", signal, "PUT", input);
+export const readAttentionFeedback = (signal: AbortSignal) => appRequest<AttentionFeedback[]>("/host/attention-feedback", signal);
+export async function recordAttentionFeedback(input: { id: string; targets: AttentionFeedbackTarget[] }, signal: AbortSignal): Promise<AttentionFeedback> {
+  // A lost response must retry the same durable ID, never create another label.
+  try { return await appRequest<AttentionFeedback>("/host/attention-feedback", signal, "POST", input); }
+  catch (error) {
+    if (signal.aborted || error instanceof InboxViewPreferencesError && error.status < 500) throw error;
+    return appRequest<AttentionFeedback>("/host/attention-feedback", signal, "POST", input);
+  }
+}
+export const retractAttentionFeedback = (id: string, signal: AbortSignal) => appRequest<AttentionFeedback>(`/host/attention-feedback/${encodeURIComponent(id)}/undo`, signal, "POST");

@@ -48,6 +48,7 @@ import type { InboxIssue } from "./inbox";
 import { captureIssueReport, type IssueReport } from "./issue-reports";
 import SenderContext from "./SenderContext";
 import { senderContact } from "./sender-context";
+import { normalizeSplits, attentionSplit, type SplitPreferences } from "../../shared/splits";
 
 type Route = {
   account: string;
@@ -100,10 +101,11 @@ export default function App() {
   const [route, setRoute] = useState<Route>(readRoute);
   const inbox = useInbox();
   const { store, mail, drafts } = inbox;
-  const [preferences, setPreferences] = useState<Preferences>(() => ({
-    ...defaultPreferences,
-    ...loadSaved("preferences", {}),
-  }));
+  const [preferences, setPreferences] = useState<Preferences>(() => {
+    const saved = loadSaved<Record<string, unknown>>("preferences", {});
+    const { version: _version, ...splits } = normalizeSplits({ ...saved, version: undefined });
+    return { ...defaultPreferences, ...saved, ...splits };
+  });
   const [navigation, setNavigation] = useState(false);
   const [settings, setSettings] = useState(false);
   const [settingsPage, setSettingsPage] = useState<string>();
@@ -338,6 +340,16 @@ export default function App() {
   usePersistence("preferences", preferences, storageFailure);
   usePersistence("searches", searchHistory, storageFailure);
   usePersistence("profile", userProfile, storageFailure);
+  useLayoutEffect(() => {
+    const saved = inbox.splitPreferences;
+    if (!saved) return;
+    const { version: _version, revision: _revision, ...values } = saved;
+    setPreferences(previous => Object.entries(values).every(([key, value]) => JSON.stringify(previous[key]) === JSON.stringify(value)) ? previous : { ...previous, ...values });
+    if (!saved.splits.includes(route.split)) {
+      const original = attentionSplit({ splitRules: (preferences.splitRules as Record<string, string>) || {}, splitAliases: (preferences.splitAliases as Record<string, string>) || {} }, route.split);
+      navigate({ split: saved.splits.find(name => original && attentionSplit(saved, name) === original) || saved.splits[0] || "Important" });
+    }
+  }, [inbox.splitPreferences, route.split]);
   useEffect(() => {
     if (!inbox.policy) return;
     const sendDelay = inbox.policy.undoSendSeconds ? `${inbox.policy.undoSendSeconds} seconds` : "No delay";
@@ -496,15 +508,15 @@ export default function App() {
     closeNavigation();
   }
   function updatePreferences(patch: Partial<Preferences>) {
-    const { sendDelay, showImages, ...local } = patch;
+    const { sendDelay, showImages, splits, inactiveSplits, splitRules, splitAliases, ...local } = patch;
     setPreferences((p) => ({ ...p, ...local }));
+    const splitPatch = Object.fromEntries(Object.entries({ splits, inactiveSplits, splitRules, splitAliases }).filter(([, value]) => value !== undefined));
+    if (Object.keys(splitPatch).length) void store.setSplitPreferences(splitPatch as Partial<Omit<SplitPreferences, "version">>).catch(actionError);
     if (typeof sendDelay === "string") {
       const seconds = Number.parseInt(sendDelay, 10) || 0;
       void store.setPolicy({ undoSendSeconds: Math.min(120, seconds) }).catch(actionError);
     }
     if (typeof showImages === "boolean") void store.setPolicy({ remoteImages: showImages }).catch(actionError);
-    if (patch.splits && !patch.splits.includes(route.split))
-      navigate({ split: patch.splits[0] || "Other" });
     if (typeof patch.profileName === "string")
       setUserProfile((p) => ({ ...p, name: patch.profileName as string }));
     if (typeof patch.profileLocation === "string")
@@ -821,6 +833,7 @@ export default function App() {
       return;
     }
     if (!ids.length) return;
+    if (action === "not-important" && inbox.pending) return;
     const previousRoute = route;
     const previousHighlight = highlight;
     const before = mail.filter((m) => ids.includes(m.id));
@@ -843,6 +856,7 @@ export default function App() {
     finally { finishMotion(); }
     const labels: Record<string, string> = {
       done: "Marked as Done.",
+      "not-important": "Marked Done. Not-important feedback saved; categorization is unchanged.",
       trash: "Moved to Trash",
       spam: "Moved to Spam",
       inbox: "Moved to Inbox",
@@ -859,7 +873,7 @@ export default function App() {
     setSelected([]);
     if (
       currentMail &&
-      ["done", "trash", "spam", "inbox", "mute", "cancel"].includes(action)
+      ["done", "not-important", "trash", "spam", "inbox", "mute", "cancel"].includes(action)
     ) {
       const next =
         visibleMail[
@@ -1005,7 +1019,17 @@ export default function App() {
     }
   }
   const commandDraft = drafts.find((draft) => draft.id === commandDraftId);
+  const lastFeedback = inbox.attentionFeedback.find(event => event.status === "active");
   const commandItems: CommandItem[] = [
+    ...(!commandDraft && store.canRecordFeedback(targets) && !inbox.pending ? [{
+      label: "Done + not important to me", detail: "Save feedback only. This does not change future categorization.", key: "W", icon: "Check", run: () => applyAction("not-important"),
+    }] : []),
+    ...(lastFeedback ? [{
+      label: "Undo last not-important feedback", detail: "Retract the saved feedback and restore its previous Done state", key: "", icon: "ArrowLeft", run: () => {
+        setOverlay(null);
+        void store.undoFeedback(lastFeedback.id).then(() => setNotice({ text: "Feedback retracted and Done state restored." })).catch(actionError);
+      },
+    }] : []),
     ...(commandDraft
       ? [
           {
@@ -1345,7 +1369,7 @@ export default function App() {
         else closeNavigation();
         break;
       case "goFolder":
-        goFolder(intent.folder, intent.split);
+        goFolder(intent.folder, intent.split ? preferences.splits.find(name => attentionSplit({ splitRules: (preferences.splitRules as Record<string, string>) || {}, splitAliases: (preferences.splitAliases as Record<string, string>) || {} }, name) === intent.split) || intent.split : undefined);
         break;
       case "labelMode":
         openOverlay("label");

@@ -29,7 +29,8 @@ export const shortcutGroups: [string, [string, string][]][] = [
   [
     "Conversations",
     [
-      ["Mark Done (Archive)", "E"],
+      ["Mark Done", "E"],
+      ["Done + record not important to me", "W"],
       ["Mark not Done", "Shift E"],
       ["Remind Me (Snooze)", "H"],
       ["Star", "S"],

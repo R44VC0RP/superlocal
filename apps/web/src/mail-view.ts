@@ -1,6 +1,8 @@
 import type { Mail, Preferences } from "./data.ts";
 import { inFolder } from "./mail-model.ts";
 import { matchesSearch } from "./mail-search.ts";
+import { conversationAttention } from "../../shared/mail-attention.ts";
+import { attentionSplit } from "../../shared/splits.ts";
 
 export type MailListEntry = {
   key: string;
@@ -28,17 +30,12 @@ export function selectMailView(
   const aliases = preferences.splitAliases as
     Record<string, string> | undefined;
   function inSplit(message: Mail, name: string) {
+    const category = attentionSplit({ splitRules: rules ?? {}, splitAliases: aliases ?? {} }, name);
+    if (category) return conversationAttention(message) === category;
     if (rules && typeof rules[name] === "string" && rules[name].trim()) {
-      return matchesSearch(message, rules[name]);
+      return matchesSearch(message, rules[name], false);
     }
-    const original = aliases?.[name] || name;
-    return (
-      message.split === original ||
-      (original === "Other" &&
-        !preferences.splits.some(
-          (name) => (aliases?.[name] || name) === message.split,
-        ))
-    );
+    return false;
   }
   const splitCounts = Object.fromEntries(
     preferences.splits.map((name) => [
@@ -53,7 +50,7 @@ export function selectMailView(
   const visibleMail = accountMail.filter((message) => {
     if (filter === "Unread" && !message.unread) return false;
     if (filter === "Starred" && !message.starred) return false;
-    if (filter === "Important" && message.split !== "Important") return false;
+    if (filter === "Important" && conversationAttention(message) !== "Important") return false;
     if (filter === "No reply" && !(message.messages.at(-1)?.outgoing ?? message.messages.at(-1)?.email === account))
       return false;
     if (search)
@@ -103,7 +100,7 @@ export function selectMailView(
     entries,
     totalHeight,
     rowHeight,
-    inboxCount: inbox.filter((message) => message.split === "Important").length,
+    inboxCount: inbox.filter((message) => conversationAttention(message) === "Important").length,
   };
 }
 

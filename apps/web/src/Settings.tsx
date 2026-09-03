@@ -6,6 +6,8 @@ import type { HostConfiguration } from "./host";
 import ProviderConnections from "./ProviderConnections";
 import MailboxSettings from "./MailboxSettings";
 import "./settings.css";
+import { attentionSplit, splitTemplates } from "../../shared/splits";
+import { splitRuleError } from "./mail-search";
 
 export type SettingsProps = {
   preferences: Preferences;
@@ -84,14 +86,10 @@ const morePreferences = [
   "Notification Options",
   "Calendar Settings",
 ];
-const defaultSplitRules: Record<string, string> = {
-  Important: "Direct, personal, and high priority messages",
-  Github: "from:notifications@github.com",
-  Inbound: "(from:feedback@inbound.new OR from:support@inbound.new)",
-  Calendar: "Never miss an invitation again",
-  Other:
-    "Split conversations from marketing, social networks, and automatic updates",
-};
+const defaultSplitRules: Record<string, string> = Object.assign(Object.create(null), {
+  Important: "Correspondence, actionable mail, and uncertain messages",
+  Other: "Promotions and newsletters with subscription evidence",
+});
 
 const inlineToggles: Record<string, [string, boolean]> = {
   "Recent Opens": ["recentOpens", true],
@@ -196,13 +194,13 @@ export function Settings({
   const inactiveSplits = list("inactiveSplits").filter(
     (split) => !preferences.splits.includes(split),
   );
-  const splitRules: Record<string, string> = {
-    ...(preferences.splitRules &&
+  const splitRules: Record<string, string> = Object.assign(Object.create(null),
+    (preferences.splitRules &&
     typeof preferences.splitRules === "object" &&
     !Array.isArray(preferences.splitRules)
       ? (preferences.splitRules as Record<string, string>)
       : {}),
-  };
+  );
   const signatureAccounts = [
     ...new Set([account, ...accounts]),
   ];
@@ -637,8 +635,11 @@ export function Settings({
                   return;
                 }
                 const rules = { ...splitRules };
+                const category = splitEditor ? attentionSplit({ splitRules, splitAliases: (preferences.splitAliases as Record<string, string>) || {} }, splitEditor) : undefined;
+                const invalid = category ? null : splitRuleError(splitRule);
+                if (invalid) { setError(invalid); return; }
                 if (splitEditor) delete rules[splitEditor];
-                rules[name] = splitRule.trim();
+                if (!category) rules[name] = splitRule.trim();
                 const aliases = {
                   ...((preferences.splitAliases as Record<string, string>) ||
                     {}),
@@ -682,10 +683,13 @@ export function Settings({
                 <input
                   aria-label="Split rule"
                   value={splitRule}
-                  placeholder="from:example.com"
+                  disabled={!!splitEditor && !!attentionSplit({ splitRules, splitAliases: (preferences.splitAliases as Record<string, string>) || {} }, splitEditor)}
+                  placeholder={splitEditor && attentionSplit({ splitRules, splitAliases: (preferences.splitAliases as Record<string, string>) || {} }, splitEditor) ? "Built-in attention category" : "from:john@doe.com"}
+                  maxLength={4096}
                   onChange={(event) => setSplitRule(event.target.value)}
                 />
               </label>
+              {!splitEditor || !attentionSplit({ splitRules, splitAliases: (preferences.splitAliases as Record<string, string>) || {} }, splitEditor) ? <p className="settings-note">Match senders, subjects, or other message details. Combine filters with OR and parentheses. Filters use cached message details, not bodies loaded when opening mail.</p> : null}
               {error && (
                 <p className="settings-error" role="alert">
                   {error}
@@ -712,8 +716,7 @@ export function Settings({
             <>
               <div className="settings-split-intro">
                 <p>
-                  Customize your splits, create new ones, or explore the library
-                  to find your ideal workflow and focus on what matters most.
+                  Important and Other divide your inbox. Custom filters can overlap either view.
                 </p>
                 <button
                   type="button"
@@ -804,11 +807,11 @@ export function Settings({
                       >
                         <span>{split}</span>
                         <span
-                          title={splitRules[split] || defaultSplitRules[split]}
+                          title={splitRules[split] || defaultSplitRules[((preferences.splitAliases as Record<string, string>) || {})[split] || split]}
                         >
                           {splitRules[split] ||
-                            defaultSplitRules[split] ||
-                            "All matching conversations"}
+                            defaultSplitRules[((preferences.splitAliases as Record<string, string>) || {})[split] || split] ||
+                            "Add a search rule"}
                         </span>
                       </button>
                       {pendingDelete === split ? (
@@ -887,7 +890,7 @@ export function Settings({
                                 name="Minus"
                                 title={`Deactivate ${split}`}
                                 size={14}
-                                disabled={preferences.splits.length <= 1}
+                                disabled={!!attentionSplit({ splitRules, splitAliases: (preferences.splitAliases as Record<string, string>) || {} }, split)}
                                 onClick={() =>
                                   onChange({
                                     splits: preferences.splits.filter(
@@ -918,8 +921,7 @@ export function Settings({
                             title={`Delete ${split}`}
                             size={14}
                             disabled={
-                              splitTab === "Active" &&
-                              preferences.splits.length <= 1
+                              !!attentionSplit({ splitRules, splitAliases: (preferences.splitAliases as Record<string, string>) || {} }, split)
                             }
                             onClick={() => setPendingDelete(split)}
                           />
@@ -968,15 +970,7 @@ export function Settings({
     case "Split Inbox Library":
       content = (
         <div className="settings-library">
-          {[
-            "Important",
-            "Github",
-            "Inbound",
-            "Calendar",
-            "Newsletters",
-            "Receipts",
-            "Other",
-          ].map((split) => (
+          {Object.keys(splitTemplates).map((split) => (
             <div className="settings-control-row" key={split}>
               <span>{split}</span>
               <button
@@ -986,6 +980,7 @@ export function Settings({
                 onClick={() =>
                   onChange({
                     splits: [...preferences.splits, split],
+                    splitRules: { ...splitRules, [split]: Object.hasOwn(splitRules, split) ? splitRules[split] : splitTemplates[split] },
                     inactiveSplits: inactiveSplits.filter(
                       (item) => item !== split,
                     ),
