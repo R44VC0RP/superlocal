@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util'
 import { classifyEmail, InferenceError } from './inference'
 import { createDataset, inventory, openMailSource, privateDirectory } from './store'
 import type { TrainingExample } from './model'
-import { preprocessingVersion, promptVersion, taxonomyVersion, validateClassification, validateClassificationInput } from './schema'
+import { preprocessingVersion, promptVersion, taxonomyVersion, validateClassification, validateClassificationInput, type ClassificationInput } from './schema'
 
 function readExamples(path: string): TrainingExample[] {
   const rows = readFileSync(path, 'utf8').split('\n').filter(line => line.trim()).map(line => JSON.parse(line))
@@ -72,7 +72,7 @@ export async function labelRun(dataset: Dataset, options: {
 }) {
   if (!Number.isSafeInteger(options.concurrency) || options.concurrency < 1 || options.concurrency > 64) throw new Error('INVALID_CONCURRENCY')
   const config = dataset.assertCurrent(options.run), classify = options.classify ?? classifyEmail
-  let completed = 0, stopped: string | null = null, retryAfterMs = 0
+  let completed = 0, stopped: string | null = null, stoppedStatus: number | null = null, retryAfterMs = 0
   await Promise.all(Array.from({ length: options.concurrency }, async () => {
     while (!options.signal?.aborted && !stopped) {
       const job = dataset.claim(options.run)
@@ -85,17 +85,17 @@ export async function labelRun(dataset: Dataset, options: {
         const code = error instanceof InferenceError ? error.code : 'LABEL_FAILED'
         const interrupted = options.signal?.aborted
         const rateLimited = error instanceof InferenceError && error.status === 429
-        const configurationFailure = error instanceof InferenceError && [400, 401, 403, 404, 429].includes(error.status ?? 0)
+        const configurationFailure = error instanceof InferenceError && [400, 401, 402, 403, 404, 429].includes(error.status ?? 0)
         const releaseAttempt = !!(interrupted || configurationFailure)
         const retry = releaseAttempt || error instanceof InferenceError && error.retryable && job.attempts < 3
         dataset.fail(options.run, job, interrupted ? 'INTERRUPTED' : code, retry, releaseAttempt)
-        if (configurationFailure) stopped = rateLimited ? 'RATE_LIMITED' : code
+        if (configurationFailure) { stopped = rateLimited ? 'RATE_LIMITED' : code; stoppedStatus = error.status ?? null }
         if (rateLimited) retryAfterMs = Math.max(retryAfterMs, error.retryAfterMs ?? 30_000)
         if (retry && !interrupted && !stopped) await Bun.sleep(Math.min(10_000, 1000 * 2 ** job.attempts))
       }
     }
   }))
-  return { ...dataset.status(options.run), stopped: options.signal?.aborted ? 'INTERRUPTED' : stopped, retryAfterMs }
+  return { ...dataset.status(options.run), stopped: options.signal?.aborted ? 'INTERRUPTED' : stopped as string | null, stoppedStatus: stoppedStatus as number | null, retryAfterMs }
 }
 
 const help = `Offline email classification (does not change the inbox)
@@ -123,7 +123,7 @@ fork reuses the exact frozen inputs to compare another model or revised taxonomy
 Concurrency is bounded to 1–64. A 429 stops new claims and releases throttled attempts for resume; retryAfterMs reports the provider cooldown.
 The explicitly read --key-file defaults to non-gittract.env in the project root (0600).
 Set OPENCODE_API_KEY in that file; optional OPENCODE_ORG_ID supports session tokens.
-Only label uploads email content, to the fixed OpenCode Responses endpoint with store:false.
+Only label/audit upload email content, to the fixed OpenCode Responses endpoint with store:false.
 review input: one {"exampleId":"...","classification":{...}} record per line; corrections append.
 Exports contain private mail: 0600 files outside this checkout; existing exports are not overwritten.
 Unreviewed ambiguous/truncated results go to review.jsonl, not training files.
@@ -133,6 +133,7 @@ train fits a local message-type/action baseline; validation selects a small fixe
 --defer-test leaves final evaluation untouched while comparing learner families using validation only.
 It does not train time sensitivity or risk prediction yet. LLM-label scores are teacher agreement.
 predict runs locally without a key; each input line is a ClassificationInput or {input,exampleId}.
+predict/evaluate also accept opt-in plain-JSON word-TFIDF/SVM artifacts; inference needs no Python.
 audit sends only {exampleId,input} sources, never existing labels or predictions, to an independent LLM. It persists every success/failure/unstarted record; this is not human ground truth.
 `
 
@@ -190,15 +191,22 @@ async function main() {
   if (command === 'train') { print(await trainExport(required('input'), required('out'), { deferTest: values['defer-test'] })); return }
   if (command === 'evaluate' || command === 'predict') {
     const savedText = readFileSync(required('model-file'), 'utf8'), saved = JSON.parse(savedText)
-    if (saved.version !== 1 || saved.dataset?.taxonomyVersion !== taxonomyVersion) throw new Error('MODEL_VERSION_MISMATCH')
-    const { evaluateClassifier, predictClassifier } = await import('./model')
-    if (command === 'evaluate') print(evaluateClassifier(saved.model, readExamples(required('input'))))
+    const { evaluateClassifier, evaluatePredictions, predictClassifier } = await import('./model')
+    const { validateLinearModel, predictLinearClassifier } = await import('./linear')
+    const payload = saved.model ?? saved
+    const linear = payload.engine === 'word-tfidf-linear-svc' ? validateLinearModel(payload) : null
+    if (!linear && (saved.version !== 1 || saved.dataset?.taxonomyVersion !== taxonomyVersion)) throw new Error('MODEL_VERSION_MISMATCH')
+    const predict = (input: ClassificationInput) => linear ? predictLinearClassifier(linear, input) : predictClassifier(saved.model, input)
+    if (command === 'evaluate') {
+      const rows = readExamples(required('input'))
+      print(linear ? evaluatePredictions({ training: linear.training, warnings: ['UNCALIBRATED_SCORES', 'LINEAR_SVC_BASELINE', 'TEST_NOT_USED_FOR_SELECTION'] }, rows, rows.map(row => predictLinearClassifier(linear, row.input))) : evaluateClassifier(saved.model, rows))
+    }
     else {
       const rows = readFileSync(required('input'), 'utf8').split('\n').filter(line => line.trim()).map(line => JSON.parse(line))
       const predictions = rows.map((row, index) => {
         const input = row.input ?? row
         validateClassificationInput(input)
-        return { exampleId: typeof row.exampleId === 'string' ? row.exampleId : String(index), inputHash: createHash('sha256').update(JSON.stringify(input)).digest('hex'), ...predictClassifier(saved.model, input) }
+        return { exampleId: typeof row.exampleId === 'string' ? row.exampleId : String(index), inputHash: createHash('sha256').update(JSON.stringify(input)).digest('hex'), ...predict(input) }
       })
       const root = privateDirectory(required('out'))
       const fd = openSync(resolve(root, 'predictions.jsonl'), 'wx', 0o600)

@@ -48,6 +48,7 @@ export type Prediction = {
   /** Type abstention only; independently supported actions may still be returned. */
   abstained: boolean
 }
+export type EvaluatedPrediction = Pick<Prediction, 'primaryType' | 'actions' | 'abstained'> & { rawPrimaryType: EmailType }
 export type LabelMetrics = {
   support: number
   trainingSupport: number
@@ -411,13 +412,26 @@ function metrics(support: number, trainingSupport: number, predicted: number, tr
 /** Aggregate only: never returns message text, identities, evidence, or per-example results. */
 export function evaluateClassifier(model: Model, examples: TrainingExample[]): Evaluation {
   validateModel(model); validateExamples(examples)
-  const support = distribution(examples), vocabulary = new Set(model.lexicalHashes)
+  const vocabulary = new Set(model.lexicalHashes)
+  const predictions = examples.map(example => {
+    const raw = rawPrediction(model, features(example.input, model.dimensions, vocabulary))
+    return { ...prediction(model, raw), rawPrimaryType: raw.label }
+  })
+  return evaluatePredictions(model, examples, predictions)
+}
+
+/** One metric definition for native and portable learners; abstentions never count as correct. */
+export function evaluatePredictions(model: Pick<Model, 'training' | 'warnings'>, examples: TrainingExample[], predictions: EvaluatedPrediction[]): Evaluation {
+  validateExamples(examples)
+  if (predictions.length !== examples.length || predictions.some(row => !row || !types.includes(row.primaryType) || !types.includes(row.rawPrimaryType) || typeof row.abstained !== 'boolean' ||
+    !Array.isArray(row.actions) || !row.actions.every(action => actions.includes(action)) || new Set(row.actions).size !== row.actions.length)) fail('CLASSIFIER_PREDICTIONS_INVALID')
+  const support = distribution(examples)
   const typeCounts = mapTypes(() => ({ predicted: 0, truePositive: 0 })), actionCounts = mapActions(() => ({ predicted: 0, truePositive: 0 }))
   let correct = 0, rawCorrect = 0, covered = 0, coveredCorrect = 0, exactActions = 0
-  for (const example of examples) {
-    const raw = rawPrediction(model, features(example.input, model.dimensions, vocabulary)), result = prediction(model, raw)
+  for (let index = 0; index < examples.length; index++) {
+    const example = examples[index], result = predictions[index]
     const match = !result.abstained && result.primaryType === example.classification.primaryType
-    correct += Number(match); rawCorrect += Number(raw.label === example.classification.primaryType)
+    correct += Number(match); rawCorrect += Number(result.rawPrimaryType === example.classification.primaryType)
     covered += Number(!result.abstained); coveredCorrect += Number(!result.abstained && match)
     typeCounts[result.primaryType].predicted++
     if (match) typeCounts[result.primaryType].truePositive++

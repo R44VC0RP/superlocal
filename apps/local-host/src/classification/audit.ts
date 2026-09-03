@@ -66,7 +66,7 @@ export async function auditExamples(examples: Array<{ exampleId: string; input: 
         const safe = error instanceof InferenceError ? new InferenceError(error.code, false, error.status, error.retryAfterMs) : new InferenceError('INFERENCE_FAILURE')
         Object.assign(record, { status: 'failed', errorCode: safe.code, httpStatus: safe.status ?? null, retryAfterMs: safe.retryAfterMs ?? null })
         if (safe.status === 429) { stopped = true; cooldown = Math.max(cooldown ?? 0, safe.retryAfterMs ?? 0) }
-        if ([400, 401, 403, 404].includes(safe.status ?? 0)) { stopped = true; stopCode = 'AUDIT_CONFIGURATION_STOPPED' }
+        if ([400, 401, 402, 403, 404].includes(safe.status ?? 0)) { stopped = true; stopCode = 'AUDIT_CONFIGURATION_STOPPED' }
       }
       await publish(record)
     }

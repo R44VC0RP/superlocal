@@ -24,8 +24,9 @@ import { mailFacts } from '../src/mail-facts'
 import { createDataset, inventory, openMailSource } from '../../../apps/local-host/src/classification/store'
 import { labelRun, trainExport } from '../../../apps/local-host/src/classification/cli'
 import { classifyEmail, InferenceError } from '../../../apps/local-host/src/classification/inference'
-import { validateClassification, type Classification, type ClassificationInput } from '../../../apps/local-host/src/classification/schema'
-import { trainClassifier, predictClassifier, evaluateClassifier, type TrainingExample } from '../../../apps/local-host/src/classification/model'
+import { sourceFactKeys, taxonomy, validateClassification, type Classification, type ClassificationInput } from '../../../apps/local-host/src/classification/schema'
+import { trainClassifier, predictClassifier, evaluateClassifier, evaluatePredictions, type TrainingExample } from '../../../apps/local-host/src/classification/model'
+import { validateLinearModel, predictLinearClassifier, type LinearModel } from '../../../apps/local-host/src/classification/linear'
 import { auditExamples, auditInputHash, compareAudits } from '../../../apps/local-host/src/classification/audit'
 import { createMockHost } from '../../../apps/mock-api/src/host'
 import type {
@@ -62,6 +63,42 @@ afterEach(async () => {
 })
 
 describe('offline classification dataset', () => {
+  test('portable linear inference loads bounded JSON, ignores identities and measures abstentions consistently', () => {
+    const actions = Object.keys(taxonomy.actions), types = Object.keys(taxonomy.types)
+    const sourceBooleans = [...sourceFactKeys, 'bodyTruncated'], width = 3 + sourceBooleans.length
+    const coef = (index: number) => Array.from({ length: width }, (_, i) => Number(i === index) * 2)
+    const support = { samples: 30, types: Object.fromEntries(types.map(t => [t, ['notification', 'promotion', 'transaction'].includes(t) ? 10 : 0])),
+      actions: Object.fromEntries(actions.map(a => [a, { positive: a === 'pay' ? 10 : 0, negative: a === 'pay' ? 20 : 30 }])), labelSources: { llm: 30, human: 0, unspecified: 0 } }
+    const payload = { engine: 'word-tfidf-linear-svc', version: 1, taxonomyVersion: '1', preprocessingVersion: '1',
+      recipe: 'quoted-headers-url-email-subject2-body24000-word12-sublinear-idf-l2-booleans035-l2-v1', sourceBooleans, vocabulary: ['notice', 'sale', 'pay'], idf: [1, 1, 1],
+      unicode: { version: '15.0.0', word: [[48, 57], [65, 90], [95, 95], [97, 122]], space: [[9, 13], [32, 32]], cased: [[65, 90], [97, 122]], ignorable: [[39, 39]],
+        lower: Array.from({ length: 26 }, (_, i) => [65 + i, String.fromCharCode(97 + i)]), fold: [[233, 'e']] },
+      types: { classes: ['notification', 'promotion', 'transaction'], coef: [coef(0), coef(1), coef(2)], intercept: [0, 0, 0], selection: { method: 'validation', threshold: 0.2, accepted: 30, precision: 1 } },
+      actions: Object.fromEntries(actions.map(a => [a, a === 'pay' ? { coef: coef(2), intercept: -1, constant: null, selection: { method: 'conservative_default', threshold: 0, accepted: null, precision: null } } :
+        { coef: null, intercept: 0, constant: 0, selection: { method: 'disabled', threshold: 0, accepted: 0, precision: null } }])), training: support, validation: support,
+      selection: { minimumAccepted: 20, targetPrecision: 0.9, minimumClassSamples: 3 } }
+    const saved = JSON.stringify(payload), model = validateLinearModel(JSON.parse(saved))
+    const input: ClassificationInput = { subject: 'PAY', bodyText: 'From: sale@example.test\nTo: notice@example.test\nPay', from: 'sale@example.test', to: [], cc: [], receivedAt: '2026-09-01T12:00:00Z', bodyTruncated: false, facts: {} }
+    const prediction = predictLinearClassifier(model, input)
+    expect(prediction).toMatchObject({ primaryType: 'transaction', rawPrimaryType: 'transaction', actions: ['pay'], abstained: false })
+    expect(predictLinearClassifier(validateLinearModel(JSON.parse(saved)), input)).toEqual(prediction)
+    expect(predictLinearClassifier(model, { ...input, from: 'notice@example.test', receivedAt: '2001-01-01', to: ['sale@example.test'] })).toEqual(prediction)
+    expect(predictLinearClassifier(model, { ...input, subject: 'salé', bodyText: '' }).primaryType).toBe('promotion')
+    const empty = predictLinearClassifier(model, { ...input, subject: '', bodyText: 'https://fictional.test/pay pay@example.test', facts: { listId: true } })
+    expect(empty.abstained).toBe(true); expect(empty.actions).toEqual([])
+    const measured = evaluatePredictions({ training: model.training, warnings: [] }, [{ input, classification: { primaryType: 'unknown', actions: [] }, labelSource: 'llm' }], [empty])
+    expect(measured.types.accuracy).toBe(0); expect(measured.types.coverage).toBe(0)
+    expect(() => evaluatePredictions({ training: model.training, warnings: [] }, [], [prediction])).toThrow('CLASSIFIER_PREDICTIONS_INVALID')
+    expect(Object.isFrozen(model.types.coef[0])).toBe(true)
+    expect(() => { model.types.coef[0]![0] = 99 }).toThrow()
+    for (const mutate of [
+      (m: LinearModel) => { m.types.coef[0]![0] = NaN },
+      (m: LinearModel) => { m.vocabulary.push('notice') },
+      (m: LinearModel) => { m.unicode.word = [[90, 65]] },
+      (m: LinearModel) => { m.actions.pay.selection = { method: 'validation', threshold: 0, accepted: 30, precision: 1 } },
+    ]) { const malformed = JSON.parse(saved); mutate(malformed); expect(() => validateLinearModel(malformed)).toThrow('CLASSIFIER_LINEAR_MODEL_INVALID') }
+  })
+
   test('blind auditing excludes teacher labels and accounts for failed, missing and changed-source examples', async () => {
     const input: ClassificationInput = { subject: 'Weekly newsletter', from: 'digest@example.test', to: ['reader@example.test'], cc: [], receivedAt: '2026-09-01T12:00:00Z', bodyText: 'Our weekly digest.', bodyTruncated: false, facts: { listId: true } }
     const classification: Classification = { primaryType: 'newsletter', secondaryTypes: [], actions: [], timeSensitivity: 'none', deadline: null, risk: 'none_observed', riskReasons: [], certainty: 'clear', evidence: [{ dimension: 'primaryType', label: 'newsletter', field: 'bodyText', quote: 'Our weekly digest.' }] }
@@ -88,10 +125,12 @@ describe('offline classification dataset', () => {
     })
     expect(limited.map(row => row.status)).toEqual(['failed', 'unstarted', 'unstarted', 'unstarted', 'unstarted'])
     expect(limited.every(row => row.retryAfterMs === 60_000)).toBe(true)
-    const unauthorized = await auditExamples(examples, { model: 'gpt-5.6-terra', apiKey: 'fictional', concurrency: 1,
-      classify: async () => { throw new InferenceError('INFERENCE_HTTP_ERROR', false, 401) },
-    })
-    expect(unauthorized[1]!.errorCode).toBe('AUDIT_CONFIGURATION_STOPPED')
+    for (const status of [401, 402]) {
+      const unauthorized = await auditExamples(examples, { model: 'gpt-5.6-terra', apiKey: 'fictional', concurrency: 1,
+        classify: async () => { throw new InferenceError('INFERENCE_HTTP_ERROR', false, status) },
+      })
+      expect(unauthorized[1]!.errorCode).toBe('AUDIT_CONFIGURATION_STOPPED')
+    }
     await expect(auditExamples(examples, { model: 'gpt-5.6-terra', apiKey: 'fictional', classify: async () => ({ classification, model: 'gpt-5.6-terra', responseId: null, usage: { inputTokens: 1, outputTokens: 1 } }), onResult: () => { throw new Error('private persistence details') } })).rejects.toThrow('AUDIT_PERSISTENCE_FAILED')
   })
 
@@ -199,8 +238,11 @@ describe('offline classification dataset', () => {
     expect(dataset.fork('pilot', 'second-model', 'gpt-5.6-terra')).toMatchObject({ selected: 6 })
     expect(dataset.partition('second-model')).toEqual(frozenPartition)
     expect(dataset.partition('second-model', ['pilot']).every(row => row.split === 'train' && row.developmentExposed)).toBe(true)
-    await labelRun(dataset, { run: 'second-model', apiKey: 'expired', concurrency: 1, classify: async () => { throw new InferenceError('INFERENCE_HTTP_ERROR', false, 401) } })
-    expect(dataset.status('second-model').counts).toEqual({ pending: 6 })
+    for (const status of [401, 402]) {
+      const stopped = await labelRun(dataset, { run: 'second-model', apiKey: 'expired', concurrency: 1, classify: async () => { throw new InferenceError('INFERENCE_HTTP_ERROR', false, status) } })
+      expect(stopped.stoppedStatus).toBe(status)
+      expect(dataset.status('second-model').counts).toEqual({ pending: 6 })
+    }
     await labelRun(dataset, { run: 'second-model', apiKey: 'fictional', concurrency: 2, classify: classifier })
     expect(dataset.compare('pilot', 'second-model')).toMatchObject({ overlappingCompleted: 6, changes: {} })
     dataset.fork('pilot', 'throttled', 'gpt-5.6-sol')
