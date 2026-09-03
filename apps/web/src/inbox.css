@@ -9,6 +9,16 @@
 @media (min-width: 701px) {
   /* Highlight swaps metadata (8 + 84) for actions (84 - 6 right margin); 14px keeps the swap width-neutral. */
   .mail-row.has-mailbox .row-actions { margin-left: 14px; }
+  .mail-workspace:not([data-folder="Reminders"]):not([data-folder="Scheduled"]) .mail-row {
+    --row-status-width: max(93px, calc(9ch + 41px));
+  }
+  .mail-workspace:not([data-folder="Reminders"]):not([data-folder="Scheduled"]) .mail-row :is(.row-metadata, .row-actions) {
+    flex: 0 0 var(--row-status-width);
+  }
+  .mail-workspace:not([data-folder="Reminders"]):not([data-folder="Scheduled"]) .mail-row .row-actions {
+    margin-left: 14px;
+    justify-content: flex-end;
+  }
 }
 .thread-mailbox-origin { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font: 13px/20px "Helvetica Neue", sans-serif; }
 .message-body-loading { padding: 16px 0; opacity: 0.7; }
