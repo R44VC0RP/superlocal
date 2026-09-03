@@ -1,5 +1,7 @@
 import { useEffectEvent, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
 
+export type MessageCanvasColor = readonly [number, number, number];
+
 type MessageBodyProps = {
   html: string;
   text?: string;
@@ -9,7 +11,55 @@ type MessageBodyProps = {
   onActivate: () => void;
   onKeyboard: (event: KeyboardEvent) => void;
   onImageSettings: () => void;
+  onCanvasColor: (color: MessageCanvasColor | null) => void;
 };
+
+function canvasColor(doc: Document): MessageCanvasColor | null {
+  const view = doc.defaultView;
+  if (!view || !doc.documentElement.clientWidth) return null;
+  const width = doc.documentElement.clientWidth;
+  const height = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
+  const coversCanvas = (element: Element) => {
+    const bounds = element.getBoundingClientRect();
+    return bounds.left <= 2 && bounds.top <= 2 && bounds.right >= width - 2 && bounds.bottom >= height - 2;
+  };
+  const rgba = (value: string) => {
+    const match = /^rgba?\(([\d.,\s]+)\)$/.exec(value);
+    const channels = match?.[1].split(",").map(Number);
+    if (!channels || (channels.length !== 3 && channels.length !== 4)
+      || channels.some((channel, index) => !Number.isFinite(channel) || channel < 0 || channel > (index === 3 ? 1 : 255))) return null;
+    return [...channels.slice(0, 3), channels[3] ?? 1];
+  };
+  let color: MessageCanvasColor | null = null;
+  let element: Element = doc.documentElement;
+  // Follow only a single full-canvas wrapper chain, never banners, links or images.
+  for (let depth = 0; depth < 12; depth++) {
+    const style = view.getComputedStyle(element);
+    if (style.opacity !== "1" || style.filter !== "none" || style.mixBlendMode !== "normal"
+      || style.transform !== "none" || style.visibility !== "visible") return null;
+    const background = rgba(style.backgroundColor);
+    if (!background || style.backgroundImage !== "none") color = null;
+    else if (background[3] === 1) color = [background[0], background[1], background[2]];
+    else if (background[3] > 0 && color) {
+      const mixed: number[] = color.map((channel, index) => background[index] * background[3] + channel * (1 - background[3]));
+      color = [mixed[0], mixed[1], mixed[2]];
+    }
+    if (element === doc.documentElement) {
+      // CSS propagates the body's background to a transparent root canvas.
+      if (!coversCanvas(doc.body) && !(background?.[3] === 0 && style.backgroundImage === "none")) break;
+      element = doc.body;
+      continue;
+    }
+    if (element.childElementCount > 100) break;
+    const wrappers = Array.from(element.children).filter(child =>
+      /^(DIV|TABLE|TBODY|TR|TD|CENTER|SECTION|MAIN|ARTICLE)$/.test(child.tagName) && coversCanvas(child));
+    if (wrappers.length !== 1) break;
+    const position = view.getComputedStyle(wrappers[0]).position;
+    if (position === "absolute" || position === "fixed") break;
+    element = wrappers[0];
+  }
+  return color;
+}
 
 function linkedText(text: string): ReactNode[] {
   const result: ReactNode[] = [];
@@ -119,16 +169,18 @@ function emailDocument(html: string, styles: string, fontSize: string) {
   return { id, html: `<!doctype html>${doc.documentElement.outerHTML}`, blockedImages };
 }
 
-export default function MessageBody({ html, text = "", format, styles = "", fontSize, onActivate, onKeyboard, onImageSettings }: MessageBodyProps) {
+export default function MessageBody({ html, text = "", format, styles = "", fontSize, onActivate, onKeyboard, onImageSettings, onCanvasColor }: MessageBodyProps) {
   const frame = useRef<HTMLIFrameElement>(null);
   const cleanup = useRef<() => void>(() => {});
   const activate = useEffectEvent(onActivate);
   const keyboard = useEffectEvent(onKeyboard);
+  const reportCanvas = useEffectEvent(onCanvasColor);
   const plain = format === "text";
   const document = useMemo(() => plain ? null : emailDocument(html, styles, fontSize), [plain, html, styles, fontSize]);
   const content = useMemo(() => plain ? linkedText(text) : null, [plain, text]);
 
   useLayoutEffect(() => {
+    reportCanvas(null);
     if (!document) return;
     let waiting = 0;
     const attach = () => {
@@ -156,6 +208,7 @@ export default function MessageBody({ html, text = "", format, styles = "", font
       element.style.height = `${height}px`;
       const scrollbar = Math.max(0, (element.contentWindow?.innerHeight ?? height) - doc.documentElement.clientHeight);
       if (scrollbar) element.style.height = `${height + scrollbar}px`;
+      reportCanvas(canvasColor(doc));
     };
     const schedule = () => { if (!pending && !disposed) pending = requestAnimationFrame(measure); };
     const bodySize = new ResizeObserver(schedule);

@@ -7,7 +7,7 @@ import {
   type CSSProperties,
 } from "react";
 import Composer from "./Composer";
-import MessageBody from "./MessageBody";
+import MessageBody, { type MessageCanvasColor } from "./MessageBody";
 import { Icon, IconButton } from "./components";
 import {
   displayDate,
@@ -28,6 +28,33 @@ type ThreadComment = {
   body: string;
   createdAt: string;
 };
+
+function messageCanvasStyle(background: MessageCanvasColor): CSSProperties {
+  const luminance = (color: readonly number[]) => color.reduce((sum, channel, index) => {
+    const value = channel / 255;
+    return sum + (value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4) * [0.2126, 0.7152, 0.0722][index];
+  }, 0);
+  const light = luminance(background);
+  const ink = (light + 0.05) / 0.05 >= 1.05 / (light + 0.05) ? 0 : 255;
+  const blend = (target: number, amount: number) => background.map(channel => Math.round(channel * (1 - amount) + target * amount));
+  const contrast = (color: readonly number[]) => ink === 0 ? (luminance(color) + 0.05) / 0.05 : 1.05 / (luminance(color) + 0.05);
+  let hover = blend(ink, 0.08);
+  if (contrast(hover) < 4.5) hover = blend(255 - ink, 0.08);
+  const surface = ink === 0 ? Math.min(light, luminance(hover)) : Math.max(light, luminance(hover));
+  const foreground = (ratio: number) => {
+    const value = ink === 0 ? Math.max(0, (surface + 0.05) / ratio - 0.05) : Math.min(1, (surface + 0.05) * ratio - 0.05);
+    // Neutral OKLCH lightness is the cube root of linear luminance.
+    return `oklch(${Number(Math.cbrt(value).toFixed(3))} 0 0)`;
+  };
+  const css = (color: readonly number[]) => `rgb(${color.map(channel => Math.round(channel)).join(" ")})`;
+  return {
+    "--message-canvas": css(background),
+    "--message-foreground": foreground(12),
+    "--message-secondary": foreground(6),
+    "--message-hover": css(hover),
+    "--message-border": css(blend(ink, 0.22)),
+  } as CSSProperties;
+}
 
 type ThreadViewProps = {
   mail: Mail;
@@ -80,6 +107,7 @@ export default function ThreadView({
     mail.messages.at(-1)?.id || "",
   ]);
   const [details, setDetails] = useState<string[]>([]);
+  const [messageCanvases, setMessageCanvases] = useState<Record<string, MessageCanvasColor | null>>({});
   const [response, setResponse] = useState("");
   const [replyFocused, setReplyFocused] = useState(false);
   const [pendingCommentDelete, setPendingCommentDelete] = useState<string | null>(null);
@@ -185,6 +213,7 @@ export default function ThreadView({
 
   useLayoutEffect(() => {
     setExpanded([mail.messages.at(-1)?.id || ""]);
+    setMessageCanvases({});
     revealedReply.current = "";
     setPendingCommentDelete(null);
     activeMessage.current = mail.messages.at(-1)?.id || "";
@@ -567,6 +596,7 @@ export default function ThreadView({
           {mail.messages.map((message, index) => {
             const open = expanded.includes(message.id) || !!replyResult && message.id === replyResult.id && revealedReply.current !== replyFocusKey;
             const showDetails = details.includes(message.id);
+            const canvas = open && message.loaded !== false && message.bodyFormat !== "text" ? messageCanvases[message.id] : null;
             const sent =
               message.outgoing ?? (message.email === account || message.email === mail.account);
             const isInvitation =
@@ -578,6 +608,8 @@ export default function ThreadView({
                 data-thread-message={message.id}
                 data-send-operation={message.operationId}
                 data-send-status={message.sendStatus}
+                data-message-canvas={canvas ? "" : undefined}
+                style={canvas ? messageCanvasStyle(canvas) : undefined}
                 tabIndex={-1}
                 onFocusCapture={() => {
                   activeMessage.current = message.id;
@@ -728,6 +760,11 @@ export default function ThreadView({
                         onActivate={() => { activeMessage.current = message.id; }}
                         onKeyboard={event => bodyKeyboard(event, message.id)}
                         onImageSettings={onImageSettings}
+                        onCanvasColor={color => setMessageCanvases(all => {
+                          const previous = all[message.id];
+                          if (previous === color || previous && color && previous.every((channel, index) => channel === color[index])) return all;
+                          return { ...all, [message.id]: color };
+                        })}
                       />
                     )}
                     {isInvitation && (

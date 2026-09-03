@@ -1085,7 +1085,7 @@
 .thread-message.is-expanded {
   position: relative;
   padding: 9px calc(2 * var(--reader-unit)) 24px;
-  background: var(--panel);
+  background: var(--message-canvas, var(--panel));
   box-shadow:
     inset 0.15px 0.5px 0 rgba(255, 255, 255, 0.06),
     0 6px 32px rgba(0, 0, 0, 0.1);
@@ -1440,6 +1440,32 @@
 }
 [data-theme="light"] .message-menu {
   background: var(--panel);
+}
+.thread-message[data-message-canvas] {
+  --text: var(--message-foreground);
+  --muted: var(--message-secondary);
+  --subtle: var(--message-secondary);
+  --hover: var(--message-hover);
+  --border: var(--message-border);
+  color: var(--text);
+}
+.message-view .thread-message[data-message-canvas] .thread-sender-name,
+.thread-message[data-message-canvas] .message-image-policy button,
+.thread-message[data-message-canvas] .thread-read-status.is-read {
+  color: var(--text);
+}
+.message-view .thread-message[data-message-canvas] .icon-button {
+  color: var(--muted);
+}
+.message-view .thread-message[data-message-canvas] .icon-button:hover {
+  color: var(--text);
+}
+.message-view .thread-message[data-message-canvas] :is(button, a):focus-visible {
+  outline-color: var(--text);
+}
+.thread-message[data-message-canvas] .message-attachment,
+.thread-message[data-message-canvas] .thread-invitation button:not(.is-selected) {
+  border-color: var(--border);
 }
 @media (max-width: 1680px) {
   .message-view {
