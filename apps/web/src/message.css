@@ -120,7 +120,7 @@
 .thread-back-gutter {
   position: absolute;
   inset: 0 auto 0 0;
-  width: var(--back-gutter-width, var(--reader-gutter));
+  width: calc(var(--back-gutter-width, var(--reader-gutter)) * 0.25);
   padding: 0;
   border: 0;
   border-radius: 0;
@@ -151,7 +151,8 @@
   width: 32px;
   height: 32px;
   border-radius: 50%;
-  pointer-events: none;
+  /* Keep the visible arrow clickable when a narrow gutter ends before it. */
+  pointer-events: auto;
   transition: background-color 150ms ease-out, transform 120ms ease-out;
 }
 .thread-back-gutter:hover::before,
