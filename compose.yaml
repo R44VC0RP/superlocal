@@ -1,0 +1,24 @@
+services:
+  superlocal:
+    build: .
+    image: superlocal:local
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      # The host remains local-only until public authentication is implemented.
+      - "127.0.0.1:${SUPERLOCAL_DOCKER_PORT:-5178}:5178"
+    environment:
+      SUPERLOCAL_CONFIG: /persist/superlocal.local.json
+      SUPERLOCAL_DATA_DIR: /persist/data
+      SUPERLOCAL_WEB_BIND: 0.0.0.0
+      SUPERLOCAL_WEB_ORIGIN: "http://localhost:${SUPERLOCAL_DOCKER_PORT:-5178}"
+      SUPERLOCAL_GOOGLE_CLIENT_ID: "${SUPERLOCAL_GOOGLE_CLIENT_ID:-}"
+      SUPERLOCAL_GOOGLE_CLIENT_SECRET: "${SUPERLOCAL_GOOGLE_CLIENT_SECRET:-}"
+    volumes:
+      - state:/persist
+
+volumes:
+  state:
+    # Stable across rebuilds and Compose project/directory names.
+    name: "${SUPERLOCAL_VOLUME_NAME:-superlocal-state}"

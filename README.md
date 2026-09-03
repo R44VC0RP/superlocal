@@ -22,6 +22,42 @@ The first run starts two fictional mailboxes through the real Inbox SDK. No prov
 
 `start` builds and serves the optimized client locally. Use `bun --no-env-file run dev` for hot-reloading development; development-mode React diagnostics add overhead on large mailboxes. Both commands keep the same local-only host, sessions, and provider configuration.
 
+## Docker with persistent storage
+
+Run `docker compose up -d --build --wait`, then open **http://localhost:5178**.
+The image contains the built app, not your configuration or mail. On first run,
+the app creates a fictional installation in the named volume **`superlocal-state`**:
+
+```text
+/persist/superlocal.local.json
+/persist/data/mock/             # Fictional mail, databases and generated keys
+/persist/data/real/             # Created when real mode is selected
+```
+
+Each mode keeps `host.sqlite`, its mail database(s), `runtime-secrets.json` and
+SQLite journals together. Configure real providers in the retained config as
+described below; **never replace its instance ID or keys during an update**.
+Google OAuth client secrets can be supplied through the same explicit environment
+variables used locally. They are runtime inputs, not image build arguments.
+
+After updating the checkout, run `docker compose up -d --build --wait` again.
+Compose replaces the app container and reattaches the same volume. A hosting
+platform's Git-triggered redeploy must likewise retain this volume at `/persist`;
+no GitHub deployment workflow or remote host is configured by these files.
+`docker compose down` retains the volume; **do not use `down -v` or delete the
+volume when updating**. Back up config, databases and keys together with the app
+stopped. Existing Mac installations are not imported automatically.
+
+Set `SUPERLOCAL_DOCKER_PORT` to use another local port and `SUPERLOCAL_VOLUME_NAME`
+only for a deliberately separate installation. Do not run two app instances on
+the same volume. Named volumes are initialized for the image's non-root `bun`
+user; a bind-mount replacement must be owned by that user's UID/GID (1000:1000),
+with private directories and `0600` config/key files.
+
+Only the web port is published, on host loopback. The backend stays inside the
+container. Public hosting/authentication is unchanged. Browser-local settings
+and recovery copies remain in the browser; this volume preserves server state.
+
 ## One inbox, separate mailboxes
 
 - **Unified by default.** Every added mailbox joins the unified view. Choose a smaller selection in **Settings → Mailboxes** when you want one.

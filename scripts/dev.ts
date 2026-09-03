@@ -28,6 +28,10 @@ process.on('SIGTERM', signal)
 
 try {
   const config = loadLocalConfig()
+  const webBind = process.env.SUPERLOCAL_WEB_BIND ?? '127.0.0.1'
+  if (!['127.0.0.1', '0.0.0.0'].includes(webBind)) {
+    throw new LocalConfigurationError('LOCAL_WEB_BIND_INVALID', 'Use 127.0.0.1 or 0.0.0.0 for SUPERLOCAL_WEB_BIND.')
+  }
   const webDir = join(ROOT_DIR, 'apps', 'web')
   if (built && !await Bun.file(join(webDir, 'dist', 'index.html')).exists()) {
     throw new LocalConfigurationError('LOCAL_WEB_BUILD_MISSING', 'Build the optimized local client with bun --no-env-file run start.')
@@ -44,7 +48,7 @@ try {
     }
     Object.assign(env, { NODE_ENV: built ? 'production' : 'development', SUPERLOCAL_API_ORIGIN: `http://127.0.0.1:${service.server.port}`,
       SUPERLOCAL_WEB_PORT: String(config.web.port), SUPERLOCAL_WEB_ORIGIN: config.web.origin, SUPERLOCAL_CONFIG: config.configPath })
-    web = Bun.spawn([process.execPath, '--no-env-file', vite, ...(built ? ['preview'] : []), '--host', '127.0.0.1', '--port', String(config.web.port), '--strictPort'], {
+    web = Bun.spawn([process.execPath, '--no-env-file', vite, ...(built ? ['preview'] : []), '--host', webBind, '--port', String(config.web.port), '--strictPort'], {
       cwd: webDir, env, stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
     })
     console.info(`Superlocal (${config.mode}, ${built ? 'optimized local UI' : 'development UI'}): ${config.web.origin}\nConfiguration: ${config.configPath}\nCtrl-C stops the web server and drains the local SDK host.`)
