@@ -6,6 +6,7 @@ import { Context, Effect, Either, Fiber, Layer, ManagedRuntime, Schedule } from 
 import { createCredentialCrypto } from '../server/crypto'
 import { sanitizeEmailBody } from '../server/sanitize'
 import { createMediaStore } from './media'
+import { mailPreview } from './mail-preview'
 import { ProviderError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
 import { CredentialError, InboxError, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
   type DraftInput, type Folder, type Inbox, type InboxOptions, type Label, type Message,
@@ -104,6 +105,12 @@ export function createInbox(options: InboxOptions): Inbox {
   db.query('INSERT OR IGNORE INTO sdk_meta VALUES (?,?)').run('epoch', randomUUID())
   const epoch = db.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='epoch'").get()!.value
   const now = options.now ?? Date.now
+  // Capture only the existing indexed ID boundary, never bodies at startup.
+  // New ingestion already derives previews and needs no historical repair.
+  type PreviewRepair = { through: string; after: string; deferred: string[]; retryAt: number; done: boolean; fallbacks: number }
+  db.query(`INSERT OR IGNORE INTO sdk_meta(key,value) SELECT 'mail-preview-v1',
+    json_object('through',coalesce(max(id),''),'after','','deferred',json('[]'),'retryAt',0,'done',CASE WHEN max(id) IS NULL THEN json('true') ELSE json('false') END,'fallbacks',0)
+    FROM sdk_messages`).run()
   // Existing source IDs and encrypted envelopes remain valid; each gets one isolated grant.
   db.transaction(() => {
     const sources = db.query<AccountRow, []>('SELECT * FROM sdk_accounts').all()
@@ -755,7 +762,7 @@ export function createInbox(options: InboxOptions): Inbox {
       return info
     })
     const summary: MessageSummary = { id, accountId: row.id, threadId, revision: 1,
-      from: mail.from, to: mail.to, cc: mail.cc, subject: mail.subject, preview: mail.preview.slice(0, 256), receivedAt: mail.receivedAt,
+      from: mail.from, to: mail.to, cc: mail.cc, subject: mail.subject, preview: mailPreview(mail), receivedAt: mail.receivedAt,
       isRead: mail.isRead, isStarred: mail.isStarred, folder: mail.folder, folderIds,
       labelIds: [], hasAttachments: attachments.length > 0, snoozedUntil: null }
     const body = JSON.stringify({ bcc: mail.bcc, bodyText: mail.bodyText, bodyHtml: mail.bodyHtml, attachments,
@@ -775,6 +782,103 @@ export function createInbox(options: InboxOptions): Inbox {
   }
 
   function summary(row: MessageRow): MessageSummary { return JSON.parse(row.visible) }
+
+  function repairPreviews(): void {
+    const saved = db.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!
+    const initial = JSON.parse(saved.value) as PreviewRepair
+    if (initial.done || initial.retryAt > now() && (initial.after >= initial.through || initial.deferred.length >= 128)) return
+    transaction(() => {
+      // Other instances can finish a batch between our cheap check and this lock.
+      if (db.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()?.value !== saved.value) return
+      const state = initial
+      const started = performance.now()
+      const byteBudget = 1024 * 1024
+      let bytes = 0, attempts = 0
+      // Inspect a bounded active queue once, not all account payloads per message.
+      // On overflow, defer conservatively rather than overlook an active writer.
+      const active = db.query<{ id: string; owner: string; account: string; generation: number; bytes: number }, []>(`SELECT id,owner,account,generation,length(CAST(payload AS BLOB)) bytes
+        FROM sdk_operations WHERE type='mutation' AND status IN ('pending','processing') LIMIT 33`).all()
+      const blocked = new Set<string>()
+      const uncertain = active.length > 32 || active.reduce((sum, row) => sum + row.bytes, 0) > 128 * 1024
+      if (!uncertain) for (const op of active) {
+        const payload = db.query<{ payload: string }, [string]>('SELECT payload FROM sdk_operations WHERE id=?').get(op.id)!.payload
+        bytes += op.bytes
+        for (const id of (JSON.parse(payload) as MutationPayload).input.messageIds) blocked.add(JSON.stringify([op.owner, op.account, op.generation, id]))
+      }
+      const attempt = (id: string): 'done' | 'defer' | 'budget' => {
+        attempts++
+        const meta = db.query<{ owner: string; account: string; generation: number; revision: number; deleted: number; bodyBytes: number; summaryBytes: number; currentGeneration: number; status: string; attached: number }, [string]>(`SELECT m.owner,m.account,m.generation,m.revision,m.deleted,
+          length(CAST(m.body AS BLOB)) bodyBytes,length(CAST(m.confirmed AS BLOB))+length(CAST(m.visible AS BLOB)) summaryBytes,a.generation currentGeneration,a.status,
+          EXISTS(SELECT 1 FROM sdk_memberships v JOIN sdk_mailboxes b ON b.id=v.mailbox AND b.owner=v.owner AND b.source=v.source
+            WHERE v.message=m.id AND v.owner=m.owner AND v.source=m.account AND json_extract(b.data,'$.status')<>'detached') attached
+          FROM sdk_messages m JOIN sdk_accounts a ON a.id=m.account AND a.owner=m.owner WHERE m.id=?`).get(id)
+        if (!meta || meta.deleted) return 'done'
+        if (meta.generation !== meta.currentGeneration || meta.status !== 'connected' || !meta.attached || uncertain || blocked.has(JSON.stringify([meta.owner, meta.account, meta.generation, id]))) return 'defer'
+        // Oversized summaries are left intact. Oversized bodies get only the
+        // bounded existing-preview fallback; neither is reported as full repair.
+        if (meta.summaryBytes > 64 * 1024) { state.fallbacks++; return 'done' }
+        const full = meta.bodyBytes <= 512 * 1024
+        const size = meta.summaryBytes + (full ? meta.bodyBytes : 0)
+        if (bytes + size > byteBudget) return 'budget'
+        bytes += size
+        const row = db.query<{ confirmed: string; visible: string; body: string | null }, [string, string, string, number, number]>(`SELECT confirmed,visible,${full ? 'body' : 'NULL body'} FROM sdk_messages
+          WHERE id=? AND owner=? AND account=? AND generation=? AND revision=? AND deleted=0`).get(id, meta.owner, meta.account, meta.generation, meta.revision)
+        if (!row) return 'defer'
+        let confirmed: MessageSummary, visible: MessageSummary
+        try { confirmed = JSON.parse(row.confirmed); visible = JSON.parse(row.visible) }
+        catch { state.fallbacks++; return 'done' }
+        if (!confirmed || typeof confirmed !== 'object' || Array.isArray(confirmed) || !visible || typeof visible !== 'object' || Array.isArray(visible)) { state.fallbacks++; return 'done' }
+        let body: { bodyText?: string; bodyHtml?: string } | undefined
+        if (row.body !== null) {
+          try { body = JSON.parse(row.body) }
+          catch { /* Keep malformed historical bodies untouched; clean only the preview. */ }
+        }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) { body = undefined; state.fallbacks++ }
+        const preview = mailPreview(body ? { bodyText: typeof body.bodyText === 'string' ? body.bodyText : undefined, bodyHtml: typeof body.bodyHtml === 'string' ? body.bodyHtml : undefined,
+          preview: typeof confirmed.preview === 'string' ? confirmed.preview : undefined, subject: typeof confirmed.subject === 'string' ? confirmed.subject : undefined,
+          from: typeof confirmed.from?.name === 'string' ? { name: confirmed.from.name } : undefined }
+          : { preview: typeof confirmed.preview === 'string' ? confirmed.preview.slice(0, 4096) : '' })
+        const changed = visible.preview !== preview
+        if (confirmed.preview === preview && !changed) return 'done'
+        confirmed.preview = preview
+        visible.preview = preview
+        if (changed) visible.revision = meta.revision + 1
+        // Read/extraction and the conditional write share this short transaction:
+        // no body, scope, generation or active operation can change between them.
+        const result = db.query(`UPDATE sdk_messages SET confirmed=?,visible=?,revision=?
+          WHERE id=? AND owner=? AND account=? AND generation=? AND revision=? AND deleted=0
+            AND EXISTS(SELECT 1 FROM sdk_accounts a WHERE a.id=sdk_messages.account AND a.owner=sdk_messages.owner AND a.generation=sdk_messages.generation AND a.status='connected')
+            AND EXISTS(SELECT 1 FROM sdk_memberships v JOIN sdk_mailboxes b ON b.id=v.mailbox AND b.owner=v.owner AND b.source=v.source
+              WHERE v.message=sdk_messages.id AND v.owner=sdk_messages.owner AND v.source=sdk_messages.account AND json_extract(b.data,'$.status')<>'detached')`).run(
+          JSON.stringify(confirmed), JSON.stringify(visible), changed ? meta.revision + 1 : meta.revision, id, meta.owner, meta.account, meta.generation, meta.revision)
+        if (!result.changes) return 'defer'
+        if (changed) event(meta.owner, 'mail.changed', meta.account, id, 'updated', 'backfill')
+        return 'done'
+      }
+      const timeLeft = () => attempts === 0 || performance.now() - started < 8
+      const retries = state.retryAt <= now() ? Math.min(state.deferred.length, state.deferred.length >= 128 || state.after >= state.through ? 16 : 4) : 0
+      for (let i = 0; i < retries && attempts < 16 && timeLeft(); i++) {
+        const id = state.deferred.shift()!
+        const result = attempt(id)
+        if (result !== 'done') state.deferred.push(id)
+        if (result === 'budget') break
+      }
+      if (attempts < 16 && timeLeft() && state.deferred.length < 128 && state.after < state.through) {
+        const ids = db.query<{ id: string }, [string, string, number]>('SELECT id FROM sdk_messages WHERE id>? AND id<=? ORDER BY id LIMIT ?').all(state.after, state.through, 16 - attempts)
+        if (!ids.length) state.after = state.through
+        for (const { id } of ids) {
+          if (attempts >= 16 || !timeLeft() || state.deferred.length >= 128) break
+          const result = attempt(id)
+          if (result === 'budget') break
+          if (result === 'defer') state.deferred.push(id)
+          state.after = id
+        }
+      }
+      state.retryAt = state.deferred.length ? now() + 1000 : 0
+      state.done = state.after >= state.through && state.deferred.length === 0
+      db.query("UPDATE sdk_meta SET value=? WHERE key='mail-preview-v1' AND value=?").run(JSON.stringify(state), saved.value)
+    })
+  }
 
   function where(owner: string, query: Query, mailboxMode = false): { sql: string; params: Array<string | number> } {
     ownerId(owner)
@@ -1891,6 +1995,7 @@ export function createInbox(options: InboxOptions): Inbox {
       if (due) return due
       due = run(async () => {
         for (let batch = 0; batch < Math.ceil(100 / concurrency); batch++) if (await processDue() === 0) break
+        if (!stopping) repairPreviews()
       }).finally(() => { due = undefined })
       return due
     },
