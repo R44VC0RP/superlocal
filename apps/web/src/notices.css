@@ -1,0 +1,86 @@
+/* One fixed, bottom-anchored stack shares the toast's position so floating
+   notices never overlap each other or shift the header, list, or reader. */
+.notice-stack {
+  position: fixed;
+  left: calc(46px + 1.75 * var(--layout-unit));
+  bottom: 32px;
+  z-index: 120;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: calc(100vw - 80px);
+  pointer-events: none;
+}
+.notice-stack > *,
+.notice-list > * {
+  pointer-events: auto;
+}
+.notice-stack > .toast {
+  position: static;
+}
+.notice-list {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 100%;
+}
+.notice-list:empty {
+  display: none;
+}
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: min(640px, 100%);
+  min-height: 48px;
+  padding-left: calc(1.75 * var(--layout-unit));
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 6px 30px 2px #0003;
+  color: var(--text);
+  font-size: var(--ui-small);
+  letter-spacing: var(--ui-tracking);
+}
+.notice-quiet {
+  color: var(--muted);
+}
+.notice-text {
+  margin: 0;
+  padding: 12px 0;
+  line-height: 16px;
+  min-width: 0;
+}
+.notice-detail {
+  color: var(--muted);
+}
+.notice-action {
+  flex: 0 0 auto;
+  align-self: stretch;
+  padding: 0 var(--layout-unit);
+  color: var(--link-border);
+  white-space: nowrap;
+}
+.notice-close.icon-button {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  padding: 10px;
+  margin-right: 4px;
+}
+.notice-text + .notice-close.icon-button {
+  margin-left: 8px;
+}
+.app:has(.empty-mailbox.inbox-zero) .notice-stack {
+  bottom: 68px;
+}
+@media (max-width: 700px) {
+  .notice-stack {
+    max-width: calc(100vw - 30px);
+  }
+  .notice-text {
+    line-height: 18px;
+  }
+}

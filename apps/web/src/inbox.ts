@@ -14,6 +14,20 @@ import type { SenderHistoryMessage } from "./sender-context";
 type Edit = { draft: Draft; revision: number; version: number; error?: string };
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
 type Sending = { ref: SendReference; operation: Operation; draft: SdkDraft };
+/** A coalesced background problem. Repeats of the same key update one issue instead of adding another notice. */
+export type InboxIssue = {
+  key: string;
+  scope: "snapshot" | "live" | "thread" | "draft" | "storage";
+  code: string;
+  title: string;
+  detail?: string;
+  /** Whether the generic Retry (refresh and reconnect, never a resend) applies. */
+  retry: boolean;
+  count: number;
+  since: number;
+  updatedAt: number;
+  dismissed: boolean;
+};
 export type InboxSnapshot = {
   accounts: MailboxOption[];
   mailboxes: Mailbox[];
@@ -24,16 +38,31 @@ export type InboxSnapshot = {
   drafts: Draft[];
   labels: Record<string, string[]>;
   loading: boolean;
+  /** A snapshot has loaded at least once; later failures keep the cached mail. */
+  loaded: boolean;
   refreshing: boolean;
   pending: number;
   unsaved: boolean;
+  /** The latest snapshot (connect/refresh) failure, or null once a refresh succeeds. */
   error: string | null;
+  issues: InboxIssue[];
+  live: "connecting" | "live" | "polling";
   policy: Policy | null;
   host: HostConfiguration | null;
   operations: Readonly<Record<string, Operation>>;
 };
 
-const initial: InboxSnapshot = { accounts: [], mailboxes: [], sources: [], viewPreferences: null, mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, refreshing: false, pending: 0, unsaved: false, error: null, policy: null, host: null, operations: {} };
+const initial: InboxSnapshot = { accounts: [], mailboxes: [], sources: [], viewPreferences: null, mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, loaded: false, refreshing: false, pending: 0, unsaved: false, error: null, issues: [], live: "connecting", policy: null, host: null, operations: {} };
+const MAX_ISSUES = 4;
+/** A problem stays visible until its recovery has held this long, so ready/error flapping never re-announces. */
+const RESOLVE_HOLD_MS = 10_000;
+/** A dismissed problem that recurs within this window starts hidden instead of reopening. */
+const DISMISSAL_MEMORY_MS = 5 * 60_000;
+/** Change-history polling cadence while the event stream is unavailable. */
+const POLL_MS = 30_000;
+const MAX_BACKOFF_MS = 60_000;
+/** A stream counts as healthy only after staying open this long; ready/close flapping neither refreshes nor recovers. */
+const STREAM_HEALTHY_MS = 5000;
 const recoveryKey = "sdk-draft-recovery";
 const outboxKey = "sdk-outbox-references";
 const formatAddress = (person: Participant) => person.name && person.name !== person.email
@@ -52,6 +81,17 @@ const pause = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, r
   const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
   if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true });
 });
+const failureCode = (error: unknown) => error instanceof ApiError ? error.code : error instanceof TypeError ? "NETWORK" : "ERROR";
+// API problems carry only the server's generic wording; a fetch TypeError would leak browser phrasing.
+const failureMessage = (error: unknown) => error instanceof ApiError ? error.message : error instanceof Error && !(error instanceof TypeError) ? error.message : "The inbox could not be reached.";
+const retryAfter = (error: unknown) => {
+  const hint = error instanceof ApiError ? error.retryAfterMs : undefined;
+  return typeof hint === "number" && Number.isFinite(hint) && hint > 0 ? Math.min(hint, 2147483647) : 0;
+};
+const liveDetail = (code: string) => code === "STREAM_LIMIT"
+  ? "Too many open connections. Checking for new mail every 30 seconds."
+  : code === "UNAUTHENTICATED" ? "Sign in through the host application to resume live updates."
+  : "Reconnecting automatically. Checking for new mail every 30 seconds.";
 
 // Message reads are sanitized by the SDK. Drafts are editable input, so constrain their HTML separately.
 function draftHtml(value: string): string {
@@ -119,6 +159,10 @@ export class InboxStore {
   private loadingThreads = new Map<string, Promise<void>>();
   private recovery = readSaved<Record<string, { draft: Draft; revision: number }>>(recoveryKey, {});
   private references = readSaved<SendReference[]>(outboxKey, []).filter(ref => ref && [ref.id, ref.draftId, ref.accountId, ref.mailboxId].every(value => typeof value === "string"));
+  private issueHolds = new Map<string, ReturnType<typeof setTimeout>>();
+  private dismissals = new Map<string, number>();
+  private following = false;
+  private wake?: () => void;
   readonly client: InboxClient;
 
   constructor() {
@@ -142,10 +186,44 @@ export class InboxStore {
   private requestOptions() { return { signal: this.controller.signal }; }
   private fail(error: unknown, action: string) {
     if (this.controller.signal.aborted || error instanceof DOMException && error.name === "AbortError") return;
-    const code = error instanceof ApiError ? error.code : "NETWORK";
+    const code = failureCode(error);
     console.warn({ event: "inbox.action", action, code });
-    this.publish({ loading: false, refreshing: false, error: error instanceof ApiError ? `${error.message} (${error.code})` : error instanceof Error ? error.message : "The inbox could not be reached." });
+    const detail = failureMessage(error);
+    if (action === "connect" || action === "refresh" || action === "retry") {
+      this.publish({ loading: false, refreshing: false, error: detail });
+      this.raise({ scope: "snapshot", code, title: this.state.loaded ? "Couldn't refresh the inbox" : "Couldn't open the inbox", detail, retry: true });
+    } else if (action === "read") this.raise({ scope: "thread", code, title: "Couldn't load this conversation", detail, retry: true });
+    else if (action === "save-draft") this.raise({ scope: "draft", code, title: "Draft not saved", detail, retry: false });
+    // Other actions are user-initiated: their caller shows the failure once, so no persistent notice is added.
   }
+  private raise(issue: Pick<InboxIssue, "scope" | "code" | "title" | "retry"> & { detail?: string }) {
+    if (this.controller.signal.aborted) return;
+    // One slot per problem: live updates, the snapshot, the open conversation, and the draft each stay a single notice whatever the code.
+    const key = issue.scope === "storage" ? `storage:${issue.code}` : issue.scope, now = Date.now();
+    clearTimeout(this.issueHolds.get(key)); this.issueHolds.delete(key);
+    const existing = this.state.issues.find(item => item.key === key);
+    if (existing) {
+      this.publish({ issues: this.state.issues.map(item => item.key === key ? { ...item, code: issue.code, title: issue.title, detail: issue.detail, retry: issue.retry, count: item.count + 1, updatedAt: now } : item) });
+      return;
+    }
+    const dismissedAt = this.dismissals.get(key);
+    const next: InboxIssue = { key, scope: issue.scope, code: issue.code, title: issue.title, detail: issue.detail, retry: issue.retry, count: 1, since: now, updatedAt: now,
+      dismissed: dismissedAt !== undefined && now - dismissedAt < DISMISSAL_MEMORY_MS };
+    this.publish({ issues: [...this.state.issues, next].slice(-MAX_ISSUES) });
+  }
+  /** Marks a scope recovered. Its notices leave only after the recovery holds, so a quick relapse keeps the same quiet notice. */
+  private resolve(scope: InboxIssue["scope"]) {
+    for (const issue of this.state.issues) if (issue.scope === scope && !this.issueHolds.has(issue.key)) {
+      this.issueHolds.set(issue.key, setTimeout(() => {
+        this.issueHolds.delete(issue.key);
+        if (this.state.issues.some(item => item.key === issue.key)) this.publish({ issues: this.state.issues.filter(item => item.key !== issue.key) });
+      }, RESOLVE_HOLD_MS));
+    }
+  }
+  dismissIssue = (key: string) => {
+    this.dismissals.set(key, Date.now());
+    this.publish({ issues: this.state.issues.map(issue => issue.key === key ? { ...issue, dismissed: true } : issue) });
+  };
   private account(boxId: string) {
     const box = this.boxes.find(box => box.id === boxId);
     const source = this.sourceAccounts.find(account => account.id === box?.sourceId);
@@ -261,7 +339,7 @@ export class InboxStore {
   start = () => {
     this.controller = new AbortController(); this.started = true;
     const generation = ++this.generation;
-    const onFocus = () => { if (this.started && !this.state.loading && generation === this.generation) void this.refresh().catch(error => this.fail(error, "refresh")); };
+    const onFocus = () => { if (this.started && !this.state.loading && generation === this.generation) void this.retry(); };
     window.addEventListener("focus", onFocus);
     void (async () => {
       try {
@@ -282,21 +360,92 @@ export class InboxStore {
       this.started = false; this.generation++; this.controller.abort();
       clearTimeout(this.refreshTimer);
       for (const timer of this.saveTimers.values()) clearTimeout(timer);
-      this.saveTimers.clear(); this.refreshPromise = undefined;
+      for (const timer of this.issueHolds.values()) clearTimeout(timer);
+      this.saveTimers.clear(); this.issueHolds.clear(); this.refreshPromise = undefined;
+      this.wake?.();
     };
   };
 
+  /**
+   * One event-stream loop per store. A rejected or dropped stream backs off with
+   * jitter (bounded by MAX_BACKOFF_MS, never below the server's Retry-After) and
+   * polls durable change history meanwhile, instead of refreshing the whole
+   * snapshot every two seconds. Retry wakes the wait; ready resolves the notice.
+   */
   private async follow(generation: number) {
-    while (this.started && generation === this.generation) {
-      try {
-        for await (const event of this.client.events({ ...this.requestOptions(), reconnect: false })) {
-          if (generation !== this.generation) return;
-          if (event.type !== "ready") this.scheduleRefresh();
+    if (this.following) return;
+    this.following = true;
+    let attempt = 0, lastPoll = 0;
+    let cursor: string | undefined;
+    let healthy: ReturnType<typeof setTimeout> | undefined;
+    try {
+      while (this.started && generation === this.generation) {
+        const openedAt = Date.now();
+        let failure: unknown, failed = false;
+        try {
+          for await (const event of this.client.events({ ...this.requestOptions(), reconnect: false, ...(cursor ? { since: cursor } : {}) })) {
+            if (generation !== this.generation) return;
+            if (event.type === "ready") {
+              const firstBaseline = cursor === undefined;
+              cursor = event.state;
+              clearTimeout(healthy);
+              healthy = setTimeout(() => {
+                if (generation !== this.generation) return;
+                // Catch up once after a real interruption; a stream resumed from its cursor replays the rest itself.
+                if (attempt > 0 || firstBaseline) this.scheduleRefresh();
+                attempt = 0;
+                if (this.state.live !== "live") this.publish({ live: "live" });
+                this.resolve("live");
+              }, STREAM_HEALTHY_MS);
+            } else if ("state" in event) { cursor = event.state; this.scheduleRefresh(); }
+            else { cursor = event.id; this.scheduleRefresh(); }
+          }
+        } catch (error) { failure = error; failed = true; }
+        finally { clearTimeout(healthy); }
+        if (!this.started || generation !== this.generation || this.controller.signal.aborted) return;
+        // Streams rotate after five minutes; a stream that stayed healthy ends its incident, an error or immediate close backs off.
+        const lived = Date.now() - openedAt;
+        if (lived > STREAM_HEALTHY_MS) attempt = 0;
+        if (!failed && lived > STREAM_HEALTHY_MS) continue;
+        attempt++;
+        const code = failed ? failureCode(failure) : "STREAM_CLOSED";
+        const serverWait = retryAfter(failure);
+        const delay = Math.max(serverWait, Math.round(Math.min(MAX_BACKOFF_MS, 1000 * 2 ** Math.min(attempt - 1, 6) * (0.5 + Math.random()))));
+        console.warn({ event: "inbox.action", action: "events", code, attempt, delayMs: delay });
+        if (this.state.live !== "polling") this.publish({ live: "polling" });
+        this.raise({ scope: "live", code, title: "Live updates paused", detail: liveDetail(code), retry: true });
+        if (!lastPoll) lastPoll = Date.now();
+        const notBefore = Date.now() + serverWait;
+        const until = Date.now() + delay;
+        while (Date.now() < until) {
+          // A focus/Retry wake may shorten our own backoff, never the server's minimum wait.
+          if (await this.sleep(Math.min(until - Date.now(), 5000)) && Date.now() >= notBefore) break;
+          if (!this.started || generation !== this.generation) return;
+          if (Date.now() - lastPoll >= POLL_MS && document.visibilityState === "visible") {
+            lastPoll = Date.now();
+            try { cursor = await this.pollChanges(cursor); }
+            catch { /* The paused-stream notice already covers connectivity; polling stays quiet. */ }
+          }
         }
-      } catch (error) { if (generation === this.generation) this.fail(error, "events"); }
-      try { await pause(2000, this.controller.signal); if (generation === this.generation) await this.retry(); }
-      catch { if (this.controller.signal.aborted) return; }
-    }
+      }
+    } finally { this.following = false; }
+  }
+  /** Resolves true when Retry or focus asks for an immediate reconnect. */
+  private sleep(ms: number): Promise<boolean> {
+    return new Promise(resolve => {
+      const done = (woken: boolean) => { clearTimeout(timer); this.controller.signal.removeEventListener("abort", abort); this.wake = undefined; resolve(woken); };
+      const timer = setTimeout(() => done(false), ms);
+      const abort = () => done(false);
+      this.controller.signal.addEventListener("abort", abort, { once: true });
+      this.wake = () => done(true);
+    });
+  }
+  private async pollChanges(cursor?: string): Promise<string | undefined> {
+    const page = await this.client.changes({ ...(cursor ? { since: cursor } : {}), limit: 100 }, this.requestOptions());
+    // Without a cursor, changes() only returns a new baseline. Refresh once so
+    // arrivals between the original snapshot and this baseline cannot be lost.
+    if (!cursor || page.resetRequired || page.events.length) this.scheduleRefresh();
+    return page.resetRequired || !page.hasMore ? page.state : page.events.at(-1)?.id ?? page.state;
   }
   private scheduleRefresh() {
     clearTimeout(this.refreshTimer);
@@ -391,7 +540,8 @@ export class InboxStore {
         this.bodyEpoch++;
         this.details.clear();
       }
-      this.publish({ policy, host, viewPreferences, mailboxes: selected, sources: accounts, loading: false, refreshing: false, error: null }); this.rebuild();
+      this.publish({ policy, host, viewPreferences, mailboxes: selected, sources: accounts, loading: false, loaded: true, refreshing: false, error: null }); this.rebuild();
+      this.resolve("snapshot");
     })();
     this.refreshPromise = work.finally(() => { if (this.refreshPromise === finished) this.refreshPromise = undefined; });
     const finished = this.refreshPromise;
@@ -534,7 +684,7 @@ export class InboxStore {
         if (generation !== this.generation || bodyEpoch !== this.bodyEpoch) return;
         this.details.set(message.id, detail);
       }
-      this.rebuild();
+      this.rebuild(); this.resolve("thread");
     })().catch(error => { this.fail(error, "read"); throw error; }).finally(() => {
       this.loadingThreads.delete(id);
       if (generation === this.generation && bodyEpoch !== this.bodyEpoch) void this.loadThread(id).catch(() => {});
@@ -545,7 +695,8 @@ export class InboxStore {
   private saveRecovery() {
     const recovery = Object.fromEntries([...this.edits].map(([id, edit]) => [id, { draft: edit.draft, revision: edit.revision }]));
     this.recovery = recovery;
-    if (!writeSaved(recoveryKey, recovery)) this.publish({ error: "Browser recovery storage is full. Keep this draft open until it is saved to the inbox." });
+    if (!writeSaved(recoveryKey, recovery)) this.raise({ scope: "storage", code: "RECOVERY", title: "Browser storage is full", detail: "Keep this draft open until it is saved to the inbox.", retry: false });
+    else this.resolve("storage");
   }
   editDraft = (draft: Draft) => {
     const old = this.state.drafts.find(value => value.id === draft.id), raw = this.rawDrafts.get(draft.id);
@@ -596,7 +747,7 @@ export class InboxStore {
         const current = this.edits.get(id);
         if (current?.version === edit.version) this.edits.delete(id);
         else if (current) current.revision = saved.revision;
-        this.saveRecovery(); this.rebuild();
+        this.saveRecovery(); this.rebuild(); this.resolve("draft");
       }
       const saved = this.rawDrafts.get(id); if (!saved) throw new Error("This draft is no longer active."); return saved;
     })().catch(error => {
@@ -661,7 +812,7 @@ export class InboxStore {
     catch (error) { if (error instanceof ApiError && error.status >= 400 && error.status < 500) this.submissions.delete(draft.id); throw error; }
     const ref = { id: operation.id, draftId: raw.id, accountId: raw.accountId, mailboxId: raw.mailboxId || draft.account };
     this.references = [...this.references.filter(item => item.id !== ref.id), ref].slice(-200);
-    if (!writeSaved(outboxKey, this.references)) this.publish({ error: "The send is queued, but this browser could not save its operation reference." });
+    if (!writeSaved(outboxKey, this.references)) this.raise({ scope: "storage", code: "OUTBOX", title: "Browser storage is full", detail: "The send is queued, but this browser could not save its operation reference.", retry: false });
     this.draftEpoch++; this.rawDrafts.delete(raw.id); this.edits.delete(raw.id); this.saveRecovery();
     this.operations.set(operation.id, operation);
     this.sending.set(operation.id, { ref, operation, draft: raw }); this.rebuild(); this.scheduleRefresh();
@@ -834,7 +985,9 @@ export class InboxStore {
     }
     if (failed) throw new Error(`${failed} ${failed === 1 ? "source could" : "sources could"} not refresh. Cached mail is still available.`);
   });
+  /** Refreshes the snapshot (re-establishing the session if needed) and reconnects live updates now. Reads only; nothing is resent. */
   retry = async () => {
+    const generation = this.generation;
     try { await this.refresh(); }
     catch (error) {
       if (error instanceof ApiError && error.status === 401) {
@@ -842,8 +995,10 @@ export class InboxStore {
           const response = await fetch("/session", { method: "POST", credentials: "include", headers: { "X-Superlocal": "1" }, signal: this.controller.signal });
           if (!response.ok) throw new Error("Sign in through the host application before opening this inbox.");
           this.client.clearCache(); await this.refresh();
-        } catch (next) { this.fail(next, "connect"); }
-      } else this.fail(error, "retry");
+        } catch (next) { this.fail(next, "connect"); return; }
+      } else { this.fail(error, "retry"); return; }
     }
+    if (!this.started || generation !== this.generation) return;
+    if (this.following) this.wake?.(); else void this.follow(generation);
   };
 }

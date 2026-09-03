@@ -43,6 +43,8 @@ import { plainText } from "./mail-text";
 import { resolveMailShortcut } from "./mail-shortcuts";
 import MailCommandDialog, { type CommandItem } from "./MailCommandDialog";
 import IssueReporter from "./IssueReporter";
+import Notices, { Notice } from "./Notices";
+import type { InboxIssue } from "./inbox";
 import { captureIssueReport, type IssueReport } from "./issue-reports";
 import SenderContext from "./SenderContext";
 import { senderContact } from "./sender-context";
@@ -156,6 +158,8 @@ export default function App() {
   } | null>(null);
   const [noticeFading, setNoticeFading] = useState(false);
   const [noticeHovered, setNoticeHovered] = useState(false);
+  // The read-only host reminder shows once per tab; the disabled controls and Add Accounts keep the state visible afterwards.
+  const [readOnlyDismissed, setReadOnlyDismissed] = useState(() => { try { return sessionStorage.getItem("superlocal:read-only-notice") === "dismissed"; } catch { return false; } });
   const [onboardingReturn, setOnboardingReturn] = useState<{ providerId: string; connectionId: string | null } | null>(null);
   useEffect(() => {
     const url = new URL(location.href);
@@ -512,6 +516,52 @@ export default function App() {
   function actionError(error: unknown) {
     setNotice({ text: error instanceof Error ? error.message : "The inbox action failed. Your data has not been replaced with simulated state." });
   }
+  // Retry for background problems only rereads: refresh the snapshot, reconnect live updates, reload the open conversation.
+  function retryIssue(issue: InboxIssue) {
+    void store.retry();
+    if (issue.scope === "thread" && currentMail && !currentMail.operationId) void store.loadThread(currentMail.id).catch(() => {});
+  }
+  function dismissReadOnly() {
+    setReadOnlyDismissed(true);
+    try { sessionStorage.setItem("superlocal:read-only-notice", "dismissed"); } catch { /* The reminder simply returns next load. */ }
+  }
+  const notices = (
+    <Notices issues={inbox.issues} onRetry={retryIssue} onDismiss={store.dismissIssue}>
+      {inbox.host && !inbox.host.allowProviderWrites && !readOnlyDismissed && (
+        <div role="status">
+          <Notice quiet title="Read-only host" detail="Sending and provider changes are disabled." action={{ label: "Accounts", onClick: () => openSettings("Add Accounts") }} onDismiss={dismissReadOnly} data={{ scope: "read-only" }} />
+        </div>
+      )}
+      {notice && (
+        <div
+          className={`toast ${noticeFading ? "is-fading" : ""}`}
+          role="status"
+          onMouseEnter={() => setNoticeHovered(true)}
+          onMouseLeave={() => setNoticeHovered(false)}
+        >
+          <span className="toast-status">{notice.text}</span>
+          {notice.undo && (
+            <button
+              className="toast-undo"
+              onClick={() => {
+                notice.undo?.();
+                setNotice(null);
+              }}
+            >
+              Undo
+            </button>
+          )}
+          <IconButton
+            name="Notification-closeIcon"
+            title="Dismiss notification"
+            size={10}
+            className="toast-close"
+            onClick={() => setNotice(null)}
+          />
+        </div>
+      )}
+    </Notices>
+  );
   function undoAction(reverse: () => Promise<void>) {
     return () => { void reverse().catch(actionError); };
   }
@@ -1389,8 +1439,9 @@ export default function App() {
     return () => removeEventListener("keydown", onKey);
   }, []);
 
-  if (inbox.loading && !inbox.error) {
-    return <div className="app" data-inbox-state="loading" />;
+  if (!inbox.loaded) {
+    // Stay blank until the first snapshot arrives; an initial failure adds only the floating notice with Retry.
+    return <div className="app" data-inbox-state={inbox.loading ? "loading" : "error"}>{inbox.loading ? null : notices}</div>;
   }
 
   const composer = currentDraft && (
@@ -1476,18 +1527,6 @@ export default function App() {
         </div>
       </nav>
       <main className="mail-workspace" data-folder={route.folder}>
-        {inbox.error && (
-          <div className="inbox-connection-status" role="alert">
-            <span>{inbox.error}</span>
-            <button type="button" onClick={() => { void store.retry(); }}>Retry</button>
-          </div>
-        )}
-        {!inbox.loading && !inbox.error && inbox.host && !inbox.host.allowProviderWrites && (
-          <div className="inbox-connection-status inbox-read-only" role="status">
-            <span>Read-only · Sending and provider changes are disabled.</span>
-            <button type="button" onClick={() => openSettings("Add Accounts")}>Accounts</button>
-          </div>
-        )}
         {route.view === "calendar" ? (
           <CalendarView
             initialView={calendarInitialView}
@@ -1504,7 +1543,7 @@ export default function App() {
             onOpenFolders={() => setNavigation(true)}
             onOpenSettings={() => openSettings()}
           />
-        ) : !inbox.loading && !inbox.error && inbox.accounts.length === 0 ? (
+        ) : inbox.accounts.length === 0 ? (
           <div className="inbox-setup-empty">
             <h1>Connect an account</h1>
             <button className="settings-button" type="button" onClick={() => openSettings("Add Accounts")}>Add accounts</button>
@@ -1815,7 +1854,6 @@ export default function App() {
                 />
               )}
               {rowCount === 0 &&
-                !inbox.loading && !inbox.error &&
                 !(search && searchResult?.key === searchKey && (searchResult.loading || searchResult.error)) &&
                 !motion.hasExits &&
                 !(search && (!query || !searchSubmitted)) && (
@@ -2300,34 +2338,7 @@ export default function App() {
           </form>
         </Modal>
       )}
-      {notice && (
-        <div
-          className={`toast ${noticeFading ? "is-fading" : ""}`}
-          role="status"
-          onMouseEnter={() => setNoticeHovered(true)}
-          onMouseLeave={() => setNoticeHovered(false)}
-        >
-          <span className="toast-status">{notice.text}</span>
-          {notice.undo && (
-            <button
-              className="toast-undo"
-              onClick={() => {
-                notice.undo?.();
-                setNotice(null);
-              }}
-            >
-              Undo
-            </button>
-          )}
-          <IconButton
-            name="Notification-closeIcon"
-            title="Dismiss notification"
-            size={10}
-            className="toast-close"
-            onClick={() => setNotice(null)}
-          />
-        </div>
-      )}
+      {notices}
     </div>
   );
 }

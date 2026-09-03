@@ -1662,9 +1662,6 @@ kbd {
   margin-left: -10px;
   margin-right: 8px;
 }
-.app:has(.inbox-zero) .toast {
-  bottom: 68px;
-}
 .toggle {
   width: 30px;
   height: 16px;
