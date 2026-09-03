@@ -1,3 +1,5 @@
+import type { MailboxMembership } from "inbox-sdk/types";
+
 export { readSaved as loadSaved } from "./storage.ts";
 
 export type Attachment = {
@@ -31,6 +33,10 @@ export type Message = {
   operationId?: string;
   sendStatus?: "pending" | "processing" | "succeeded" | "partial" | "failed" | "cancelled" | "uncertain";
   pending?: boolean;
+  nativeFolder?: string;
+  isRead?: boolean;
+  isStarred?: boolean;
+  memberships?: MailboxMembership[];
 };
 export type Mail = {
   id: string;
@@ -60,6 +66,8 @@ export type Mail = {
   accountEmail?: string;
   locations?: string[];
   operationId?: string;
+  mailboxIds?: string[];
+  mailboxNames?: string[];
 };
 export type Draft = {
   id: string;
@@ -88,6 +96,7 @@ export type MailboxOption = {
   name: string;
   email: string;
   canSend: boolean;
+  selectorKind?: "all" | "domain" | "address";
 };
 export type SendOptions = { instant?: boolean; markDone?: boolean };
 export type Preferences = {

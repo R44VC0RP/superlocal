@@ -28,6 +28,7 @@ export type MailShortcutContext = {
 
 export type MailShortcut = (
   | { type: "account"; index: number }
+  | { type: "unified" }
   | { type: "command" }
   | { type: "escape" }
   | { type: "toggleFocus" }
@@ -82,10 +83,10 @@ export function resolveMailShortcut(
     event.ctrlKey &&
     !event.metaKey &&
     !event.altKey &&
-    /^[1-9]$/.test(event.key) &&
+    /^[0-9]$/.test(event.key) &&
     (!context.modal || context.accountDialog)
   )
-    return { type: "account", index: Number(event.key) - 1 };
+    return event.key === "0" ? { type: "unified" } : { type: "account", index: Number(event.key) - 1 };
 
   if (
     mod &&

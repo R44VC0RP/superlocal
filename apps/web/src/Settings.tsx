@@ -4,6 +4,7 @@ import type { Preferences } from "./data";
 import type { InboxStore } from "./inbox";
 import type { HostConfiguration } from "./host";
 import ProviderConnections from "./ProviderConnections";
+import MailboxSettings from "./MailboxSettings";
 import "./settings.css";
 
 export type SettingsProps = {
@@ -19,7 +20,7 @@ export type SettingsProps = {
 };
 
 const sections = [
-  { title: "", items: ["Reminders", "Split Inbox", "Split Inbox Library"] },
+  { title: "", items: ["Mailboxes", "Reminders", "Split Inbox", "Split Inbox Library"] },
   {
     title: "My Account",
     items: ["Add Accounts", "Edit Profile", "Theme", "Shortcuts"],
@@ -130,11 +131,19 @@ export function Settings({
   const [splitEditor, setSplitEditor] = useState<string | null>(null);
   const [splitRule, setSplitRule] = useState("");
   const [splitHelp, setSplitHelp] = useState(false);
+  const [mailboxEditState, setMailboxEditState] = useState({ dirty: false, saving: false });
+  const [confirmMailboxClose, setConfirmMailboxClose] = useState(false);
   const sidebar = useRef<HTMLDivElement>(null);
   const openShortcuts = useRef(onOpenShortcuts);
   openShortcuts.current = onOpenShortcuts;
 
-  const closeDetail = () => setPage("");
+  const closeDetail = () => {
+    if (page === "Mailboxes") {
+      if (mailboxEditState.saving) return;
+      if (mailboxEditState.dirty) { setConfirmMailboxClose(true); return; }
+    }
+    setPage("");
+  };
 
   useEffect(() => {
     const next = findPage(initialPage);
@@ -150,11 +159,17 @@ export function Settings({
     setPendingDelete(null);
     setSplitEditor(null);
     setSplitHelp(false);
+    setMailboxEditState({ dirty: false, saving: false });
+    setConfirmMailboxClose(false);
   }, [page]);
 
   useEffect(() => {
     if (!page) sidebar.current?.focus({ preventScroll: true });
   }, []);
+
+  useEffect(() => {
+    if (!mailboxEditState.dirty) setConfirmMailboxClose(false);
+  }, [mailboxEditState.dirty]);
 
   const text = (key: string, fallback = "") =>
     typeof preferences[key] === "string"
@@ -1311,6 +1326,9 @@ export function Settings({
         </>
       );
       break;
+    case "Mailboxes":
+      content = <MailboxSettings host={host} store={store} onEditStateChange={setMailboxEditState} />;
+      break;
     case "Add Accounts":
       content = <ProviderConnections host={host} store={store} />;
       break;
@@ -1382,7 +1400,7 @@ export function Settings({
         : splitEditor
           ? "Edit Split Inbox"
           : "Add Split Inbox"
-      : page;
+      : page === "Add Accounts" ? "Provider connections" : page;
 
   return (
     <div
@@ -1482,9 +1500,19 @@ export function Settings({
             <IconButton
               name="Close"
               title={`Close ${page}`}
+              disabled={page === "Mailboxes" && mailboxEditState.saving}
               onClick={closeDetail}
             />
           </header>
+          {page === "Mailboxes" && confirmMailboxClose && (
+            <div className="mailbox-close-confirm" role="alert">
+              <p>Discard unsaved mailbox changes?</p>
+              <div className="mailbox-bulk-actions">
+                <button type="button" className="settings-text-button" onClick={() => setConfirmMailboxClose(false)}>Keep editing</button>
+                <button type="button" className="settings-text-button" disabled={mailboxEditState.saving} onClick={() => setPage("")}>Discard changes</button>
+              </div>
+            </div>
+          )}
           <div
             className={
               page === "Theme" ? "settings-theme-body" : "settings-dialog-body"

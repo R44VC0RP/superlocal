@@ -4,6 +4,7 @@ import { createMockHost, type MockHost } from '@superlocal/mock-api'
 import { createInbox, InboxError, type Inbox } from 'inbox-sdk'
 import { createInboxApi } from 'inbox-sdk/http'
 import { loadLocalConfig, object, type LocalConfig } from './config'
+import { createInboxViewPreferencesStore, INBOX_PREFERENCES_BODY_LIMIT } from './inbox-preferences'
 import { createRealRegistrations, type HostProvider, type HostProviderRegistration } from './providers'
 import { openLocalRuntime } from './runtime'
 
@@ -12,11 +13,13 @@ function problem(status: number, code: string, error: string): Response {
   return Response.json({ code, error, retryable: status >= 500 }, { status, headers: safeHeaders })
 }
 
-async function jsonBody(request: Request): Promise<Record<string, unknown>> {
+async function jsonBody(request: Request, kind: 'connection' | 'preferences' = 'connection'): Promise<Record<string, unknown>> {
+  const limit = kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
+  const description = kind === 'preferences' ? 'Preferences' : 'Connection'
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) throw new InboxError('HOST_JSON_REQUIRED', 'Use application/json.', 415)
   const length = request.headers.get('content-length')
-  if (length && (!/^\d+$/.test(length) || Number(length) > 16_384)) throw new InboxError('HOST_BODY_TOO_LARGE', 'Connection input exceeds the size limit.', 413)
-  if (request.headers.has('content-encoding') && request.headers.get('content-encoding') !== 'identity') throw new InboxError('HOST_ENCODING_FORBIDDEN', 'Encoded connection input is not supported.', 415)
+  if (length && (!/^\d+$/.test(length) || Number(length) > limit)) throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
+  if (request.headers.has('content-encoding') && request.headers.get('content-encoding') !== 'identity') throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
   if (!request.body) throw new InboxError('HOST_INVALID_INPUT', 'A JSON object is required.', 400)
   const reader = request.body.getReader()
   const chunks: Uint8Array[] = []
@@ -26,13 +29,13 @@ async function jsonBody(request: Request): Promise<Record<string, unknown>> {
       const { value, done } = await reader.read()
       if (done) break
       size += value.byteLength
-      if (size > 16_384) { await reader.cancel(); throw new InboxError('HOST_BODY_TOO_LARGE', 'Connection input exceeds the size limit.', 413) }
+      if (size > limit) { await reader.cancel(); throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413) }
       chunks.push(value)
     }
   } finally { reader.releaseLock() }
   let input: unknown
   try { input = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))) }
-  catch { throw new InboxError('HOST_INVALID_JSON', 'Invalid JSON connection input.', 400) }
+  catch { throw new InboxError('HOST_INVALID_JSON', `Invalid JSON ${kind} input.`, 400) }
   if (!object(input)) throw new InboxError('HOST_INVALID_INPUT', 'A JSON object is required.', 400)
   return input
 }
@@ -60,6 +63,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
   const runtime = openLocalRuntime(config)
   let mock: MockHost | undefined
   let inbox: Inbox | undefined
+  let inboxPreferences: ReturnType<typeof createInboxViewPreferencesStore>
   let registrations: HostProviderRegistration[] = []
   let owner = `local:${config.instanceId}`
   try {
@@ -76,6 +80,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         defaultPolicy: { remoteImages: true },
         verifyCredentials: real.verifyCredentials, log: event => console.info(JSON.stringify({ event: 'local.sdk', code: /^[A-Z][A-Z0-9_]{0,79}$/.test(event.code) ? event.code : 'SDK_ERROR' })) })
     }
+    inboxPreferences = createInboxViewPreferencesStore(runtime.database, inbox, owner)
   } catch (error) { try { if (mock) await mock.close(); else await inbox?.close() } finally { runtime.database.close() }; throw error }
   const liveInbox = inbox
   const origins = new Set(config.web.allowedOrigins)
@@ -130,6 +135,12 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       return problem(401, 'UNAUTHENTICATED', 'Initialize a local browser session first.')
     }
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
+    if (url.pathname === '/host/inbox-preferences') {
+      if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Inbox preferences take no query parameters.')
+      if (request.method === 'GET') return Response.json(await inboxPreferences.read(), { headers: safeHeaders })
+      if (request.method === 'PUT') return Response.json(await inboxPreferences.write(await jsonBody(request, 'preferences')), { headers: safeHeaders })
+      return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use GET or PUT for inbox preferences.')
+    }
     if (url.pathname === '/host/config' && request.method === 'GET') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Host configuration takes no query parameters.')
       const connections = await liveInbox.connections(owner)

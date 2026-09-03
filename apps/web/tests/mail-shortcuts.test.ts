@@ -123,7 +123,10 @@ test("Control account numbers work in inputs and the account dialog, but not oth
     assert.equal(resolve(key, {}, { ctrlKey: true, metaKey: true }), null);
     assert.equal(resolve(key, {}, { metaKey: true }), null);
   }
-  assert.equal(resolve("0", {}, { ctrlKey: true }), null);
+  assert.deepEqual(resolve("0", {}, { ctrlKey: true }), { type: "unified" });
+  assert.deepEqual(resolve("0", { editing: true, modal: true, accountDialog: true }, { ctrlKey: true }), { type: "unified" });
+  assert.equal(resolve("0", { modal: true }, { ctrlKey: true }), null);
+  assert.equal(resolve("0", {}, { metaKey: true }), null);
   assert.deepEqual(resolve("2", { settings: true }, { ctrlKey: true }), {
     type: "account",
     index: 1,

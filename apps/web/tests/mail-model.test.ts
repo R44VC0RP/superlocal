@@ -10,6 +10,8 @@ import {
   normalizeSchedule,
   remindMail,
   restoreMail,
+  unifiedMail,
+  UNIFIED_ACCOUNT,
 } from "../src/mail-model.ts";
 
 const inbox = seedMail().find(
@@ -235,4 +237,68 @@ test("changing From creates a sent conversation owned by the chosen account", ()
   assert.equal(sent.messages[0].email, accounts[1]);
   assert.equal(sent.messages[0].to, inbox.email);
   assert.equal(inFolder(sent, "Sent"), true);
+});
+
+test("unified mail deduplicates overlapping receiving views without merging different sources", () => {
+  const boxes = [
+    { id: "all", sourceId: "source-a", name: "All mail", email: "sender@example.test", canSend: true },
+    { id: "domain", sourceId: "source-a", name: "Example domain", email: "sender@example.test", canSend: true },
+    { id: "other", sourceId: "source-b", name: "Other source", email: "other@example.test", canSend: true },
+  ];
+  const message = { ...inbox.messages[0], id: "canonical-a", receivedAt: deadline, revision: 1, nativeFolder: "inbox", isRead: false, isStarred: false };
+  const first: Mail = { ...inbox, id: "all:thread", account: "all", sourceId: "source-a", mailboxId: "all", sdkThreadId: "native-thread", locations: ["Inbox"],
+    messages: [{ ...message, memberships: [{ mailboxId: "all", messageId: message.id, revision: 1, done: false, snoozedUntil: null }] }] };
+  const overlapping: Mail = { ...first, id: "domain:thread", account: "domain", mailboxId: "domain",
+    messages: [{ ...message, memberships: [{ mailboxId: "domain", messageId: message.id, revision: 1, done: false, snoozedUntil: null }] }] };
+  const other: Mail = { ...first, id: "other:thread", account: "other", sourceId: "source-b", mailboxId: "other",
+    messages: [{ ...message, id: "canonical-b", memberships: [{ mailboxId: "other", messageId: "canonical-b", revision: 1, done: false, snoozedUntil: null }] }] };
+  const original = [first, overlapping, other], before = structuredClone(original);
+  const combined = unifiedMail(original, boxes.map(box => box.id), boxes, due);
+  assert.equal(combined.length, 2);
+  const shared = combined.find(mail => mail.sourceId === "source-a")!;
+  assert.equal(shared.account, UNIFIED_ACCOUNT);
+  assert.equal(shared.messages.length, 1);
+  assert.equal(shared.messages[0].id, "canonical-a");
+  assert.deepEqual(new Set(shared.messages[0].memberships?.map(state => state.mailboxId)), new Set(["all", "domain"]));
+  assert.equal(combined.find(mail => mail.sourceId === "source-b")!.messages[0].id, "canonical-b");
+  assert.deepEqual(original, before);
+  assert.equal(unifiedMail([...original].reverse(), boxes.map(box => box.id), boxes, due).find(mail => mail.sourceId === "source-a")!.id, shared.id);
+});
+
+test("unified inclusion is explicit and an empty selection never falls back to all mail", () => {
+  const box = { id: "one", sourceId: "source", name: "One", email: "one@example.test", canSend: true };
+  const mail: Mail = { ...inbox, account: box.id, mailboxId: box.id, sourceId: box.sourceId, sdkThreadId: "thread" };
+  assert.deepEqual(unifiedMail([mail], [], [box]), []);
+  assert.deepEqual(unifiedMail([mail], ["unrelated"], [box]), []);
+  assert.equal(unifiedMail([mail], [box.id], [box]).length, 1);
+});
+
+test("unified Done and snooze use all represented memberships, not an arbitrary primary mailbox", () => {
+  const boxes = ["a", "b"].map(id => ({ id, sourceId: "source", name: id, email: `${id}@example.test`, canSend: true }));
+  const copies: Mail[] = boxes.map(box => ({ ...inbox, id: `${box.id}:thread`, account: box.id, mailboxId: box.id, sourceId: box.sourceId, sdkThreadId: "thread", locations: ["Inbox"],
+    messages: [{ ...inbox.messages[0], id: "shared", nativeFolder: "inbox", receivedAt: deadline,
+      memberships: [{ mailboxId: box.id, messageId: "shared", revision: 1, done: box.id === "a", snoozedUntil: null }] }] }));
+  const mixed = unifiedMail(copies, ["a", "b"], boxes, due)[0];
+  assert.equal(inFolder(mixed, "Inbox"), true);
+  assert.equal(inFolder(mixed, "Done"), false);
+  const done = copies.map(mail => ({ ...mail, messages: mail.messages.map(message => ({ ...message, memberships: message.memberships!.map(state => ({ ...state, done: true })) })) }));
+  assert.equal(inFolder(unifiedMail(done, ["a", "b"], boxes, due)[0], "Done"), true);
+  assert.equal(inFolder(unifiedMail(done, ["a", "b"], boxes, due)[0], "Inbox"), false);
+  const sleeping = copies.map((mail, index) => ({ ...mail, messages: mail.messages.map(message => ({ ...message, memberships: message.memberships!.map(state => ({ ...state, done: false, snoozedUntil: index === 0 ? new Date(due + 60000).toISOString() : null })) })) }));
+  const partial = unifiedMail(sleeping, ["a", "b"], boxes, due)[0];
+  assert.equal(inFolder(partial, "Inbox"), true);
+  assert.equal(inFolder(partial, "Reminders"), true);
+  assert.equal(inFolder(unifiedMail(sleeping, ["a"], boxes, due)[0], "Inbox"), false);
+});
+
+test("unified rendering retains the newest canonical revision rather than a stale loaded alias", () => {
+  const boxes = ["a", "b"].map(id => ({ id, sourceId: "source", name: id, email: `${id}@example.test`, canSend: true }));
+  const copies: Mail[] = boxes.map((box, index) => ({ ...inbox, id: `${box.id}:thread`, account: box.id, mailboxId: box.id, sourceId: box.sourceId, sdkThreadId: "thread", unread: index === 1,
+    messages: [{ ...inbox.messages[0], id: "shared", nativeFolder: "inbox", receivedAt: deadline, revision: index === 0 ? 2 : 1, loaded: index === 1,
+      isRead: index === 0, body: index === 1 ? "stale content" : "", memberships: [{ mailboxId: box.id, messageId: "shared", revision: 1, done: false, snoozedUntil: null }] }] }));
+  const combined = unifiedMail(copies, ["a", "b"], boxes, due)[0];
+  assert.equal(combined.messages[0].revision, 2);
+  assert.equal(combined.messages[0].loaded, false);
+  assert.equal(combined.messages[0].body, "");
+  assert.equal(combined.unread, false);
 });

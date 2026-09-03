@@ -1,4 +1,78 @@
-import type { Draft, Mail, Message } from "./data.ts";
+import type { Draft, Mail, MailboxOption, Message } from "./data.ts";
+
+export const UNIFIED_ACCOUNT = "unified";
+export const unifiedThreadId = (source: string, thread: string) => `${UNIFIED_ACCOUNT}:${source}:${thread}`;
+
+/** Combine owned receiving views, never identities from unrelated source accounts. */
+export function unifiedMail(
+  mail: readonly Mail[],
+  includedMailboxIds: readonly string[],
+  mailboxes: readonly MailboxOption[],
+  now = Date.now(),
+): Mail[] {
+  const included = new Set(includedMailboxIds);
+  const options = new Map(mailboxes.map((box, index) => [box.id, { ...box, index }]));
+  const groups = new Map<string, Mail[]>();
+  for (const item of mail) {
+    if (!included.has(item.account) || item.account === UNIFIED_ACCOUNT) continue;
+    const key = item.operationId ? `${UNIFIED_ACCOUNT}:operation:${item.operationId}`
+      : item.sourceId && item.sdkThreadId ? unifiedThreadId(item.sourceId, item.sdkThreadId) : `${UNIFIED_ACCOUNT}:${item.id}`;
+    const group = groups.get(key) ?? [];
+    group.push(item); groups.set(key, group);
+  }
+  const result: Mail[] = [];
+  const sleeping = (value: string | null) => !!value && Date.parse(value) > now;
+  for (const [id, copies] of groups) {
+    const base = [...copies].sort((a, b) => (b.receivedAt ?? 0) - (a.receivedAt ?? 0) || a.id.localeCompare(b.id))[0];
+    const first = [...copies].sort((a, b) => (Date.parse(a.messages.find(message => !message.pending)?.receivedAt ?? "") || Infinity)
+      - (Date.parse(b.messages.find(message => !message.pending)?.receivedAt ?? "") || Infinity) || a.id.localeCompare(b.id))[0];
+    const byMessage = new Map<string, Message>();
+    for (const copy of copies) for (const message of copy.messages) {
+      const previous = byMessage.get(message.id);
+      const memberships = new Map(previous?.memberships?.map(state => [state.mailboxId, state]) ?? []);
+      for (const state of message.memberships ?? []) if (included.has(state.mailboxId)) {
+        if (!memberships.has(state.mailboxId) || memberships.get(state.mailboxId)!.revision <= state.revision) memberships.set(state.mailboxId, state);
+      }
+      const newer = !previous || (message.revision ?? 0) > (previous.revision ?? 0)
+        || message.revision === previous.revision && previous.loaded === false && message.loaded !== false;
+      byMessage.set(message.id, { ...(newer ? message : previous), memberships: [...memberships.values()] });
+    }
+    const messages = [...byMessage.values()].sort((a, b) => Number(!!a.pending) - Number(!!b.pending)
+      || (Date.parse(a.receivedAt ?? "") || 0) - (Date.parse(b.receivedAt ?? "") || 0) || a.id.localeCompare(b.id));
+    const received = messages.filter(message => !message.pending);
+    const latestBoxes = new Set(received.at(-1)?.memberships?.map(state => state.mailboxId));
+    const mailboxIds = [...new Set(copies.map(copy => copy.mailboxId ?? copy.account))].sort((a, b) => {
+      const left = options.get(a), right = options.get(b);
+      const specificity = { all: 0, domain: 1, address: 2 };
+      return Number(latestBoxes.has(b)) - Number(latestBoxes.has(a)) || Number(!!right?.canSend) - Number(!!left?.canSend)
+        || specificity[right?.selectorKind ?? "all"] - specificity[left?.selectorKind ?? "all"] || (left?.index ?? 0) - (right?.index ?? 0);
+    });
+    const states = received.flatMap(message => message.memberships ?? []);
+    const hidden = received.length && received.every(message => message.nativeFolder === "trash") ? "Trash"
+      : received.length && received.every(message => message.nativeFolder === "spam") ? "Spam" : undefined;
+    const done = states.length > 0 && states.every(state => state.done);
+    const reminders = states.flatMap(state => sleeping(state.snoozedUntil) ? [state.snoozedUntil!] : []).sort();
+    const locations: string[] = [];
+    if (base.operationId) locations.push("Scheduled");
+    else if (hidden) locations.push(hidden);
+    else if (states.length) {
+      if (received.some(message => message.nativeFolder === "inbox" && message.memberships?.some(state => !state.done && !sleeping(state.snoozedUntil)))) locations.push("Inbox");
+      if (received.some(message => message.nativeFolder === "sent")) locations.push("Sent");
+      if (done) locations.push("Done");
+      if (reminders.length) locations.push("Reminders");
+      if (received.every(message => ["archive", "sent"].includes(message.nativeFolder ?? "")) && received.some(message => message.nativeFolder === "archive")) locations.push("Auto Archived");
+    } else locations.push(...new Set(copies.flatMap(copy => copy.locations ?? [copy.folder])));
+    result.push({ ...base, id, subject: first.subject, account: UNIFIED_ACCOUNT, mailboxId: mailboxIds[0], mailboxIds,
+      mailboxNames: mailboxIds.map(box => options.get(box)?.name ?? "Mailbox"), messages, locations,
+      folder: hidden ?? (locations.includes("Inbox") ? "Inbox" : done ? "Done" : reminders.length ? "Reminders" : locations[0] ?? base.folder),
+      unread: received.length > 0 && received.every(message => typeof message.isRead === "boolean") ? received.some(message => !message.isRead) : copies.some(copy => copy.unread),
+      starred: received.length > 0 && received.every(message => typeof message.isStarred === "boolean") ? received.some(message => message.isStarred) : copies.some(copy => copy.starred),
+      labels: [...new Set(copies.flatMap(copy => copy.labels))],
+      reminder: reminders[0], reminderAt: reminders.length ? Date.parse(reminders[0]) : undefined,
+    });
+  }
+  return result.sort((a, b) => (b.receivedAt ?? 0) - (a.receivedAt ?? 0) || a.id.localeCompare(b.id));
+}
 
 export function normalizeSchedule(mail: Mail): Mail {
   if (mail.locations) return mail;

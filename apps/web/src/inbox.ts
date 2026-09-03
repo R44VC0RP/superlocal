@@ -7,13 +7,17 @@ import type { Attachment, Draft, Mail, MailboxOption, Message } from "./data";
 import { escapeHTML, plainText } from "./mail-text";
 import { readSaved, writeSaved } from "./storage";
 import { matchesSearch } from "./mail-search";
-import { readHostConfiguration, type HostConfiguration } from "./host";
+import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, type HostConfiguration, type InboxViewPreferences } from "./host";
+import { UNIFIED_ACCOUNT, unifiedMail, unifiedThreadId } from "./mail-model";
 
 type Edit = { draft: Draft; revision: number; version: number; error?: string };
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
 type Sending = { ref: SendReference; operation: Operation; draft: SdkDraft };
 export type InboxSnapshot = {
   accounts: MailboxOption[];
+  mailboxes: Mailbox[];
+  sources: Account[];
+  viewPreferences: InboxViewPreferences | null;
   mail: Mail[];
   drafts: Draft[];
   labels: Record<string, string[]>;
@@ -27,7 +31,7 @@ export type InboxSnapshot = {
   operations: Readonly<Record<string, Operation>>;
 };
 
-const initial: InboxSnapshot = { accounts: [], mail: [], drafts: [], labels: {}, loading: true, refreshing: false, pending: 0, unsaved: false, error: null, policy: null, host: null, operations: {} };
+const initial: InboxSnapshot = { accounts: [], mailboxes: [], sources: [], viewPreferences: null, mail: [], drafts: [], labels: {}, loading: true, refreshing: false, pending: 0, unsaved: false, error: null, policy: null, host: null, operations: {} };
 const recoveryKey = "sdk-draft-recovery";
 const outboxKey = "sdk-outbox-references";
 const formatAddress = (person: Participant) => person.name && person.name !== person.email
@@ -146,7 +150,32 @@ export class InboxStore {
     if (!box || !source) throw new Error("Select a connected mailbox first.");
     return { box, source };
   }
+  unifiedMailboxIds(): string[] {
+    const available = this.boxes.map(box => box.id);
+    const preferences = this.state.viewPreferences;
+    if (!preferences) return [];
+    return preferences.unifiedMode === "all" ? available : available.filter(id => preferences.includedMailboxIds.includes(id));
+  }
+  defaultMailbox(boxId = UNIFIED_ACCOUNT, mail?: Mail, messageId?: string): MailboxOption | undefined {
+    if (boxId !== UNIFIED_ACCOUNT) return this.state.accounts.find(account => account.id === boxId);
+    const message = messageId ? mail?.messages.find(message => message.id === messageId) : mail?.messages.filter(message => !message.pending).at(-1);
+    const ids = message?.memberships?.length ? message.memberships.map(state => state.mailboxId) : mail?.mailboxIds ?? this.unifiedMailboxIds();
+    const pins = this.state.viewPreferences?.pinnedMailboxIds ?? [];
+    const specificity = { all: 0, domain: 1, address: 2 };
+    return this.state.accounts.filter(account => ids.includes(account.id) && (!mail?.sourceId || mail.sourceId === account.sourceId)).sort((a, b) =>
+      Number(b.canSend) - Number(a.canSend)
+      || (mail ? specificity[b.selectorKind ?? "all"] - specificity[a.selectorKind ?? "all"] : 0)
+      || (pins.includes(a.id) ? pins.indexOf(a.id) : 1000) - (pins.includes(b.id) ? pins.indexOf(b.id) : 1000))[0];
+  }
   supports(action: string, boxId: string): boolean {
+    if (boxId === UNIFIED_ACCOUNT) {
+      if (action === "send" || action === "reply") {
+        const box = this.defaultMailbox();
+        return !!box && this.supports(action, box.id);
+      }
+      const ids = this.unifiedMailboxIds();
+      return ids.length > 0 && ids.every(id => this.supports(action, id));
+    }
     try {
       const { source } = this.account(boxId);
       if (["done", "inbox", "remind", "label", "cancel"].includes(action)) return true;
@@ -165,13 +194,15 @@ export class InboxStore {
 
   async search(boxId: string, query: string, signal: AbortSignal): Promise<Set<string>> {
     const options = { signal: AbortSignal.any([signal, this.controller.signal]) };
-    const { source } = this.account(boxId);
+    const scope = boxId === UNIFIED_ACCOUNT ? this.unifiedMailboxIds() : [this.account(boxId).box.id];
+    if (!scope.length) return new Set();
     let selected = new Set(this.state.mail.filter(mail => mail.account === boxId && !mail.operationId).map(mail => mail.id));
     for (const raw of query.match(/(?:[^\s"]|"[^"]*")+/g) ?? []) {
       const negative = raw.startsWith("-");
       let term = negative ? raw.slice(1) : raw;
       const match = term.match(/^([a-z_]+):(.*)$/i);
-      const filter: Parameters<InboxClient["mailboxMessages"]>[0] = { mailboxIds: [boxId], limit: 100 };
+      const filter: Parameters<InboxClient["mailboxMessages"]>[0] = { mailboxIds: scope, limit: 100 };
+      let filters = [filter];
       if (match?.[1] === "older_than" || match?.[1] === "newer_than") {
         const age = match[2].match(/^(\d+)([dmy])$/);
         if (!age) throw new Error("Use an age such as 3d, 1m, or 1y.");
@@ -190,23 +221,34 @@ export class InboxStore {
         term = "";
       } else if (match?.[1] === "label") {
         const name = match[2].replaceAll('"', "");
-        const local = this.labels.find(label => label.accountId === source.id && label.name.toLowerCase() === name.toLowerCase());
-        const native = this.folders.get(source.id)?.find(folder => folder.kind === "label" && folder.name.toLowerCase() === name.toLowerCase());
-        if (local) { filter.labelId = local.id; term = ""; }
-        else if (native) { filter.folder = native.id; term = ""; }
+        const groups = new Map<string, string[]>();
+        for (const id of scope) {
+          const sourceId = this.account(id).source.id;
+          const ids = groups.get(sourceId) ?? []; ids.push(id); groups.set(sourceId, ids);
+        }
+        filters = [...groups].map(([sourceId, mailboxIds]) => {
+          const local = this.labels.find(label => label.accountId === sourceId && label.name.toLowerCase() === name.toLowerCase());
+          const native = this.folders.get(sourceId)?.find(folder => folder.kind === "label" && folder.name.toLowerCase() === name.toLowerCase());
+          return { mailboxIds, limit: 100, ...(local ? { labelId: local.id } : native ? { folder: native.id } : { search: term }) };
+        });
+        term = "";
       }
       if (term) filter.search = term;
-      let matched = new Set<string>();
-      for (let attempt = 0; ; attempt++) {
-        try {
-          matched = new Set(); let cursor: string | undefined;
-          do {
-            const page = await this.client.mailboxMessages({ ...filter, ...(cursor ? { cursor } : {}) }, options);
-            page.items.forEach(message => matched.add(viewThreadId(boxId, message.threadId)));
-            cursor = page.nextCursor ?? undefined;
-          } while (cursor);
-          break;
-        } catch (error) { if (!(error instanceof ApiError) || error.code !== "STALE_CURSOR" || attempt >= 2) throw error; }
+      const matched = new Set<string>();
+      for (const selection of filters) for (let offset = 0; offset < selection.mailboxIds.length; offset += 50) {
+        const mailboxIds = selection.mailboxIds.slice(offset, offset + 50);
+        for (let attempt = 0; ; attempt++) {
+          try {
+            const batch = new Set<string>(); let cursor: string | undefined;
+            do {
+              const page = await this.client.mailboxMessages({ ...selection, mailboxIds, ...(cursor ? { cursor } : {}) }, options);
+              page.items.forEach(message => batch.add(boxId === UNIFIED_ACCOUNT ? unifiedThreadId(message.sourceId, message.threadId) : viewThreadId(boxId, message.threadId)));
+              cursor = page.nextCursor ?? undefined;
+            } while (cursor);
+            for (const id of batch) matched.add(id);
+            break;
+          } catch (error) { if (!(error instanceof ApiError) || error.code !== "STALE_CURSOR" || attempt >= 2) throw error; }
+        }
       }
       selected = new Set([...selected].filter(id => negative ? !matched.has(id) : matched.has(id)));
     }
@@ -217,6 +259,8 @@ export class InboxStore {
   start = () => {
     this.controller = new AbortController(); this.started = true;
     const generation = ++this.generation;
+    const onFocus = () => { if (this.started && !this.state.loading && generation === this.generation) void this.refresh().catch(error => this.fail(error, "refresh")); };
+    window.addEventListener("focus", onFocus);
     void (async () => {
       try {
         try { await this.client.accounts(this.requestOptions()); }
@@ -232,6 +276,7 @@ export class InboxStore {
       } catch (error) { if (generation === this.generation) this.fail(error, "connect"); }
     })();
     return () => {
+      window.removeEventListener("focus", onFocus);
       this.started = false; this.generation++; this.controller.abort();
       clearTimeout(this.refreshTimer);
       for (const timer of this.saveTimers.values()) clearTimeout(timer);
@@ -262,21 +307,28 @@ export class InboxStore {
     const draftEpoch = this.draftEpoch;
     this.publish({ refreshing: true });
     const work = (async () => {
-      const [accounts, boxes, labels, drafts, policy, host] = await Promise.all([
+      const [accounts, boxes, labels, drafts, policy, host, viewPreferences] = await Promise.all([
         this.client.accounts(options), this.client.mailboxes(options), this.client.labels(undefined, options), this.client.drafts(undefined, options), this.client.policy(options),
         readHostConfiguration(options.signal),
+        readInboxViewPreferences(options.signal),
       ]);
       const selected = boxes.filter(box => box.status !== "detached");
-      const summaries = new Map<string, MailboxMessageSummary[]>();
-      for (const box of selected) {
+      const summaries = new Map<string, MailboxMessageSummary[]>(selected.map(box => [box.id, []]));
+      // The SDK deduplicates canonical messages across a bounded mailbox selection.
+      // Batch domains instead of issuing one complete paginated scan for every mailbox.
+      for (let offset = 0; offset < selected.length; offset += 50) {
+        const mailboxIds = selected.slice(offset, offset + 50).map(box => box.id);
         for (let attempt = 0; ; attempt++) {
           try {
             const items: MailboxMessageSummary[] = []; let cursor: string | undefined;
             do {
-              const page = await this.client.mailboxMessages({ mailboxIds: [box.id], limit: 100, ...(cursor ? { cursor } : {}) }, options);
+              const page = await this.client.mailboxMessages({ mailboxIds, limit: 100, ...(cursor ? { cursor } : {}) }, options);
               items.push(...page.items); cursor = page.nextCursor ?? undefined;
             } while (cursor);
-            summaries.set(box.id, items); break;
+            for (const item of items) for (const membership of item.memberships) {
+              if (mailboxIds.includes(membership.mailboxId)) summaries.get(membership.mailboxId)?.push(item);
+            }
+            break;
           } catch (error) { if (!(error instanceof ApiError) || error.code !== "STALE_CURSOR" || attempt >= 2) throw error; }
         }
       }
@@ -337,7 +389,7 @@ export class InboxStore {
         this.bodyEpoch++;
         this.details.clear();
       }
-      this.publish({ policy, host, loading: false, refreshing: false, error: null }); this.rebuild();
+      this.publish({ policy, host, viewPreferences, mailboxes: selected, sources: accounts, loading: false, refreshing: false, error: null }); this.rebuild();
     })();
     this.refreshPromise = work.finally(() => { if (this.refreshPromise === finished) this.refreshPromise = undefined; });
     const finished = this.refreshPromise;
@@ -366,7 +418,7 @@ export class InboxStore {
   private rebuild() {
     const accounts: MailboxOption[] = this.boxes.map(box => {
       const source = this.sourceAccounts.find(account => account.id === box.sourceId)!;
-      return { id: box.id, sourceId: source.id, name: box.name || source.name, email: box.defaultSender || source.email,
+      return { id: box.id, sourceId: source.id, name: box.name || source.name, email: box.defaultSender || source.email, selectorKind: box.selector.kind,
         canSend: this.state.host?.allowProviderWrites === true && source.status === "connected" && box.status === "active" && source.capabilities.send && !!box.defaultSender };
     });
     const mail: Mail[] = [], labelNames: Record<string, string[]> = {};
@@ -393,7 +445,7 @@ export class InboxStore {
         const locations: string[] = [];
         if (hidden) locations.push(hidden);
         else {
-          if (rows.some(row => row.folder === "inbox") && !done && reminders.length === 0) locations.push("Inbox");
+          if (rows.some((row, index) => row.folder === "inbox" && !states[index].done && (!states[index].snoozedUntil || Date.parse(states[index].snoozedUntil!) <= Date.now()))) locations.push("Inbox");
           if (rows.some(row => row.folder === "sent")) locations.push("Sent");
           if (done) locations.push("Done");
           if (reminders.length) locations.push("Reminders");
@@ -409,14 +461,15 @@ export class InboxStore {
           return { id: row.id, revision: row.revision, from: row.from.name || row.from.email, email: row.from.email, to: addresses(row.to), cc: addresses(row.cc),
             bcc: detail ? addresses(detail.bcc) : undefined, date: displayTime(row.receivedAt).date, receivedAt: row.receivedAt,
             body: detail?.bodyHtml ?? "", loaded: !!detail, outgoing: row.folder === "sent", hasAttachments: row.hasAttachments,
-            bodyText: detail?.bodyText, bodyFormat: detail?.bodyFormat, bodyDocument: detail?.bodyDocument,
+             bodyText: detail?.bodyText, bodyFormat: detail?.bodyFormat, bodyDocument: detail?.bodyDocument,
+             nativeFolder: row.folder, isRead: row.isRead, isStarred: row.isStarred, memberships: row.memberships.filter(state => state.mailboxId === box.id),
             ...(operation?.accountId === source.id ? { operationId: operation.id, sendStatus: operation.status } : {}),
             attachments: detail?.attachments.map(info => this.file(info)), };
         });
         mail.push({ id: viewThreadId(box.id, thread), account: box.id, sourceId: source.id, mailboxId: box.id, sdkThreadId: thread, accountEmail: source.email,
           from: latest.from.name || latest.from.email, email: latest.from.email, to: addresses(latest.to), subject: rows[0].subject,
           snippet: latest.preview, ...displayTime(latest.receivedAt), receivedAt: Date.parse(latest.receivedAt), split: "Important",
-          folder: hidden ?? (done ? "Done" : reminders.length ? "Reminders" : locations[0] ?? "Auto Archived"), locations, unread: rows.some(row => !row.isRead), starred: rows.some(row => row.isStarred), labels: names, messages,
+          folder: hidden ?? (locations.includes("Inbox") ? "Inbox" : done ? "Done" : reminders.length ? "Reminders" : locations[0] ?? "Auto Archived"), locations, unread: rows.some(row => !row.isRead), starred: rows.some(row => row.isStarred), labels: names, messages,
           ...(reminders.length ? { reminder: reminders[0], reminderAt: Date.parse(reminders[0]) } : {}),
         });
       }
@@ -443,6 +496,9 @@ export class InboxStore {
         messages: [{ ...pendingMessage, scheduledAt: date }],
       });
     }
+    const included = this.unifiedMailboxIds();
+    labelNames[UNIFIED_ACCOUNT] = [...new Set(included.flatMap(id => labelNames[id] ?? []))];
+    mail.push(...unifiedMail(mail, included, accounts));
     mail.sort((a, b) => (b.receivedAt ?? 0) - (a.receivedAt ?? 0) || a.id.localeCompare(b.id));
     const drafts = [...this.rawDrafts.values()].map(raw => {
       const edit = this.edits.get(raw.id);
@@ -460,7 +516,8 @@ export class InboxStore {
     const bodyEpoch = this.bodyEpoch;
     const work = (async () => {
       for (const message of mail.messages) if (!message.pending && this.details.get(message.id)?.revision !== message.revision) {
-        const detail = await this.client.mailboxMessage(mail.mailboxId!, message.id, this.requestOptions());
+        const mailboxId = message.memberships?.[0]?.mailboxId ?? mail.mailboxId!;
+        const detail = await this.client.mailboxMessage(mailboxId, message.id, this.requestOptions());
         if (generation !== this.generation || bodyEpoch !== this.bodyEpoch) return;
         this.details.set(message.id, detail);
       }
@@ -538,6 +595,7 @@ export class InboxStore {
   };
 
   newDraft = async (boxId: string, input: { subject?: string; body?: string; popOut?: boolean; to?: string; mode?: Draft["mode"]; mail?: Mail; sourceMessageId?: string } = {}): Promise<Draft> => {
+    if (boxId === UNIFIED_ACCOUNT) boxId = this.defaultMailbox(boxId, input.mail, input.sourceMessageId)?.id ?? "";
     const { box, source } = this.account(boxId);
     if (!this.state.accounts.find(account => account.id === boxId)?.canSend) throw new Error("This mailbox cannot send messages.");
     if (input.mode && input.mode !== "new" && input.mode !== "forward" && !source.capabilities.reply) throw new Error("This source cannot send replies.");
@@ -614,6 +672,22 @@ export class InboxStore {
     const operation = await this.client.mutate({ messageIds: ids, viaMailboxId: boxId, changes, ifRevisions: Object.fromEntries(rows.map(row => [row.id, row.revision])), idempotencyKey: crypto.randomUUID() }, this.requestOptions());
     this.scheduleRefresh(); return this.settled(operation);
   }
+  private mailboxTargets(mail: Mail, allMemberships = false): Map<string, string[]> {
+    const result = new Map<string, string[]>();
+    const seen = new Set<string>();
+    for (const message of mail.messages) {
+      if (message.pending || seen.has(message.id)) continue;
+      seen.add(message.id);
+      const memberships = message.memberships?.map(state => state.mailboxId);
+      const ids = memberships?.length ? [...new Set(memberships)] : [mail.mailboxId ?? mail.account];
+      for (const id of allMemberships ? ids : ids.slice(0, 1)) {
+        const source = this.account(id).source;
+        if (mail.sourceId && source.id !== mail.sourceId) throw new Error("A conversation cannot span unrelated source accounts.");
+        const messages = result.get(id) ?? []; messages.push(message.id); result.set(id, messages);
+      }
+    }
+    return result;
+  }
   async act<T>(action: string, work: () => Promise<T>): Promise<T> {
     const previous = this.actionQueue;
     let release!: () => void;
@@ -625,52 +699,82 @@ export class InboxStore {
     finally { release(); this.publish({ pending: Math.max(0, this.state.pending - 1) }); }
   }
   action = (selected: Mail[], action: string, value?: string): Promise<() => Promise<void>> => this.act(action, async () => {
-    selected = selected.map(mail => this.state.mail.find(current => current.id === mail.id) ?? mail);
+    // Keep the clicked message/membership scope: a queued action must not absorb
+    // a newly arrived reply or a later change to Unified inbox configuration.
     const undo: Array<() => Promise<unknown>> = [];
     const starred = selected.some(mail => !mail.starred), unread = selected.some(mail => !mail.unread);
+    const native = action === "star" ? { isStarred: starred } : action === "unread" ? { isRead: !unread } : action === "read" ? { isRead: true }
+      : action === "trash" ? { folder: "trash" } : action === "spam" ? { folder: "spam" } : undefined;
     for (const mail of selected) {
-      if (mail.operationId) {
-        if (!["trash", "cancel"].includes(action)) throw new Error("Cancel the queued send before changing it.");
-        await this.client.cancel(mail.operationId, this.requestOptions()); continue;
-      }
-      const { source } = this.account(mail.account), ids = mail.messages.filter(message => !message.pending).map(message => message.id);
-      const native = action === "star" ? { isStarred: starred } : action === "unread" ? { isRead: !unread } : action === "read" ? { isRead: true }
-        : action === "trash" ? { folder: "trash" } : action === "spam" ? { folder: "spam" } : undefined;
-      if (native) {
+      if (mail.operationId && !["trash", "cancel"].includes(action)) throw new Error("Cancel the queued send before changing it.");
+      if (!mail.operationId && !native && !["done", "inbox", "remind"].includes(action)) throw new Error(`The SDK does not expose ${action}; no simulated mail change was made.`);
+      if (native && !mail.operationId) for (const boxId of this.mailboxTargets(mail).keys()) {
         const capability = action === "star" ? "star" : action === "unread" && unread ? "markUnread" : ["unread", "read"].includes(action) ? "markRead" : action === "trash" ? "trash" : "folders";
-        if (!source.capabilities[capability]) throw new Error(`This source does not support ${action}.`);
-        const operation = await this.mutation(mail.account, ids, native); undo.push(() => this.client.undo(operation.id, this.requestOptions()).then(operation => this.settled(operation)));
-      } else if (["done", "inbox", "remind"].includes(action)) {
-        if (action === "inbox") {
-          const rows = await Promise.all(ids.map(id => this.client.mailboxMessage(mail.account, id, this.requestOptions())));
-          const moved = rows.filter(row => !["inbox", "sent"].includes(row.folder));
-          if (moved.length) { const operation = await this.mutation(mail.account, moved.map(row => row.id), { folder: "inbox" }); undo.push(() => this.client.undo(operation.id, this.requestOptions()).then(operation => this.settled(operation))); }
+        const { source } = this.account(boxId);
+        if (!this.state.host?.allowProviderWrites || source.status !== "connected" || !source.capabilities[capability]) throw new Error(`A selected source does not support ${action}.`);
+      }
+    }
+    try {
+      for (const mail of selected) {
+        if (mail.operationId) { await this.client.cancel(mail.operationId, this.requestOptions()); continue; }
+        if (native) {
+          for (const [boxId, ids] of this.mailboxTargets(mail)) {
+            const operation = await this.mutation(boxId, ids, native);
+            undo.push(() => this.client.undo(operation.id, this.requestOptions()).then(operation => this.settled(operation)));
+          }
+        } else {
+          if (action === "inbox") for (const [boxId, ids] of this.mailboxTargets(mail)) {
+            const rows = await Promise.all(ids.map(id => this.client.mailboxMessage(boxId, id, this.requestOptions())));
+            const moved = rows.filter(row => !["inbox", "sent"].includes(row.folder));
+            if (moved.length) {
+              const operation = await this.mutation(boxId, moved.map(row => row.id), { folder: "inbox" });
+              undo.push(() => this.client.undo(operation.id, this.requestOptions()).then(operation => this.settled(operation)));
+            }
+          }
+          // Unified local actions affect only memberships represented by this view.
+          for (const [boxId, ids] of this.mailboxTargets(mail, true)) for (const id of ids) {
+            const row = await this.client.mailboxMessage(boxId, id, this.requestOptions());
+            const before = row.memberships.find(state => state.mailboxId === boxId)!;
+            const saved = await this.client.setMailboxState(boxId, id, action === "remind" ? { snoozedUntil: value ?? null } : { done: action === "done", snoozedUntil: null }, before.revision, this.requestOptions());
+            undo.push(() => this.client.setMailboxState(boxId, id, { done: before.done, snoozedUntil: before.snoozedUntil }, saved.revision, this.requestOptions()));
+          }
         }
-        for (const id of ids) {
-          const row = await this.client.mailboxMessage(mail.account, id, this.requestOptions());
-          const before = row.memberships.find(state => state.mailboxId === mail.account)!;
-          const saved = await this.client.setMailboxState(mail.account, id, action === "remind" ? { snoozedUntil: value ?? null } : { done: action === "done", snoozedUntil: null }, before.revision, this.requestOptions());
-          undo.push(() => this.client.setMailboxState(mail.account, id, { done: before.done, snoozedUntil: before.snoozedUntil }, saved.revision, this.requestOptions()));
-        }
-      } else throw new Error(`The SDK does not expose ${action}; no simulated mail change was made.`);
+      }
+    } catch (error) {
+      let incomplete = false;
+      for (const reverse of [...undo].reverse()) try { await reverse(); } catch { incomplete = true; }
+      if (incomplete) throw new Error("The action did not finish, and some changes could not be restored. Refresh the inbox before retrying.");
+      throw error;
     }
     return async () => { await this.act("undo", async () => { for (const reverse of [...undo].reverse()) await reverse(); }); };
   });
 
   setLabel = (selected: Mail[], name: string, remove: boolean) => this.act("label", async () => {
     const operations: Operation[] = [];
+    const plans: Array<{ boxId: string; ids: string[]; changes: Changes }> = [];
     for (const mail of selected) {
-      const { source } = this.account(mail.account);
-      const local = this.labels.find(label => label.accountId === source.id && label.name === name);
-      const native = this.folders.get(source.id)?.find(folder => folder.kind === "label" && folder.name === name);
-      if (!local && !native) throw new Error("This label is no longer available.");
-      const changes: Changes = local ? (remove ? { removeLabelIds: [local.id] } : { addLabelIds: [local.id] }) : (remove ? { removeLabels: [native!.role] } : { addLabels: [native!.role] });
-      operations.push(await this.mutation(mail.account, mail.messages.filter(message => !message.pending).map(message => message.id), changes));
+      if (mail.operationId) throw new Error("Queued sends cannot be relabeled.");
+      for (const [boxId, ids] of this.mailboxTargets(mail)) {
+        const { source } = this.account(boxId);
+        const local = this.labels.find(label => label.accountId === source.id && label.name === name);
+        const native = this.folders.get(source.id)?.find(folder => folder.kind === "label" && folder.name === name);
+        if (!local && !native) throw new Error("This label is not available in every selected source. Choose an individual mailbox to manage its labels.");
+        const changes: Changes = local ? (remove ? { removeLabelIds: [local.id] } : { addLabelIds: [local.id] }) : (remove ? { removeLabels: [native!.role] } : { addLabels: [native!.role] });
+        plans.push({ boxId, ids, changes });
+      }
+    }
+    try { for (const plan of plans) operations.push(await this.mutation(plan.boxId, plan.ids, plan.changes)); }
+    catch (error) {
+      let incomplete = false;
+      for (const operation of [...operations].reverse()) try { await this.settled(await this.client.undo(operation.id, this.requestOptions())); } catch { incomplete = true; }
+      if (incomplete) throw new Error("Label changes did not finish, and some changes could not be restored. Refresh before retrying.");
+      throw error;
     }
     return async () => { await this.act("undo-label", async () => { for (const operation of operations) await this.settled(await this.client.undo(operation.id, this.requestOptions())); }); };
   });
-  createLabel = async (boxId: string, name: string) => { const { source } = this.account(boxId); await this.client.createLabel(source.id, name, this.requestOptions()); await this.refresh(); };
+  createLabel = async (boxId: string, name: string) => { if (boxId === UNIFIED_ACCOUNT) throw new Error("Choose an individual mailbox to create a source label."); const { source } = this.account(boxId); await this.client.createLabel(source.id, name, this.requestOptions()); await this.refresh(); };
   editLabel = async (boxId: string, name: string, value?: string) => {
+    if (boxId === UNIFIED_ACCOUNT) throw new Error("Choose an individual mailbox to edit a source label.");
     const { source } = this.account(boxId), label = this.labels.find(label => label.accountId === source.id && label.name === name);
     if (!label) throw new Error("The SDK can only rename or delete local labels, not provider labels.");
     if (value === undefined) await this.client.deleteLabel(label.id, this.requestOptions()); else await this.client.updateLabel(label.id, value, label.revision, this.requestOptions());
@@ -696,9 +800,26 @@ export class InboxStore {
     this.publish({ policy: saved });
     this.rebuild();
   };
+  setViewPreferences = (input: Omit<InboxViewPreferences, "revision">): Promise<void> => {
+    const revision = this.state.viewPreferences?.revision;
+    return this.act("inbox-preferences", async () => {
+      if (revision === undefined) throw new Error("Inbox preferences are still loading.");
+      const viewPreferences = await writeInboxViewPreferences({ ...input, revision }, this.controller.signal);
+      this.publish({ viewPreferences }); this.rebuild();
+    });
+  };
   sync = async (boxId: string) => this.act("sync", async () => {
-    const { box } = this.account(boxId);
-    await this.client.syncMailbox(box.id, { folder: "inbox" }, this.requestOptions());
+    const ids = boxId === UNIFIED_ACCOUNT ? this.unifiedMailboxIds() : [boxId];
+    const sources = new Set<string>();
+    let failed = 0;
+    for (const id of ids) {
+      const { box } = this.account(id);
+      if (box.status !== "active" || sources.has(box.sourceId)) continue;
+      sources.add(box.sourceId);
+      try { await this.client.syncMailbox(box.id, { folder: "inbox" }, this.requestOptions()); }
+      catch (error) { if (this.controller.signal.aborted) throw error; failed++; }
+    }
+    if (failed) throw new Error(`${failed} ${failed === 1 ? "source could" : "sources could"} not refresh. Cached mail is still available.`);
   });
   retry = async () => {
     try { await this.refresh(); }

@@ -1391,28 +1391,22 @@ kbd {
 .command-footer {
   display: none;
 }
-.accounts-modal:not(.has-query) .command-input {
-  height: 0;
-  flex-basis: 0;
-  padding: 0;
-  overflow: hidden;
-  opacity: 0;
-}
 .accounts-modal .command-input {
-  transition: opacity 150ms 100ms;
+  flex-shrink: 0;
 }
 .accounts-modal .command-results {
-  max-height: 320px;
+  max-height: min(55vh, 480px);
+  min-height: 0;
+  overflow-y: auto;
   padding-bottom: 0;
 }
 .accounts-modal .account-option {
   min-height: 62px;
   font:
-    16px/22px "Operator Mono Book",
-    monospace;
-  letter-spacing: -0.01em;
+    14px/20px "Helvetica Neue",
+    sans-serif;
   gap: 8px;
-  color: var(--subtle);
+  color: var(--text);
 }
 .accounts-modal .account-option.active,
 .accounts-modal .account-option:hover {
@@ -1431,6 +1425,9 @@ kbd {
   flex: 0 0 auto !important;
   gap: 4px;
 }
+.accounts-modal .account-option-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.accounts-modal .account-option-name small { overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+.accounts-modal .account-avatar, .accounts-modal .account-option > .icon { flex-shrink: 0; }
 .account-shortcut kbd {
   font: 600 var(--ui-small)/18px var(--font);
   padding: 0 4px;
@@ -1443,16 +1440,18 @@ kbd {
   flex: 0 0 76px;
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 .account-add button {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 8px;
   color: var(--subtle);
   font:
-    16px/22px "Operator Mono Book",
-    monospace;
-  letter-spacing: -0.01em;
+    14px/20px "Helvetica Neue",
+    sans-serif;
+  min-height: 40px;
 }
 .account-add button:hover {
   color: var(--text);

@@ -38,6 +38,7 @@ import FolderNavigation from "./FolderNavigation";
 import MailRows from "./MailRows";
 import RecentOpens from "./RecentOpens";
 import { selectMailView } from "./mail-view";
+import { UNIFIED_ACCOUNT } from "./mail-model";
 import { plainText } from "./mail-text";
 import { resolveMailShortcut } from "./mail-shortcuts";
 import MailCommandDialog, { type CommandItem } from "./MailCommandDialog";
@@ -82,7 +83,7 @@ const searchTips = [
 function readRoute(): Route {
   const params = new URLSearchParams(location.hash.replace(/^#\/?/, ""));
   return {
-    account: params.get("account") || "",
+    account: params.get("account") || UNIFIED_ACCOUNT,
     folder: params.get("folder") || "Inbox",
     split: params.get("split") || "Important",
     thread: params.get("thread") || undefined,
@@ -180,8 +181,12 @@ export default function App() {
   const listScroll = useRef(0);
   const sequence = useRef({ key: "", time: 0 });
   const searchOrigin = useRef<Route | null>(null);
-  const accountOptions = inbox.accounts.map(account => account.id);
-  const activeAccount = inbox.accounts.find(account => account.id === route.account);
+  const isUnified = route.account === UNIFIED_ACCOUNT;
+  const accountOptions = (inbox.viewPreferences?.pinnedMailboxIds ?? []).filter(id => inbox.accounts.some(account => account.id === id));
+  const unifiedMailboxIds = useMemo(() => inbox.viewPreferences?.unifiedMode === "all" ? inbox.accounts.map(account => account.id)
+    : inbox.accounts.filter(account => inbox.viewPreferences?.includedMailboxIds.includes(account.id)).map(account => account.id), [inbox.accounts, inbox.viewPreferences]);
+  const activeAccount = isUnified ? store.defaultMailbox() : inbox.accounts.find(account => account.id === route.account);
+  const accountTitle = isUnified ? "Unified inbox" : activeAccount?.name || activeAccount?.email || "Choose a mailbox";
   const accountEmail = activeAccount?.email ?? "";
   const deferredQuery = useDeferredValue(query);
   const resultQuery = searchSubmitted ? query : deferredQuery;
@@ -257,8 +262,8 @@ export default function App() {
     ],
   );
   const accountDrafts = useMemo(
-    () => drafts.filter((d) => d.account === route.account),
-    [drafts, route.account],
+    () => drafts.filter((d) => isUnified ? unifiedMailboxIds.includes(d.account) : d.account === route.account),
+    [drafts, route.account, isUnified, unifiedMailboxIds],
   );
   const isDrafts = route.folder === "Drafts" && !search;
   const currentMail = accountMail.find((m) => m.id === route.thread);
@@ -266,7 +271,7 @@ export default function App() {
   const currentDraft =
     drafts.find((d) => d.id === route.draft) ||
     (currentMail
-      ? drafts.find((d) => d.threadId === currentMail.id)
+      ? drafts.find((d) => d.threadId === currentMail.id || !!d.sourceMessageId && d.sourceId === currentMail.sourceId && currentMail.messages.some(message => message.id === d.sourceMessageId))
       : undefined);
   const rowCount = isDrafts ? accountDrafts.length : visibleMail.length;
   const virtualized =
@@ -318,12 +323,12 @@ export default function App() {
     setPreferences(previous => previous.sendDelay === sendDelay && previous.showImages === showImages ? previous : { ...previous, sendDelay, showImages });
   }, [inbox.policy]);
   useEffect(() => {
-    if (!inbox.accounts.length || inbox.accounts.some(account => account.id === route.account)) return;
-    const account = inbox.accounts.find(account => account.email === route.account) ?? inbox.accounts[0];
-    const next: Route = { account: account.id, folder: "Inbox", split: "Important" };
+    if (!inbox.accounts.length || route.account === UNIFIED_ACCOUNT || inbox.accounts.some(account => account.id === route.account)) return;
+    const account = inbox.accounts.find(account => account.email === route.account);
+    const next: Route = { account: account?.id ?? UNIFIED_ACCOUNT, folder: "Inbox", split: preferences.splits[0] || "Important" };
     history.replaceState(null, "", `#/${new URLSearchParams({ account: next.account, folder: next.folder, split: next.split })}`);
     setRoute(next);
-  }, [inbox.accounts, route.account]);
+  }, [inbox.accounts, route.account, preferences.splits]);
   useEffect(() => {
     if (!currentMail || currentMail.operationId) return;
     void store.loadThread(currentMail.id).catch(() => {});
@@ -560,7 +565,7 @@ export default function App() {
   function openMail(m: Mail) {
     if (list.current) listScroll.current = list.current.scrollTop;
     motion.prepare("switch");
-    if (preferences.markRead && m.unread && store.supports("read", m.account))
+    if (preferences.markRead && m.unread && store.supports("read", m.mailboxId ?? m.account))
       void store.action([m], "read").catch(actionError);
     navigate({ thread: m.id, draft: undefined, view: undefined });
     setSelected([]);
@@ -670,7 +675,7 @@ export default function App() {
     if (!currentMail) return;
     setReplyRequest((value) => value + 1);
     const existing =
-      currentDraft?.threadId === currentMail.id ? currentDraft : undefined;
+      currentDraft && (currentDraft.threadId === currentMail.id || currentDraft.sourceId === currentMail.sourceId && currentMail.messages.some(message => message.id === currentDraft.sourceMessageId)) ? currentDraft : undefined;
     if (existing) {
       store.editDraft({ ...existing, popOut: popOut || existing.popOut, updated: Date.now() });
       if (existing.mode !== mode || sourceMessageId && existing.sourceMessageId !== sourceMessageId)
@@ -705,17 +710,18 @@ export default function App() {
   async function sendDraft(draft: Draft, when?: string, options?: SendOptions) {
     if (options?.instant) when = undefined;
     const conversation = ["reply", "replyAll"].includes(draft.mode)
-      ? mail.find(mail => mail.id === draft.threadId && mail.account === draft.account && !mail.operationId) : undefined;
+      ? accountMail.find(mail => !mail.operationId && (mail.id === draft.threadId || mail.sourceId === draft.sourceId && mail.messages.some(message => message.id === draft.sourceMessageId)))
+        ?? mail.find(mail => mail.id === draft.threadId && mail.account === draft.account && !mail.operationId) : undefined;
     try {
       const operation = await store.submit(draft, when);
       if (options?.markDone && draft.threadId) {
-        const original = mail.find(mail => mail.id === draft.threadId);
+        const original = conversation ?? mail.find(mail => mail.id === draft.threadId);
         if (original) await store.action([original], "done");
       }
       const current = readRoute();
       if (conversation) {
         setReplyFeedback({ id: operation.id, threadId: conversation.id, scheduled: when });
-        if (current.draft === draft.id) navigate({ account: draft.account, draft: undefined, thread: conversation.id, view: undefined });
+        if (current.draft === draft.id) navigate({ account: conversation.account, draft: undefined, thread: conversation.id, view: undefined });
       } else if (current.draft === draft.id) navigate({ draft: undefined, thread: undefined, view: undefined });
       setNotice({
         text: when ? `${conversation ? "Reply scheduled" : "Scheduled"} for ${new Date(when).toLocaleString()}` : operation.status === "succeeded" ? conversation ? "Reply sent." : "Message sent" : conversation ? "Sending reply…" : "Send queued in the inbox",
@@ -1074,10 +1080,24 @@ export default function App() {
     },
     {
       label: "Switch Account",
-      detail: "Open another mailbox",
+      detail: "Unified inbox and individual mailboxes",
       key: "Control 1–9",
       icon: "User",
       run: () => openOverlay("accounts"),
+    },
+    {
+      label: "Unified inbox",
+      detail: "Mail from all included mailboxes",
+      key: "Control 0",
+      icon: "Inbox",
+      run: () => selectAccount(UNIFIED_ACCOUNT),
+    },
+    {
+      label: "Manage mailboxes",
+      detail: "Unified inbox selection and pinned shortcuts",
+      key: "",
+      icon: "Gear",
+      run: () => openSettings("Mailboxes"),
     },
     {
       label: "Snippets",
@@ -1125,7 +1145,7 @@ export default function App() {
     navigate({
       account,
       folder: "Inbox",
-      split: "Important",
+      split: preferences.splits[0] || "Important",
       thread: undefined,
       draft: undefined,
       view: undefined,
@@ -1167,8 +1187,8 @@ export default function App() {
     });
     if (!intent) return;
     if (intent.clearSequence) sequence.current.key = "";
-    if (intent.type === "account") {
-      const account = accountOptions[intent.index];
+    if (intent.type === "account" || intent.type === "unified") {
+      const account = intent.type === "unified" ? UNIFIED_ACCOUNT : accountOptions[intent.index];
       if (account) {
         e.preventDefault();
         selectAccount(account);
@@ -1458,6 +1478,12 @@ export default function App() {
             <h1>Connect an account</h1>
             <button className="settings-button" type="button" onClick={() => openSettings("Add Accounts")}>Add accounts</button>
           </div>
+        ) : isUnified && !unifiedMailboxIds.length && !route.draft && !currentMail ? (
+          <div className="inbox-setup-empty">
+            <h1>No mailboxes in Unified inbox</h1>
+            <button className="settings-button" type="button" onClick={() => openSettings("Mailboxes")}>Choose mailboxes</button>
+            <button className="text-button" type="button" onClick={() => openOverlay("accounts")}>Open an individual mailbox</button>
+          </div>
         ) : route.draft && currentDraft && !currentDraft.popOut ? (
           composer
         ) : currentMail ? (
@@ -1473,7 +1499,7 @@ export default function App() {
             onBack={goBack}
             onNavigate={navigateThread}
             onAction={applyAction}
-            supportsAction={action => !!currentMail.operationId ? action === "trash" : store.supports(action, currentMail.account)}
+            supportsAction={action => !!currentMail.operationId ? action === "trash" : store.supports(action, currentMail.mailboxId ?? currentMail.account)}
             onCompose={composeReply}
             replyRequest={replyRequest}
             onDraftChange={updateDraft}
@@ -1501,6 +1527,10 @@ export default function App() {
                   onClick={() => setNavigation(!navigation)}
                 />
               )}
+              {!search && !selected.length && <button type="button" className="inbox-scope-selector" onClick={() => openOverlay("accounts")} title={accountTitle} aria-label={`Choose inbox. Current: ${accountTitle}`}>
+                <Icon name={isUnified ? "Inbox" : "Envelope"} size={16} />
+                <span>{accountTitle}</span><Icon name="ChevronDown" size={12} />
+              </button>}
               {search ? (
                 <div className="search-field">
                   <input
@@ -1569,7 +1599,7 @@ export default function App() {
                       key={action}
                       name={icon}
                       title={title}
-                      disabled={!store.supports(action, route.account)}
+                      disabled={!targets.length || targets.some(mail => !mail.operationId && !store.supports(action, mail.mailboxId ?? mail.account))}
                       onClick={() => applyAction(action)}
                     />
                   ))}
@@ -1873,7 +1903,7 @@ export default function App() {
                 <div>
                   <b>
                     {route.draft
-                      ? accountEmail
+                      ? currentDraft?.from || accountEmail
                       : currentMail?.email || accountEmail}
                   </b>
                   <p>{route.draft ? userProfile.location : ""}</p>
@@ -1995,7 +2025,7 @@ export default function App() {
       </aside>
       <FolderNavigation
         open={navigation}
-        account={activeAccount?.email || activeAccount?.name || "No mailbox selected"}
+        account={accountTitle}
         folder={route.folder}
         inboxCount={inboxCount}
         labels={customLabels}
@@ -2009,6 +2039,7 @@ export default function App() {
           openOverlay("label");
         }}
         onEditLabel={editLabel}
+        canManageLabels={!isUnified}
       />
       <MailCommandDialog
         mode={commandMode ?? "command"}
@@ -2022,6 +2053,9 @@ export default function App() {
         onCreateLabel={(label) => { void store.createLabel(route.account, label).then(() => changeLabel(label)).catch(actionError); }}
         onRemind={remind}
         accounts={inbox.accounts}
+        pinnedMailboxIds={accountOptions}
+        unifiedMailboxCount={unifiedMailboxIds.length}
+        canCreateLabel={!isUnified}
         currentAccount={route.account}
         onAccount={selectAccount}
         onSettings={openSettings}

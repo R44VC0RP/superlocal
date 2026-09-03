@@ -130,7 +130,9 @@ export default function ThreadView({
   const revealedReply = useRef("");
   const replyResult = focusOperationId ? mail.messages.find(message => message.operationId === focusOperationId) : undefined;
   const replyFocusKey = replyResult ? `${mail.id}:${replyResult.id}` : "";
-  const commentKey = `superlocal:comments:${encodeURIComponent(account)}:${encodeURIComponent(mail.id)}`;
+  const metadataMailbox = useRef(mail.mailboxId ?? account).current;
+  const metadataThread = mail.sdkThreadId ? `${metadataMailbox}:${mail.sdkThreadId}` : mail.id;
+  const commentKey = `superlocal:comments:${encodeURIComponent(metadataMailbox)}:${encodeURIComponent(metadataThread)}`;
   const [commentState, setCommentState] = useState({
     key: "",
     comments: [] as ThreadComment[],
@@ -222,13 +224,13 @@ export default function ThreadView({
     setSnippetRequest(0);
     try {
       setResponse(
-        localStorage.getItem(`superlocal:invitation:${mail.id}`) || "",
+        localStorage.getItem(`superlocal:invitation:${metadataThread}`) || "",
       );
     } catch {
       setResponse("");
     }
     scroller.current?.scrollTo(0, 0);
-  }, [mail.id]);
+  }, [mail.id, metadataThread]);
 
   useLayoutEffect(() => {
     if (!replyResult || revealedReply.current === replyFocusKey) return;
@@ -447,7 +449,7 @@ export default function ThreadView({
   function respond(value: string) {
     setResponse(value);
     try {
-      localStorage.setItem(`superlocal:invitation:${mail.id}`, value);
+      localStorage.setItem(`superlocal:invitation:${metadataThread}`, value);
     } catch {
       /* Keep the response for this session. */
     }
@@ -547,6 +549,7 @@ export default function ThreadView({
               {unsubscribed ? "Unsubscribed" : "Unsubscribe"}
             </button>
           )}
+          {!!mail.mailboxNames?.length && <div className="thread-mailbox-origin" title={mail.mailboxNames.join(", ")}>{mail.mailboxNames[0]}{mail.mailboxNames.length > 1 ? ` +${mail.mailboxNames.length - 1} mailboxes` : ""}</div>}
           {!!mail.labels.length && (
             <div className="thread-labels">
               {mail.labels.map((label) => (

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Icon, IconButton, Key, Modal } from "./components";
 import type { Mail, MailboxOption } from "./data";
+import { UNIFIED_ACCOUNT } from "./mail-model";
 
 export type CommandItem = {
   label: string;
@@ -23,6 +24,9 @@ type MailCommandDialogProps = {
   onCreateLabel: (label: string) => void;
   onRemind: (when: string) => void;
   accounts: MailboxOption[];
+  pinnedMailboxIds?: string[];
+  unifiedMailboxCount?: number;
+  canCreateLabel?: boolean;
   currentAccount: string;
   onAccount: (account: string) => void;
   onSettings: (page?: string) => void;
@@ -41,6 +45,9 @@ export default function MailCommandDialog({
   onCreateLabel,
   onRemind,
   accounts,
+  pinnedMailboxIds = [],
+  unifiedMailboxCount = accounts.length,
+  canCreateLabel = true,
   currentAccount,
   onAccount,
   onSettings,
@@ -82,11 +89,18 @@ export default function MailCommandDialog({
     "someday",
     "never",
   ].filter((time) => time.includes(query.toLowerCase()));
-  const filteredAccounts = accounts.filter((account) =>
-    `${account.name} ${account.email}`.toLowerCase().includes(query.toLowerCase()),
-  );
+  const accountChoices = [
+    { id: UNIFIED_ACCOUNT, name: "Unified inbox", detail: `${unifiedMailboxCount} ${unifiedMailboxCount === 1 ? "mailbox" : "mailboxes"}`, shortcut: 0 },
+    ...[...accounts].sort((a, b) => (pinnedMailboxIds.includes(a.id) ? pinnedMailboxIds.indexOf(a.id) : 1000)
+      - (pinnedMailboxIds.includes(b.id) ? pinnedMailboxIds.indexOf(b.id) : 1000) || a.name.localeCompare(b.name)).map(account => ({
+        id: account.id, name: account.name || account.email, detail: account.email !== account.name ? account.email : "",
+        shortcut: pinnedMailboxIds.includes(account.id) ? pinnedMailboxIds.indexOf(account.id) + 1 : undefined,
+      })),
+  ];
+  const filteredAccounts = accountChoices.filter(account => `${account.name} ${account.detail}`.toLowerCase().includes(query.toLowerCase()));
 
   function createLabel() {
+    if (!canCreateLabel) return;
     onCreateLabel(query);
     setQuery("");
   }
@@ -102,7 +116,7 @@ export default function MailCommandDialog({
             ? "Remind Me"
             : mode === "label"
               ? "Labels"
-              : mode
+               : "Mailboxes"
       }
       onClose={onClose}
       className={`app-modal command-modal ${mode === "accounts" ? `accounts-modal ${query ? "has-query" : ""}` : ""}`}
@@ -130,7 +144,7 @@ export default function MailCommandDialog({
                   : labelMode === "navigate"
                     ? "Go to label"
                     : "Add or remove label"
-                : "Accounts"}
+                 : "Mailboxes"}
         </span>
         <IconButton name="Close" title="Close" onClick={onClose} />
       </div>
@@ -148,11 +162,11 @@ export default function MailCommandDialog({
                     ? "Move to folder or label"
                     : labelMode === "navigate"
                       ? "Find a label"
-                      : "Find or create a label"
-                  : "Find an account"
+                      : canCreateLabel ? "Find or create a label" : "Find a label"
+                  : "Find a mailbox"
           }
           value={query}
-          placeholder={mode === "remind" ? "Try: 8 am, 3 days, aug 7" : ""}
+          placeholder={mode === "remind" ? "Try: 8 am, 3 days, aug 7" : mode === "accounts" ? "Search mailboxes…" : ""}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "ArrowDown") {
@@ -187,7 +201,7 @@ export default function MailCommandDialog({
                 onClose();
               } else if (
                 mode === "label" &&
-                labelMode !== "navigate" &&
+                labelMode !== "navigate" && canCreateLabel &&
                 query &&
                 !labels.includes(query)
               ) {
@@ -276,13 +290,14 @@ export default function MailCommandDialog({
                   )}
               </button>
             ))}
-            {labelMode !== "navigate" && query && !labels.includes(query) && (
+            {canCreateLabel && labelMode !== "navigate" && query && !labels.includes(query) && (
               <button className="command-option" onClick={createLabel}>
                 <Icon name="Plus" />
                 <span>Create label "{query}"</span>
               </button>
             )}
             <div className="label-done">
+              {!canCreateLabel && <p className="settings-note">Choose an individual mailbox to create or rename labels.</p>}
               <button className="primary-button" onClick={onClose}>
                 Done
               </button>
@@ -298,21 +313,20 @@ export default function MailCommandDialog({
               onMouseMove={() => setMenuIndex(i)}
               onClick={() => onAccount(account.id)}
             >
-              <span className="account-avatar">{account.name.slice(0, 1)}</span>
-              <span>{account.email || account.name}</span>
+              <span className="account-avatar">{account.id === UNIFIED_ACCOUNT ? <Icon name="Inbox" size={16} /> : account.name.slice(0, 1)}</span>
+              <span className="account-option-name" title={[account.name, account.detail].filter(Boolean).join(" · ")}>{account.name}{account.detail && <small>{account.detail}</small>}</span>
               {account.id === currentAccount && <Icon name="Check" />}
-              <span className="account-shortcut">
-                <Key>control</Key>
-                <Key>{accounts.indexOf(account) + 1}</Key>
-              </span>
+              {account.shortcut !== undefined && <span className="account-shortcut"><Key>Ctrl</Key><Key>{account.shortcut}</Key></span>}
             </button>
           ))}
+        {mode === "accounts" && !filteredAccounts.length && <p className="no-options">No matching mailboxes.</p>}
       </div>
       {mode === "accounts" && (
         <div className="account-add">
+          <button onClick={() => onSettings("Mailboxes")}><Icon name="Gear" />Manage mailboxes</button>
           <button onClick={() => onSettings("Add Accounts")}>
             <Icon name="Plus" />
-            Add Account
+            Connect provider
           </button>
         </div>
       )}

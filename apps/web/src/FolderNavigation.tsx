@@ -14,6 +14,7 @@ type FolderNavigationProps = {
   onSnippets: () => void;
   onCreateLabel: () => void;
   onEditLabel: (label: string) => void;
+  canManageLabels?: boolean;
 };
 
 function FolderNavigation({
@@ -28,6 +29,7 @@ function FolderNavigation({
   onSnippets,
   onCreateLabel,
   onEditLabel,
+  canManageLabels = true,
 }: FolderNavigationProps) {
   return (
     <>
@@ -80,6 +82,7 @@ function FolderNavigation({
             <IconButton
               name="Plus"
               title="Create label"
+              disabled={!canManageLabels}
               onClick={onCreateLabel}
             />
           </div>
@@ -93,7 +96,7 @@ function FolderNavigation({
                 onClick={() => onFolder(label)}
                 onContextMenu={(e) => {
                   e.preventDefault();
-                  onEditLabel(label);
+                  if (canManageLabels) onEditLabel(label);
                 }}
               >
                 <Icon name="Label" size={14} />
@@ -102,6 +105,7 @@ function FolderNavigation({
               <IconButton
                 name="More"
                 title={`Manage label ${label}`}
+                disabled={!canManageLabels}
                 className="label-manage"
                 onClick={() => onEditLabel(label)}
               />
