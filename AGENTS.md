@@ -8,6 +8,39 @@
   sync/policy in `src/core.ts`; tests in `tests/`.
 - `apps/local-host` — local host process; `apps/mock-api` — mock provider.
 
+## Current app baseline
+
+All work, whether local or on GitHub, must use the latest intended application
+baseline. An up-to-date remote branch is not sufficient when the user's local
+app is newer; a newer checkout does not prove the running app serves that build.
+
+1. Before implementation or review, inspect the working tree, fetch the relevant
+   remote refs, check merged PRs, and compare local and remote history. Identify
+   the running service and served build when relevant. Preserve concurrent work;
+   do not assume `origin/main`, a retained worktree, or an old fixture is current.
+2. Resolve baseline differences before proceeding. Preserve the latest applicable
+   app changes, including layout, interactions and settings. Do not silently use
+   an older public UI to keep a patch isolated. If the current baseline cannot be
+   reproduced safely, stop and ask for the integration/publishing decision. This
+   rule does not authorize publishing unrelated local commits, merging unapproved
+   features, discarding edits, or deploying work in progress.
+3. Develop and verify against that current baseline. If an isolated public PR
+   must use a different base, also maintain a current-app integration of the exact
+   patch and disclose both revisions. Checks against the older PR base alone do
+   not qualify the change for the app the user actually uses.
+4. Capture before/after UI evidence from the current-app baseline and that same
+   baseline plus the proposed change, using fictional mail. Match the user's
+   layout, theme, density and relevant settings; keep fixture state, viewport,
+   zoom and build mode identical between captures. Inspect the rendered result
+   and verify the loaded assets. Do not present an older UI or fresh-profile
+   defaults as representative, even for a backend-only patch that changes visible
+   output. Label integration evidence accurately rather than implying it is the
+   standalone public PR build.
+5. Recheck refs, concurrent changes and build identity before requesting approval,
+   merging or deploying. If relevant code or UI changed, update the integration
+   and affected evidence/checks before proceeding. Existing PR evidence from a
+   stale UI must be refreshed before it is used for approval or deployment.
+
 ## Commands
 
 - Always run bun with `--no-env-file`.
@@ -100,9 +133,10 @@ layout, styling, copy, loading/empty/error states, focus, keyboard/pointer behav
 motion, virtualization, or email rendering. A backend/sanitizer change that alters
 the rendered result also qualifies, even if no CSS file changes.
 
-1. Before editing UI, identify the review base, affected scenarios and expected
-   differences. Capture the **before** state from that actual base using fictional
-   mail in an isolated profile. Load `personal-design` as required.
+1. Before editing UI, establish the **current app baseline** above, identify the
+   review base, affected scenarios and expected differences. Capture the **before**
+   state from that current baseline using fictional mail in an isolated profile.
+   Load `personal-design` as required.
 2. Open a **draft PR titled `UIPR: <scope>`** on an isolated review branch before
    implementation; a baseline-evidence-only initial commit is allowed if needed
    to open the draft. Use `.github/pull_request_template.md`. If permissions or a
