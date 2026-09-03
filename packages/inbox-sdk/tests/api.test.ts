@@ -1867,6 +1867,290 @@ describe('mutation revision receipts', () => {
   })
 })
 
+describe('local preview repair', () => {
+  test('ingestion derives previews; historical repair changes only previews and visible revision without provider requests', async () => {
+    const h = await fixture()
+    const { account, box } = await h.seed('alice', 'preview-preservation', [native('one', {
+      preview: '[Logo](https://tracking.example.test/logo)', bodyText: 'A useful sentence about the project.', bodyHtml: '<p>A useful sentence about the project.</p>',
+    })])
+    const message = (await h.page()).items[0]!
+    expect(message.preview).toBe('A useful sentence about the project.')
+    const database = new Database(h.database)
+    try {
+      await h.inbox.runDue()
+      expect((await h.page()).items[0]!.revision).toBe(message.revision)
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value).done).toBe(true)
+      database.query("UPDATE sdk_messages SET confirmed=json_set(confirmed,'$.preview','[Logo](https://tracking.example.test/logo)','$.bodyRevision','opaque-original'),visible=json_set(visible,'$.preview','[Logo](https://tracking.example.test/logo)','$.bodyRevision','opaque-original') WHERE id=?").run(message.id)
+      database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
+      const before = database.query<Record<string, unknown>, [string]>('SELECT * FROM sdk_messages WHERE id=?').get(message.id)!
+      const memberships = database.query('SELECT * FROM sdk_memberships ORDER BY mailbox,message').all()
+      const nativeKeys = database.query('SELECT * FROM sdk_native_keys ORDER BY native_id').all()
+      await h.restart()
+      const calls = structuredClone(box.calls)
+      const state = (await h.inbox.changes('alice')).state
+      expect((await h.page()).items[0]!.preview).toBe('[Logo](https://tracking.example.test/logo)')
+      expect((await h.inbox.message('alice', message.id)).preview).toBe('[Logo](https://tracking.example.test/logo)')
+      await h.inbox.runDue()
+      const after = database.query<Record<string, unknown>, [string]>('SELECT * FROM sdk_messages WHERE id=?').get(message.id)!
+      expect({ ...after, confirmed: before.confirmed, visible: before.visible, revision: before.revision } as Record<string, unknown>).toEqual(before)
+      expect(JSON.parse(after.confirmed as string)).toEqual({ ...JSON.parse(before.confirmed as string), preview: message.preview })
+      expect(JSON.parse(after.visible as string)).toEqual({ ...JSON.parse(before.visible as string), preview: message.preview, revision: message.revision + 1 })
+      expect(after.revision).toBe(message.revision + 1)
+      expect(database.query('SELECT * FROM sdk_memberships ORDER BY mailbox,message').all()).toEqual(memberships)
+      expect(database.query('SELECT * FROM sdk_native_keys ORDER BY native_id').all()).toEqual(nativeKeys)
+      expect(box.calls).toEqual(calls)
+      const changes = await h.inbox.changes('alice', { since: state })
+      expect(changes.events).toHaveLength(1)
+      expect(changes.events[0]).toMatchObject({ type: 'mail.changed', accountId: account.id, entityId: message.id, change: 'updated', reason: 'backfill' })
+      await h.inbox.runDue()
+      expect((await h.inbox.changes('alice', { since: changes.state })).events).toEqual([])
+      expect(database.query('SELECT * FROM sdk_messages WHERE id=?').get(message.id)).toEqual(after)
+      // An internal-only stale confirmed preview must not manufacture a visible revision.
+      database.query("UPDATE sdk_messages SET confirmed=json_set(confirmed,'$.preview','[Logo](https://tracking.example.test/logo)') WHERE id=?").run(message.id)
+      database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
+      await h.restart()
+      await h.inbox.runDue()
+      expect((await h.page()).items[0]!.revision).toBe(message.revision + 1)
+      expect((await h.inbox.changes('alice', { since: changes.state })).events).toEqual([])
+    } finally { database.close() }
+  })
+
+  test('bounded ID progress resumes after restart and two SQLite workers publish each repair once', async () => {
+    const h = await fixture()
+    const { box } = await h.seed('alice', 'preview-pages', Array.from({ length: 41 }, (_, index) => native(`page-${index}`)))
+    const database = new Database(h.database)
+    try {
+      database.query("UPDATE sdk_messages SET confirmed=json_set(confirmed,'$.preview','[Logo](https://tracking.example.test/logo)'),visible=json_set(visible,'$.preview','[Logo](https://tracking.example.test/logo)')").run()
+      database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
+      await h.restart()
+      const baseline = (await h.inbox.changes('alice')).state
+      const calls = structuredClone(box.calls)
+      await h.inbox.runDue()
+      const changed = database.query<{ count: number }, []>("SELECT count(*) count FROM sdk_messages WHERE json_extract(visible,'$.preview')<>'[Logo](https://tracking.example.test/logo)'").get()!.count
+      expect(changed).toBeGreaterThan(0)
+      expect(changed).toBeLessThanOrEqual(16)
+      const checkpoint = database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value
+      await h.restart()
+      expect(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value).toBe(checkpoint)
+      const worker = h.worker()
+      for (let i = 0; i < 42; i++) {
+        await Promise.all([h.inbox.runDue(), worker.runDue()])
+        if (JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value).done) break
+      }
+      const completed = JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value)
+      expect(completed).toMatchObject({ done: true, deferred: [], fallbacks: 0 })
+      expect(completed.after).toBe(completed.through)
+      const events = (await h.inbox.changes('alice', { since: baseline })).events
+      expect(events).toHaveLength(41)
+      expect(new Set(events.map(event => event.entityId)).size).toBe(41)
+      expect(box.calls).toEqual(calls)
+      await h.restart()
+      const state = (await h.inbox.changes('alice')).state
+      await h.inbox.runDue()
+      expect((await h.inbox.changes('alice', { since: state })).events).toEqual([])
+    } finally { database.close() }
+  })
+
+  test('hydration is byte bounded and oversized or malformed bodies use explicit preview-only fallback', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'preview-bytes', Array.from({ length: 6 }, (_, index) => native(`bytes-${index}`)))
+    const database = new Database(h.database)
+    try {
+      const rows = database.query<{ id: string }, []>('SELECT id FROM sdk_messages ORDER BY id').all()
+      for (const row of rows.slice(0, 4)) database.query("UPDATE sdk_messages SET body=?,confirmed=json_set(confirmed,'$.preview','[Logo](https://tracking.example.test/logo)'),visible=json_set(visible,'$.preview','[Logo](https://tracking.example.test/logo)') WHERE id=?").run(
+        JSON.stringify({ bodyText: `Useful body sentence. ${' '.repeat(350_000)}` }), row.id)
+      const oversized = JSON.stringify({ bodyText: `Body must not be hydrated. ${'🦆'.repeat(150_000)}` })
+      for (const [index, body] of [[4, oversized], [5, 'invalid historical JSON']] as const) database.query("UPDATE sdk_messages SET body=?,confirmed=json_set(confirmed,'$.preview','Useful fallback sentence.'),visible=json_set(visible,'$.preview','[Logo](https://tracking.example.test/logo)') WHERE id=?").run(body, rows[index]!.id)
+      database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
+      await h.restart()
+      await h.inbox.runDue()
+      const first = database.query<{ count: number }, []>("SELECT count(*) count FROM sdk_messages WHERE json_extract(visible,'$.preview')<>'[Logo](https://tracking.example.test/logo)'").get()!.count
+      expect(first).toBeGreaterThan(0)
+      expect(first).toBeLessThanOrEqual(2)
+      for (let i = 0; i < 7; i++) await h.inbox.runDue()
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value)).toMatchObject({ done: true, fallbacks: 2 })
+      for (const row of rows.slice(0, 4)) expect((await h.inbox.messages('alice', {})).items.find(message => message.id === row.id)!.preview).toBe('Useful body sentence.')
+      for (const row of rows.slice(4)) expect(database.query<{ preview: string }, [string]>("SELECT json_extract(visible,'$.preview') preview FROM sdk_messages WHERE id=?").get(row.id)!.preview).toBe('Useful fallback sentence.')
+      expect(database.query<{ body: string }, [string]>('SELECT body FROM sdk_messages WHERE id=?').get(rows[4]!.id)!.body).toBe(oversized)
+      expect(database.query<{ body: string }, [string]>('SELECT body FROM sdk_messages WHERE id=?').get(rows[5]!.id)!.body).toBe('invalid historical JSON')
+    } finally { database.close() }
+  })
+
+  test('pending repair deferrals survive restart, preserve operation preconditions, and resume after cancellation', async () => {
+    const h = await fixture()
+    const { box } = await h.seed('alice', 'preview-pending')
+    const database = new Database(h.database)
+    try {
+      const message = (await h.page()).items[0]!
+      database.query("UPDATE sdk_messages SET confirmed=json_set(confirmed,'$.preview','[Logo](https://tracking.example.test/logo)'),visible=json_set(visible,'$.preview','[Logo](https://tracking.example.test/logo)') WHERE id=?").run(message.id)
+      const operation = await h.inbox.mutate('alice', { messageIds: [message.id], changes: { isRead: true }, ifRevisions: { [message.id]: message.revision }, idempotencyKey: 'preview-pending' })
+      database.query('UPDATE sdk_operations SET next_at=? WHERE id=?').run(h.clock.value + 60_000, operation.id)
+      const payload = database.query<{ payload: string }, [string]>('SELECT payload FROM sdk_operations WHERE id=?').get(operation.id)!.payload
+      database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
+      await h.restart()
+      await h.inbox.runDue()
+      expect((await h.page()).items[0]!.preview).toBe('[Logo](https://tracking.example.test/logo)')
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value)).toMatchObject({ done: false, deferred: [message.id] })
+      expect(database.query<{ payload: string }, [string]>('SELECT payload FROM sdk_operations WHERE id=?').get(operation.id)!.payload).toBe(payload)
+      await h.restart()
+      await h.inbox.cancel('alice', operation.id)
+      h.clock.value += 1001
+      await h.inbox.runDue()
+      expect((await h.page()).items[0]).toMatchObject({ preview: 'Body same', isRead: false })
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value)).toMatchObject({ done: true, deferred: [] })
+      expect(box.calls.mutate).toEqual([])
+    } finally { database.close() }
+  })
+
+  test('deferred capacity applies backpressure without forgetting rows, then fairly drains after cancellation', async () => {
+    const h = await fixture()
+    const { account, box } = await h.seed('alice', 'preview-backpressure', Array.from({ length: 100 }, (_, index) => native(`waiting-${index}`)))
+    for (let index = 100; index < 140; index++) box.put(native(`waiting-${index}`))
+    await h.sync('alice', account.id)
+    const database = new Database(h.database)
+    try {
+      const ids = database.query<{ id: string }, []>('SELECT id FROM sdk_messages ORDER BY id').all().map(row => row.id)
+      expect(ids).toHaveLength(140)
+      database.query("UPDATE sdk_messages SET confirmed=json_set(confirmed,'$.preview','[Logo](https://tracking.example.test/logo)'),visible=json_set(visible,'$.preview','[Logo](https://tracking.example.test/logo)')").run()
+      const operation = await h.inbox.mutate('alice', { messageIds: ids, changes: { isRead: true }, idempotencyKey: 'preview-backpressure' })
+      database.query('UPDATE sdk_operations SET next_at=? WHERE id=?').run(h.clock.value + 3_600_000, operation.id)
+      database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
+      await h.restart()
+      for (let i = 0; i < 20; i++) {
+        h.clock.value += 1001
+        await h.inbox.runDue()
+        const state = JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value)
+        expect(state.deferred.length).toBeLessThanOrEqual(128)
+        if (state.deferred.length === 128) break
+      }
+      const full = JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value)
+      expect(full.deferred).toHaveLength(128)
+      expect(full.after < full.through).toBe(true)
+      expect(full.done).toBe(false)
+      await h.restart()
+      h.clock.value += 1001
+      await h.inbox.runDue()
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value).after).toBe(full.after)
+      await h.inbox.cancel('alice', operation.id)
+      for (let i = 0; i < 141; i++) {
+        h.clock.value += 1001
+        await h.inbox.runDue()
+        if (JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value).done) break
+      }
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value)).toMatchObject({ done: true, deferred: [] })
+      expect(database.query<{ count: number }, []>("SELECT count(*) count FROM sdk_messages WHERE json_extract(visible,'$.preview') LIKE '[Logo]%'").get()!.count).toBe(0)
+      expect(box.calls.mutate).toEqual([])
+    } finally { database.close() }
+  })
+
+  test('active-operation inspection overflow defers conservatively rather than overlooking uninspected targets', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'preview-active-limit', [native('busy'), native('other')])
+    const database = new Database(h.database)
+    try {
+      const message = (await h.page()).items[0]!
+      const operations: Operation[] = []
+      for (let index = 0; index < 33; index++) operations.push(await h.inbox.mutate('alice', { messageIds: [message.id], changes: { isRead: true }, idempotencyKey: `preview-active-${index}` }))
+      database.query("UPDATE sdk_operations SET next_at=? WHERE status='pending'").run(h.clock.value + 60_000)
+      database.query("UPDATE sdk_messages SET confirmed=json_set(confirmed,'$.preview','[Logo](https://tracking.example.test/logo)'),visible=json_set(visible,'$.preview','[Logo](https://tracking.example.test/logo)')").run()
+      database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
+      await h.restart()
+      await h.inbox.runDue()
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value).deferred).toHaveLength(2)
+      for (const operation of operations) await h.inbox.cancel('alice', operation.id)
+      h.clock.value += 1001
+      await h.inbox.runDue()
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value)).toMatchObject({ done: true, deferred: [] })
+    } finally { database.close() }
+  })
+
+  test('another worker defers an in-flight mutation and lets its normalized receipt settle without duplicate repair', async () => {
+    const h = await fixture()
+    const { box } = await h.seed('alice', 'preview-processing')
+    const database = new Database(h.database)
+    try {
+      const message = (await h.page()).items[0]!
+      database.query("UPDATE sdk_messages SET confirmed=json_set(confirmed,'$.preview','[Logo](https://tracking.example.test/logo)'),visible=json_set(visible,'$.preview','[Logo](https://tracking.example.test/logo)') WHERE id=?").run(message.id)
+      database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
+      await h.restart()
+      const barrier = h.gate(native('same', { isRead: true }))
+      box.nextMutation('same', () => barrier.wait())
+      const operation = await h.inbox.mutate('alice', { messageIds: [message.id], changes: { isRead: true }, idempotencyKey: 'preview-processing' })
+      const running = h.pending(h.inbox.runDue())
+      await bounded(barrier.entered, 'preview mutation dispatch')
+      const worker = h.worker()
+      await worker.runDue()
+      expect((await h.page()).items[0]!.preview).toBe('[Logo](https://tracking.example.test/logo)')
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value).deferred).toEqual([message.id])
+      barrier.release()
+      await bounded(running, 'preview mutation receipt')
+      h.clock.value += 1001
+      const baseline = (await h.inbox.changes('alice')).state
+      await worker.runDue()
+      expect((await h.page()).items[0]).toMatchObject({ preview: 'Preview same', isRead: true })
+      expect((await h.inbox.operation('alice', operation.id)).status).toBe('succeeded')
+      expect((await h.inbox.changes('alice', { since: baseline })).events).toEqual([])
+      expect(box.calls.mutate).toHaveLength(1)
+    } finally { database.close() }
+  })
+
+  test('deleted rows stay untouched while detached and disconnected generations defer until eligible again', async () => {
+    const h = await fixture()
+    const a = await h.seed('alice', 'preview-detached')
+    const b = await h.seed('bob', 'preview-disconnected')
+    await h.seed('alice', 'preview-deleted')
+    const database = new Database(h.database)
+    try {
+      const mailbox = (await h.inbox.mailboxes('alice')).find(box => box.sourceId === a.account.id)!
+      const detached = await h.inbox.updateMailbox('alice', mailbox.id, { status: 'detached' }, mailbox.revision)
+      await h.inbox.disconnect('bob', b.account.id)
+      database.query("UPDATE sdk_messages SET confirmed=json_set(confirmed,'$.preview','[Logo](https://tracking.example.test/logo)'),visible=json_set(visible,'$.preview','[Logo](https://tracking.example.test/logo)')").run()
+      database.query('UPDATE sdk_messages SET deleted=1 WHERE account<>? AND account<>?').run(a.account.id, b.account.id)
+      const before = database.query('SELECT * FROM sdk_messages ORDER BY id').all()
+      database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
+      await h.restart()
+      await h.inbox.runDue()
+      expect(database.query('SELECT * FROM sdk_messages ORDER BY id').all()).toEqual(before)
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value).deferred).toHaveLength(2)
+      await h.inbox.updateMailbox('alice', mailbox.id, { status: 'active' }, detached.revision)
+      await h.inbox.reconnect('bob', b.account.id, { mailbox: 'preview-disconnected', accessToken: SECRET })
+      // A temporarily stale cached generation must not be admitted just because its source is connected.
+      database.query('UPDATE sdk_messages SET generation=generation-1 WHERE account=?').run(b.account.id)
+      h.clock.value += 1001
+      await h.inbox.runDue()
+      expect((await h.inbox.messages('alice', { accountId: a.account.id })).items[0]!.preview).toBe('Body same')
+      expect(database.query<{ preview: string }, [string]>("SELECT json_extract(visible,'$.preview') preview FROM sdk_messages WHERE account=?").get(b.account.id)!.preview).toBe('[Logo](https://tracking.example.test/logo)')
+      database.query('UPDATE sdk_messages SET generation=(SELECT generation FROM sdk_accounts WHERE id=account) WHERE account=?').run(b.account.id)
+      h.clock.value += 1001
+      await h.inbox.runDue()
+      expect((await h.inbox.messages('bob', { accountId: b.account.id })).items[0]!.preview).toBe('Body same')
+      expect(database.query("SELECT json_extract(visible,'$.preview') preview FROM sdk_messages WHERE deleted=1").get()).toEqual({ preview: '[Logo](https://tracking.example.test/logo)' })
+      expect(JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value)).toMatchObject({ done: true, deferred: [] })
+    } finally { database.close() }
+  })
+
+  test('a repaired preview honestly advances revision and historical generic Undo fails closed without rebasing receipts', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'preview-undo')
+    const message = (await h.page()).items[0]!
+    const operation = await h.inbox.mutate('alice', { messageIds: [message.id], changes: { isStarred: true }, idempotencyKey: 'preview-undo' })
+    await h.inbox.runDue()
+    const database = new Database(h.database)
+    try {
+      const payload = database.query<{ payload: string }, [string]>('SELECT payload FROM sdk_operations WHERE id=?').get(operation.id)!.payload
+      const revision = (await h.page()).items[0]!.revision
+      database.query("UPDATE sdk_messages SET confirmed=json_set(confirmed,'$.preview','[Logo](https://tracking.example.test/logo)'),visible=json_set(visible,'$.preview','[Logo](https://tracking.example.test/logo)') WHERE id=?").run(message.id)
+      database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
+      await h.restart()
+      await h.inbox.runDue()
+      expect((await h.page()).items[0]).toMatchObject({ preview: 'Body same', revision: revision + 1, isStarred: true })
+      await expect(h.inbox.undo('alice', operation.id)).rejects.toMatchObject({ code: 'CONFLICT' })
+      expect(database.query<{ payload: string }, [string]>('SELECT payload FROM sdk_operations WHERE id=?').get(operation.id)!.payload).toBe(payload)
+      await expect(h.inbox.mutate('alice', { messageIds: [message.id], changes: { isRead: true }, ifRevisions: { [message.id]: revision }, idempotencyKey: 'preview-stale' })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' })
+    } finally { database.close() }
+  })
+})
+
 describe('mail HTTP ownership and provider lifecycle', () => {
   test('authentication is the host seam; query, body, and unrelated headers cannot choose the owner', async () => {
     const h = await fixture()

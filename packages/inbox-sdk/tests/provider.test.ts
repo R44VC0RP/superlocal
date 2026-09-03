@@ -10,12 +10,135 @@ import { createInbox } from '../src/core'
 import { mailFacts } from '../src/mail-facts'
 import { classifyAttention } from '../../../apps/shared/mail-attention'
 import { Database } from 'bun:sqlite'
+import { mailPreview } from '../src/mail-preview'
 import type { ProviderDefinition } from '../src/contracts'
 import { ImapProvider, type ImapCredentials } from '../server/sdk/imap'
 import type {
   InboxProvider, MailMessage, MessageMutation, ProviderCapabilities, ProviderCredentials,
   ProviderFolder, SendInput, SendResult, SyncCursor,
 } from '../server/sdk/types'
+
+describe('mail preview', () => {
+  test('prefers sender preheaders over logos, navigation and tracking links', () => {
+    const cases = [
+      { from: 'Harbor Aroma', preview: '![Harbor Aroma](https://track.example.test/logo) [WOMEN](https://track.example.test/women) [MEN](https://track.example.test/men)', html: '<div style="display:none;max-height:0">Try two discovery sprays for $3 through Sunday.</div>', expected: 'Try two discovery sprays for $3 through Sunday.' },
+      { from: 'Lantern Hotel', preview: `https://track.example.test/${'fictional/'.repeat(30)}`, html: '<div class="preheader">Book early for 22% off your next stay.</div>', expected: 'Book early for 22% off your next stay.' },
+      { from: 'Northline', preview: `Northline${'\u200c\u00a0'.repeat(150)}`, html: `<span class="preheader" style="display:none">Soft layers made for slow mornings.${'\u200c&nbsp;'.repeat(150)}</span>`, expected: 'Soft layers made for slow mornings.' },
+      { from: 'Home Team', preview: 'View this email in your browser https://track.example.test/webview', html: '<div id="preview-text">Meet the vacuum and mop that work together.</div>', expected: 'Meet the vacuum and mop that work together.' },
+    ]
+    for (const item of cases) {
+      expect(mailPreview({ preview: item.preview, bodyText: item.preview, bodyHtml: `${item.html}<a href="https://example.test"><img alt="Logo"></a><nav>WOMEN MEN</nav><p>Other body content.</p>`, from: { name: item.from } })).toBe(item.expected)
+    }
+  })
+
+  test('skips standalone web-version prompts without removing technical discussion', () => {
+    for (const prompt of ['To view this email as a web page, click here.', 'View web version']) {
+      expect(mailPreview({ preview: prompt, bodyHtml: `<div><a href="https://track.example.test/webview">${prompt}</a></div><p>The revised plan is ready for review.</p>` })).toBe('The revised plan is ready for review.')
+      expect(mailPreview({ bodyText: `${prompt}\nThe revised plan is ready for review.` })).toBe('The revised plan is ready for review.')
+    }
+    for (const bodyText of [
+      'To view this email as a web page, click the export button in the debugger.',
+      'View web version is the label we need to rename.',
+      'We should discuss viewing email as a web page at the technical review.',
+    ]) expect(mailPreview({ bodyText })).toBe(bodyText)
+  })
+
+  test('does not use subscription footers or image-only alt as a made-up summary', () => {
+    const footer = 'You are receiving this email because you subscribed to Bayview Sports.\nUnsubscribe\n123 Fictional Road, Example, CA 90000'
+    expect(mailPreview({ preview: footer, bodyText: footer, bodyHtml: '<a href="https://example.test"><img alt=""></a><footer>' + footer + '</footer>' })).toBe('')
+    expect(mailPreview({ bodyHtml: '<img alt="Logo"><img alt="Buy now"><footer>Privacy policy</footer>' })).toBe('')
+    for (const footer of [
+      "You're receiving this email because you've subscribed to service from Bayview Sports. 123 Fictional Road. If you do not wish to receive these emails, unsubscribe.",
+      'You’re receiving this email because you’ve subscribed to service from Bayview Sports.',
+      'You are receiving this email because you have subscribed to Bayview Sports.',
+    ]) expect(mailPreview({ preview: footer, bodyText: footer, bodyHtml: `<img alt=""><p>${footer}</p>` })).toBe('')
+    expect(mailPreview({ bodyHtml: '<p>Your ticket is ready.</p><p>Unsubscribe</p><p>123 Fictional Road, Example, CA 90000</p>' })).toBe('Your ticket is ready.')
+  })
+
+  test('preserves conversational text, short replies, security and transaction details', () => {
+    for (const bodyText of [
+      'Could you review the proposal before Friday? The notes are ready.', 'OK', 'Thanks!', '👍', 'はい',
+      'Please unsubscribe me from the newsletter when you have a moment.',
+      'The privacy policy needs your review before Friday.',
+      'Privacy policy changes require your review.',
+      'You are receiving this security alert because your password changed.',
+      'Your order will ship to 123 Fictional Road tomorrow.',
+    ]) expect(mailPreview({ bodyText })).toBe(bodyText)
+    expect(mailPreview({ preview: 'Already useful provider text.', bodyHtml: '<p>Different complete body text.</p>' })).toBe('Already useful provider text.')
+    expect(mailPreview({ bodyHtml: '<p><a href="https://example.test/reset">Reset your password</a> or <a href="https://example.test/support">contact our support team</a>.</p>' })).toBe('Reset your password or contact our support team.')
+  })
+
+  test('keeps meaningful link labels without Markdown or hrefs, even a single link', () => {
+    const bodyText = '[Read the proposal](https://docs.example.test/proposal?tracking=fictional)\nThe revised budget is ready for your review.'
+    const expected = 'Read the proposal The revised budget is ready for your review.'
+    expect(mailPreview({ preview: bodyText, bodyText })).toBe(expected)
+    expect(mailPreview({ preview: bodyText, bodyHtml: '<a href="https://docs.example.test/proposal?tracking=fictional">Read the proposal</a><p>The revised budget is ready for your review.</p>' })).toBe(expected)
+    expect(mailPreview({ bodyText: '[Read the proposal](https://docs.example.test/proposal)' })).toBe('Read the proposal')
+    expect(mailPreview({ bodyText: '[Read the proposal](https://track.example.test/truncated' })).toBe('Read the proposal')
+    expect(mailPreview({ bodyText: '![Brand](https://track.example.test/logo)\n[WOMEN](https://example.test/w) | [MEN](https://example.test/m)\nThe new collection is here.' })).toBe('The new collection is here.')
+  })
+
+  test('preserves emoji joiners and multilingual words while removing inbox padding', () => {
+    const bodyText = '👩🏽‍💻 The design review is ready. 明日の会議で確認しましょう。'
+    expect(mailPreview({ bodyText, preview: bodyText })).toBe(bodyText)
+    expect(mailPreview({ bodyText: 'می\u200cروم و क्\u200dष — مرحبًا بالعالم' })).toBe('می\u200cروم و क्\u200dष — مرحبًا بالعالم')
+    expect(mailPreview({ bodyText: `${'\u200c\u00a0\u200b\u034f'.repeat(150)}A useful sentence.${'\u200d\u00a0'.repeat(150)}` })).toBe('A useful sentence.')
+    expect(mailPreview({ bodyHtml: '<div class="preheader">Caf&eacute; &amp; tea&nbsp;for 明日.</div>' })).toBe('Café & tea for 明日.')
+  })
+
+  test('recognizes small hidden leading preheaders but not arbitrary hidden content', () => {
+    for (const style of ['display:none', 'opacity:0', 'max-height:0px;overflow:hidden', 'mso-hide:all']) {
+      expect(mailPreview({ bodyHtml: `<div style="${style}">The sender’s useful introduction.${'&nbsp;\u200c'.repeat(150)}</div><p>The visible body.</p>` })).toBe('The sender’s useful introduction.')
+    }
+    expect(mailPreview({ bodyHtml: '<head><title>Not a preheader</title><style>arbitrary CSS</style></head><script>not a preview</script><div aria-hidden="true">An accessible duplicate</div><p>The actual body.</p><div style="display:none">' + 'Hidden implementation detail. '.repeat(100) + '</div>' })).toBe('The actual body.')
+    expect(mailPreview({ bodyHtml: '<div style="display:none"><a href="https://example.test">Hidden navigation</a></div><p>The visible content.</p>' })).toBe('The visible content.')
+  })
+
+  test('drops only clear leading exact subject duplicates with a useful remainder', () => {
+    expect(mailPreview({ subject: 'Project update', bodyText: 'Project update\nThe revised plan is ready.' })).toBe('The revised plan is ready.')
+    expect(mailPreview({ subject: 'Project update', bodyText: 'Project update — The revised plan is ready.' })).toBe('The revised plan is ready.')
+    expect(mailPreview({ subject: 'Project update', bodyText: 'Project update' })).toBe('Project update')
+    expect(mailPreview({ subject: 'Project update', bodyText: 'Project update is ready.' })).toBe('Project update is ready.')
+    expect(mailPreview({ subject: 'Updated project', bodyText: 'Project update is ready.' })).toBe('Project update is ready.')
+  })
+
+  test('prefers paragraph boundaries and enforces UTF-16 safe caller limits', () => {
+    expect(mailPreview({ bodyText: 'The short opening paragraph is complete.\n' + 'The following paragraph is longer. '.repeat(10) }, 60)).toBe('The short opening paragraph is complete.')
+    const text = '👩🏽‍💻 明日の会議で確認しましょう。'.repeat(30)
+    for (let limit = 0; limit <= 200; limit++) {
+      const output = mailPreview({ bodyText: text }, limit)
+      expect(output.length).toBeLessThanOrEqual(limit)
+      expect(() => encodeURIComponent(output)).not.toThrow()
+    }
+    expect(mailPreview({ bodyText: 'Thanks' }, -5)).toBe('')
+    expect(mailPreview({ bodyText: 'Thanks' }, 2.5)).toBe('Th')
+    expect(() => encodeURIComponent(mailPreview({ bodyText: 'A'.repeat(16 * 1024 - 1) + '👩' }, 16 * 1024))).not.toThrow()
+    expect(mailPreview({ bodyText: '\ud800Thanks\udc00' })).toBe('Thanks')
+  })
+
+  test('handles malformed, deeply nested and oversized inputs deterministically within bounded work', () => {
+    const cases = [
+      '<p>A useful opening.<div><a href="https://example.test">Read the details',
+      '<div>'.repeat(20_000) + 'Unreachable deep text' + '</div>'.repeat(20_000),
+      '<!--' + 'hidden'.repeat(200_000),
+      '<div class="preheader">A useful introduction.</div>' + '<p>Extra text.</p>'.repeat(100_000),
+      '<script>' + 'x'.repeat(2_000_000) + '</script><p>Outside the bounded input.</p>',
+      '<div title="' + '['.repeat(500_000),
+    ]
+    const start = performance.now()
+    for (const bodyHtml of cases) {
+      const input = Object.freeze({ bodyHtml, preview: 'Safe provider fallback.' })
+      const output = mailPreview(input)
+      expect(output).toBe(mailPreview(input))
+      expect(output.length).toBeLessThanOrEqual(200)
+      expect(() => encodeURIComponent(output)).not.toThrow()
+    }
+    expect(mailPreview({ bodyText: '['.repeat(200_000) })).toBe('')
+    expect(mailPreview({ bodyHtml: '<div class="preheader">A useful introduction.</div>' + '<p>Extra text.</p>'.repeat(100_000) })).toBe('A useful introduction.')
+    // A coarse runaway guard, not an accuracy or user-visible latency claim.
+    expect(performance.now() - start).toBeLessThan(2_000)
+  })
+})
 
 const TEXT = 'Plain caf\u00e9, \u65e5\u672c\u8a9e and a literal <tag>.\nSecond line.'
 const HTML = '<p>HTML caf\u00e9, <strong>\u65e5\u672c\u8a9e</strong></p><img src="cid:contract-inline">'
