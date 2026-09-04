@@ -1,4 +1,5 @@
 import { preprocessingVersion, sourceFactKeys, taxonomy, taxonomyVersion, validateClassificationInput, type Classification, type ClassificationInput } from './schema'
+import { hasCurrentText } from './source'
 
 type EmailType = Classification['primaryType']
 type Action = Classification['actions'][number]
@@ -197,7 +198,9 @@ function features(model: LinearModel, input: ClassificationInput, state: Compile
   booleans.forEach((key, i) => { if ((key === 'bodyTruncated' ? input.bodyTruncated : input.facts[key]) === true) entries.push([model.vocabulary.length + i, 0.35]) })
   const norm = Math.sqrt(entries.reduce((sum, [, value]) => sum + value * value, 0))
   if (norm) for (const entry of entries) entry[1] /= norm
-  return { entries, grounded: counts.size > 0 }
+  let grounded = false
+  for (const id of counts.keys()) if (!/^(?:email|url|re|fw|fwd)(?: (?:email|url|re|fw|fwd))?$/.test(model.vocabulary[id])) { grounded = true; break }
+  return { entries, grounded: grounded && hasCurrentText(input, 24_000) }
 }
 
 /** Uncalibrated SVM scores, not probabilities. No identity features or email side effects. */

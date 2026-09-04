@@ -1,4 +1,5 @@
 import { preprocessingVersion, sourceFactKeys, taxonomy, taxonomyVersion, validateClassificationInput, type Classification, type ClassificationInput } from './schema'
+import { hasCurrentText } from './source'
 
 type EmailType = Classification['primaryType']
 type Action = Classification['actions'][number]
@@ -140,7 +141,7 @@ function lexical(input: ClassificationInput): Array<Map<number, number>> {
   })
 }
 
-type Features = { indices: Uint16Array; values: Float32Array; knownFraction: number; known: number }
+type Features = { indices: Uint16Array; values: Float32Array; knownFraction: number; known: number; grounded: boolean }
 function features(input: ClassificationInput, dimensions: number, vocabulary: Set<number>): Features {
   const fields = lexical(input), all = new Set(fields.flatMap(field => [...field.keys()]))
   const known = [...all].filter(id => vocabulary.has(id)).length
@@ -160,7 +161,7 @@ function features(input: ClassificationInput, dimensions: number, vocabulary: Se
   values.set(0, 1)
   values.set(1, input.bodyTruncated ? 0.25 : 0)
   sourceFactKeys.forEach((key, index) => { if (typeof input.facts[key] === 'boolean') values.set(index + 2, input.facts[key] ? 0.25 : -0.25) })
-  return { indices: Uint16Array.from(values.keys()), values: Float32Array.from(values.values()), knownFraction: all.size ? known / all.size : 0, known }
+  return { indices: Uint16Array.from(values.keys()), values: Float32Array.from(values.values()), knownFraction: all.size ? known / all.size : 0, known, grounded: hasCurrentText(input) }
 }
 
 function dot(weights: number[], vector: Features): number {
@@ -189,7 +190,7 @@ function random(seed: number): () => number {
 
 function rawPrediction(model: Model, vector: Features) {
   const scores = softmax(model.weights.types, vector), winner = scores.indexOf(Math.max(...scores)), label = types[winner]
-  const grounded = vector.known > 0 && vector.knownFraction >= model.hyperparameters.minimumKnownFraction
+  const grounded = vector.grounded && vector.known > 0 && vector.knownFraction >= model.hyperparameters.minimumKnownFraction
   const eligible = grounded && label !== 'unknown' && model.training.types[label] >= model.hyperparameters.minimumClassSamples && types.filter(type => model.training.types[type] > 0).length >= 2
   const actionScores = mapActions(action => sigmoid(dot(model.weights.actions[actions.indexOf(action)], vector)))
   return { label, typeScore: scores[winner], actionScores, grounded, eligible }

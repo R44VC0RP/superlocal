@@ -174,6 +174,21 @@ describe('offline classification dataset', () => {
     expect(empty.abstained).toBe(true); expect(empty.actions).toEqual([])
     expect(empty.abstainedActions).toEqual(actions)
     expect(prediction.abstainedActions).not.toContain('pay')
+    // Unlike the small vocabulary above, real models know the URL/email placeholders.
+    const markerPayload = JSON.parse(saved), extra = ['email', 'url', 're', 'subject', 'invoice', 'reply', 'message', 'id']
+    markerPayload.vocabulary.push(...extra); markerPayload.idf.push(...extra.map(() => 1))
+    markerPayload.types.coef = markerPayload.types.coef.map((row: number[]) => [...row.slice(0, 3), ...extra.map(() => 0), ...row.slice(3)])
+    markerPayload.types.intercept = [0, 10, 0]
+    markerPayload.actions.pay.coef = [...markerPayload.actions.pay.coef.slice(0, 3), ...extra.map(() => 0), ...markerPayload.actions.pay.coef.slice(3)]
+    markerPayload.actions.pay.intercept = 10
+    const markerModel = validateLinearModel(markerPayload)
+    for (const bodyText of ['https://example.test sender@example.test', '<https://example.test> “https://example.test” [email] [url]', 'zzzzzzzzzzzzz [url]', 'HTTPſ://example.test ｈｔｔｐｓ：／／example.test', 'Subject: invoice\nReply-To: sender@example.test\nMessage-ID: <abc@example.test>', 'Subject: monthly\n invoice\nReply-To: sender@example.test', '> Please pay the invoice.', 'On Tuesday someone wrote:\nPlease pay the invoice.']) {
+      const unavailable = predictLinearClassifier(markerModel, { ...input, subject: 'Ｒｅ：', bodyText })
+      expect(unavailable).toMatchObject({ primaryType: 'unknown', eligible: false, eligibleActions: [], actions: [], abstainedActions: actions })
+      expect(unavailable.typeScore).toBeGreaterThan(0)
+    }
+    expect(predictLinearClassifier(markerModel, { ...input, subject: '', bodyText: 'Please pay the invoice.' })).toMatchObject({ eligible: true, actions: ['pay'] })
+    expect(predictLinearClassifier(markerModel, { ...input, subject: '', bodyText: 'From: sender@example.test\n\n Please pay the invoice.' })).toMatchObject({ eligible: true, actions: ['pay'] })
     const disabled = JSON.parse(saved)
     disabled.actions.pay.selection = { method: 'disabled', threshold: 0, accepted: 0, precision: null }
     const disabledPrediction = predictLinearClassifier(validateLinearModel(disabled), input)
@@ -282,6 +297,9 @@ describe('offline classification dataset', () => {
     disabled.thresholds.type = 1.01
     expect(predictClassifier(disabled, examples[100]!.input)).toMatchObject({ primaryType: 'unknown', abstained: true, rawPrimaryType: 'conversation', eligible: true })
     expect(predictClassifier(disabled, { ...examples[100]!.input, subject: '', bodyText: '' })).toMatchObject({ eligible: false, eligibleActions: [] })
+    for (const bodyText of ['Subject: Please reply with your approval\nTo: person@example.test', '> Please reply with your approval', 'On Tuesday someone wrote:\nPlease reply with your approval']) {
+      expect(predictClassifier(model, { ...examples[100]!.input, subject: 'Re:', bodyText })).toMatchObject({ primaryType: 'unknown', eligible: false, eligibleActions: [], actions: [] })
+    }
   })
 
   test('snapshots canonical mail read-only, resumes without relabeling, preserves reviews and exports private grouped training data', async () => {
