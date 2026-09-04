@@ -103,6 +103,10 @@ SUPERLOCAL_GOOGLE_CLIENT_ID=your-google-web-client-id
 SUPERLOCAL_GOOGLE_CLIENT_SECRET=your-google-web-client-secret
 ```
 
+For a real remote mailbox setup, also select `mode: "real"` and enable the desired
+providers in the retained config, as described under **Connect real providers**.
+Mock mode remains an offline demo, not a connection to real mail services.
+
 Register **both** redirect URIs on that Google OAuth web client:
 
 ```text
@@ -117,15 +121,24 @@ whitespace normalize, but plus tags and Gmail dots are not rewritten. Restart
 after changing the list: removed users' existing sessions then fail the access
 check. Sign out is available in the sidebar footer.
 
-**This is shared access to one installation.** Every approved person can access
-its connected mail and settings. The gate does not create separate tenants or
-per-mailbox roles. Google login does not connect Gmail or grant mailbox scopes;
-users still choose mailbox connections separately. Login provider tokens are not
-retained after identity verification, and mailbox credentials stay in the SDK.
+**Each approved person has a private account on the installation.** Their first
+Google sign-in starts with no connected mailboxes. They can connect multiple
+mailboxes across the enabled providers; connections, mail, drafts and settings
+are scoped to that person. There are no shared-mailbox or team roles. Google
+login does not connect Gmail or grant mailbox scopes. Login provider tokens are
+not retained after identity verification, and mailbox credentials stay in the SDK.
 
-Better Auth stores login identities and sessions in `auth.sqlite` beside the
-mode's other databases. Its secret is derived from the retained runtime session
-key, so `/persist` also preserves login state across redeploys. Missing Google
+Browser-held preferences, draft recovery and issue reports are also user-scoped.
+Switching the signed-in person loads a fresh application context; stale tabs and
+requests cannot operate under the next person's session. Existing unscoped local
+browser data and legacy loopback mail are not imported or exposed to Google
+users. Configure a fresh remote installation and reconnect the desired providers;
+this feature does not migrate an existing local installation.
+
+Better Auth stores login identities, durable private-owner bindings and sessions
+in `auth.sqlite` beside the mode's other databases. Its secret is derived from the
+retained runtime session key, so `/persist` also preserves login state and user
+ownership across redeploys. Missing Google
 credentials fail closed in Google mode; it never falls back to local access.
 Only the login shell/assets, auth flow and health check are public. Mail,
 settings, attachments, authenticated images and event streams require an
@@ -197,7 +210,7 @@ Client → Inbox SDK APIs → provider adapters
 | `packages/inbox-sdk` | Normalized mail contracts, SQLite storage, encrypted credentials, queries, jobs, drafts, events, and provider translation. |
 | `apps/mock-api` | A fictional upstream and real `InboxProvider` implementation, not a fake SDK HTTP layer. |
 
-The SDK currently runs on Bun and SQLite. The host supports explicit local-only sessions or a Google allowlist gate for shared installation access. Separate-user tenancy and team/mailbox access controls are not implemented.
+The SDK currently runs on Bun and SQLite. The host supports explicit local-only sessions or allowlisted Google sign-in with private per-user mailboxes and settings. Shared-mailbox and team roles are not implemented.
 
 ## Connect real providers
 

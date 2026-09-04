@@ -1,3 +1,4 @@
+import { readText, removeSaved, writeText } from "./storage";
 import {
   useCallback,
   useEffect,
@@ -293,7 +294,7 @@ export default function Composer({
   const [reminder, setReminder] = useState(() => {
     try {
       return (
-        localStorage.getItem(`superlocal:draft-reminder:${draft.id}`) || ""
+        readText(`draft-reminder:${draft.id}`) || ""
       );
     } catch {
       return "";
@@ -389,7 +390,7 @@ export default function Composer({
       setMenu(null);
       try {
         setReminder(
-          localStorage.getItem(`superlocal:draft-reminder:${draft.id}`) || "",
+          readText(`draft-reminder:${draft.id}`) || "",
         );
       } catch {
         setReminder("");
@@ -576,11 +577,7 @@ export default function Composer({
     setReminder(value);
     setMenu(null);
     update({});
-    try {
-      if (value)
-        localStorage.setItem(`superlocal:draft-reminder:${draft.id}`, value);
-      else localStorage.removeItem(`superlocal:draft-reminder:${draft.id}`);
-    } catch {
+    if (!(value ? writeText(`draft-reminder:${draft.id}`, value) : removeSaved(`draft-reminder:${draft.id}`))) {
       setError("Your browser could not save the reminder.");
     }
   }

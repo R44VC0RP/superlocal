@@ -3,7 +3,7 @@ import { betterAuth } from 'better-auth'
 import { APIError } from 'better-auth/api'
 import { getMigrations } from 'better-auth/db/migration'
 import { verifyGoogleIdToken, type GoogleProfile } from 'better-auth/social-providers'
-import { createHmac } from 'node:crypto'
+import { createHmac, randomUUID } from 'node:crypto'
 import { closeSync, constants, fstatSync, lstatSync, openSync } from 'node:fs'
 import { join } from 'node:path'
 import { InboxError } from 'inbox-sdk'
@@ -42,7 +42,7 @@ function privateFile(path: string, create = false): void {
   } finally { if (fd !== undefined) closeSync(fd) }
 }
 
-/** Installation access only. This store never provisions or changes the fixed SDK mail owner. */
+/** Each admitted identity receives a new private mail owner. Legacy installation mail is never assigned. */
 export async function createApplicationAuth(config: LocalConfig, runtime: ReturnType<typeof openLocalRuntime>, environment: NodeJS.ProcessEnv) {
   const clientId = resolveSecret(config.providers.gmail.oauth.clientId, environment)
   const clientSecret = resolveSecret(config.providers.gmail.oauth.clientSecret, environment)
@@ -59,6 +59,21 @@ export async function createApplicationAuth(config: LocalConfig, runtime: Return
     const accounts = database.query<{ providerId: string; issuer: string; accountId: string }, [string]>('SELECT providerId, issuer, accountId FROM account WHERE userId = ?').all(id)
     return !!user && permits(user.email, user.emailVerified === 1) && accounts.length === 1 && accounts[0]!.providerId === 'google' && accounts[0]!.issuer === googleIssuer && validSubject(accounts[0]!.accountId)
   }
+  const privateOwner = (userId: string): string => {
+    const read = () => database.query<{ owner: string }, [string]>('SELECT owner FROM application_owner WHERE user_id=?').get(userId)?.owner
+    const existing = read()
+    const owner = existing ?? database.transaction(() => {
+      const existing = read()
+      if (existing) return existing
+      if (database.query<{ count: number }, []>('SELECT COUNT(*) AS count FROM application_owner').get()!.count >= 256) throw new APIError('FORBIDDEN', { code: 'access_denied', message: 'User limit reached' })
+      const owner = `user:${randomUUID()}`
+      database.query('INSERT INTO application_owner (user_id,owner) VALUES (?,?)').run(userId, owner)
+      return owner
+    }).immediate()
+    if (!/^user:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(owner)) throw new APIError('FORBIDDEN', { code: 'access_denied', message: 'Owner binding unavailable' })
+    return owner
+  }
+  const scopeFor = (owner: string) => createHmac('sha256', runtime.sessionKey).update(JSON.stringify(['superlocal:user-scope:v1', config.instanceId, config.mode, owner])).digest('hex')
   try {
     database.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;')
     const auth = betterAuth({
@@ -99,7 +114,9 @@ export async function createApplicationAuth(config: LocalConfig, runtime: Return
       rateLimit: { enabled: true, window: 60, max: 60, storage: 'database', customRules: { '/sign-in/social': { window: 60, max: 20 }, '/callback/google': false } },
       onAPIError: { errorURL: `${config.web.origin}/?auth=denied` },
       databaseHooks: {
-        user: { create: { async before(user) { if (!permits(user.email, user.emailVerified)) throw new APIError('FORBIDDEN', { code: 'access_denied', message: 'Access denied' }) } } },
+        user: { create: { async before(user) {
+          if (!permits(user.email, user.emailVerified) || database.query<{ count: number }, []>('SELECT COUNT(*) AS count FROM user').get()!.count >= 256) throw new APIError('FORBIDDEN', { code: 'access_denied', message: 'Access denied' })
+        } } },
         account: {
           create: { async before(account) {
             if (account.providerId !== 'google' || account.issuer !== googleIssuer || !validSubject(account.accountId)) throw new APIError('FORBIDDEN', { code: 'access_denied', message: 'Access denied' })
@@ -109,10 +126,18 @@ export async function createApplicationAuth(config: LocalConfig, runtime: Return
           } },
           update: { async before(account) { return { data: { ...account, accessToken: null, refreshToken: null, idToken: null } } } },
         },
-        session: { create: { async before(session) { if (!storedUserAllowed(session.userId)) throw new APIError('FORBIDDEN', { code: 'access_denied', message: 'Access denied' }) } } },
+        session: { create: { async before(session) {
+          if (!storedUserAllowed(session.userId)) throw new APIError('FORBIDDEN', { code: 'access_denied', message: 'Access denied' })
+          privateOwner(session.userId)
+        } } },
       },
     })
     await (await getMigrations(auth.options)).runMigrations()
+    // Do not derive owners from email or re-use a shared owner after an auth DB reset.
+    // Bindings remain reserved even if an identity is removed; admission is bounded.
+    database.exec(`CREATE TABLE IF NOT EXISTS application_owner (user_id TEXT PRIMARY KEY NOT NULL, owner TEXT UNIQUE NOT NULL) STRICT;
+      CREATE TRIGGER IF NOT EXISTS application_user_limit BEFORE INSERT ON user
+      WHEN (SELECT COUNT(*) FROM user) >= 256 BEGIN SELECT RAISE(ABORT, 'Application user limit reached'); END;`)
     await auth.$context
     for (const suffix of ['', '-wal', '-shm', '-journal']) privateFile(`${path}${suffix}`)
 
@@ -120,7 +145,8 @@ export async function createApplicationAuth(config: LocalConfig, runtime: Return
       if (closed || request.headers.has('authorization') || (request.headers.get('cookie')?.length ?? 0) > 16_384) return null
       const result = await auth.api.getSession({ headers: request.headers, query: { disableCookieCache: true, disableRefresh: true } })
       if (!result || !permits(result.user.email, result.user.emailVerified) || !storedUserAllowed(result.user.id)) return null
-      return { sessionId: result.session.id, name: result.user.name, email: result.user.email }
+      const owner = privateOwner(result.user.id)
+      return { owner, scope: scopeFor(owner), name: result.user.name, email: result.user.email }
     }
     const canonical = (request: Request, route: string, body?: object) => new Request(`${config.web.origin}/api/auth${route}`, {
       method: body ? 'POST' : 'GET', headers: { ...(request.headers.get('cookie') ? { Cookie: request.headers.get('cookie')! } : {}),
@@ -143,11 +169,20 @@ export async function createApplicationAuth(config: LocalConfig, runtime: Return
         if (request.headers.get('origin') && request.headers.get('origin') !== config.web.origin || request.headers.get('sec-fetch-site') === 'cross-site') throw new InboxError('HOST_ORIGIN_FORBIDDEN', 'Use the configured application origin.', 403)
         if (url.pathname === '/host/auth' && request.method === 'GET') {
           const user = await identity(request)
-          return Response.json({ method: 'google', authenticated: !!user, user: user ? { name: user.name, email: user.email } : null }, { headers })
+          return Response.json({ method: 'google', authenticated: !!user, user: user ? { name: user.name, email: user.email } : null, scope: user?.scope ?? null }, { headers })
         }
         if (!['/host/auth/sign-in', '/host/auth/sign-out'].includes(url.pathname)) throw new InboxError('HOST_AUTH_ROUTE_FORBIDDEN', 'Authentication route not available.', 404)
         if (request.method !== 'POST') throw new InboxError('HOST_METHOD_NOT_ALLOWED', 'Use POST for authentication.', 405)
         if (request.headers.get('origin') !== config.web.origin || request.headers.get('x-superlocal') !== '1') throw new InboxError('HOST_ORIGIN_FORBIDDEN', 'An exact Origin and X-Superlocal: 1 are required.', 403)
+        if (url.pathname === '/host/auth/sign-out' && request.headers.has('x-superlocal-scope')) {
+          // Logout remains available to removed allowlist users, but an old tab must
+          // not revoke a different user's session after the shared browser cookie changes.
+          const current = await auth.api.getSession({ headers: request.headers, query: { disableCookieCache: true, disableRefresh: true } })
+          const owner = current && database.query<{ owner: string }, [string]>('SELECT owner FROM application_owner WHERE user_id=?').get(current.user.id)?.owner
+          if (current && (!owner || request.headers.get('x-superlocal-scope') !== scopeFor(owner))) return Response.json({ code: 'HOST_SCOPE_CHANGED', error: 'The signed-in user changed. Reload before continuing.', retryable: false }, {
+            status: 409, headers: { ...headers, 'X-Superlocal-Auth': 'required' },
+          })
+        }
         await emptyBody(request)
         response = await auth.handler(canonical(request, url.pathname.endsWith('/sign-in') ? '/sign-in/social' : '/sign-out',
           url.pathname.endsWith('/sign-in') ? { provider: 'google', callbackURL: `${config.web.origin}/`, errorCallbackURL: `${config.web.origin}/?auth=denied`, disableRedirect: true } : {}))

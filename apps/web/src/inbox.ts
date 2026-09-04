@@ -6,8 +6,9 @@ import type {
 } from "inbox-sdk/types";
 import type { Attachment, Draft, Mail, MailboxOption, Message } from "./data";
 import { escapeHTML, plainText } from "./mail-text";
-import { readSaved, writeSaved } from "./storage";
-import { checkAuthenticationResponse } from "./application-auth";
+import { getApplicationStorage } from "./storage";
+import { createScopedFetch } from "./application-auth";
+import { getApplicationScope } from "./application-scope";
 import { matchesSearch } from "./mail-search";
 import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, type HostConfiguration, type InboxViewPreferences } from "./host";
 import { readSplitPreferences, writeSplitPreferences, readAttentionFeedback, recordAttentionFeedback, retractAttentionFeedback, InboxViewPreferencesError,
@@ -164,6 +165,9 @@ function displayTimes() {
 }
 
 export class InboxStore {
+  private readonly applicationScope = getApplicationScope();
+  private readonly storage = getApplicationStorage();
+  private readonly transport = createScopedFetch(this.applicationScope);
   private state: InboxSnapshot = initial;
   private listeners = new Set<() => void>();
   private controller = new AbortController();
@@ -211,8 +215,8 @@ export class InboxStore {
   private operations = new Map<string, Operation>();
   private submissions = new Map<string, { idempotencyKey: string; revision: number; sendAt?: string }>();
   private loadingThreads = new Map<string, Promise<void>>();
-  private recovery = readSaved<Record<string, { draft: Draft; revision: number }>>(recoveryKey, {});
-  private references = readSaved<SendReference[]>(outboxKey, []).filter(ref => ref && [ref.id, ref.draftId, ref.accountId, ref.mailboxId].every(value => typeof value === "string"));
+  private recovery = this.storage.readSaved<Record<string, { draft: Draft; revision: number }>>(recoveryKey, {});
+  private references = this.storage.readSaved<SendReference[]>(outboxKey, []).filter(ref => ref && [ref.id, ref.draftId, ref.accountId, ref.mailboxId].every(value => typeof value === "string"));
   private issueHolds = new Map<string, ReturnType<typeof setTimeout>>();
   private dismissals = new Map<string, number>();
   private following = false;
@@ -225,8 +229,7 @@ export class InboxStore {
       const path = new URL(input instanceof Request ? input.url : String(input), location.origin).pathname;
       const finish = measureRequest(path, init?.method ?? "GET");
       try {
-        const response = await fetch(input, init);
-        checkAuthenticationResponse(response);
+        const response = await this.fetch(input, init);
         finish(response.status);
         console.info({ event: "inbox.request", method: init?.method ?? "GET", path, status: response.status, durationMs: Math.round(performance.now() - start), requestId: response.headers.get("x-request-id") });
         return response;
@@ -240,7 +243,14 @@ export class InboxStore {
 
   getSnapshot = () => this.state;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => this.listeners.delete(listener); };
-  private publish(patch: Partial<InboxSnapshot> = {}) { this.state = { ...this.state, ...patch }; this.listeners.forEach(listener => listener()); }
+  private fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    return this.transport(input, { ...init, signal: signal ? AbortSignal.any([this.controller.signal, signal]) : this.controller.signal });
+  }
+  private publish(patch: Partial<InboxSnapshot> = {}) {
+    if (this.controller.signal.aborted || this.applicationScope.signal.aborted) return;
+    this.state = { ...this.state, ...patch }; this.listeners.forEach(listener => listener());
+  }
   private requestOptions() { return { signal: this.controller.signal }; }
   private fail(error: unknown, action: string) {
     if (this.controller.signal.aborted || error instanceof DOMException && error.name === "AbortError") return;
@@ -395,8 +405,10 @@ export class InboxStore {
   }
 
   start = () => {
+    this.applicationScope.signal.throwIfAborted();
     this.controller = new AbortController(); this.started = true;
     const generation = ++this.generation;
+    const options = this.requestOptions();
     // Strict-mode remounts resume accepted IDs or the same unacknowledged
     // payload; stopping a view never cancels the durable SDK operation.
     this.flagQueues.clear(); this.flagReconciler = undefined;
@@ -406,10 +418,11 @@ export class InboxStore {
     window.addEventListener("focus", onFocus);
     void (async () => {
       try {
-        try { await this.client.accounts(this.requestOptions()); }
+        try { await this.client.accounts(options); }
         catch (error) {
+          if (options.signal.aborted || generation !== this.generation) return;
           if (!(error instanceof ApiError) || error.status !== 401) throw error;
-          const response = await fetch("/session", { method: "POST", credentials: "include", headers: { "X-Superlocal": "1" }, signal: this.controller.signal });
+          const response = await this.fetch("/session", { method: "POST", credentials: "include", headers: { "X-Superlocal": "1" }, signal: options.signal });
           if (!response.ok) throw new Error("Sign in through the host application before opening this inbox.");
           this.client.clearCache();
         }
@@ -421,6 +434,7 @@ export class InboxStore {
     return () => {
       window.removeEventListener("focus", onFocus);
       this.started = false; this.generation++; this.controller.abort();
+      this.client.clearCache();
       clearTimeout(this.refreshTimer);
       for (const timer of this.saveTimers.values()) clearTimeout(timer);
       for (const timer of this.issueHolds.values()) clearTimeout(timer);
@@ -690,7 +704,7 @@ export class InboxStore {
     }
     if (epoch === this.draftEpoch && !same([...drafts], [...this.rawDrafts])) {
       for (const raw of drafts.values()) for (const id of raw.attachmentIds) if (!this.blobInfo.has(id)) {
-        const response = await fetch(`/v1/blobs/${encodeURIComponent(id)}`, { method: "HEAD", credentials: "include", signal });
+        const response = await this.fetch(`/v1/blobs/${encodeURIComponent(id)}`, { method: "HEAD", credentials: "include", signal });
         if (!response.ok) throw new Error("Could not read draft attachment metadata.");
         const info = JSON.parse(decodeURIComponent(response.headers.get("x-inbox-blob-info") || "")) as BlobInfo;
         if (info.id !== id || info.accountId !== raw.accountId) throw new Error("The attachment metadata belongs to another source.");
@@ -760,10 +774,10 @@ export class InboxStore {
         // Legacy browser preferences have no owner. Bind their one-time import
         // to this host identity; never copy them into a later, unrelated owner.
         const scope = host.preferenceScope;
-        const bound = readSaved<string | null>("legacy-split-owner", null);
-        const importLegacy = !!scope && (!bound || bound === scope);
-        if (importLegacy && !writeSaved("legacy-split-owner", scope)) throw new Error("Your existing splits could not be bound to this inbox. Browser storage must be available before importing them.");
-        const legacy = importLegacy ? readSaved<Record<string, unknown>>("preferences", {}) : {};
+        const bound = this.storage.readSaved<string | null>("legacy-split-owner", null);
+        const importLegacy = this.applicationScope.scope === null && !!scope && (!bound || bound === scope);
+        if (importLegacy && !this.storage.writeSaved("legacy-split-owner", scope)) throw new Error("Your existing splits could not be bound to this inbox. Browser storage must be available before importing them.");
+        const legacy = importLegacy ? this.storage.readSaved<Record<string, unknown>>("preferences", {}) : {};
         try { splitPreferences = await writeSplitPreferences({ ...normalizeSplits({ ...legacy, version: undefined }), revision: 0 }, options.signal); }
         catch (error) {
           if (!(error instanceof InboxViewPreferencesError) || error.status !== 412) throw error;
@@ -806,7 +820,7 @@ export class InboxStore {
         this.folders.set(account.id, await this.client.cachedFolders(account.id, options));
       }
       for (const draft of drafts) for (const id of draft.attachmentIds) if (!this.blobInfo.has(id)) {
-        const response = await fetch(`/v1/blobs/${encodeURIComponent(id)}`, { method: "HEAD", credentials: "include", signal: options.signal });
+        const response = await this.fetch(`/v1/blobs/${encodeURIComponent(id)}`, { method: "HEAD", credentials: "include", signal: options.signal });
         if (!response.ok) throw new Error("Could not read draft attachment metadata.");
         const info = JSON.parse(decodeURIComponent(response.headers.get("x-inbox-blob-info") || "")) as BlobInfo;
         if (info.id !== id || info.accountId !== draft.accountId) throw new Error("The attachment metadata belongs to another source.");
@@ -1103,7 +1117,7 @@ export class InboxStore {
   private saveRecovery() {
     const recovery = Object.fromEntries([...this.edits].map(([id, edit]) => [id, { draft: edit.draft, revision: edit.revision }]));
     this.recovery = recovery;
-    if (!writeSaved(recoveryKey, recovery)) this.raise({ scope: "storage", code: "RECOVERY", title: "Browser storage is full", detail: "Keep this draft open until it is saved to the inbox.", retry: false });
+    if (!this.storage.writeSaved(recoveryKey, recovery)) this.raise({ scope: "storage", code: "RECOVERY", title: "Browser storage is full", detail: "Keep this draft open until it is saved to the inbox.", retry: false });
     else this.resolve("storage");
   }
   editDraft = (draft: Draft) => {
@@ -1220,7 +1234,7 @@ export class InboxStore {
     catch (error) { if (error instanceof ApiError && error.status >= 400 && error.status < 500) this.submissions.delete(draft.id); throw error; }
     const ref = { id: operation.id, draftId: raw.id, accountId: raw.accountId, mailboxId: raw.mailboxId || draft.account };
     this.references = [...this.references.filter(item => item.id !== ref.id), ref].slice(-200);
-    if (!writeSaved(outboxKey, this.references)) this.raise({ scope: "storage", code: "OUTBOX", title: "Browser storage is full", detail: "The send is queued, but this browser could not save its operation reference.", retry: false });
+    if (!this.storage.writeSaved(outboxKey, this.references)) this.raise({ scope: "storage", code: "OUTBOX", title: "Browser storage is full", detail: "The send is queued, but this browser could not save its operation reference.", retry: false });
     this.draftEpoch++; this.rawDrafts.delete(raw.id); this.edits.delete(raw.id); this.saveRecovery();
     this.operations.set(operation.id, operation);
     this.sending.set(operation.id, { ref, operation, draft: raw }); this.rebuild(); this.scheduleRefresh();
@@ -1791,7 +1805,7 @@ export class InboxStore {
     catch (error) {
       if (error instanceof ApiError && error.status === 401) {
         try {
-          const response = await fetch("/session", { method: "POST", credentials: "include", headers: { "X-Superlocal": "1" }, signal: this.controller.signal });
+          const response = await this.fetch("/session", { method: "POST", credentials: "include", headers: { "X-Superlocal": "1" }, signal: this.controller.signal });
           if (!response.ok) throw new Error("Sign in through the host application before opening this inbox.");
           this.client.clearCache(); await this.readUpdates(true);
         } catch (next) { this.fail(next, "connect"); return; }

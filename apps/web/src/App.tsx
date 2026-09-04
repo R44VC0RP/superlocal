@@ -31,7 +31,7 @@ import CalendarView from "./CalendarView";
 import Snippets from "./Snippets";
 import { useMailMotion } from "./mail-motion";
 import { shortcutGroups } from "./shortcuts";
-import { removeSaved } from "./storage";
+import { readSessionText, removeSaved, writeSessionText } from "./storage";
 import { usePersistence } from "./use-persistence";
 import { useInbox } from "./use-inbox";
 import "./inbox.css";
@@ -163,7 +163,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const [noticeFading, setNoticeFading] = useState(false);
   const [noticeHovered, setNoticeHovered] = useState(false);
   // The read-only host reminder shows once per tab; the disabled controls and Add Accounts keep the state visible afterwards.
-  const [readOnlyDismissed, setReadOnlyDismissed] = useState(() => { try { return sessionStorage.getItem("superlocal:read-only-notice") === "dismissed"; } catch { return false; } });
+  const [readOnlyDismissed, setReadOnlyDismissed] = useState(() => readSessionText("read-only-notice") === "dismissed");
   const [onboardingReturn, setOnboardingReturn] = useState<{ providerId: string; connectionId: string | null } | null>(null);
   useEffect(() => {
     const url = new URL(location.href);
@@ -549,7 +549,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   }
   function dismissReadOnly() {
     setReadOnlyDismissed(true);
-    try { sessionStorage.setItem("superlocal:read-only-notice", "dismissed"); } catch { /* The reminder simply returns next load. */ }
+    writeSessionText("read-only-notice", "dismissed");
   }
   const notices = (
     <Notices issues={inbox.issues} onRetry={retryIssue} onDismiss={store.dismissIssue}>

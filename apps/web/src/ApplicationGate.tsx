@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import App from "./App";
-import { readSaved } from "./storage";
+import { bindApplicationScope, type ApplicationScope } from "./application-scope";
 import { AUTH_REQUIRED_EVENT, beginGoogleLogin, readApplicationAccess, signOutApplication, type ApplicationAccess } from "./application-auth";
 import "./application-auth.css";
 
@@ -14,13 +15,20 @@ export default function ApplicationGate() {
   const sequence = useRef(0);
   const channel = useRef<BroadcastChannel | null>(null);
   const current = useRef<ApplicationAccess | null>(null);
+  const binding = useRef<ApplicationScope | null>(null);
+  const announced = useRef(false);
 
   const lock = useCallback((detail = "Your session ended. Sign in again.") => {
     sequence.current++;
     request.current?.abort();
-    setAccess(null);
-    setState("required");
-    setMessage(detail);
+    binding.current?.lock();
+    document.title = "Sign in - Superlocal";
+    // Remove messages/iframes before any fresh identity check or navigation.
+    flushSync(() => {
+      setAccess(null);
+      setState("required");
+      setMessage(detail);
+    });
   }, []);
 
   const refresh = useCallback(async (initial = false) => {
@@ -32,16 +40,37 @@ export default function ApplicationGate() {
     try {
       const next = await readApplicationAccess(controller.signal);
       if (controller.signal.aborted || version !== sequence.current) return;
+      const ready = next.method === "loopback" || next.authenticated;
+      if (!ready) {
+        current.current = next;
+        if (binding.current) lock();
+        else { setAccess(null); setState("required"); }
+        return;
+      }
+      const scope = next.method === "google" ? next.scope : null;
+      if (binding.current && (binding.current.signal.aborted || binding.current.scope !== scope)) {
+        lock("Your account changed. Opening your inbox…");
+        // Cookies are shared across tabs; JS closures are not. Never mount B in
+        // A's runtime, and discard A's thread/draft route on the way out.
+        location.replace("/");
+        return;
+      }
+      binding.current = bindApplicationScope(scope);
       current.current = next;
-      setAccess(next);
-      setState(next.method === "loopback" || next.authenticated ? "ready" : "required");
+      setAccess(previous => previous?.method === "google" && next.method === "google" && previous.authenticated && next.authenticated
+        && previous.scope === next.scope && previous.user.name === next.user.name && previous.user.email === next.user.email ? previous : next);
+      setState("ready");
+      if (next.method === "google" && !announced.current) {
+        announced.current = true;
+        channel.current?.postMessage({ type: "signed-in", scope: next.scope });
+      }
     } catch {
       if (controller.signal.aborted || version !== sequence.current) return;
       // Never leave private UI visible when the current session cannot be checked.
-      setAccess(null);
+      lock("");
       setState("error");
     }
-  }, []);
+  }, [lock]);
 
   useEffect(() => {
     const url = new URL(location.href);
@@ -53,11 +82,22 @@ export default function ApplicationGate() {
       history.replaceState(null, "", url);
     }
     void refresh(true);
-    const required = () => { if (current.current?.method === "google") lock(); };
+    const required = () => {
+      if (current.current?.method !== "google") return;
+      lock();
+      void refresh();
+    };
     addEventListener(AUTH_REQUIRED_EVENT, required);
     try {
       channel.current = new BroadcastChannel("superlocal:application-auth");
-      channel.current.onmessage = event => { if (event.data === "signed-out" && current.current?.method === "google") lock(); };
+      channel.current.onmessage = event => {
+        if (current.current?.method !== "google") return;
+        if (event.data === "signed-out") lock();
+        else if (event.data?.type === "signed-in" && (binding.current?.signal.aborted || binding.current?.scope !== event.data.scope)) {
+          lock();
+          void refresh();
+        }
+      };
     } catch { /* Server-side session checks remain authoritative. */ }
     return () => {
       sequence.current++;
@@ -80,17 +120,9 @@ export default function ApplicationGate() {
   useEffect(() => {
     if (state === "ready") return;
     document.title = "Sign in - Superlocal";
-    const preferences = readSaved<Record<string, unknown>>("preferences", {});
-    const media = matchMedia("(prefers-color-scheme: dark)");
-    const apply = () => {
-      const theme = preferences.theme;
-      const dark = !["Light", "light"].includes(String(theme)) && (!["System", "Match System"].includes(String(theme)) || media.matches);
-      document.documentElement.dataset.theme = dark ? "dark" : "light";
-      document.documentElement.dataset.style = preferences.themeStyle === "Classic" ? "Classic" : "Superlocal";
-    };
-    apply();
-    media.addEventListener("change", apply);
-    return () => media.removeEventListener("change", apply);
+    // An unauthenticated document must not inspect legacy private preferences.
+    document.documentElement.dataset.theme ||= "dark";
+    document.documentElement.dataset.style ||= "Superlocal";
   }, [state]);
 
   async function signIn() {

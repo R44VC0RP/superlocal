@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib'
 import { SaxesParser } from 'saxes'
 import { createInbox } from '../src/core'
+import { builtInProviders } from '../src/providers'
 import { createInboxApi } from '../src/http'
 import { createInboxClient } from '../src/client'
 import { pinnedMediaNetwork } from '../src/media'
@@ -29,6 +30,8 @@ import { trainClassifier, predictClassifier, evaluateClassifier, evaluatePredict
 import { validateLinearModel, predictLinearClassifier, type LinearModel } from '../../../apps/local-host/src/classification/linear'
 import { auditExamples, auditInputHash, compareAudits } from '../../../apps/local-host/src/classification/audit'
 import { createMockHost } from '../../../apps/mock-api/src/host'
+import { MockMailStore } from '../../../apps/mock-api/src/store'
+import { seedMockMail } from '../../../apps/mock-api/src/seed'
 import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
   Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, Message,
@@ -315,11 +318,11 @@ describe('offline classification dataset', () => {
 })
 
 describe('Google application authentication', () => {
-  async function fixture(allowedEmails = ['allowed@example.test'], gmail = false) {
+  async function fixture(allowedEmails = ['allowed@example.test'], gmail = false, mode: 'real' | 'mock' = 'real') {
     const root = await mkdtemp(join(TEMP_ROOT, 'google-app-auth-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const initial = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
-    const config: LocalConfig = { ...initial, mode: 'real', dataDir: join(root, 'runtime'), auth: { method: 'google', sessionHours: 1, allowedEmails },
+    const config: LocalConfig = { ...initial, mode, dataDir: join(root, 'runtime'), auth: { method: 'google', sessionHours: 1, allowedEmails },
       web: { ...initial.web, origin: 'https://app.example.test', allowedOrigins: ['https://app.example.test'] },
       providers: { ...initial.providers, imap: { enabled: false, servers: [] }, gmail: { enabled: gmail, oauth: { ...initial.providers.gmail.oauth,
         clientId: { env: 'FIXTURE_CLIENT_ID' }, clientSecret: { env: 'FIXTURE_CLIENT_SECRET' } } } } }
@@ -348,10 +351,17 @@ describe('Google application authentication', () => {
     cleanup.push(async () => { globalThis.fetch = originalFetch })
     let host = await createLocalHost(config, environment)
     cleanup.push(() => host.close())
-    const request = (path: string, options: { method?: string; cookie?: string; body?: string; origin?: string; headers?: Record<string, string> } = {}) => host.fetch(new Request(`http://localhost:${config.backend.port}${path}`, {
+    const scopes = new Map<string, string>()
+    const request = (path: string, options: { method?: string; cookie?: string; scope?: string | null; body?: string; origin?: string; headers?: Record<string, string> } = {}) => host.fetch(new Request(`http://localhost:${config.backend.port}${path}`, {
       method: options.method ?? 'GET', headers: { Origin: options.origin ?? config.web.origin, ...(options.cookie ? { Cookie: options.cookie } : {}),
+        ...((options.scope === undefined ? scopes.get(options.cookie ?? '') : options.scope) ? { 'X-Superlocal-Scope': (options.scope === undefined ? scopes.get(options.cookie ?? '') : options.scope)! } : {}),
         ...(options.body !== undefined ? { 'Content-Type': 'application/json', 'X-Superlocal': '1' } : {}), ...options.headers }, ...(options.body !== undefined ? { body: options.body } : {}),
     }))
+    const ownerFor = (email: string) => {
+      const db = new Database(join(config.dataDir, config.mode, 'auth.sqlite'), { readonly: true })
+      try { return db.query<{ owner: string }, [string]>('SELECT application_owner.owner FROM application_owner JOIN user ON user.id=application_owner.user_id WHERE user.email=?').get(email)?.owner ?? null }
+      finally { db.close() }
+    }
     const cookie = (response: Response) => response.headers.getSetCookie().map(value => value.split(';')[0]!).join('; ')
     const begin = async (claims: Record<string, unknown> = {}, options: { forged?: boolean; wrongChallenge?: boolean } = {}) => {
       const response = await request('/host/auth/sign-in', { method: 'POST', body: '{}' })
@@ -363,18 +373,47 @@ describe('Google application authentication', () => {
     const login = async (claims: Record<string, unknown> = {}, options: { forged?: boolean; wrongChallenge?: boolean } = {}) => {
       const attempt = await begin(claims, options)
       const response = await request(attempt.callback, { cookie: attempt.cookie })
-      return { ...attempt, response, sessionCookie: cookie(response) }
+      const sessionCookie = cookie(response)
+      const status = await (await request('/host/auth', { cookie: sessionCookie })).json()
+      if (status.scope) scopes.set(sessionCookie, status.scope)
+      return { ...attempt, response, sessionCookie, scope: status.scope as string | null, owner: status.user ? ownerFor(status.user.email) : null }
     }
-    return { root, config, environment, request, begin, login, cookie, get host() { return host }, get exchanges() { return exchanges }, get jwksRequests() { return jwksRequests },
+    return { root, config, environment, request, begin, login, cookie, ownerFor, get host() { return host }, get exchanges() { return exchanges }, get jwksRequests() { return jwksRequests },
       async restart(next = config) { await host.close(); host = await createLocalHost(next, environment) },
       authDb() { return new Database(join(config.dataDir, config.mode, 'auth.sqlite'), { readonly: true }) },
+      async seed(owner: string, marker: string) {
+        const store = new MockMailStore(join(config.dataDir, config.mode, 'mock-upstream.sqlite'))
+        try {
+          seedMockMail(store, owner)
+          const connections: Connection[] = []
+          for (const mailbox of store.mailboxes(owner)) {
+            const connection = await host.inbox.createConnection(owner, { providerId: 'mock', credentials: { storeId: mailbox.id, databaseId: store.identity } },
+              { issuer: 'superlocal.mock.offline', subject: mailbox.id, registrationId: store.identity })
+            connections.push(connection)
+            const scope = { owner, storeId: mailbox.id, accountId: connection.sourceIds[0]! }
+            store.linkSource(scope, connection.id)
+            store.receive(scope, { from: { name: marker, email: `${marker}@fixture.test` }, to: { name: mailbox.name, email: mailbox.email }, subject: marker,
+              text: `Private ${marker}`, html: `<p>Private ${marker}</p><img src="https://images.example.test/${marker}.png">`, folder: 'inbox',
+              attachments: [{ filename: `${marker}.txt`, contentType: 'text/plain', content: `Attachment ${marker}` }] })
+            await host.inbox.folders(owner, scope.accountId)
+            let more = true
+            while (more) more = (await host.inbox.sync(owner, scope.accountId, { folder: 'all', lane: 'backfill', limit: 100 })).hasMore
+            for (const added of (await host.inbox.mailboxes(owner)).filter(value => value.sourceId === scope.accountId)) {
+              more = true
+              while (more) more = (await host.inbox.syncMailbox(owner, added.id, { folder: 'inbox', lane: 'backfill', limit: 100 })).hasMore
+            }
+            store.markCacheReady(scope)
+          }
+          return connections
+        } finally { store.close() }
+      },
     }
   }
 
   test('actual Better Auth Google code flow reuses Gmail credentials without mailbox scopes, preserves owner and persists across restart', async () => {
     const f = await fixture([' ALLOWED@Example.Test '], true)
-    expect(await (await f.request('/host/auth')).json()).toEqual({ method: 'google', authenticated: false, user: null })
-    const initialOwner = f.host.owner, login = await f.login()
+    expect(await (await f.request('/host/auth')).json()).toEqual({ method: 'google', authenticated: false, user: null, scope: null })
+    const login = await f.login()
     expect(login.response.status).toBe(302)
     expect(login.response.headers.get('location')).toBe(`${f.config.web.origin}/`)
     expect(login.url.origin).toBe('https://accounts.google.com')
@@ -389,14 +428,18 @@ describe('Google application authentication', () => {
     expect(login.response.headers.getSetCookie().some(value => /session_data=/.test(value))).toBe(false)
     const status = await f.request('/host/auth', { cookie: login.sessionCookie })
     expect(status.headers.get('cache-control')).toBe('no-store')
-    expect(await status.json()).toEqual({ method: 'google', authenticated: true, user: { name: 'Allowed Person', email: 'allowed@example.test' } })
+    expect(await status.json()).toEqual({ method: 'google', authenticated: true, user: { name: 'Allowed Person', email: 'allowed@example.test' }, scope: login.scope })
+    expect(login.scope).toMatch(/^[0-9a-f]{64}$/)
+    expect(login.owner).toMatch(/^user:/)
+    expect(() => f.host.owner).toThrow('requires an authenticated user owner')
     expect((await f.request('/host/config', { cookie: login.sessionCookie })).status).toBe(200)
-    expect(await f.host.inbox.connections(f.host.owner)).toHaveLength(0)
+    expect(await f.host.inbox.connections(login.owner!)).toHaveLength(0)
     const db = f.authDb()
     try { expect(db.query('SELECT accessToken, refreshToken, idToken FROM account').get()).toEqual({ accessToken: null, refreshToken: null, idToken: null }) } finally { db.close() }
     const keyMetadata = await stat(join(f.config.dataDir, f.config.mode, 'runtime-secrets.json'))
     await f.restart()
-    expect(f.host.owner).toBe(initialOwner)
+    expect(f.ownerFor('allowed@example.test')).toBe(login.owner)
+    expect((await (await f.request('/host/auth', { cookie: login.sessionCookie })).json()).scope).toBe(login.scope)
     expect((await stat(join(f.config.dataDir, f.config.mode, 'runtime-secrets.json'))).mtimeMs).toBe(keyMetadata.mtimeMs)
     expect((await f.request('/v1/accounts', { cookie: login.sessionCookie })).status).toBe(200)
     const mailboxStart = await f.request('/host/providers/gmail/connect', { method: 'POST', body: '{}', cookie: login.sessionCookie })
@@ -406,7 +449,7 @@ describe('Google application authentication', () => {
     expect(mailboxUrl.searchParams.get('client_id')).toBe(f.environment.FIXTURE_CLIENT_ID)
     expect(mailboxUrl.searchParams.get('redirect_uri')).toBe(`${f.config.web.origin}/v1/oauth/google/callback`)
     expect(mailboxUrl.searchParams.get('scope')).toContain('https://www.googleapis.com/auth/gmail.modify')
-    expect(await f.host.inbox.connections(f.host.owner)).toHaveLength(0)
+    expect(await f.host.inbox.connections(login.owner!)).toHaveLength(0)
     for (const suffix of ['', '-wal', '-shm']) expect((await stat(join(f.config.dataDir, f.config.mode, `auth.sqlite${suffix}`))).mode & 0o777).toBe(0o600)
   })
 
@@ -421,8 +464,8 @@ describe('Google application authentication', () => {
     const denied = await f.login()
     expect(denied.response.headers.get('location')).toBe(`${f.config.web.origin}/?auth=denied`)
     const db = f.authDb()
-    try { for (const table of ['user', 'session', 'account']) expect(db.query(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 0 }) } finally { db.close() }
-    expect(await f.host.inbox.connections(f.host.owner)).toHaveLength(0)
+    try { for (const table of ['user', 'session', 'account', 'application_owner']) expect(db.query(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 0 }) } finally { db.close() }
+    expect((await f.request('/v1/connections')).status).toBe(401)
   })
 
   test('state cookie, replay, PKCE, signed Google identity and direct credential route boundaries fail closed', async () => {
@@ -482,7 +525,7 @@ describe('Google application authentication', () => {
     await bounded((async () => { while (!(await reader.read()).done) {} })(), 'Google logout ends events')
     const second = await f.login()
     await f.restart({ ...f.config, auth: { ...f.config.auth, allowedEmails: ['someoneelse@example.test'] } })
-    expect(await (await f.request('/host/auth', { cookie: second.sessionCookie })).json()).toEqual({ method: 'google', authenticated: false, user: null })
+    expect(await (await f.request('/host/auth', { cookie: second.sessionCookie })).json()).toEqual({ method: 'google', authenticated: false, user: null, scope: null })
     expect((await f.request('/v1/accounts', { cookie: second.sessionCookie })).headers.get('x-superlocal-auth')).toBe('required')
     expect((await f.request('/host/auth/sign-out', { method: 'POST', body: '{}', cookie: second.sessionCookie })).status).toBe(200)
     await f.restart()
@@ -517,7 +560,8 @@ describe('Google application authentication', () => {
     expect(callback.status).toBe(302)
     expect(callback.headers.get('location')).toBe(`${f.config.web.origin}/`)
     expect(f.exchanges).toBe(1)
-    expect((await f.request('/host/config', { cookie: f.cookie(callback) })).status).toBe(200)
+    const scope = (await (await f.request('/host/auth', { cookie: f.cookie(callback) })).json()).scope
+    expect((await f.request('/host/config', { cookie: f.cookie(callback), scope })).status).toBe(200)
   })
 
   test('every request rejects expired sessions, unverified stored users and missing or invalid Google account identities', async () => {
@@ -596,6 +640,225 @@ describe('Google application authentication', () => {
     await expect(createLocalHost(f.config, f.environment)).rejects.toMatchObject({ code: 'LOCAL_AUTH_RUNTIME_MISSING' })
     await expect(createLocalHost({ ...f.config, auth: { method: 'loopback', sessionHours: 1 } }, f.environment)).rejects.toMatchObject({ code: 'LOCAL_AUTH_RUNTIME_MISSING' })
     await expect(stat(join(f.config.dataDir, f.config.mode, 'runtime-secrets.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('Google users receive durable isolated mail owners, multiple connections and private preferences without inheriting legacy mock mail', async () => {
+    const f = await fixture(['allowed@example.test', 'other@example.test', 'renamed@example.test'], false, 'mock')
+    const a = await f.login(), b = await f.login({ sub: 'google-other-subject', email: 'other@example.test', name: 'Other Person' })
+    expect(a.owner).not.toBe(b.owner); expect(a.scope).not.toBe(b.scope)
+    for (const user of [a, b]) {
+      expect(user.owner).toMatch(/^user:[0-9a-f-]{36}$/)
+      expect(user.scope).toMatch(/^[0-9a-f]{64}$/)
+      expect(await (await f.request('/v1/accounts', { cookie: user.sessionCookie })).json()).toEqual([])
+      expect(await (await f.request('/v1/connections', { cookie: user.sessionCookie })).json()).toEqual([])
+    }
+    const ca = await f.seed(a.owner!, 'private-a'), cb = await f.seed(b.owner!, 'private-b')
+    expect(ca).toHaveLength(2); expect(cb).toHaveLength(2)
+    const aBoxes = await f.host.inbox.mailboxes(a.owner!), bBoxes = await f.host.inbox.mailboxes(b.owner!)
+    const aBox = aBoxes[0]!, bBox = bBoxes[0]!
+    const aMessage = (await f.host.inbox.mailboxMessages(a.owner!, { mailboxIds: [aBox.id], search: 'private-a' })).items[0]!
+    const bMessage = (await f.host.inbox.mailboxMessages(b.owner!, { mailboxIds: [bBox.id], search: 'private-b' })).items[0]!
+    const bBody = await (await f.request(`/v1/messages/${bMessage.id}`, { cookie: b.sessionCookie })).json()
+    const blob = bBody.attachments[0].id
+    const media = /\/v1\/messages\/[^"\s<>]+\/media\/[^"\s<>]+/.exec(JSON.stringify(bBody))?.[0]?.replace(/\\$/, '')
+    expect(media).toBeDefined()
+    const bDraft = await (await f.request('/v1/drafts', { method: 'POST', cookie: b.sessionCookie, body: JSON.stringify({ accountId: cb[0]!.sourceIds[0], subject: 'Private B draft', bodyText: 'Never belongs to A' }) })).json()
+    for (const user of [a, b]) {
+      const connections = await (await f.request('/v1/connections', { cookie: user.sessionCookie })).json()
+      expect(connections.map((connection: Connection) => connection.id).sort()).toEqual((user === a ? ca : cb).map(connection => connection.id).sort())
+      const config = await (await f.request('/host/config', { cookie: user.sessionCookie })).json()
+      expect(config.providers[0].connectionIds.sort()).toEqual(connections.map((connection: Connection) => connection.id).sort())
+    }
+    for (const path of [`/v1/connections/${cb[0]!.id}`, `/v1/accounts/${cb[0]!.sourceIds[0]}`, `/v1/messages/${bMessage.id}`, `/v1/mailboxes/${bBox.id}`,
+      `/v1/mailboxes/${bBox.id}/messages/${bMessage.id}`, `/v1/drafts/${bDraft.id}`, `/v1/messages?accountId=${cb[0]!.sourceIds[0]}&search=private-b`]) {
+      const response = await f.request(path, { cookie: a.sessionCookie })
+      expect(response.status).toBe(404)
+      expect(await response.text()).not.toContain('private-b')
+    }
+    for (const method of ['GET', 'HEAD']) {
+      expect((await f.request(`/v1/blobs/${blob}`, { method, cookie: a.sessionCookie, scope: null })).status).toBe(404)
+      expect((await f.request(media!, { method, cookie: a.sessionCookie, scope: null })).status).toBe(404)
+      expect((await f.request(`/v1/blobs/${blob}`, { method, cookie: b.sessionCookie, scope: null })).status).toBe(200)
+    }
+    expect((await (await f.request('/v1/messages?search=private-b', { cookie: a.sessionCookie })).json()).items).toEqual([])
+    expect((await f.request('/v1/mailbox-snapshot', { method: 'POST', cookie: a.sessionCookie, body: JSON.stringify({ mailboxIds: [bBox.id] }) })).status).toBe(404)
+    const bSnapshot = await (await f.request('/v1/mailbox-snapshot', { method: 'POST', cookie: b.sessionCookie, body: JSON.stringify({ mailboxIds: [bBox.id], limit: 1 }) })).json()
+    expect(bSnapshot.items.every((row: { sourceId: string }) => row.sourceId === bBox.sourceId)).toBe(true)
+    const foreignSnapshot = await f.request('/v1/mailbox-snapshot', { method: 'POST', cookie: a.sessionCookie, body: JSON.stringify({ mailboxIds: [aBox.id], cursor: bSnapshot.nextCursor, limit: 1 }) })
+    expect(foreignSnapshot.status).not.toBe(200)
+    const aPrefs = await (await f.request('/host/inbox-preferences', { cookie: a.sessionCookie })).json()
+    const bPrefs = await (await f.request('/host/inbox-preferences', { cookie: b.sessionCookie })).json()
+    expect(aPrefs.pinnedMailboxIds.every((id: string) => aBoxes.some(box => box.id === id))).toBe(true)
+    expect(bPrefs.pinnedMailboxIds.every((id: string) => bBoxes.some(box => box.id === id))).toBe(true)
+    expect((await f.request('/host/inbox-preferences', { cookie: a.sessionCookie, method: 'PUT', body: JSON.stringify({ ...aPrefs, pinnedMailboxIds: [bBox.id] }) })).status).toBe(400)
+    const split = { ...normalizeSplits({ splits: ['A only'], splitRules: { 'A only': 'from:a@fixture.test' } }), revision: 0 }
+    expect((await f.request('/host/split-preferences', { cookie: a.sessionCookie, method: 'PUT', body: JSON.stringify(split) })).status).toBe(200)
+    expect(await (await f.request('/host/split-preferences', { cookie: b.sessionCookie })).json()).toBeNull()
+    const target = (message: MailboxMessageSummary, box: Mailbox) => ({ sourceId: message.sourceId, mailboxId: box.id, messageId: message.id, messageRevision: message.revision, revision: message.memberships[0]!.revision })
+    expect((await f.request('/host/attention-feedback', { cookie: a.sessionCookie, method: 'POST', body: JSON.stringify({ id: 'private-owner-feedback-01', targets: [target(bMessage, bBox)] }) })).status).toBe(404)
+    expect((await f.request('/host/attention-feedback', { cookie: b.sessionCookie, method: 'POST', body: JSON.stringify({ id: 'private-owner-feedback-01', targets: [target(bMessage, bBox)] }) })).status).toBe(200)
+    expect(await (await f.request('/host/attention-feedback', { cookie: a.sessionCookie })).json()).toEqual([])
+    expect((await f.request('/host/attention-feedback/private-owner-feedback-01/undo', { cookie: a.sessionCookie, method: 'POST', body: '{}' })).status).toBe(404)
+    expect((await f.host.inbox.mailboxMessage(a.owner!, aBox.id, aMessage.id)).memberships[0]!.done).toBe(false)
+    expect((await f.request(`/v1/accounts/${cb[0]!.sourceIds[0]}`, { method: 'DELETE', cookie: a.sessionCookie })).status).toBe(404)
+    expect((await f.request(`/v1/drafts/${bDraft.id}`, { method: 'PATCH', cookie: a.sessionCookie, headers: { 'If-Match': '*' }, body: JSON.stringify({ subject: 'No' }) })).status).toBe(404)
+    expect((await f.request('/v1/policy', { method: 'PATCH', cookie: a.sessionCookie, body: JSON.stringify({ remoteImages: false }) })).status).toBe(200)
+    expect((await (await f.request('/v1/policy', { cookie: b.sessionCookie })).json()).remoteImages).toBe(true)
+    const aStream = await f.request('/v1/events', { cookie: a.sessionCookie }), reader = aStream.body!.getReader()
+    const ready = new TextDecoder().decode((await reader.read()).value)
+    expect(ready).toContain('event: ready'); expect(ready).not.toContain(bMessage.id)
+    await f.host.inbox.createDraft(b.owner!, { accountId: cb[0]!.sourceIds[0]!, subject: 'B event must not cross owners' })
+    const aDraft = await f.host.inbox.createDraft(a.owner!, { accountId: ca[0]!.sourceIds[0]!, subject: 'A event' })
+    const event = new TextDecoder().decode((await bounded(reader.read(), 'private owner SSE event')).value)
+    expect(event).toContain(aDraft.id); expect(event).not.toContain(bDraft.id)
+    await reader.cancel()
+    const same = await f.login({ email: 'ALLOWED@EXAMPLE.TEST' })
+    expect(same.owner).toBe(a.owner); expect(same.scope).toBe(a.scope)
+    await f.restart()
+    expect(f.ownerFor('allowed@example.test')).toBe(a.owner); expect(f.ownerFor('other@example.test')).toBe(b.owner)
+    expect(await (await f.request('/host/split-preferences', { cookie: a.sessionCookie })).json()).toEqual({ ...split, revision: 1 })
+    for (const user of [a, b]) {
+      expect((await (await f.request('/v1/accounts', { cookie: user.sessionCookie })).json())).toHaveLength(2)
+      const connection = (await f.host.inbox.connections(user.owner!))[0]!
+      await f.host.inbox.sync(user.owner!, connection.sourceIds[0]!, { folder: 'all' })
+    }
+    const renamed = await f.login({ email: 'renamed@example.test' })
+    expect(renamed.owner).toBe(a.owner); expect(renamed.scope).toBe(a.scope)
+    expect(await (await f.request('/host/split-preferences', { cookie: renamed.sessionCookie })).json()).toEqual({ ...split, revision: 1 })
+  }, 20_000)
+
+  test('recreating only a fictional auth database never gives a new identity access to an old private or shared mail owner', async () => {
+    const f = await fixture(['allowed@example.test'], false, 'mock'), first = await f.login()
+    const connections = await f.seed(first.owner!, 'retired-private-owner')
+    await f.host.close()
+    // Isolated synthetic runtime only: simulate lost app auth data while mail and its
+    // original encryption/session keys survive. No migration or identity adoption.
+    for (const suffix of ['', '-wal', '-shm', '-journal']) await rm(join(f.config.dataDir, 'mock', `auth.sqlite${suffix}`), { force: true })
+    await f.restart()
+    const second = await f.login()
+    expect(second.owner).not.toBe(first.owner); expect(second.scope).not.toBe(first.scope)
+    expect(await (await f.request('/v1/accounts', { cookie: second.sessionCookie })).json()).toEqual([])
+    expect((await f.request(`/v1/accounts/${connections[0]!.sourceIds[0]}`, { cookie: second.sessionCookie })).status).toBe(404)
+    expect(await f.host.inbox.connections(first.owner!)).toHaveLength(2)
+  })
+
+  test('stale or missing document scope rejects every private request before cross-user reads, writes or logout', async () => {
+    const f = await fixture(['allowed@example.test', 'other@example.test'])
+    const a = await f.login(), b = await f.login({ sub: 'google-other-subject', email: 'other@example.test' })
+    for (const scope of [null, a.scope]) for (const [path, method, body] of [
+      ['/host/config', 'GET'], ['/v1/accounts', 'GET'], ['/v1/events', 'GET'], ['/v1/policy', 'GET'], ['/host/inbox-preferences', 'GET'], ['/host/split-preferences', 'GET'], ['/host/attention-feedback', 'GET'],
+      ['/host/sender-domains/example.test', 'GET'], ['/v1/mailbox-snapshot', 'POST', '{}'], ['/v1/drafts', 'POST', '{}'], ['/v1/policy', 'PATCH', '{"remoteImages":false}'],
+      ['/host/split-preferences', 'PUT', '{}'], ['/host/attention-feedback', 'POST', '{}'], ['/host/providers/gmail/connect', 'POST', '{}'], ['/v1/accounts/foreign', 'DELETE'],
+    ]) {
+      const response = await f.request(path!, { method, body, cookie: b.sessionCookie, scope })
+      expect(response.status).toBe(409)
+      expect(response.headers.get('x-superlocal-auth')).toBe('required')
+      expect((await response.json()).code).toBe('HOST_SCOPE_CHANGED')
+    }
+    for (const path of ['/v1/blobs/foreign', '/v1/messages/foreign/media/reference', '/host/sender-domains/example.test/icon']) {
+      expect((await f.request(path, { cookie: b.sessionCookie, scope: a.scope })).status).toBe(409)
+      expect((await f.request(path, { cookie: b.sessionCookie, scope: null })).status).not.toBe(409)
+    }
+    expect((await f.request('/host/auth/sign-out', { method: 'POST', body: '{}', cookie: b.sessionCookie, scope: a.scope })).status).toBe(409)
+    expect((await (await f.request('/host/auth', { cookie: b.sessionCookie })).json()).authenticated).toBe(true)
+    expect((await (await f.request('/v1/policy', { cookie: b.sessionCookie })).json()).remoteImages).toBe(true)
+    expect(await (await f.request('/host/split-preferences', { cookie: b.sessionCookie })).json()).toBeNull()
+    expect(await (await f.request('/v1/drafts', { cookie: b.sessionCookie })).json()).toEqual([])
+  })
+
+  test('private owners retain multiple Gmail accounts and an Inbound connection with separately encrypted credentials across restart', async () => {
+    const boxes = new Map<string, ReferenceMailbox>()
+    const gmail = builtInProviders.find(provider => provider.id === 'gmail')!, inbound = builtInProviders.find(provider => provider.id === 'inbound')!
+    const factory = (providerId: string, credentials: ProviderCredentials & Record<string, unknown>) => {
+      const key = String(providerId === 'gmail' ? credentials.accessToken : credentials.apiKey), box = boxes.get(key)
+      if (!box) throw new ProviderAuthenticationError(providerId, 'Unknown synthetic mailbox credential')
+      return box.adapter(credentials, providerId, fullCapabilities)
+    }
+    // Only native mailbox adapters are replaced; BA, encrypted SDK storage, owner
+    // checks, routes, and real host onboarding descriptors execute unchanged.
+    const gmailFactory = spyOn(gmail, 'create').mockImplementation(credentials => factory('gmail', credentials))
+    const inboundFactory = spyOn(inbound, 'create').mockImplementation(credentials => factory('inbound', credentials))
+    const inboundDiscovery = spyOn(inbound, 'discover').mockImplementation(async provider => {
+      const account = await provider.getAccount()
+      return { identities: [{ email: account.email, name: account.name }], sources: [{ kind: 'address', value: account.email, canReceive: true, canSend: true, canFilter: true }] }
+    })
+    cleanup.push(async () => { gmailFactory.mockRestore(); inboundFactory.mockRestore(); inboundDiscovery.mockRestore() })
+    const f = await fixture(['allowed@example.test', 'other@example.test'], true)
+    const config = { ...f.config, providers: { ...f.config.providers, inbound: { enabled: true } } }
+    await f.restart(config)
+    const a = await f.login(), b = await f.login({ sub: 'google-other-subject', email: 'other@example.test' })
+    const start = await f.request('/host/providers/gmail/connect', { cookie: a.sessionCookie, method: 'POST', body: '{}' })
+    const authorizeUrl = (await start.json()).authorizeUrl as string
+    expect((await f.request(authorizeUrl, { cookie: b.sessionCookie, scope: null })).status).toBe(404)
+    expect((await f.request(authorizeUrl, { cookie: b.sessionCookie })).status).toBe(404)
+    expect((await f.request(authorizeUrl, { cookie: a.sessionCookie, scope: b.scope })).status).toBe(409)
+    expect((await f.request(authorizeUrl.replace('/authorize/', '/%61uthorize/'), { cookie: b.sessionCookie })).status).toBe(400)
+    const handoff = await f.request(authorizeUrl, { cookie: a.sessionCookie, scope: null })
+    expect(handoff.status).toBe(302)
+    expect((await f.request(authorizeUrl, { cookie: a.sessionCookie, scope: null })).status).not.toBe(302)
+    const google = new URL(handoff.headers.get('location')!)
+    const exchanges = f.exchanges
+    const wrongOwnerCallback = await f.request(`/v1/oauth/google/callback?state=${google.searchParams.get('state')}&code=foreign-code`, {
+      cookie: `${b.sessionCookie}; ${f.cookie(handoff)}`, scope: null,
+    })
+    expect(wrongOwnerCallback.status).toBe(303)
+    expect(wrongOwnerCallback.headers.get('location')).toContain('connection=failed')
+    expect(f.exchanges).toBe(exchanges)
+    expect(await f.host.inbox.connections(a.owner!)).toEqual([])
+    expect(await f.host.inbox.connections(b.owner!)).toEqual([])
+    const grants = new Map<string, Array<{ connection: Connection; token: string; box: ReferenceMailbox }>>()
+    for (const user of [a, b]) {
+      const owned = []
+      for (const [index, providerId] of ['gmail', 'gmail', 'inbound'].entries()) {
+        const token = `synthetic-private-${user === a ? 'a' : 'b'}-${providerId}-${index}`
+        const box = referenceMailbox(token, `${user === a ? 'a' : 'b'}-${index}@fixture.test`, [native('same-native-id', { subject: `Only ${token}` })])
+        boxes.set(token, box)
+        let connection: Connection
+        if (providerId === 'inbound') {
+          const response = await f.request('/host/providers/inbound/connect', { method: 'POST', cookie: user.sessionCookie, body: JSON.stringify({ credentials: { apiKey: token } }) })
+          expect(response.status).toBe(200)
+          connection = await f.host.inbox.connection(user.owner!, (await response.json()).connectionId)
+          await f.host.inbox.createMailbox(user.owner!, { sourceId: connection.sourceIds[0]!, name: box.email, selector: { kind: 'address', value: box.email } })
+        } else {
+          connection = await f.host.inbox.createConnection(user.owner!, { providerId, credentials: { accessToken: token, refreshToken: `${token}-refresh` } },
+            { issuer: 'https://accounts.google.com', subject: `mailbox-${token}`, registrationId: f.environment.FIXTURE_CLIENT_ID })
+        }
+        await f.host.inbox.sync(user.owner!, connection.sourceIds[0]!, { folder: 'all', lane: 'backfill' })
+        owned.push({ connection, token, box })
+      }
+      grants.set(user.owner!, owned)
+      const config = await (await f.request('/host/config', { cookie: user.sessionCookie })).json()
+      expect(config.providers.find((provider: { id: string }) => provider.id === 'gmail').connectionIds).toHaveLength(2)
+      expect(config.providers.find((provider: { id: string }) => provider.id === 'inbound').connectionIds).toHaveLength(1)
+      expect((await (await f.request('/v1/accounts', { cookie: user.sessionCookie })).json())).toHaveLength(3)
+    }
+    const db = new Database(join(f.config.dataDir, 'real', 'inbox.sqlite'), { readonly: true })
+    try {
+      const rows = db.query<{ owner: string; credentials: string }, []>('SELECT owner,credentials FROM sdk_connections').all()
+      expect(rows).toHaveLength(6)
+      for (const row of rows) {
+        expect([a.owner, b.owner]).toContain(row.owner)
+        expect(row.credentials.length).toBeGreaterThan(30)
+        expect(row.credentials).not.toContain('synthetic-private-')
+        expect(row.credentials).not.toContain('accessToken')
+      }
+    } finally { db.close() }
+    for (const grant of grants.get(b.owner!)!) {
+      expect((await f.request(`/v1/accounts/${grant.connection.sourceIds[0]}`, { cookie: a.sessionCookie })).status).toBe(404)
+      const ownMessages = await (await f.request(`/v1/messages?accountId=${grant.connection.sourceIds[0]}`, { cookie: b.sessionCookie })).json()
+      expect(ownMessages.items).toHaveLength(1)
+      expect((await f.request(`/v1/messages/${ownMessages.items[0].id}`, { cookie: a.sessionCookie })).status).toBe(404)
+    }
+    await f.restart(config)
+    for (const user of [a, b]) {
+      expect(f.ownerFor(user === a ? 'allowed@example.test' : 'other@example.test')).toBe(user.owner)
+      for (const grant of grants.get(user.owner!)!) {
+        await f.host.inbox.sync(user.owner!, grant.connection.sourceIds[0]!, { folder: 'all' })
+        const restored = grant.box.calls.create.at(-1)!
+        expect(grant.connection.providerId === 'gmail' ? restored.accessToken : restored.apiKey).toBe(grant.token)
+      }
+      expect((await (await f.request('/v1/accounts', { cookie: user.sessionCookie })).json())).toHaveLength(3)
+    }
   })
 })
 

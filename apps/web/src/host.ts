@@ -1,7 +1,7 @@
 import type { SplitPreferences } from "../../shared/splits";
 import type { MailboxMembership } from "inbox-sdk/types";
 import { configurePerformanceLogging, measureRequest } from "./browser-logs";
-import { checkAuthenticationResponse } from "./application-auth";
+import { privateFetch } from "./application-auth";
 export type SavedSplitPreferences = SplitPreferences & { revision: number };
 export type AttentionFeedback = { id: string; createdAt: string; status: "pending" | "active" | "retracting" | "retracted" | "failed"; count: number; problem?: string; states?: MailboxMembership[] };
 export type AttentionFeedbackTarget = { sourceId: string; messageId: string; mailboxId: string; messageRevision: number; revision: number };
@@ -45,7 +45,7 @@ export class InboxViewPreferencesError extends Error {
 
 async function hostFetch(path: string, init: RequestInit): Promise<Response> {
   const finish = measureRequest(path, init.method ?? "GET");
-  try { const response = await fetch(path, init); checkAuthenticationResponse(response); finish(response.status); return response; }
+  try { const response = await privateFetch(path, init); finish(response.status); return response; }
   catch (error) { finish(0); throw error; }
 }
 

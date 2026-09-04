@@ -80,7 +80,6 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
   let applicationAuth: Awaited<ReturnType<typeof createApplicationAuth>> | undefined
   let mock: MockHost | undefined
   let inbox: Inbox | undefined
-  let inboxPreferences: ReturnType<typeof createInboxViewPreferencesStore>
   let registrations: HostProviderRegistration[] = []
   let owner = `local:${config.instanceId}`
   try {
@@ -98,13 +97,31 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         defaultPolicy: { remoteImages: true },
         verifyCredentials: real.verifyCredentials, log: event => console.info(JSON.stringify({ event: 'local.sdk', code: /^[A-Z][A-Z0-9_]{0,79}$/.test(event.code) ? event.code : 'SDK_ERROR' })) })
     }
-    inboxPreferences = createInboxViewPreferencesStore(runtime.database, inbox, owner)
   } catch (error) { try { if (mock) await mock.close(); else await inbox?.close() } finally { applicationAuth?.close(); runtime.database.close() }; throw error }
   const liveInbox = inbox
-  const splitPreferences = createSplitPreferencesStore(runtime.database, owner)
-  const attentionFeedback = createAttentionFeedbackStore(runtime.database, liveInbox, owner)
   const performanceLog = createPerformanceLog(runtime.dataDir, config.mode)
-  const senderDomains = createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' })
+  const ownerContexts = new Map<string, {
+    inboxPreferences: ReturnType<typeof createInboxViewPreferencesStore>
+    splitPreferences: ReturnType<typeof createSplitPreferencesStore>
+    attentionFeedback: ReturnType<typeof createAttentionFeedbackStore>
+    senderDomains: ReturnType<typeof createSenderDomainHost>
+  }>()
+  function contextFor(owner: string) {
+    if (closed) throw new InboxError('HOST_CLOSED', 'The local host is shutting down.', 503)
+    let context = ownerContexts.get(owner)
+    if (!context) {
+      // Auth admission is capped at 256 durable identities. Never evict a live owner's queue.
+      if (ownerContexts.size >= 256) throw new InboxError('HOST_OWNER_LIMIT', 'This host has reached its active-user limit.', 503)
+      context = {
+        inboxPreferences: createInboxViewPreferencesStore(runtime.database, liveInbox, owner),
+        splitPreferences: createSplitPreferencesStore(runtime.database, owner),
+        attentionFeedback: createAttentionFeedbackStore(runtime.database, liveInbox, owner),
+        senderDomains: createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' }),
+      }
+      ownerContexts.set(owner, context)
+    }
+    return context
+  }
   const allowedOrigins = applicationAuth ? [config.web.origin] : config.web.allowedOrigins
   const origins = new Set(allowedOrigins)
   const hosts = new Set([`127.0.0.1:${config.backend.port}`, `localhost:${config.backend.port}`, ...allowedOrigins.map(value => new URL(value).host)])
@@ -116,9 +133,12 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
   let closed = false
   let closing: Promise<void> | undefined
 
-  const authenticate = async (request: Request): Promise<{ id: string } | null> => {
+  const currentIdentity = async (request: Request): Promise<{ id: string; scope?: string } | null> => {
     if (closed || request.headers.has('authorization')) return null
-    if (applicationAuth) return await applicationAuth.identity(request) ? { id: owner } : null
+    if (applicationAuth) {
+      const identity = await applicationAuth.identity(request)
+      return identity ? { id: identity.owner, scope: identity.scope } : null
+    }
     const cookies = (request.headers.get('cookie') ?? '').split(';').map(value => value.trim()).filter(value => value.startsWith(`${cookieName}=`))
     if (cookies.length !== 1) return null
     const token = cookies[0]!.slice(cookieName.length + 1)
@@ -126,6 +146,29 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     const session = sessions.get(cookieHash(token))
     const origin = request.headers.get('origin')
     return session && session.expires > Date.now() && (!origin || origin === session.origin) ? { id: owner } : null
+  }
+  function scopeMatches(request: Request, scope: string | undefined): boolean {
+    if (!applicationAuth) return true
+    const supplied = request.headers.get('x-superlocal-scope')
+    if (supplied !== null) return supplied === scope
+    const path = new URL(request.url).pathname
+    // Only native element/download URLs have no custom header. Their opaque IDs remain
+    // owner-checked by the SDK; never exempt a generic JSON GET or an encoded path alias.
+    return ['GET', 'HEAD'].includes(request.method) && (/^\/v1\/messages\/[^/%]+\/media\/[^/%]+$/.test(path) || /^\/v1\/blobs\/[^/%]+$/.test(path)) ||
+      request.method === 'GET' && (/^\/host\/sender-domains\/[^/%]+\/icon$/.test(path) || path === '/v1/oauth/google/callback' || !!mailboxAuthorizationId(request))
+  }
+  const mailboxAuthorizationId = (request: Request) => request.method === 'GET' ? /^\/v1\/oauth\/google\/authorize\/([^/%]+)$/.exec(new URL(request.url).pathname)?.[1] : undefined
+  function ownsMailboxAuthorization(request: Request, owner: string): boolean {
+    const id = mailboxAuthorizationId(request)
+    if (!applicationAuth || !id) return true
+    // The SDK's redirect handoff consumes a one-use ticket; check its owner before
+    // consumption, including native navigations that cannot supply the document scope.
+    return !!runtime.database.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sdk_oauth_attempts'").get() &&
+      !!runtime.database.query('SELECT 1 FROM sdk_oauth_attempts WHERE id=? AND owner=?').get(id, owner)
+  }
+  const authenticate = async (request: Request): Promise<{ id: string } | null> => {
+    const identity = await currentIdentity(request)
+    return identity && scopeMatches(request, identity.scope) && ownsMailboxAuthorization(request, identity.id) ? { id: identity.id } : null
   }
   const api = createInboxApi({ inbox: liveInbox, authenticate, allowedOrigins })
   const extensions = registrations.flatMap(registration => registration.mount ? [registration.mount(liveInbox, authenticate)] : [])
@@ -158,7 +201,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     // Never route encoded or trailing-slash auth aliases through a more permissive handler.
     let normalized: string
     try { normalized = decodeURIComponent(url.pathname).replace(/\/+$/, '') } catch { return problem(400, 'HOST_INVALID_PATH', 'Invalid request path.') }
-    if (normalized !== url.pathname && (normalized === '/session' || normalized.startsWith('/api/auth') || normalized.startsWith('/host/auth'))) return problem(400, 'HOST_INVALID_PATH', 'Use the exact authentication path.')
+    if (normalized !== url.pathname && (normalized === '/session' || normalized.startsWith('/api/auth') || normalized.startsWith('/host/auth') || applicationAuth && normalized.startsWith('/v1/oauth/google/authorize/'))) return problem(400, 'HOST_INVALID_PATH', 'Use the exact authentication path.')
     if (url.pathname === '/session') return url.search ? problem(400, 'HOST_INVALID_INPUT', 'Session initialization takes no query parameters.') : session(request)
     if (url.pathname === '/health' && request.method === 'GET') return Response.json({ ok: true }, { headers: safeHeaders })
     if (url.pathname.startsWith('/api/auth')) return applicationAuth && url.pathname === '/api/auth/callback/google' ? applicationAuth.handle(request) : problem(404, 'NOT_FOUND', 'Route not found.')
@@ -173,11 +216,20 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     const callback = extension?.callbackPath === url.pathname && request.method === 'GET'
     const origin = request.headers.get('origin')
     if (!callback && (origin && !origins.has(origin) || request.headers.get('sec-fetch-site') === 'cross-site')) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'This request origin is not permitted.')
-    if (!await authenticate(request)) {
+    const identity = await currentIdentity(request)
+    if (!identity) {
       if (applicationAuth) return authRequired()
       if (callback) return new Response(null, { status: 303, headers: { ...safeHeaders, Location: `${config.web.origin}/?connection=failed` } })
       return authRequired()
     }
+    if (!scopeMatches(request, identity.scope)) {
+      const response = problem(409, 'HOST_SCOPE_CHANGED', 'The signed-in user changed. Reload before continuing.')
+      response.headers.set('X-Superlocal-Auth', 'required')
+      return response
+    }
+    if (!ownsMailboxAuthorization(request, identity.id)) return problem(404, 'NOT_FOUND', 'OAuth attempt not found.')
+    const owner = identity.id
+    const { inboxPreferences, splitPreferences, attentionFeedback, senderDomains } = contextFor(owner)
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
     if (url.pathname === '/host/performance') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Performance batches take no query parameters.')
@@ -245,7 +297,11 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
   }
 
   return {
-    config, inbox: liveInbox, owner,
+    config, inbox: liveInbox,
+    get owner() {
+      if (applicationAuth) throw new InboxError('HOST_OWNER_REQUIRED', 'Google mail access requires an authenticated user owner.', 400)
+      return owner
+    },
     fetch(request: Request): Promise<Response> {
       const task = dispatch(request).then(async response => {
         if (applicationAuth && response.status === 401 && !await applicationAuth.identity(request)) response.headers.set('X-Superlocal-Auth', 'required')
@@ -267,8 +323,9 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       sessions.clear()
       streamShutdown.abort()
       return closing = (async () => {
-        await senderDomains.close()
+        await Promise.all([...ownerContexts.values()].map(context => context.senderDomains.close()))
         await Promise.allSettled([...pending])
+        ownerContexts.clear()
         await performanceLog.close()
         try { if (mock) await mock.close(); else await liveInbox.close() } finally { applicationAuth?.close(); runtime.database.close() }
       })()
