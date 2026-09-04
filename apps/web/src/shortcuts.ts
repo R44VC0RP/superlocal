@@ -10,13 +10,13 @@ export const shortcutGroups: [string, [string, string][]][] = [
   [
     "Navigation",
     [
-      ["Next / Previous Conversation", "J / K"],
-      ["Next / Previous Message", "N / P"],
+      ["Next / previous conversation (reader)", "→ / ← or J / K"],
+      ["Next / previous message", "↓ / ↑ or N / P"],
       ["Open", "Enter"],
       ["Back", "Esc"],
       ["Next Split Inbox", "Tab"],
       ["Previous Split Inbox", "Shift Tab"],
-      ["Open Label Menu", "←"],
+      ["Open label menu (inbox list)", "←"],
       ["Page Down", "Space"],
       ["Page Up", "Shift Space"],
       ["Jump to Top", "⌘ ↑"],

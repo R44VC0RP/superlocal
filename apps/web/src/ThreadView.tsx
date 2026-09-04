@@ -342,14 +342,17 @@ export default function ThreadView({
       if (!navigator.clipboard?.writeText) return;
       void navigator.clipboard.writeText(conversationLink.href).catch(() => {});
     } else if (!event.metaKey && !event.ctrlKey && !event.altKey) {
-      if (!event.shiftKey && (key === "n" || key === "p")) {
+      if (!event.shiftKey && (key === "n" || key === "p" || event.key === "ArrowDown" || event.key === "ArrowUp")) {
+        // An open drawer/settings panel owns its arrows, even while the reader stays mounted.
+        if ((event.key === "ArrowDown" || event.key === "ArrowUp") &&
+          readerPane.current?.closest(".navigation-open, .settings-open")) return;
         const message =
           mail.messages[
             Math.max(
               0,
               Math.min(
                 mail.messages.length - 1,
-                messageIndex + (key === "n" ? 1 : -1),
+                messageIndex + (key === "n" || event.key === "ArrowDown" ? 1 : -1),
               ),
             )
           ];
@@ -528,13 +531,13 @@ export default function ThreadView({
               onClick={() => onAction("more")}
             />
             <IconButton
-              name="ChevronUp"
-              title="Previous thread"
+              name="ChevronLeft"
+              title="Previous thread (←)"
               onClick={() => onNavigate(-1)}
             />
             <IconButton
-              name="ChevronDown"
-              title="Next thread"
+              name="ChevronRight"
+              title="Next thread (→)"
               onClick={() => onNavigate(1)}
             />
           </div>

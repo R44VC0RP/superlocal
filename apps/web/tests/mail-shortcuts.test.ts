@@ -387,7 +387,7 @@ test("drawer navigation overrides mail keys but follows global modifier and cale
 });
 
 test("list movement, paging, splits, and opening retain their distinct contexts", () => {
-  assert.deepEqual(resolve("ArrowLeft", { mode: "reader" }), {
+  assert.deepEqual(resolve("ArrowLeft"), {
     type: "openDrawer",
   });
   assert.deepEqual(resolve("ArrowRight"), {
@@ -399,11 +399,10 @@ test("list movement, paging, splits, and opening retain their distinct contexts"
     drafts: false,
   });
   assert.equal(resolve("ArrowRight", { hasHighlightedMail: false }), null);
-  assert.equal(resolve("ArrowRight", { mode: "reader" }), null);
   for (const key of ["j", "ArrowDown"])
     assert.deepEqual(resolve(key), { type: "navigateConversation", delta: 1 });
   for (const key of ["k", "ArrowUp"])
-    assert.deepEqual(resolve(key, { mode: "reader" }), {
+    assert.deepEqual(resolve(key), {
       type: "navigateConversation",
       delta: -1,
     });
@@ -430,6 +429,23 @@ test("list movement, paging, splits, and opening retain their distinct contexts"
   });
   assert.equal(resolve("Tab", { search: true }), null);
   assert.equal(resolve("Tab", { mode: "reader" }), null);
+});
+
+test("reader horizontal arrows switch conversations while vertical arrows stay within the reader", () => {
+  for (const [key, delta] of [["ArrowLeft", -1], ["ArrowRight", 1], ["k", -1], ["j", 1]] as const)
+    assert.deepEqual(resolve(key, { mode: "reader" }), { type: "navigateConversation", delta });
+  // ThreadView owns message reveal/focus, including keys forwarded from its HTML iframe.
+  for (const key of ["ArrowUp", "ArrowDown", "n", "p"])
+    assert.equal(resolve(key, { mode: "reader" }), null, key);
+  for (const key of ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]) {
+    for (const context of [{ editing: true }, { settings: true }, { modal: true }, { mode: "composer" }, { mode: "auxiliary" }] as const)
+      assert.equal(resolve(key, { mode: "reader", ...context }), null, key);
+    for (const event of [{ shiftKey: true }, { metaKey: true }, { ctrlKey: true }, { altKey: true }, { isComposing: true }, { defaultPrevented: true }])
+      assert.equal(resolve(key, { mode: "reader" }, event), null, key);
+  }
+  assert.deepEqual(resolve("ArrowUp", { mode: "reader", navigation: true }), { type: "drawerNavigate", delta: -1 });
+  assert.deepEqual(resolve("ArrowDown", { mode: "reader", navigation: true }), { type: "drawerNavigate", delta: 1 });
+  assert.deepEqual(resolve("ArrowRight", { mode: "reader", navigation: true }), { type: "drawerActivate" });
 });
 
 test("mail actions retain exact shifted key semantics", () => {
