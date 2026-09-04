@@ -6,13 +6,15 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     ports:
-      # The host remains local-only until public authentication is implemented.
+      # A public HTTPS reverse proxy can reach this loopback-only web port.
       - "127.0.0.1:${SUPERLOCAL_DOCKER_PORT:-5178}:5178"
     environment:
       SUPERLOCAL_CONFIG: /persist/superlocal.local.json
       SUPERLOCAL_DATA_DIR: /persist/data
       SUPERLOCAL_WEB_BIND: 0.0.0.0
-      SUPERLOCAL_WEB_ORIGIN: "http://localhost:${SUPERLOCAL_DOCKER_PORT:-5178}"
+      SUPERLOCAL_WEB_ORIGIN: "${SUPERLOCAL_WEB_ORIGIN:-http://localhost:${SUPERLOCAL_DOCKER_PORT:-5178}}"
+      SUPERLOCAL_AUTH_METHOD:
+      SUPERLOCAL_AUTH_ALLOWED_EMAILS:
       SUPERLOCAL_GOOGLE_CLIENT_ID: "${SUPERLOCAL_GOOGLE_CLIENT_ID:-}"
       SUPERLOCAL_GOOGLE_CLIENT_SECRET: "${SUPERLOCAL_GOOGLE_CLIENT_SECRET:-}"
     volumes:

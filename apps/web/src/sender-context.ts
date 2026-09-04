@@ -1,5 +1,6 @@
 import type { Participant } from "inbox-sdk/types";
 import type { Mail, MailboxOption } from "./data";
+import { privateFetch } from "./application-auth.ts";
 
 export type SenderHistoryMessage = {
   id: string;
@@ -154,7 +155,7 @@ export function senderConversations(mail: readonly Mail[], threadKeys: readonly 
 }
 
 export async function readSenderDomain(hostname: string, signal: AbortSignal): Promise<SenderDomainInfo> {
-  const response = await fetch(`/host/sender-domains/${encodeURIComponent(hostname)}`, { credentials: "include", cache: "no-store", signal });
+  const response = await privateFetch(`/host/sender-domains/${encodeURIComponent(hostname)}`, { credentials: "include", cache: "no-store", signal });
   const value = await response.json().catch(() => null);
   if (!response.ok || !value || value.hostname !== hostname || !["domain", "mail-provider", "unavailable"].includes(value.kind)
     || !["allowed", "blocked", "offline"].includes(value.imagePolicy) || value.rootDomain !== null && typeof value.rootDomain !== "string") {

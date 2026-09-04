@@ -96,7 +96,7 @@ export async function createMockHost(overrides: MockConfigOverrides = {}): Promi
         throw new Error('Network transport is disabled in the Superlocal mock.')
       }, { preconnect() { throw new Error('Network transport is disabled in the Superlocal mock.') } }),
       verifyCredentials(context) {
-        if (context.connection.providerId !== PROVIDER_ID || context.owner !== MOCK_OWNER ||
+        if (context.connection.providerId !== PROVIDER_ID ||
           context.connection.identity?.issuer !== IDENTITY_ISSUER || context.connection.identity.registrationId !== store.identity) return false
         try {
           return context.connection.sourceIds.every(accountId => {

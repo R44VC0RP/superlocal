@@ -12,6 +12,7 @@ import { createSplitPreferencesStore } from './split-preferences'
 import { createAttentionFeedbackStore } from './attention-feedback'
 import { isPerformanceSample } from '../../shared/performance'
 import { createPerformanceLog } from './performance-log'
+import { assertApplicationAuthRuntime, createApplicationAuth } from './application-auth'
 
 const safeHeaders = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', Vary: 'Origin, Cookie' }
 function problem(status: number, code: string, error: string): Response {
@@ -74,13 +75,15 @@ function credentialsFor(provider: HostProviderRegistration, input: Record<string
 }
 
 export async function createLocalHost(config: LocalConfig = loadLocalConfig(), environment: NodeJS.ProcessEnv = process.env) {
+  assertApplicationAuthRuntime(config)
   const runtime = openLocalRuntime(config)
+  let applicationAuth: Awaited<ReturnType<typeof createApplicationAuth>> | undefined
   let mock: MockHost | undefined
   let inbox: Inbox | undefined
-  let inboxPreferences: ReturnType<typeof createInboxViewPreferencesStore>
   let registrations: HostProviderRegistration[] = []
   let owner = `local:${config.instanceId}`
   try {
+    if (config.auth.method === 'google') applicationAuth = await createApplicationAuth(config, runtime, environment)
     if (config.mode === 'mock') {
       mock = await createMockHost({ dataDir: runtime.dataDir, port: config.backend.port, encryptionKey: runtime.encryptionKey,
         token: createHmac('sha256', runtime.sessionKey).update('unused-private-mock-bearer').digest('hex'), allowProviderWrites: config.allowProviderWrites })
@@ -94,15 +97,34 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         defaultPolicy: { remoteImages: true },
         verifyCredentials: real.verifyCredentials, log: event => console.info(JSON.stringify({ event: 'local.sdk', code: /^[A-Z][A-Z0-9_]{0,79}$/.test(event.code) ? event.code : 'SDK_ERROR' })) })
     }
-    inboxPreferences = createInboxViewPreferencesStore(runtime.database, inbox, owner)
-  } catch (error) { try { if (mock) await mock.close(); else await inbox?.close() } finally { runtime.database.close() }; throw error }
+  } catch (error) { try { if (mock) await mock.close(); else await inbox?.close() } finally { applicationAuth?.close(); runtime.database.close() }; throw error }
   const liveInbox = inbox
-  const splitPreferences = createSplitPreferencesStore(runtime.database, owner)
-  const attentionFeedback = createAttentionFeedbackStore(runtime.database, liveInbox, owner)
   const performanceLog = createPerformanceLog(runtime.dataDir, config.mode)
-  const senderDomains = createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' })
-  const origins = new Set(config.web.allowedOrigins)
-  const hosts = new Set([`127.0.0.1:${config.backend.port}`, `localhost:${config.backend.port}`, ...config.web.allowedOrigins.map(value => new URL(value).host)])
+  const ownerContexts = new Map<string, {
+    inboxPreferences: ReturnType<typeof createInboxViewPreferencesStore>
+    splitPreferences: ReturnType<typeof createSplitPreferencesStore>
+    attentionFeedback: ReturnType<typeof createAttentionFeedbackStore>
+    senderDomains: ReturnType<typeof createSenderDomainHost>
+  }>()
+  function contextFor(owner: string) {
+    if (closed) throw new InboxError('HOST_CLOSED', 'The local host is shutting down.', 503)
+    let context = ownerContexts.get(owner)
+    if (!context) {
+      // Auth admission is capped at 256 durable identities. Never evict a live owner's queue.
+      if (ownerContexts.size >= 256) throw new InboxError('HOST_OWNER_LIMIT', 'This host has reached its active-user limit.', 503)
+      context = {
+        inboxPreferences: createInboxViewPreferencesStore(runtime.database, liveInbox, owner),
+        splitPreferences: createSplitPreferencesStore(runtime.database, owner),
+        attentionFeedback: createAttentionFeedbackStore(runtime.database, liveInbox, owner),
+        senderDomains: createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' }),
+      }
+      ownerContexts.set(owner, context)
+    }
+    return context
+  }
+  const allowedOrigins = applicationAuth ? [config.web.origin] : config.web.allowedOrigins
+  const origins = new Set(allowedOrigins)
+  const hosts = new Set([`127.0.0.1:${config.backend.port}`, `localhost:${config.backend.port}`, ...allowedOrigins.map(value => new URL(value).host)])
   const cookieName = `superlocal_${config.instanceId.replaceAll('-', '')}_${config.mode}`
   const sessions = new Map<string, { expires: number; origin: string }>()
   const cookieHash = (value: string) => createHmac('sha256', runtime.sessionKey).update(value).digest('hex')
@@ -111,8 +133,12 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
   let closed = false
   let closing: Promise<void> | undefined
 
-  const authenticate = (request: Request): { id: string } | null => {
+  const currentIdentity = async (request: Request): Promise<{ id: string; scope?: string } | null> => {
     if (closed || request.headers.has('authorization')) return null
+    if (applicationAuth) {
+      const identity = await applicationAuth.identity(request)
+      return identity ? { id: identity.owner, scope: identity.scope } : null
+    }
     const cookies = (request.headers.get('cookie') ?? '').split(';').map(value => value.trim()).filter(value => value.startsWith(`${cookieName}=`))
     if (cookies.length !== 1) return null
     const token = cookies[0]!.slice(cookieName.length + 1)
@@ -121,10 +147,34 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     const origin = request.headers.get('origin')
     return session && session.expires > Date.now() && (!origin || origin === session.origin) ? { id: owner } : null
   }
-  const api = createInboxApi({ inbox: liveInbox, authenticate, allowedOrigins: config.web.allowedOrigins })
+  function scopeMatches(request: Request, scope: string | undefined): boolean {
+    if (!applicationAuth) return true
+    const supplied = request.headers.get('x-superlocal-scope')
+    if (supplied !== null) return supplied === scope
+    const path = new URL(request.url).pathname
+    // Only native element/download URLs have no custom header. Their opaque IDs remain
+    // owner-checked by the SDK; never exempt a generic JSON GET or an encoded path alias.
+    return ['GET', 'HEAD'].includes(request.method) && (/^\/v1\/messages\/[^/%]+\/media\/[^/%]+$/.test(path) || /^\/v1\/blobs\/[^/%]+$/.test(path)) ||
+      request.method === 'GET' && (/^\/host\/sender-domains\/[^/%]+\/icon$/.test(path) || path === '/v1/oauth/google/callback' || !!mailboxAuthorizationId(request))
+  }
+  const mailboxAuthorizationId = (request: Request) => request.method === 'GET' ? /^\/v1\/oauth\/google\/authorize\/([^/%]+)$/.exec(new URL(request.url).pathname)?.[1] : undefined
+  function ownsMailboxAuthorization(request: Request, owner: string): boolean {
+    const id = mailboxAuthorizationId(request)
+    if (!applicationAuth || !id) return true
+    // The SDK's redirect handoff consumes a one-use ticket; check its owner before
+    // consumption, including native navigations that cannot supply the document scope.
+    return !!runtime.database.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sdk_oauth_attempts'").get() &&
+      !!runtime.database.query('SELECT 1 FROM sdk_oauth_attempts WHERE id=? AND owner=?').get(id, owner)
+  }
+  const authenticate = async (request: Request): Promise<{ id: string } | null> => {
+    const identity = await currentIdentity(request)
+    return identity && scopeMatches(request, identity.scope) && ownsMailboxAuthorization(request, identity.id) ? { id: identity.id } : null
+  }
+  const api = createInboxApi({ inbox: liveInbox, authenticate, allowedOrigins })
   const extensions = registrations.flatMap(registration => registration.mount ? [registration.mount(liveInbox, authenticate)] : [])
 
   function session(request: Request): Response {
+    if (applicationAuth) return authRequired()
     if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use POST to initialize a loopback session.')
     const origin = request.headers.get('origin')
     if (!origin || !origins.has(origin) || request.headers.get('x-superlocal') !== '1') return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin and X-Superlocal: 1 are required.')
@@ -138,20 +188,48 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       'Set-Cookie': `${cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${seconds}${origin.startsWith('https:') ? '; Secure' : ''}` } })
   }
 
+  function authRequired(): Response {
+    const response = problem(401, 'UNAUTHENTICATED', applicationAuth ? 'Sign in to this installation first.' : 'Initialize a local browser session first.')
+    if (applicationAuth) response.headers.set('X-Superlocal-Auth', 'required')
+    return response
+  }
+
   async function dispatch(request: Request): Promise<Response> {
     const url = new URL(request.url)
     if (!['http:', 'https:'].includes(url.protocol) || !hosts.has(url.host)) return problem(403, 'HOST_LOOPBACK_REQUIRED', 'Use the configured loopback host or local alias.')
     if (closed) return problem(503, 'HOST_CLOSED', 'The local host is shutting down.')
+    // Never route encoded or trailing-slash auth aliases through a more permissive handler.
+    let normalized: string
+    try { normalized = decodeURIComponent(url.pathname).replace(/\/+$/, '') } catch { return problem(400, 'HOST_INVALID_PATH', 'Invalid request path.') }
+    if (normalized !== url.pathname && (normalized === '/session' || normalized.startsWith('/api/auth') || normalized.startsWith('/host/auth') || applicationAuth && normalized.startsWith('/v1/oauth/google/authorize/'))) return problem(400, 'HOST_INVALID_PATH', 'Use the exact authentication path.')
     if (url.pathname === '/session') return url.search ? problem(400, 'HOST_INVALID_INPUT', 'Session initialization takes no query parameters.') : session(request)
     if (url.pathname === '/health' && request.method === 'GET') return Response.json({ ok: true }, { headers: safeHeaders })
+    if (url.pathname.startsWith('/api/auth')) return applicationAuth && url.pathname === '/api/auth/callback/google' ? applicationAuth.handle(request) : problem(404, 'NOT_FOUND', 'Route not found.')
+    if (url.pathname === '/host/auth' || url.pathname.startsWith('/host/auth/')) {
+      if (applicationAuth) return applicationAuth.handle(request)
+      const origin = request.headers.get('origin')
+      if (origin && !origins.has(origin) || request.headers.get('sec-fetch-site') === 'cross-site') return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'This request origin is not permitted.')
+      if (url.pathname === '/host/auth' && request.method === 'GET' && !url.search) return Response.json({ method: 'loopback' }, { headers: safeHeaders })
+      return problem(404, 'NOT_FOUND', 'Route not found.')
+    }
     const extension = extensions.find(extension => extension.matches(url.pathname))
     const callback = extension?.callbackPath === url.pathname && request.method === 'GET'
     const origin = request.headers.get('origin')
     if (!callback && (origin && !origins.has(origin) || request.headers.get('sec-fetch-site') === 'cross-site')) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'This request origin is not permitted.')
-    if (!authenticate(request)) {
+    const identity = await currentIdentity(request)
+    if (!identity) {
+      if (applicationAuth) return authRequired()
       if (callback) return new Response(null, { status: 303, headers: { ...safeHeaders, Location: `${config.web.origin}/?connection=failed` } })
-      return problem(401, 'UNAUTHENTICATED', 'Initialize a local browser session first.')
+      return authRequired()
     }
+    if (!scopeMatches(request, identity.scope)) {
+      const response = problem(409, 'HOST_SCOPE_CHANGED', 'The signed-in user changed. Reload before continuing.')
+      response.headers.set('X-Superlocal-Auth', 'required')
+      return response
+    }
+    if (!ownsMailboxAuthorization(request, identity.id)) return problem(404, 'NOT_FOUND', 'OAuth attempt not found.')
+    const owner = identity.id
+    const { inboxPreferences, splitPreferences, attentionFeedback, senderDomains } = contextFor(owner)
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
     if (url.pathname === '/host/performance') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Performance batches take no query parameters.')
@@ -210,6 +288,8 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       request.method === 'PUT' && /^\/v1\/connections\/[^/]+\/credentials$/.test(path)) return problem(403, 'HOST_CONNECT_REQUIRED', 'Use the host provider connection flow, not raw SDK credential input.')
     if (extension) return extension.fetch(request)
     if (url.pathname.startsWith('/v1/')) {
+      // SDK events reauthenticate on every page and the one-second poll, against the
+      // same uncached application session lookup. Revocation also terminates open SSE.
       const forwarded = url.pathname === '/v1/events' ? new Request(request, { signal: AbortSignal.any([request.signal, streamShutdown.signal]) }) : request
       return api.fetch(forwarded)
     }
@@ -217,9 +297,16 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
   }
 
   return {
-    config, inbox: liveInbox, owner,
+    config, inbox: liveInbox,
+    get owner() {
+      if (applicationAuth) throw new InboxError('HOST_OWNER_REQUIRED', 'Google mail access requires an authenticated user owner.', 400)
+      return owner
+    },
     fetch(request: Request): Promise<Response> {
-      const task = dispatch(request).catch(error => {
+      const task = dispatch(request).then(async response => {
+        if (applicationAuth && response.status === 401 && !await applicationAuth.identity(request)) response.headers.set('X-Superlocal-Auth', 'required')
+        return response
+      }).catch(error => {
         if (error instanceof InboxError && /^HOST_[A-Z_]+$/.test(error.code)) return problem(error.status, error.code, error.message)
         const known = error instanceof InboxError
         const status = known && Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : 500
@@ -236,10 +323,11 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       sessions.clear()
       streamShutdown.abort()
       return closing = (async () => {
-        await senderDomains.close()
+        await Promise.all([...ownerContexts.values()].map(context => context.senderDomains.close()))
         await Promise.allSettled([...pending])
+        ownerContexts.clear()
         await performanceLog.close()
-        try { if (mock) await mock.close(); else await liveInbox.close() } finally { runtime.database.close() }
+        try { if (mock) await mock.close(); else await liveInbox.close() } finally { applicationAuth?.close(); runtime.database.close() }
       })()
     },
   }

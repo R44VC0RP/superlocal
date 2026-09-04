@@ -20,7 +20,7 @@ import {
 import "./message.css";
 import "./thread-comments.css";
 import { plainText } from "./mail-text";
-import { readText } from "./storage";
+import { readText, writeText } from "./storage";
 import { getQuickReplies } from "./quick-replies";
 
 type ThreadComment = {
@@ -132,7 +132,7 @@ export default function ThreadView({
   const replyFocusKey = replyResult ? `${mail.id}:${replyResult.id}` : "";
   const metadataMailbox = useRef(mail.mailboxId ?? account).current;
   const metadataThread = mail.sdkThreadId ? `${metadataMailbox}:${mail.sdkThreadId}` : mail.id;
-  const commentKey = `superlocal:comments:${encodeURIComponent(metadataMailbox)}:${encodeURIComponent(metadataThread)}`;
+  const commentKey = `comments:${encodeURIComponent(metadataMailbox)}:${encodeURIComponent(metadataThread)}`;
   const [commentState, setCommentState] = useState({
     key: "",
     comments: [] as ThreadComment[],
@@ -186,7 +186,7 @@ export default function ThreadView({
     let stored: ThreadComment[] = [];
     try {
       const parsed: unknown = JSON.parse(
-        localStorage.getItem(commentKey) || "[]",
+        readText(commentKey) || "[]",
       );
       if (Array.isArray(parsed)) {
         stored = parsed.filter(
@@ -224,7 +224,7 @@ export default function ThreadView({
     setSnippetRequest(0);
     try {
       setResponse(
-        localStorage.getItem(`superlocal:invitation:${metadataThread}`) || "",
+        readText(`invitation:${metadataThread}`) || "",
       );
     } catch {
       setResponse("");
@@ -436,7 +436,7 @@ export default function ThreadView({
   function unsubscribe() {
     setUnsubscribed(true);
     try {
-      localStorage.setItem(`superlocal:unsubscribed:${mail.email}`, "true");
+      writeText(`unsubscribed:${mail.email}`, "true");
     } catch {
       /* Keep the subscription state for this session. */
     }
@@ -449,7 +449,7 @@ export default function ThreadView({
   function respond(value: string) {
     setResponse(value);
     try {
-      localStorage.setItem(`superlocal:invitation:${metadataThread}`, value);
+      writeText(`invitation:${metadataThread}`, value);
     } catch {
       /* Keep the response for this session. */
     }
@@ -463,7 +463,7 @@ export default function ThreadView({
       { id: crypto.randomUUID(), body, createdAt: new Date().toISOString() },
     ];
     try {
-      localStorage.setItem(commentKey, JSON.stringify(next));
+      writeText(commentKey, JSON.stringify(next));
     } catch {
       /* Keep the comment in this reader when storage is unavailable. */
     }
@@ -477,7 +477,7 @@ export default function ThreadView({
 
   function deleteComment(id: string) {
     const next = comments.filter(comment => comment.id !== id);
-    try { localStorage.setItem(commentKey, JSON.stringify(next)); }
+    try { writeText(commentKey, JSON.stringify(next)); }
     catch { /* Keep the deletion in this reader when storage is unavailable. */ }
     setCommentState({ key: commentKey, comments: next, text: commentText });
     setPendingCommentDelete(null);

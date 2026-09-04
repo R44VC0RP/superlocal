@@ -1,5 +1,6 @@
 /// <reference types="vite/client" />
 import { performanceActions, type PerformanceAction, type PerformanceSample } from "../../shared/performance.ts";
+import { privateFetch } from "./application-auth.ts";
 
 let performanceEnabled = false;
 let performanceTab: string | undefined;
@@ -15,7 +16,7 @@ async function flushPerformance(): Promise<void> {
   try {
     // Never await this transport from a mail action. Failed telemetry is dropped,
     // not retried, and this fetch is deliberately outside request instrumentation.
-    await fetch("/host/performance", { method: "POST", credentials: "include", keepalive: true,
+    await privateFetch("/host/performance", { method: "POST", credentials: "include", keepalive: true,
       headers: { "Content-Type": "application/json" }, body: JSON.stringify({ samples }), signal: AbortSignal.timeout(3000) });
   } catch { /* Timing capture must not produce user errors or recursive logging. */ }
   finally { performanceSending = false; schedulePerformance(); }

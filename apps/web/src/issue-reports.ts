@@ -1,4 +1,5 @@
-import { readBrowserLogs, type BrowserLog } from "./browser-logs";
+import { readBrowserLogs, type BrowserLog } from "./browser-logs.ts";
+import { getApplicationStorage } from "./storage.ts";
 
 export type IssueReport = {
   id: string;
@@ -12,9 +13,13 @@ export type IssueReport = {
   logs?: BrowserLog[];
 };
 
-async function openIssueDatabase(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open("superlocal-issues", 1);
+const databases = new Map<string, Promise<IDBDatabase>>();
+
+function openIssueDatabase(name: string): Promise<IDBDatabase> {
+  const existing = databases.get(name);
+  if (existing) return existing;
+  const pending = new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(name, 1);
     request.onupgradeneeded = () => {
       request.result.createObjectStore("reports", { keyPath: "id" });
     };
@@ -23,43 +28,43 @@ async function openIssueDatabase(): Promise<IDBDatabase> {
       request.onsuccess = () => request.result.close();
       reject(new Error("Issue storage is blocked by another tab."));
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      const database = request.result;
+      database.onversionchange = () => { database.close(); databases.delete(name); };
+      resolve(database);
+    };
+  });
+  databases.set(name, pending);
+  void pending.catch(() => { if (databases.get(name) === pending) databases.delete(name); });
+  return pending;
+}
+
+export async function saveIssueReport(report: IssueReport, storage = getApplicationStorage()): Promise<void> {
+  // Resolve the immutable database name before the first async boundary.
+  const database = await openIssueDatabase(storage.issueDatabaseName);
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction("reports", "readwrite");
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error);
+    transaction.onerror = () => reject(transaction.error);
+    transaction.objectStore("reports").put(report);
   });
 }
 
-export async function saveIssueReport(report: IssueReport): Promise<void> {
-  const database = await openIssueDatabase();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const transaction = database.transaction("reports", "readwrite");
-      transaction.oncomplete = () => resolve();
-      transaction.onabort = () => reject(transaction.error);
-      transaction.onerror = () => reject(transaction.error);
-      transaction.objectStore("reports").put(report);
-    });
-  } finally {
-    database.close();
-  }
-}
-
-export async function readIssueReports(): Promise<IssueReport[]> {
-  const database = await openIssueDatabase();
-  try {
-    return await new Promise((resolve, reject) => {
-      const transaction = database.transaction("reports", "readonly");
-      const request = transaction.objectStore("reports").getAll();
-      transaction.oncomplete = () =>
-        resolve(
-          (request.result as IssueReport[]).sort((a, b) =>
-            b.updatedAt.localeCompare(a.updatedAt),
-          ),
-        );
-      transaction.onabort = () => reject(transaction.error);
-      transaction.onerror = () => reject(transaction.error);
-    });
-  } finally {
-    database.close();
-  }
+export async function readIssueReports(storage = getApplicationStorage()): Promise<IssueReport[]> {
+  const database = await openIssueDatabase(storage.issueDatabaseName);
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction("reports", "readonly");
+    const request = transaction.objectStore("reports").getAll();
+    transaction.oncomplete = () =>
+      resolve(
+        (request.result as IssueReport[]).sort((a, b) =>
+          b.updatedAt.localeCompare(a.updatedAt),
+        ),
+      );
+    transaction.onabort = () => reject(transaction.error);
+    transaction.onerror = () => reject(transaction.error);
+  });
 }
 
 export async function captureIssueReport(

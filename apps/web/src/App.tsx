@@ -31,7 +31,7 @@ import CalendarView from "./CalendarView";
 import Snippets from "./Snippets";
 import { useMailMotion } from "./mail-motion";
 import { shortcutGroups } from "./shortcuts";
-import { removeSaved } from "./storage";
+import { readSessionText, removeSaved, writeSessionText } from "./storage";
 import { usePersistence } from "./use-persistence";
 import { useInbox } from "./use-inbox";
 import "./inbox.css";
@@ -99,7 +99,7 @@ function readRoute(): Route {
   };
 }
 
-export default function App() {
+export default function App({ applicationUser, onSignOut }: { applicationUser?: { name: string; email: string }; onSignOut?: () => void } = {}) {
   const [route, setRoute] = useState<Route>(readRoute);
   const inbox = useInbox();
   const { store, mail, drafts } = inbox;
@@ -163,7 +163,7 @@ export default function App() {
   const [noticeFading, setNoticeFading] = useState(false);
   const [noticeHovered, setNoticeHovered] = useState(false);
   // The read-only host reminder shows once per tab; the disabled controls and Add Accounts keep the state visible afterwards.
-  const [readOnlyDismissed, setReadOnlyDismissed] = useState(() => { try { return sessionStorage.getItem("superlocal:read-only-notice") === "dismissed"; } catch { return false; } });
+  const [readOnlyDismissed, setReadOnlyDismissed] = useState(() => readSessionText("read-only-notice") === "dismissed");
   const [onboardingReturn, setOnboardingReturn] = useState<{ providerId: string; connectionId: string | null } | null>(null);
   useEffect(() => {
     const url = new URL(location.href);
@@ -549,7 +549,7 @@ export default function App() {
   }
   function dismissReadOnly() {
     setReadOnlyDismissed(true);
-    try { sessionStorage.setItem("superlocal:read-only-notice", "dismissed"); } catch { /* The reminder simply returns next load. */ }
+    writeSessionText("read-only-notice", "dismissed");
   }
   const notices = (
     <Notices issues={inbox.issues} onRetry={retryIssue} onDismiss={store.dismissIssue}>
@@ -2093,6 +2093,9 @@ export default function App() {
           )}
         </div>
         <footer className="sidebar-footer">
+          {applicationUser && onSignOut && (
+            <button className="application-sign-out" type="button" title={`Sign out ${applicationUser.email}`} onClick={onSignOut}>Sign out</button>
+          )}
           <div>
             <IconButton
               name="QuestionSquircle"

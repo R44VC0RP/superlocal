@@ -15,6 +15,7 @@ export default defineConfig(() => {
         ...(process.env.SUPERLOCAL_CONFIG ? [resolve(process.env.SUPERLOCAL_CONFIG).replaceAll('\\', '/')] : []),
       ] },
       proxy: {
+        '/api/auth': { target, changeOrigin: true },
         '/v1': { target, changeOrigin: true },
         '/host': { target, changeOrigin: true },
         '/session': {
