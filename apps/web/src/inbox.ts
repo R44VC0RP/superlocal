@@ -962,6 +962,10 @@ export class InboxStore {
     const policyAtStart = this.state.policy;
     this.publish({ refreshing: true });
     const load = async () => {
+      // Fence metadata before reading it, not only the later mail inventory.
+      // Catch-up can then refresh actual intervening metadata events without
+      // repeating every bootstrap read on the path to the first usable inbox.
+      const metadataBaseline = await this.client.changes({}, options);
       const [accounts, boxes, labels, drafts, policy, host, viewPreferences] = await Promise.all([
         this.client.accounts(options), this.client.mailboxes(options), this.client.labels(undefined, options), this.client.drafts(undefined, options), this.client.policy(options),
         readHostConfiguration(options.signal),
@@ -992,15 +996,16 @@ export class InboxStore {
       const mailboxIds = selected.map(box => box.id);
       let baseline: typeof this.mailboxCursor;
       // The fixed ID inventory finishes even while imports append mail. Its
-      // baseline is separate from the SSE cursor; catch-up follows that exact
-      // scope after the last page, never a newly sampled global ready token.
+      // scope is separate from the SSE cursor. Catch-up uses its signed scope
+      // and the earlier metadata baseline, covering both reads after the last
+      // page, never a newly sampled global ready token.
       if (mailboxIds.length && mailboxIds.length <= 1000) {
           const items: MailboxMessageSummary[] = []; let cursor: string | undefined;
           do {
             const started = performance.now();
             const page = await this.client.mailboxSnapshot({ mailboxIds, limit: 500, ...(cursor ? { cursor } : {}) }, options);
             networkMs += performance.now() - started; pages++; messages += page.items.length;
-            baseline = { state: page.state, scopeState: page.scopeState, mailboxIds };
+            baseline = { state: metadataBaseline.state, scopeState: page.scopeState, mailboxIds };
             items.push(...page.items); cursor = page.nextCursor ?? undefined;
           } while (cursor);
           for (const item of items) for (const membership of item.memberships) summaries.get(membership.mailboxId)?.push(item);
@@ -1093,7 +1098,7 @@ export class InboxStore {
       this.publish({ policy: currentPolicy, host, viewPreferences, splitPreferences, attentionFeedback: this.feedbackEpoch === feedbackEpoch ? attentionFeedback : this.state.attentionFeedback, mailboxes: selected, sources: accounts,
         loading: !this.state.loaded && this.catchingUp, loaded: this.state.loaded || !this.catchingUp, refreshing: this.catchingUp, error: null }); this.rebuild();
       this.resolve("snapshot");
-      if (baseline) { this.metadataPending = true; this.scheduleRefresh(); }
+      if (baseline) this.scheduleRefresh();
       void this.discoverFolders();
     };
     const work = (async () => {

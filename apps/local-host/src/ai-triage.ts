@@ -718,11 +718,13 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
   }
   async function visible(owner: string, value: AiDecision, boxes: Set<string>) {
     if (!value.mailboxIds.some(id => boxes.has(id))) return false
-    // Recheck one owner-bound canonical membership; current context revisions are also
-    // checked by the client before applying a projection to its live canonical rows.
+    // Visibility needs current membership, not a sanitized reader body. Context
+    // revisions are still checked by the client against its live canonical rows.
+    let sliceStarted = performance.now()
     for (const mailbox of value.mailboxIds) {
       if (!boxes.has(mailbox)) continue
-      try { const message = await inbox.mailboxMessage(owner, mailbox, value.latestMessageId); return message.sourceId === value.sourceId && message.threadId === value.threadId }
+      if (performance.now() - sliceStarted >= 8) { await yieldPage(); sliceStarted = performance.now() }
+      try { const message = await inbox.mailboxMessageSummary(owner, mailbox, value.latestMessageId); return message.sourceId === value.sourceId && message.threadId === value.threadId }
       catch (error) { if (!(error instanceof InboxError) || ![403, 404, 409].includes(error.status)) throw error }
     }
     return false
@@ -733,14 +735,20 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     if (after > boundary.head || !initial && after < boundary.floor) return { decisions: [], removed: [], cursor: boundary.head, hasMore: false, resetRequired: true }
     const selected = new Set((await scope(owner)).boxes.map(box => box.id))
     const decisions: AiDecision[] = [], removed: AiThreadKey[] = []
+    let sliceStarted = performance.now()
     if (initial) {
       const rows = db.query<DecisionRow, [string, number]>('SELECT data,fingerprint,sender,seq FROM local_ai_decisions WHERE owner=? AND seq>? ORDER BY seq LIMIT 101').all(owner, after)
-      for (const row of rows.slice(0, 100)) { const value: AiDecision = JSON.parse(row.data); if (await visible(owner, value, selected)) decisions.push(projected(owner, value)) }
+      for (const row of rows.slice(0, 100)) {
+        if (performance.now() - sliceStarted >= 8) { await yieldPage(); sliceStarted = performance.now() }
+        const value: AiDecision = JSON.parse(row.data)
+        if (await visible(owner, value, selected)) decisions.push(projected(owner, value))
+      }
       return { decisions, removed, cursor: rows.length > 100 ? rows[99]!.seq : boundary.head, hasMore: rows.length > 100, resetRequired: false }
     }
     const rows = db.query<{ seq: number; source: string; thread: string; removed: number }, [string, number]>('SELECT seq,source,thread,removed FROM local_ai_events WHERE owner=? AND seq>? ORDER BY seq LIMIT 101').all(owner, after)
     const keys = new Map(rows.slice(0, 100).map(row => [key(owner, row.source, row.thread), row]))
     for (const item of keys.values()) {
+      if (performance.now() - sliceStarted >= 8) { await yieldPage(); sliceStarted = performance.now() }
       const row = decisionRow(owner, item.source, item.thread)
       if (row) { const value: AiDecision = JSON.parse(row.data); if (await visible(owner, value, selected)) { decisions.push(projected(owner, value)); continue } }
       removed.push({ sourceId: item.source, threadId: item.thread })
