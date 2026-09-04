@@ -159,7 +159,9 @@ export function resolveMailShortcut(
     else if (event.key === ",") intent = { type: "settings" };
     else if (event.key === "Tab" && list && !context.search)
       intent = { type: "split", delta: shift ? -1 : 1 };
-    else if (event.key === "ArrowLeft") intent = { type: "openDrawer" };
+    else if (reader && !shift && (event.key === "ArrowLeft" || event.key === "ArrowRight"))
+      intent = { type: "navigateConversation", delta: event.key === "ArrowRight" ? 1 : -1 };
+    else if (event.key === "ArrowLeft" && list) intent = { type: "openDrawer" };
     else if (event.key === "ArrowRight" && list && context.hasHighlightedMail)
       intent = { type: "openConversation", drafts: false };
     else if (event.key === " " && list)
@@ -175,7 +177,7 @@ export function resolveMailShortcut(
           { u: "Unread", s: "Starred", i: "Important", r: "No reply" } as const
         )[key],
       };
-    else if (["j", "k", "ArrowDown", "ArrowUp"].includes(event.key))
+    else if (["j", "k"].includes(event.key) || list && ["ArrowDown", "ArrowUp"].includes(event.key))
       intent = {
         type: "navigateConversation",
         delta: event.key === "j" || event.key === "ArrowDown" ? 1 : -1,
