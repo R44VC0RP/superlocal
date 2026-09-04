@@ -51,6 +51,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     CREATE TABLE IF NOT EXISTS local_ai_cursor (owner TEXT PRIMARY KEY, head INTEGER NOT NULL DEFAULT 0, floor INTEGER NOT NULL DEFAULT 0) STRICT;
     CREATE TABLE IF NOT EXISTS local_ai_queue (owner TEXT NOT NULL, source TEXT NOT NULL, thread TEXT NOT NULL, fingerprint TEXT NOT NULL, generation INTEGER NOT NULL, lane TEXT NOT NULL, queued INTEGER NOT NULL, due INTEGER NOT NULL, attempts INTEGER NOT NULL, status TEXT NOT NULL, job TEXT, PRIMARY KEY(owner,source,thread)) STRICT;
     CREATE INDEX IF NOT EXISTS local_ai_queue_due ON local_ai_queue(status,due,lane,queued);
+    CREATE INDEX IF NOT EXISTS local_ai_queue_ready ON local_ai_queue(CASE lane WHEN 'incoming' THEN 0 ELSE 1 END,queued) WHERE status='queued';
     CREATE INDEX IF NOT EXISTS local_ai_queue_owner ON local_ai_queue(owner,status);
     CREATE TABLE IF NOT EXISTS local_ai_queue_counts (owner TEXT PRIMARY KEY, queued INTEGER NOT NULL CHECK(queued>=0)) STRICT;
     CREATE TABLE IF NOT EXISTS local_ai_migrations (name TEXT PRIMARY KEY) STRICT;
@@ -521,10 +522,10 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     return !!current && current.generation === queue.generation && current.fingerprint === queue.fingerprint
   }
   function pump() {
-    if (!started || closed || pumping || !configuration) return
+    if (!started || closed || pumping || !configuration || active.size >= Math.min(2, configuration.concurrency ?? 2)) return
     pumping = true
     try {
-      const rows = db.query<QueueRow, [number]>(`SELECT q.* FROM local_ai_queue q JOIN local_ai_settings s ON s.owner=q.owner LEFT JOIN local_ai_jobs j ON j.owner=q.owner AND j.id=q.job WHERE q.status='queued' AND q.due<=? AND q.generation=s.generation AND json_extract(s.data,'$.enabled')=1 AND (q.job IS NULL OR (j.enumerated=1 AND json_extract(j.data,'$.status')='running')) ORDER BY CASE q.lane WHEN 'incoming' THEN 0 ELSE 1 END,q.queued LIMIT 20`).all(now())
+      const rows = db.query<QueueRow, [number]>(`SELECT q.* FROM local_ai_queue q INDEXED BY local_ai_queue_ready JOIN local_ai_settings s ON s.owner=q.owner LEFT JOIN local_ai_jobs j ON j.owner=q.owner AND j.id=q.job WHERE q.status='queued' AND q.due<=? AND q.generation=s.generation AND json_extract(s.data,'$.enabled')=1 AND (q.job IS NULL OR (j.enumerated=1 AND json_extract(j.data,'$.status')='running')) ORDER BY CASE q.lane WHEN 'incoming' THEN 0 ELSE 1 END,q.queued LIMIT 20`).all(now())
       for (const row of rows) {
         if (active.size >= Math.min(2, configuration.concurrency ?? 2)) break
         const id = key(row.owner, row.source, row.thread)

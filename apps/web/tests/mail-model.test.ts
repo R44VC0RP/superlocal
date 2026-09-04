@@ -668,6 +668,7 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
   const globals = ["location", "window", "document", "localStorage"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
   let host: Awaited<ReturnType<typeof createMockHost>> | undefined, stop: (() => void) | undefined, releaseState: (() => void) | undefined;
   let stateGate: Promise<void> | undefined, gatedStates = 0, bodyReads = 0, inventories = 0, aiRequests = 0, changeRequests = 0;
+  let releaseAction: (() => void) | undefined;
   let decision: AiDecision | undefined, queuedChange: AiDecision | undefined;
   let aiState: AiTriageState = { configured: false, provider: null, problemCode: null,
     settings: { revision: 1, enabled: false, mode: "preview", model: "fixture-model", mailboxIds: null, personalization: false, readingSignals: false, interests: [] },
@@ -788,9 +789,16 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
 
     // Only the app-owned AI HTTP boundary is controlled; all mail continues
     // through the actual offline provider, SDK persistence, summaries and deltas.
+    const pendingAction = store.act("done", () => new Promise<void>(resolve => { releaseAction = resolve; }), false);
     decision = { ...decision, revision: 2, score: { ...decision.score!, category: "Important", score: 90 } };
     queuedChange = decision; aiState = { ...aiState, cursor: 2 };
     const beforeChanges = changeRequests, unaffected = new Map(store.getSnapshot().mail.filter(mail => mail.sdkThreadId !== selected.sdkThreadId).map(mail => [mail.id, mail]));
+    for (let attempt = 0; attempt < 400 && changeRequests === beforeChanges; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(changeRequests > beforeChanges);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(store.getSnapshot().pending, 1);
+    assert.equal(store.getSnapshot().mail.find(mail => mail.id === selected.id)?.attentionCategory, "Other", "background AI reconciliation yields to a pending durable mail action");
+    releaseAction!(); await pendingAction; releaseAction = undefined;
     for (let attempt = 0; attempt < 400 && store.getSnapshot().mail.find(mail => mail.id === selected.id)?.triage?.revision !== 2; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.ok(changeRequests > beforeChanges, "background AI changes transport ran");
     assert.equal(store.getSnapshot().mail.find(mail => mail.id === selected.id)?.attentionCategory, "Important");
@@ -856,7 +864,7 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
     await assert.rejects(ownerBoundStore.ai.lookup(keys), error => error instanceof DOMException && error.name === "AbortError");
     assert.equal(aiRequests, requestsAtLock, "a locked owner cannot dispatch AI requests");
   } finally {
-    releaseState?.(); stop?.(); await host?.close(); await fs.rm(root, { recursive: true, force: true });
+    releaseAction?.(); releaseState?.(); stop?.(); await host?.close(); await fs.rm(root, { recursive: true, force: true });
     globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
     for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
   }

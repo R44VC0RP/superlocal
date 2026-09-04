@@ -233,6 +233,9 @@ export class InboxStore {
   private aiPollPromise?: Promise<void>;
   private aiHoldTimer?: ReturnType<typeof setTimeout>;
   private aiHolds = new Map<string, { until: number; latestMessageId: string }>();
+  private aiRebuildTimer?: ReturnType<typeof setTimeout>;
+  private aiRebuildThreads = new Set<string>();
+  private aiRebuildAfter = 0;
   private knownThreads = new Set<string>();
   private readonly aiTransport = createAiTriageClient(() => AbortSignal.any([this.controller.signal, this.applicationScope.signal]), (input, init) => this.fetch(input, init));
   readonly client: InboxClient;
@@ -283,6 +286,7 @@ export class InboxStore {
     this.aiStateAt = Date.now();
     if (JSON.stringify(previous) !== JSON.stringify(value) || this.state.aiError) this.publish({ ai: value, aiError: null });
     if (changed) {
+      clearTimeout(this.aiRebuildTimer); this.aiRebuildTimer = undefined; this.aiRebuildThreads.clear();
       this.aiEpoch++; this.aiInitialLoaded = false;
       const threads = new Set([...this.aiDecisions.keys(), ...this.aiHolds.keys()]);
       if (!previous || previous.configured !== value.configured || previous.settings.enabled !== value.settings.enabled || previous.settings.model !== value.settings.model || JSON.stringify(previous.settings.mailboxIds) !== JSON.stringify(value.settings.mailboxIds)) this.aiDecisions.clear();
@@ -292,7 +296,7 @@ export class InboxStore {
     if (!this.aiPollPromise) this.scheduleAi(0);
   }
 
-  private receiveAiPage(page: AiDecisionPage) {
+  private receiveAiPage(page: AiDecisionPage, background = false) {
     if (this.controller.signal.aborted || this.applicationScope.signal.aborted) return;
     if (!Array.isArray(page.decisions) || page.decisions.length > 1000 || !Array.isArray(page.removed) || page.removed.length > 1000 || !Number.isSafeInteger(page.cursor) || page.cursor < 0) throw new Error("Invalid AI triage page.");
     const threads = new Set<string>();
@@ -310,7 +314,34 @@ export class InboxStore {
       const hold = this.aiHolds.get(key);
       if (hold && decision.latestMessageId === hold.latestMessageId && ["ready", "failed"].includes(decision.state)) this.aiHolds.delete(key);
     }
-    if (this.state.loaded && threads.size) this.rebuild(threads);
+    if (this.state.loaded && threads.size) {
+      if (background) {
+        for (const key of threads) {
+          if (!this.aiRebuildThreads.has(key) && this.aiRebuildThreads.size >= 100_000) throw new Error("AI triage reconciliation capacity reached.");
+          this.aiRebuildThreads.add(key);
+        }
+        this.scheduleAiRebuild();
+      } else this.rebuild(threads);
+    }
+  }
+
+  private scheduleAiRebuild() {
+    if (this.aiRebuildTimer || !this.aiRebuildThreads.size || this.controller.signal.aborted || this.applicationScope.signal.aborted) return;
+    this.aiRebuildTimer = setTimeout(() => {
+      this.aiRebuildTimer = undefined;
+      if (this.controller.signal.aborted || this.applicationScope.signal.aborted) { this.aiRebuildThreads.clear(); return; }
+      // Historical pages must not compete with a durable mail receipt or its next frame.
+      // Arrival hold expiry and explicit feedback still reconcile immediately.
+      if (!this.state.pending && Date.now() >= this.aiRebuildAfter) {
+        const threads = new Set<string>();
+        for (const key of this.aiRebuildThreads) {
+          threads.add(key); this.aiRebuildThreads.delete(key);
+          if (threads.size >= 500) break;
+        }
+        if (threads.size) this.rebuild(threads);
+      }
+      this.scheduleAiRebuild();
+    }, 100);
   }
 
   private scheduleAi(delay = 1000) {
@@ -332,7 +363,7 @@ export class InboxStore {
         for (let pages = 0; pages < 1000; pages++) {
           const page = await this.aiTransport.results(after);
           if (signal.aborted || generation !== this.generation || epoch !== this.aiEpoch) return;
-          this.receiveAiPage(page);
+          this.receiveAiPage(page, true);
           if (!page.hasMore) { this.aiCursor = baseline; this.aiInitialLoaded = true; break; }
           if (page.cursor <= (after ?? -1)) throw new Error("AI triage cursor did not advance.");
           after = page.cursor;
@@ -344,12 +375,13 @@ export class InboxStore {
         const page = await this.aiTransport.changes(this.aiCursor);
         if (signal.aborted || generation !== this.generation || epoch !== this.aiEpoch) return;
         if (page.resetRequired) {
+          clearTimeout(this.aiRebuildTimer); this.aiRebuildTimer = undefined; this.aiRebuildThreads.clear();
           this.aiInitialLoaded = false;
           const threads = new Set(this.aiDecisions.keys()); this.aiDecisions.clear();
           if (threads.size) this.rebuild(threads);
           return;
         }
-        this.receiveAiPage(page);
+        this.receiveAiPage(page, true);
         if (page.cursor < this.aiCursor || page.hasMore && page.cursor === this.aiCursor) throw new Error("AI triage cursor did not advance.");
         this.aiCursor = page.cursor;
         if (!page.hasMore) break;
@@ -589,6 +621,7 @@ export class InboxStore {
       this.client.clearCache();
       clearTimeout(this.refreshTimer);
       clearTimeout(this.aiPollTimer); clearTimeout(this.aiHoldTimer); this.aiPollPromise = undefined; this.aiHolds.clear();
+      clearTimeout(this.aiRebuildTimer); this.aiRebuildTimer = undefined; this.aiRebuildThreads.clear();
       for (const timer of this.saveTimers.values()) clearTimeout(timer);
       for (const timer of this.issueHolds.values()) clearTimeout(timer);
       this.saveTimers.clear(); this.issueHolds.clear(); this.loadingThreads.clear(); this.refreshPromise = undefined; this.updatesPromise = undefined; this.folderDiscovery = undefined;
@@ -1756,7 +1789,7 @@ export class InboxStore {
       return result;
     }
     catch (error) { timing({ queueMs, outcome: "error" }); this.scheduleRefresh(); this.fail(error, action); throw error; }
-    finally { release(); this.publish({ pending: Math.max(0, this.state.pending - 1) }); }
+    finally { release(); this.aiRebuildAfter = Date.now() + 50; this.publish({ pending: Math.max(0, this.state.pending - 1) }); }
   }
   private done(selected: Mail[], done: boolean): Promise<() => Promise<void>> {
     const targets = new Map<string, MailboxStateTarget>();

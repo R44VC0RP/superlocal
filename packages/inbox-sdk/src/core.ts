@@ -80,6 +80,8 @@ export function createInbox(options: InboxOptions): Inbox {
     CREATE INDEX IF NOT EXISTS sdk_message_account ON sdk_messages(owner,account,deleted,received_at,id);
     CREATE INDEX IF NOT EXISTS sdk_message_inventory ON sdk_messages(owner,account,deleted,received_at DESC,id,generation);
     CREATE INDEX IF NOT EXISTS sdk_message_thread ON sdk_messages(owner,thread_id,deleted,received_at,id);
+    CREATE INDEX IF NOT EXISTS sdk_message_due_snooze ON sdk_messages(snoozed_until) WHERE deleted=0 AND snoozed_until IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS sdk_message_sync_states ON sdk_messages(account,generation,native_id,json_extract(confirmed,'$.isRead'),json_extract(confirmed,'$.isStarred')) WHERE deleted=0;
     CREATE TABLE IF NOT EXISTS sdk_thread_keys (account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(account,generation,native_id));
     CREATE TABLE IF NOT EXISTS sdk_native_keys (account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(account,generation,native_id));
     CREATE TABLE IF NOT EXISTS sdk_folders (id TEXT PRIMARY KEY, owner TEXT NOT NULL, account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(account,generation,native_id), FOREIGN KEY(account,owner) REFERENCES sdk_accounts(id,owner));
@@ -104,6 +106,7 @@ export function createInbox(options: InboxOptions): Inbox {
     CREATE TABLE IF NOT EXISTS sdk_memberships (owner TEXT NOT NULL, source TEXT NOT NULL, mailbox TEXT NOT NULL, message TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(mailbox,message), FOREIGN KEY(mailbox,owner,source) REFERENCES sdk_mailboxes(id,owner,source), FOREIGN KEY(message,owner,source) REFERENCES sdk_messages(id,owner,account));
     CREATE INDEX IF NOT EXISTS sdk_membership_message ON sdk_memberships(owner,source,message);
     CREATE INDEX IF NOT EXISTS sdk_membership_read ON sdk_memberships(owner,source,message,mailbox);
+    CREATE INDEX IF NOT EXISTS sdk_membership_due_snooze ON sdk_memberships(json_extract(data,'$.snoozedUntil')) WHERE json_extract(data,'$.snoozedUntil') IS NOT NULL;
     CREATE TABLE IF NOT EXISTS sdk_delivery_evidence (owner TEXT NOT NULL, source TEXT NOT NULL, message TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(message,kind,value), FOREIGN KEY(message,owner,source) REFERENCES sdk_messages(id,owner,account));
     CREATE TABLE IF NOT EXISTS sdk_connection_refresh (connection TEXT PRIMARY KEY, owner TEXT NOT NULL, lease TEXT NOT NULL, until INTEGER NOT NULL, FOREIGN KEY(connection,owner) REFERENCES sdk_connections(id,owner));
   `)
