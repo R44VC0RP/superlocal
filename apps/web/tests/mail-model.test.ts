@@ -836,6 +836,24 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
     assert.equal(conversationAttention(released), "Important");
     assert.equal(inventories, beforeAiInventories, "reply and arrival holds use bounded SDK deltas");
 
+    host.store.receive(source, { from: "ready-ai@example.test", to: nativeBox.email, subject: "Ready AI arrival", text: "Fictional arrival assessed while a mail action is pending.", isRead: false });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    await store.retry();
+    const readyArrival = store.getSnapshot().mail.find(mail => mail.account === primary.id && mail.subject === "Ready AI arrival")!;
+    assert.ok(readyArrival.aiHoldUntil && readyArrival.aiHoldUntil > Date.now());
+    const pendingArrivalAction = store.act("done", () => new Promise<void>(resolve => { releaseAction = resolve; }), false);
+    queuedChange = { ...decision, sourceId: readyArrival.sourceId!, threadId: readyArrival.sdkThreadId!, revision: 3,
+      messageIds: readyArrival.messages.map(message => message.id), latestMessageId: readyArrival.messages.at(-1)!.id,
+      contextVersions: readyArrival.messages.map(message => ({ messageId: message.id, bodyRevision: message.bodyRevision! })) };
+    aiState = { ...aiState, cursor: 3 };
+    await store.ai.state();
+    for (let attempt = 0; attempt < 100 && store.getSnapshot().mail.find(mail => mail.id === readyArrival.id)?.triage?.revision !== 3; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    const ready = store.getSnapshot().mail.find(mail => mail.id === readyArrival.id)!;
+    assert.equal(store.getSnapshot().pending, 1);
+    assert.equal(ready.triage?.revision, 3, "a ready arrival bypasses historical reconciliation deferral");
+    assert.equal(ready.aiHoldUntil, undefined, "resolved arrival holds never wait behind a pending mail action");
+    releaseAction!(); await pendingArrivalAction; releaseAction = undefined;
+
     const currentAi = store.getSnapshot().ai;
     aiState = { ...aiState, settings: { ...aiState.settings, revision: 999, model: "obsolete-owner-model" } };
     stateGate = new Promise(resolve => { releaseState = resolve; });

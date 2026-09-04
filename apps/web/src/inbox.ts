@@ -299,11 +299,11 @@ export class InboxStore {
   private receiveAiPage(page: AiDecisionPage, background = false) {
     if (this.controller.signal.aborted || this.applicationScope.signal.aborted) return;
     if (!Array.isArray(page.decisions) || page.decisions.length > 1000 || !Array.isArray(page.removed) || page.removed.length > 1000 || !Number.isSafeInteger(page.cursor) || page.cursor < 0) throw new Error("Invalid AI triage page.");
-    const threads = new Set<string>();
+    const threads = new Set<string>(), releasedHolds = new Set<string>();
     for (const value of page.removed) {
       const key = nativeKey(value.sourceId, value.threadId);
       if (this.aiDecisions.delete(key)) threads.add(key);
-      if (this.aiHolds.delete(key)) threads.add(key);
+      if (this.aiHolds.delete(key)) { threads.add(key); releasedHolds.add(key); }
     }
     for (const decision of page.decisions) {
       if (!decision || typeof decision.sourceId !== "string" || typeof decision.threadId !== "string" || !Number.isSafeInteger(decision.revision) || !Array.isArray(decision.contextVersions) || decision.contextVersions.length > 8) throw new Error("Invalid AI triage decision.");
@@ -312,7 +312,11 @@ export class InboxStore {
       if (!previous && this.aiDecisions.size >= 100_000) throw new Error("AI triage cache capacity reached.");
       this.aiDecisions.set(key, decision); threads.add(key);
       const hold = this.aiHolds.get(key);
-      if (hold && decision.latestMessageId === hold.latestMessageId && ["ready", "failed"].includes(decision.state)) this.aiHolds.delete(key);
+      if (hold && decision.latestMessageId === hold.latestMessageId && ["ready", "failed"].includes(decision.state)) { this.aiHolds.delete(key); releasedHolds.add(key); }
+    }
+    if (this.state.loaded && releasedHolds.size) {
+      for (const key of releasedHolds) { threads.delete(key); this.aiRebuildThreads.delete(key); }
+      this.rebuild(releasedHolds);
     }
     if (this.state.loaded && threads.size) {
       if (background) {
