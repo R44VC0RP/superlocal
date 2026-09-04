@@ -592,7 +592,7 @@ export function createInbox(options: InboxOptions): Inbox {
   }
 
   /** Hydrate only a consecutive bounded ID prefix, never one membership query per message. */
-  function mailboxReadRows(owner: string, scope: ReturnType<typeof mailboxReadScope>, ids: string[]) {
+  function mailboxReadRows(owner: string, scope: ReturnType<typeof mailboxReadScope>, ids: string[], cachedOnly = false) {
     type Meta = { id: string; account: string; revision: number; deleted: number; generation: number; source_generation: number; bytes: number }
     const items = new Map<string, MailboxMessageSummary>()
     const rows = new Map<string, Meta>()
@@ -635,7 +635,7 @@ export function createInbox(options: InboxOptions): Inbox {
     if (selected.length) {
       const loaded = db.query<MessageRow, [string, string]>('SELECT id,owner,account,visible FROM sdk_messages WHERE owner=? AND id IN (SELECT value FROM json_each(?))').all(owner, JSON.stringify(selected))
       for (const row of loaded) {
-        const { snoozedUntil: _legacy, ...value } = summary(row)
+        const { snoozedUntil: _legacy, ...value } = cachedOnly ? cachedSummary(row) : summary(row)
         items.set(row.id, { ...value, sourceId: row.account, memberships: memberships.get(row.id)!.states })
       }
     }
@@ -930,11 +930,15 @@ export function createInbox(options: InboxOptions): Inbox {
   }
 
   const cachedFacts = new Map<string, NonNullable<MessageSummary['facts']>>()
-  function summary(row: MessageRow): MessageSummary {
+  function cachedSummary(row: MessageRow): MessageSummary {
     const value: MessageSummary = JSON.parse(row.visible)
     value.bodyRevision = createHmac('sha256', options.encryptionKey).update(JSON.stringify([
       'body-view-v1', epoch, value.accountId, value.id, value.bodyRevision ?? null, value.bodyRevision ? null : value.revision,
     ])).digest('base64url')
+    return value
+  }
+  function summary(row: MessageRow): MessageSummary {
+    const value = cachedSummary(row)
     if (!value.facts) {
       const key = `${value.id}:${value.revision}`
       let facts = cachedFacts.get(key)
@@ -1970,6 +1974,14 @@ export function createInbox(options: InboxOptions): Inbox {
       const result: MailboxChangesPage = { events, upserts, removed, state: token(owner, through), hasMore: through < head, resetRequired: false }
       if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The mailbox changes exceed their encoded budget.', 413)
       return result
+    }).deferred()),
+    mailboxMessageSummary: (owner, mailboxId, messageId) => run(() => db.transaction(() => {
+      const scope = mailboxReadScope(owner, [mailboxId])
+      if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+      const id = text(messageId, 'Message ID', 512)
+      const message = mailboxReadRows(owner, scope, [id], true).items.get(id)
+      if (!message) throw new InboxError('NOT_FOUND', 'Message is not in this mailbox.', 404)
+      return message
     }).deferred()),
     mailboxMessage: (owner, mailboxId, messageId) => run(async () => {
       membership(owner, mailboxId, messageId)

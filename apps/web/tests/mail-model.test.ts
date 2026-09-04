@@ -647,6 +647,213 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
   }
 });
+test("SDK-backed startup catches signed changes before first display without repeating fresh metadata", async () => {
+  if (!process.versions.bun) {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "SDK-backed startup", "--timeout", "30000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output);
+    return;
+  }
+  const [{ createMockHost }, { InboxStore }, fs, { tmpdir }, { join }, { Database }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("node:fs/promises"), import("node:os"), import("node:path"), import("bun:sqlite"),
+  ]);
+  const root = await fs.mkdtemp(join(tmpdir(), "startup-catchup-"));
+  const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 31).toString("base64"), token: "fictional-startup-catchup-client-token", allowProviderWrites: true });
+  const database = new Database(join(root, "mock-inbox.sqlite"));
+  const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
+  const globals = ["location", "window", "document", "localStorage"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  const until = async (check: () => boolean, message: string) => {
+    const deadline = Date.now() + 8000;
+    while (!check() && Date.now() < deadline) await sleep(10);
+    assert.ok(check(), message);
+  };
+  const gates: Array<{ promise: Promise<void>; release: () => void; seen: boolean }> = [];
+  const gate = () => {
+    let release!: () => void;
+    const value = { promise: new Promise<void>(resolve => { release = resolve; }), release: () => release(), seen: false };
+    gates.push(value); return value;
+  };
+  let beforeSnapshot: ReturnType<typeof gate> | undefined, snapshot: ReturnType<typeof gate> | undefined;
+  let delta: ReturnType<typeof gate> | undefined, redundantMetadata: ReturnType<typeof gate> | undefined;
+  let stop: (() => void) | undefined, liveEvents = false, deltaFailures = 0, foreignState: string | undefined;
+  let inventories = 0, deltas = 0, scopeResets = 0, streams = 0, hostReads = 0;
+  let preferences = { revision: 1, unifiedMode: "all", includedMailboxIds: [] as string[], pinnedMailboxIds: [] as string[] };
+  let splits = { ...normalizeSplits({}), revision: 1 };
+  try {
+    console.info = () => {}; console.warn = () => {};
+    const nativeBox = host.store.mailboxes(host.owner)[0];
+    const source = { owner: host.owner, storeId: nativeBox.id, accountId: host.store.link(host.owner, nativeBox.id)!.accountId };
+    const native = ["Done", "Deleted", "Unselected"].map(subject => host.store.receive(source, {
+      from: "startup@example.test", to: nativeBox.email, subject: `Startup ${subject}`, text: "Fictional startup message.",
+    }));
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    const primary = (await host.inbox.mailboxes(host.owner)).find(box => box.sourceId === source.accountId)!;
+    const candidate = (await host.inbox.mailboxCandidates(host.owner, primary.connectionId)).find(value => value.sourceId === source.accountId && value.selector.kind === "domain")!;
+    const overlap = await host.inbox.createMailbox(host.owner, { sourceId: source.accountId, name: "Startup overlap", selector: candidate.selector });
+    const rows = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [primary.id, overlap.id], limit: 100 })).items;
+    const done = rows.find(row => row.subject === "Startup Done")!, deleted = rows.find(row => row.subject === "Startup Deleted")!, unselected = rows.find(row => row.subject === "Startup Unselected")!;
+    const storage = new Map<string, string>();
+    Object.assign(globalThis, {
+      location: new URL("http://localhost:41999"), window: new EventTarget(),
+      document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
+      localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+    });
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+      if (url.pathname === "/host/config") {
+        if (++hostReads > 1 && redundantMetadata) { redundantMetadata.seen = true; await redundantMetadata.promise; }
+        return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], preferenceScope: "fictional-startup" });
+      }
+      if (url.pathname === "/host/inbox-preferences") return Response.json(preferences);
+      if (url.pathname === "/host/split-preferences") return Response.json(splits);
+      if (url.pathname === "/host/attention-feedback") return Response.json([]);
+      if (url.pathname === "/v1/events" && !liveEvents) return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("Request cancelled", "AbortError"));
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      if (url.pathname === "/v1/mailbox-snapshot" && beforeSnapshot) { beforeSnapshot.seen = true; await beforeSnapshot.promise; }
+      if (url.pathname === "/v1/mailbox-changes" && deltaFailures > 0) {
+        deltaFailures--;
+        return Response.json({ code: "CONTROLLED_FAILURE", error: "Controlled catch-up failure." }, { status: 503 });
+      }
+      const headers = new Headers(init?.headers); headers.set("Authorization", "Bearer fictional-startup-catchup-client-token");
+      const response = await host.fetch(new Request(url, { ...init, headers }));
+      if (url.pathname === "/v1/changes" && foreignState && response.ok) return Response.json({ ...await response.json(), state: foreignState });
+      if (url.pathname === "/v1/events" && response.ok) streams++;
+      if (url.pathname === "/v1/mailbox-snapshot") {
+        inventories++;
+        const held = snapshot;
+        if (held && response.ok && !(await response.clone().json()).nextCursor) { held.seen = true; await held.promise; }
+      }
+      if (url.pathname === "/v1/mailbox-changes") {
+        deltas++;
+        if (response.ok) {
+          const page = await response.clone().json();
+          if (page.resetReason === "scope") scopeResets++;
+          const held = delta;
+          if (held && !page.hasMore && !page.resetRequired) { held.seen = true; await held.promise; }
+        }
+      }
+      // Delayed responses deliberately ignore abort here; the actual scoped
+      // transport, rather than this test fetch, must fence stopped generations.
+      return response;
+    }) as typeof fetch;
+
+    redundantMetadata = gate(); snapshot = gate();
+    let store = new InboxStore(); stop = store.start();
+    await until(() => snapshot!.seen, "complete initial SDK snapshot held");
+    assert.equal(store.getSnapshot().loaded, false, "a snapshot alone cannot expose rows or a false empty state");
+    snapshot.release(); snapshot = undefined;
+    await until(() => store.getSnapshot().loaded, "first ready does not wait for redundant host metadata");
+    assert.equal(hostReads, 1, "fresh host metadata is not unconditionally read again during catch-up");
+    assert.equal(redundantMetadata.seen, false);
+    assert.ok(store.getSnapshot().mail.length > 0);
+    redundantMetadata.release(); redundantMetadata = undefined; stop();
+
+    // Change metadata AFTER its reads but BEFORE the inventory samples its
+    // state. The earlier signed baseline must retain these otherwise-lost events.
+    beforeSnapshot = gate(); snapshot = gate(); delta = gate(); liveEvents = true;
+    store = new InboxStore();
+    let firstReady: ReturnType<typeof store.getSnapshot> | undefined;
+    const unsubscribe = store.subscribe(() => { if (store.getSnapshot().loaded) firstReady ??= store.getSnapshot(); });
+    stop = store.start();
+    await until(() => beforeSnapshot!.seen, "metadata read before first snapshot request");
+    const label = await host.inbox.createLabel(host.owner, source.accountId, "Startup label");
+    await host.inbox.setPolicy(host.owner, { remoteImages: false });
+    let draft = await host.inbox.createDraft(host.owner, { accountId: source.accountId, mailboxId: primary.id, subject: "Startup draft" });
+    await host.inbox.updateMailbox(host.owner, primary.id, { name: "Startup renamed" }, primary.revision);
+    beforeSnapshot.release(); beforeSnapshot = undefined;
+    await until(() => snapshot!.seen, "old complete mail inventory held before mailbox changes");
+    let member = done.memberships.find(state => state.mailboxId === primary.id)!;
+    // More than one real delta page must finish before the first display.
+    for (let index = 0; index < 501; index++) member = await host.inbox.setMailboxState(host.owner, primary.id, done.id, { done: index % 2 === 0 }, member.revision);
+    host.store.mutate(source, native[1].id, { deletePermanently: true });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    // Exercise the SDK's scoped-absence result, not a fabricated delta payload.
+    database.query("DELETE FROM sdk_memberships WHERE owner=? AND message=?").run(host.owner, unselected.id);
+    await host.inbox.mutate(host.owner, { messageIds: [unselected.id], changes: { isRead: true }, idempotencyKey: "startup-unselection" });
+    const beforeDeltas = deltas;
+    snapshot.release(); snapshot = undefined;
+    await until(() => delta!.seen, "final signed delta response held after earlier page applied");
+    assert.ok(deltas - beforeDeltas >= 2, "all bounded delta pages are consumed");
+    assert.equal(store.getSnapshot().loaded, false, "partial catch-up never exposes stale Done/deleted/unselected rows");
+    assert.equal(firstReady, undefined);
+    delta.release(); delta = undefined;
+    await until(() => !!firstReady, "signed catch-up reaches first display");
+    assert.equal(firstReady!.mail.find(mail => mail.account === primary.id && mail.messages.some(message => message.id === done.id))!.folder, "Done");
+    assert.ok(!firstReady!.mail.some(mail => mail.messages.some(message => [deleted.id, unselected.id].includes(message.id))));
+    assert.equal(firstReady!.policy!.remoteImages, false);
+    assert.ok(firstReady!.labels[primary.id].includes(label.name));
+    assert.ok(firstReady!.drafts.some(value => value.id === draft.id));
+    assert.equal(firstReady!.accounts.find(value => value.id === primary.id)!.name, "Startup renamed");
+    await until(() => streams > 0, "real SDK event stream connected");
+    const metadataReads = hostReads, inventoryReads = inventories;
+    await host.inbox.updateLabel(host.owner, label.id, "Live label", label.revision);
+    await host.inbox.setPolicy(host.owner, { remoteImages: true });
+    draft = await host.inbox.updateDraft(host.owner, draft.id, { subject: "Live draft" }, draft.revision);
+    const currentPrimary = await host.inbox.mailbox(host.owner, primary.id);
+    await host.inbox.updateMailbox(host.owner, primary.id, { name: "Live renamed" }, currentPrimary.revision);
+    await until(() => store.getSnapshot().labels[primary.id].includes("Live label") && store.getSnapshot().policy?.remoteImages === true
+      && store.getSnapshot().drafts.some(value => value.id === draft.id && value.subject === "Live draft")
+      && store.getSnapshot().accounts.find(value => value.id === primary.id)?.name === "Live renamed", "actual metadata events remain current after startup");
+    assert.equal(hostReads, metadataReads, "event-specific metadata does not force unrelated host reads");
+    assert.equal(inventories, inventoryReads, "presentation metadata does not reset the mail inventory");
+    preferences = { ...preferences, revision: 2, unifiedMode: "selected", includedMailboxIds: [primary.id], pinnedMailboxIds: [primary.id] };
+    splits = { ...splits, revision: 2 };
+    await store.retry();
+    assert.equal(store.getSnapshot().viewPreferences!.revision, 2, "explicit retry still refreshes host-only manual preferences");
+    assert.deepEqual(store.unifiedMailboxIds(), [primary.id]);
+    assert.equal(store.getSnapshot().splitPreferences!.revision, 2);
+    unsubscribe(); stop(); liveEvents = false;
+
+    deltaFailures = 1;
+    store = new InboxStore(); stop = store.start();
+    await until(() => !!store.getSnapshot().error, "initial catch-up failure is reported");
+    assert.equal(store.getSnapshot().loaded, false, "failed catch-up cannot release the initial display fence");
+    delta = gate(); const retry = store.retry();
+    await until(() => delta!.seen, "retry still waits for signed catch-up");
+    assert.equal(store.getSnapshot().loaded, false);
+    delta.release(); delta = undefined; await retry;
+    assert.equal(store.getSnapshot().loaded, true); stop();
+
+    snapshot = gate(); store = new InboxStore(); stop = store.start();
+    await until(() => snapshot!.seen, "initial snapshot held before detachment");
+    await host.inbox.updateMailbox(host.owner, overlap.id, { status: "detached" }, overlap.revision);
+    const oldSnapshot = snapshot; snapshot = gate(); oldSnapshot.release();
+    await until(() => snapshot!.seen, "scope reset reboots from authorized mailbox metadata");
+    assert.ok(scopeResets > 0, "the real SDK rejects the old snapshot scope");
+    assert.equal(store.getSnapshot().loaded, false, "scope reset remains blank until its replacement catches up");
+    snapshot.release(); snapshot = undefined;
+    await until(() => store.getSnapshot().loaded, "replacement scope caught up");
+    assert.ok(!store.getSnapshot().accounts.some(value => value.id === overlap.id));
+    assert.ok(!store.getSnapshot().mail.some(mail => mail.account === overlap.id || mail.messages.some(message => message.memberships?.some(state => state.mailboxId === overlap.id))));
+    assert.ok(store.getSnapshot().accounts.some(value => value.id === primary.id)); stop();
+
+    foreignState = (await host.inbox.changes("fictional-other-owner")).state;
+    store = new InboxStore(); stop = store.start();
+    await until(() => !!store.getSnapshot().error, "SDK rejects a genuinely signed foreign-owner baseline");
+    assert.equal(store.getSnapshot().loaded, false, "a foreign signed state never releases first display");
+    stop(); foreignState = undefined;
+
+    delta = gate(); store = new InboxStore(); stop = store.start();
+    await until(() => delta!.seen, "catch-up response held before stopping the generation");
+    stop(); stop = undefined; delta.release(); delta = undefined;
+    await sleep(50);
+    assert.equal(store.getSnapshot().loaded, false, "a late catch-up response cannot publish after stop");
+  } finally {
+    stop?.(); for (const held of gates) held.release();
+    database.close(); await host.close(); await fs.rm(root, { recursive: true, force: true });
+    globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
+  }
+});
 test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bounded arrival holds and aborted generations", async () => {
   if (!process.versions.bun) {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {

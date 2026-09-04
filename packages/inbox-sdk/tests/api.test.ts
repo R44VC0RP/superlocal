@@ -1846,6 +1846,80 @@ function sse(response: Response) {
 }
 
 describe('bounded mailbox snapshot and changes', () => {
+  test('single mailbox summaries use cached metadata only, including legacy rows, and enforce live owner/source/membership fences', async () => {
+    const h = await fixture()
+    h.discoveries.set('summary-scoped', { sources: ['alpha.example.test', 'beta.example.test'].map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const html = `<html><head><style>td { color: navy }</style></head><body><script>fictionalUnsafe()</script><table>${'<tr><td onclick="fictionalUnsafe()">Fictional digest <a href="https://example.test/read">Read</a></td></tr>'.repeat(200)}</table></body></html>`
+    const { account, box } = await h.connect('alice', 'summary-scoped', [native('summary-alpha', { sourceDomains: ['alpha.example.test'], bodyHtml: html }), native('summary-beta', { sourceDomains: ['beta.example.test'] })], SCOPED)
+    const alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    const beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    await h.sync('alice', account.id)
+    const own = (await h.inbox.mailboxMessages('alice', { mailboxIds: [alpha.id] })).items[0]!
+    const excluded = (await h.inbox.mailboxMessages('alice', { mailboxIds: [beta.id] })).items[0]!
+    const sibling = await h.seed('alice', 'summary-sibling')
+    const siblingBox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === sibling.account.id)!
+    await h.seed('bob', 'summary-foreign')
+    const foreignBox = (await h.inbox.mailboxes('bob'))[0]!
+    const full = await h.inbox.mailboxMessage('alice', alpha.id, own.id)
+    expect(full.bodyHtml).toContain('Fictional digest')
+    expect(full.bodyHtml).not.toContain('onclick')
+    expect(full.bodyHtml).not.toContain('<script')
+    expect(full.bodyRevision).toBe(own.bodyRevision)
+    await h.inbox.setMailboxState('alice', alpha.id, own.id, { done: true, snoozedUntil: new Date(EPOCH + 86400000).toISOString() }, own.memberships[0]!.revision)
+    const database = new Database(h.database)
+    database.query("UPDATE sdk_messages SET visible=json_remove(visible,'$.facts') WHERE id=?").run(own.id)
+    await h.restart(database)
+    const query = database.query.bind(database)
+    let bodyReads = 0, metadataRows = 0
+    const guard = spyOn(database, 'query').mockImplementation(((sql: string) => {
+      const statement = query(sql)
+      return new Proxy(statement, {
+        get(statement, key) {
+          const value = Reflect.get(statement, key, statement)
+          if (key !== 'get' && key !== 'all') return typeof value === 'function' ? value.bind(statement) : value
+          return (...params: Parameters<typeof statement.all>) => {
+            const result = value.apply(statement, params)
+            for (const row of key === 'all' ? result : result ? [result] : []) {
+              if (Object.hasOwn(row, 'body')) { bodyReads++; throw new Error('Metadata reads must not load a cached body') }
+              if (Object.hasOwn(row, 'visible')) metadataRows++
+            }
+            return result
+          }
+        },
+      })
+    }) as typeof database.query)
+    const wire = transport(h), before = structuredClone(box.calls), state = await h.inbox.changes('alice')
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' }, cacheScope: 'metadata-only' })
+    try {
+      const result = await client.mailboxMessageSummary(alpha.id, own.id)
+      expect(result).toMatchObject({ id: own.id, sourceId: account.id, threadId: own.threadId, bodyRevision: own.bodyRevision,
+        memberships: [{ mailboxId: alpha.id, revision: 2, done: true, snoozedUntil: new Date(EPOCH + 86400000).toISOString() }] })
+      expect(result.facts).toBeUndefined()
+      for (const field of ['bodyHtml', 'bodyText', 'bodyDocument', 'attachments', 'bcc']) expect(result).not.toHaveProperty(field)
+      expect(await client.mailboxMessageSummary(alpha.id, own.id)).toEqual(result)
+      expect(wire.requests.at(-1)!.status).toBe(304)
+      for (const [mailboxId, messageId] of [[alpha.id, excluded.id], [siblingBox.id, own.id], [foreignBox.id, own.id], [alpha.id, 'missing-message']]) {
+        await expect(client.mailboxMessageSummary(mailboxId!, messageId!)).rejects.toMatchObject({ status: 404 })
+      }
+      await invalid(await h.request('bob', `/mailboxes/${alpha.id}/messages/${own.id}/summary`), 404)
+      await invalid(await h.request(null, `/mailboxes/${alpha.id}/messages/${own.id}/summary`), 401)
+      expect((await h.inbox.changes('alice')).state).toBe(state.state)
+      expect(box.calls).toEqual(before)
+      expect(metadataRows).toBe(2)
+      expect(bodyReads).toBe(0)
+      database.query('UPDATE sdk_messages SET generation=generation-1 WHERE id=?').run(own.id)
+      await expect(client.mailboxMessageSummary(alpha.id, own.id)).rejects.toMatchObject({ status: 404 })
+      database.query('UPDATE sdk_messages SET generation=generation+1,deleted=1 WHERE id=?').run(own.id)
+      await expect(client.mailboxMessageSummary(alpha.id, own.id)).rejects.toMatchObject({ status: 404 })
+      database.query('UPDATE sdk_messages SET deleted=0 WHERE id=?').run(own.id)
+      await h.inbox.updateMailbox('alice', alpha.id, { status: 'paused' }, alpha.revision)
+      expect((await client.mailboxMessageSummary(alpha.id, own.id)).id).toBe(own.id)
+      await h.inbox.updateMailbox('alice', alpha.id, { status: 'detached' }, alpha.revision + 1)
+      await expect(client.mailboxMessageSummary(alpha.id, own.id)).rejects.toMatchObject({ status: 404 })
+      expect(bodyReads).toBe(0)
+    } finally { guard.mockRestore() }
+  })
+
   test('a stable inventory finishes through mutations, Done, drafts, arrivals and deletion, then catches up without duplicate or missing rows', async () => {
     const h = await fixture()
     const { account, box } = await h.seed('alice', 'snapshot-live', Array.from({ length: 6 }, (_, index) => native(`item-${index}`)))
@@ -7649,7 +7723,7 @@ describe('bounded thread ordering', () => {
 
 import { inferAiTriage, loadAiInferenceConfig, prepareAiText, publicAiProvider, validateAiAssessment, type AiInferenceConfig } from '../../../apps/local-host/src/ai-inference'
 import { countAiTopicMatches, normalizeAiTopics, scoreAiTriage } from '../../../apps/local-host/src/ai-preferences'
-import type { AiAssessment, AiScoreSignals, AiTriageInput } from '../../../apps/shared/ai-triage'
+import type { AiAssessment, AiDecision, AiScoreSignals, AiTriageInput } from '../../../apps/shared/ai-triage'
 
 describe('AI triage inference and local scoring', () => {
   const configuration: AiInferenceConfig = {
@@ -7980,6 +8054,96 @@ describe('AI triage service', () => {
     for (const privateValue of [configuration.apiKey, 'sender@example.test', 'Subject history-', 'Body history-', 'Private local interest', 'No current action requested.']) {
       expect(JSON.stringify(diagnostics)).not.toContain(privateValue)
     }
+  })
+
+  test('saved AI result and change pages bypass reader presentation while preserving pagination, scope removals and event deduplication', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    h.discoveries.set('ai-page-scoped', { sources: ['alpha.example.test', 'beta.example.test'].map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const html = `<table>${'<tr><td style="color:navy" onclick="fictionalUnsafe()">Fictional report</td></tr>'.repeat(300)}</table><script>fictionalUnsafe()</script>`
+    const { account, box } = await h.connect('alice', 'ai-page-scoped', [
+      ...Array.from({ length: 105 }, (_, index) => native(`page-${index}`, { sourceDomains: ['alpha.example.test'], bodyHtml: html })),
+      native('page-beta', { sourceDomains: ['beta.example.test'], bodyHtml: html }),
+    ], SCOPED)
+    const alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    const beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    await h.sync('alice', account.id)
+    const sibling = await h.seed('alice', 'ai-page-sibling', [native('page-sibling', { bodyHtml: html })])
+    const siblingBox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === sibling.account.id)!
+    const foreign = await h.seed('bob', 'ai-page-foreign')
+    const foreignMessage = (await h.page('bob')).items[0]!
+    let fullReads = 0, inferenceCalls = 0, metadataReads = 0
+    const guarded: Inbox = { ...h.inbox,
+      message: async () => { fullReads++; throw new Error('Saved results must not hydrate a reader body') },
+      mailboxMessage: async () => { fullReads++; throw new Error('Saved results must not hydrate a mailbox body') },
+      mailboxMessageSummary: async (...args) => { metadataReads++; return h.inbox.mailboxMessageSummary(...args) },
+    }
+    const service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async () => { inferenceCalls++; return Response.json(response) }) as unknown as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    // Persist real SDK-backed pending work without starting inference or change draining.
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    await service.configure('bob', { ...(await service.state('bob')).settings, enabled: true })
+    await service.process('alice', { id: 'ai-page-history', scope: 'all', limit: 107 })
+    await service.process('bob', { id: 'ai-page-foreign-history', scope: 'all', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).queue.pending !== 107 || (await service.state('bob')).queue.pending !== 1) await Bun.sleep(10) })(), 'saved decision inventory')
+    const first = await service.results('alice')
+    expect(first.decisions).toHaveLength(100)
+    expect(first.hasMore).toBe(true)
+    expect(metadataReads).toBe(100)
+    const second = await service.results('alice', first.cursor)
+    expect(second.decisions).toHaveLength(7)
+    expect(second.hasMore).toBe(false)
+    const initial = [...first.decisions, ...second.decisions]
+    expect(new Set(initial.map(value => value.threadId)).size).toBe(107)
+    expect((await service.results('alice', second.cursor)).decisions).toEqual([])
+    expect((await service.results('bob')).decisions.map(value => value.sourceId)).toEqual([foreign.account.id])
+    const selected = initial.filter(value => value.mailboxIds.includes(alpha.id))
+    const [deleted, unselected, obsolete, wrongOwner, wrongSource, wrongThread, tombstone, done, snoozed] = selected as [AiDecision, AiDecision, AiDecision, AiDecision, AiDecision, AiDecision, AiDecision, AiDecision, AiDecision]
+    await h.inbox.setMailboxState('alice', alpha.id, done.latestMessageId, { done: true }, 1)
+    await h.inbox.setMailboxState('alice', alpha.id, snoozed.latestMessageId, { snoozedUntil: new Date(EPOCH + 86400000).toISOString() }, 1)
+    await service.control('alice', 'ai-page-history', 'cancel')
+    const sdk = new Database(h.database)
+    try {
+      // Simulate stale durable references after deletion, membership loss and a source-generation change.
+      const nativeId = sdk.query<{ native_id: string }, [string]>('SELECT native_id FROM sdk_messages WHERE id=?').get(deleted.latestMessageId)!.native_id
+      box.remove(nativeId); await h.sync('alice', account.id)
+      sdk.query('DELETE FROM sdk_memberships WHERE mailbox=? AND message=?').run(alpha.id, unselected.latestMessageId)
+      sdk.query('UPDATE sdk_messages SET generation=generation-1 WHERE id=?').run(obsolete.latestMessageId)
+      database.query("UPDATE local_ai_decisions SET data=json_set(data,'$.latestMessageId',?) WHERE owner='alice' AND thread=?").run(foreignMessage.id, wrongOwner.threadId)
+      database.query("UPDATE local_ai_decisions SET data=json_set(data,'$.sourceId',?) WHERE owner='alice' AND thread=?").run(sibling.account.id, wrongSource.threadId)
+      database.query("UPDATE local_ai_decisions SET data=json_set(data,'$.latestMessageId',?) WHERE owner='alice' AND thread=?").run(done.latestMessageId, wrongThread.threadId)
+      database.query("DELETE FROM local_ai_decisions WHERE owner='alice' AND thread=?").run(tombstone.threadId)
+      await h.inbox.updateMailbox('alice', beta.id, { status: 'paused' }, beta.revision)
+      await h.inbox.updateMailbox('alice', siblingBox.id, { status: 'detached' }, siblingBox.revision)
+      // Repeated durable events must produce one current decision per key in a page.
+      for (let index = 0; index < 2; index++) database.query('INSERT INTO local_ai_events(owner,source,thread,removed) VALUES (?,?,?,0)').run('alice', done.sourceId, done.threadId)
+      database.query("UPDATE local_ai_cursor SET head=(SELECT MAX(seq) FROM local_ai_events WHERE owner='alice') WHERE owner='alice'").run()
+      const before = structuredClone(box.calls), canonical = await h.inbox.mailboxMessageSummary('alice', alpha.id, done.latestMessageId)
+      const current = new Map(initial.map(value => [value.threadId, value])), removed = new Set<string>()
+      let after = second.cursor, more = true, pages = 0
+      while (more) {
+        const page = await service.changes('alice', after)
+        expect(page.resetRequired).toBe(false)
+        expect(new Set([...page.decisions, ...page.removed].map(value => value.threadId)).size).toBe(page.decisions.length + page.removed.length)
+        expect(page.decisions.length + page.removed.length).toBeLessThanOrEqual(100)
+        for (const decision of page.decisions) { expect(decision.state).toBe('stale'); current.set(decision.threadId, decision) }
+        for (const value of page.removed) { removed.add(value.threadId); current.delete(value.threadId) }
+        if (page.hasMore) expect(page.cursor).toBeGreaterThan(after)
+        after = page.cursor; more = page.hasMore; expect(++pages).toBeLessThan(4)
+      }
+      expect(removed).toEqual(new Set([...selected.slice(0, 7), ...initial.filter(value => !value.mailboxIds.includes(alpha.id))].map(value => value.threadId)))
+      expect(current.size).toBe(98)
+      const latest = await service.results('alice'), tail = await service.results('alice', latest.cursor)
+      expect(tail.hasMore).toBe(false)
+      expect([...latest.decisions, ...tail.decisions].map(value => value.threadId).sort()).toEqual([...current.keys()].sort())
+      expect(current.has(done.threadId)).toBe(true)
+      expect(current.has(snoozed.threadId)).toBe(true)
+      expect(await h.inbox.mailboxMessageSummary('alice', alpha.id, done.latestMessageId)).toEqual(canonical)
+      expect(box.calls).toEqual(before)
+      expect(database.query<{ count: number }, []>('SELECT COUNT(*) count FROM local_ai_feedback').get()!.count).toBe(0)
+      expect(fullReads).toBe(0)
+      expect(inferenceCalls).toBe(0)
+    } finally { sdk.close() }
   })
 
   test('selected mailbox consent excludes unselected bodies in the same source and thread and newest context stays bounded', async () => {

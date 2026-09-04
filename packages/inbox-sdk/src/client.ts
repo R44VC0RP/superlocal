@@ -380,6 +380,7 @@ export function createInboxClient(options: InboxClientOptions = {}) {
       }
       return request<Result<'mailboxMessages'>>(`/mailbox-messages${queryString({ ...input, mailboxIds: [...new Set(input.mailboxIds)].sort().join(',') })}`, requestOptions)
     },
+    mailboxMessageSummary: (mailboxId: string, messageId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'mailboxMessageSummary'>>(`/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}/summary`, requestOptions),
     mailboxMessage: (mailboxId: string, messageId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'mailboxMessage'>>(`/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}`, requestOptions),
     mailboxSnapshot: (input: Parameters<Inbox['mailboxSnapshot']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxSnapshot'>>('/mailbox-snapshot', 'POST', input, requestOptions),
     mailboxChanges: (input: Parameters<Inbox['mailboxChanges']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxChanges'>>('/mailbox-changes', 'POST', input, requestOptions),

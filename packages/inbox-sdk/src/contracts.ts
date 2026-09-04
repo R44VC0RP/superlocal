@@ -432,6 +432,8 @@ export interface Inbox {
   mailboxMessages(owner: string, query: MailboxQuery): Promise<Page<MailboxMessageSummary>>
   mailboxSnapshot(owner: string, input: MailboxSnapshotInput): Promise<MailboxSnapshotPage>
   mailboxChanges(owner: string, input: MailboxChangesInput): Promise<MailboxChangesPage>
+  /** Cached metadata only; never reads a body, including legacy fact enrichment. */
+  mailboxMessageSummary(owner: string, mailboxId: string, messageId: string): Promise<MailboxMessageSummary>
   mailboxMessage(owner: string, mailboxId: string, messageId: string): Promise<Message & { sourceId: string; memberships: MailboxMembership[] }>
   setMailboxState(owner: string, mailboxId: string, messageId: string, input: { done?: boolean; snoozedUntil?: string | null }, revision: number): Promise<MailboxMembership>
   /** Atomic local-only state change with a durable idempotency receipt; no provider mutation. */
