@@ -1,7 +1,23 @@
 import type { Draft, Mail, MailboxOption, Message } from "./data.ts";
+import type { AiDecision } from "../../shared/ai-triage.ts";
 
 export const UNIFIED_ACCOUNT = "unified";
 export const unifiedThreadId = (source: string, thread: string) => `${UNIFIED_ACCOUNT}:${source}:${thread}`;
+
+/** A cached assessment cannot follow a later reply or changed body implicitly. */
+export function currentAiDecision(mail: Mail, decision: AiDecision | undefined, model: string): AiDecision | undefined {
+  if (!decision || mail.operationId || mail.sourceId !== decision.sourceId || mail.sdkThreadId !== decision.threadId) return;
+  const boxes = mail.mailboxIds ?? (mail.mailboxId ? [mail.mailboxId] : [mail.account]);
+  if (!boxes.some(id => decision.mailboxIds.includes(id))) return;
+  const received = mail.messages.filter(message => !message.pending);
+  const latest = received.at(-1);
+  const versions = new Map(received.map(message => [message.id, message.bodyRevision]));
+  const stale = decision.model !== model || latest?.id !== decision.latestMessageId || decision.contextVersions.some(context => {
+    const version = versions.get(context.messageId);
+    return version !== undefined && context.bodyRevision !== null && version !== context.bodyRevision;
+  });
+  return stale && decision.state === "ready" ? { ...decision, state: "stale", score: null, override: null } : decision;
+}
 
 /** Combine owned receiving views, never identities from unrelated source accounts. */
 export function unifiedMail(
@@ -62,14 +78,19 @@ export function unifiedMail(
       if (reminders.length) locations.push("Reminders");
       if (received.every(message => ["archive", "sent"].includes(message.nativeFolder ?? "")) && received.some(message => message.nativeFolder === "archive")) locations.push("Auto Archived");
     } else locations.push(...new Set(copies.flatMap(copy => copy.locations ?? [copy.folder])));
-    result.push({ ...base, id, subject: first.subject, account: UNIFIED_ACCOUNT, mailboxId: mailboxIds[0], mailboxIds,
+    const merged: Mail = { ...base, id, subject: first.subject, account: UNIFIED_ACCOUNT, mailboxId: mailboxIds[0], mailboxIds,
       mailboxNames: mailboxIds.map(box => options.get(box)?.name ?? "Mailbox"), messages, locations,
       folder: hidden ?? (locations.includes("Inbox") ? "Inbox" : done ? "Done" : reminders.length ? "Reminders" : locations[0] ?? base.folder),
       unread: received.length > 0 && received.every(message => typeof message.isRead === "boolean") ? received.some(message => !message.isRead) : copies.some(copy => copy.unread),
       starred: received.length > 0 && received.every(message => typeof message.isStarred === "boolean") ? received.some(message => message.isStarred) : copies.some(copy => copy.starred),
       labels: [...new Set(copies.flatMap(copy => copy.labels))],
       reminder: reminders[0], reminderAt: reminders.length ? Date.parse(reminders[0]) : undefined,
-    });
+    };
+    if (base.triage) {
+      merged.triage = currentAiDecision(merged, base.triage, base.triage.model);
+      if (merged.triage?.state !== "ready") merged.attentionCategory = undefined;
+    }
+    result.push(merged);
   }
   return result.sort((a, b) => (b.receivedAt ?? 0) - (a.receivedAt ?? 0) || a.id.localeCompare(b.id));
 }

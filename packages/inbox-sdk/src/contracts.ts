@@ -448,7 +448,7 @@ export interface Inbox {
   /** Fetch an eligible image referenced by the current owned message, subject to current image policy. */
   media(owner: string, messageId: string, resource: string): Promise<MediaContent>
   threads(owner: string, query?: Query): Promise<Page<ThreadSummary>>
-  thread(owner: string, id: string, query?: Pick<Query, 'cursor' | 'limit'>): Promise<Page<MessageSummary>>
+  thread(owner: string, id: string, query?: Pick<Query, 'cursor' | 'limit' | 'sort'>): Promise<Page<MessageSummary>>
   labels(owner: string, accountId?: string): Promise<Label[]>
   createLabel(owner: string, accountId: string, name: string): Promise<Label>
   updateLabel(owner: string, id: string, name: string, revision: number): Promise<Label>

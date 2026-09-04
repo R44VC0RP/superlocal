@@ -1,5 +1,6 @@
 import type { MailboxMembership } from "inbox-sdk/types";
 import type { AttentionDecision } from "../../shared/mail-attention";
+import type { AiDecision, AiCategory } from "../../shared/ai-triage";
 
 export { readSaved as loadSaved } from "./storage.ts";
 
@@ -57,6 +58,10 @@ export type Mail = {
   starred: boolean;
   labels: string[];
   messages: Message[];
+  triage?: AiDecision;
+  /** A validated, opted-in local decision; never a provider folder mutation. */
+  attentionCategory?: AiCategory;
+  aiHoldUntil?: number;
   opened?: string;
   muted?: boolean;
   reminder?: string;

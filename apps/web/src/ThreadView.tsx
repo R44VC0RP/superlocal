@@ -22,6 +22,9 @@ import "./thread-comments.css";
 import { plainText } from "./mail-text";
 import { readText, writeText } from "./storage";
 import { getQuickReplies } from "./quick-replies";
+import type { AiDecision, AiFeedbackInput, AiReadingInput } from "../../shared/ai-triage";
+import ConversationTriage from "./ConversationTriage";
+import { useReadingEngagement } from "./use-reading-engagement";
 
 type ThreadComment = {
   id: string;
@@ -82,6 +85,12 @@ type ThreadViewProps = {
   onSearch?: () => void;
   onToggleFocus?: () => void;
   onImageSettings: () => void;
+  aiDecision?: AiDecision;
+  aiEnabled?: boolean;
+  aiMode?: "preview" | "apply";
+  onAiFeedback?: (input: AiFeedbackInput) => Promise<AiDecision>;
+  onAiReading?: (input: AiReadingInput) => Promise<void>;
+  aiReadingEnabled?: boolean;
 };
 
 export default function ThreadView({
@@ -106,6 +115,12 @@ export default function ThreadView({
   onSearch,
   onToggleFocus,
   onImageSettings,
+  aiDecision,
+  aiEnabled = false,
+  aiMode = "preview",
+  onAiFeedback,
+  onAiReading,
+  aiReadingEnabled = false,
 }: ThreadViewProps) {
   const [expanded, setExpanded] = useState<string[]>([
     messageKey(mail.messages.at(-1)),
@@ -147,6 +162,21 @@ export default function ThreadView({
   const comments = commentState.key === commentKey ? commentState.comments : [];
   const commentText = commentState.key === commentKey ? commentState.text : "";
   const commentRows = Math.min(4, commentText.split("\n").length);
+  const readingActivity = useReadingEngagement({
+    enabled: aiEnabled && aiReadingEnabled,
+    sourceId: mail.sourceId,
+    threadId: mail.sdkThreadId,
+    readerRef: readerPane,
+    scrollerRef: scroller,
+    activeMessageRef: activeMessage,
+    messageIds: mail.messages.filter(message =>
+      message.loaded === true && !message.pending && !message.operationId &&
+      !(message.outgoing ?? (message.email === account || message.email === mail.account)) &&
+      expanded.includes(messageKey(message)),
+    ).map(message => message.id),
+    paused: replyFocused || popOut || !!pendingCommentDelete,
+    onReading: onAiReading,
+  });
   const marketing = !mail.sourceId && ["Basecamp", "Mail Me Later"].includes(mail.from);
   const conversationLink = new URL(location.href);
   const linkParams = new URLSearchParams(location.hash.replace(/^#\/?/, ""));
@@ -378,6 +408,7 @@ export default function ThreadView({
             )
           ];
         if (!message) return;
+        if (event.isTrusted && !bodyMessage) readingActivity(event.target);
         revealMessage(message.id);
       } else if (key === "o") {
         if (event.shiftKey) toggleAllMessages();
@@ -570,6 +601,12 @@ export default function ThreadView({
           </div>
         </div>
         <div className="message-column thread-toolbar">
+          {aiEnabled && <ConversationTriage
+            key={JSON.stringify([mail.sourceId, mail.sdkThreadId])}
+            decision={aiDecision?.sourceId === mail.sourceId && aiDecision?.threadId === mail.sdkThreadId ? aiDecision : undefined}
+            mode={aiMode}
+            onFeedback={onAiFeedback}
+          />}
           {marketing && (
             <button
               className="thread-unsubscribe"

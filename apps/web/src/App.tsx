@@ -257,6 +257,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     entries,
     totalHeight,
     rowHeight,
+    holdingMail,
   } = useMemo(
     () =>
       selectMailView(
@@ -1175,6 +1176,11 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         goFolder(label);
       },
     })),
+    ...(inbox.ai?.configured && inbox.ai.settings.enabled ? ["Needs reply", "Action requested", "Time-sensitive", "Suspicious", "Unassessed"].map(name => ({
+      label: `Filter: ${name}`, detail: "Use saved AI assessments in the current view", key: "", icon: "Search",
+      run: () => { setOverlay(null); setMailFilter(value => value === name ? null : name); setHighlight(0); },
+    })) : []),
+    { label: "AI triage", detail: "Assessment settings, historical processing and costs", key: "", icon: "Gear", run: () => openSettings("AI triage") },
     {
       label: "Settings",
       detail: "Customize Superlocal",
@@ -1608,6 +1614,12 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           <ThreadView
             key={currentMail.id}
             mail={currentMail}
+            aiDecision={currentMail.triage}
+            aiEnabled={!!inbox.ai?.configured && inbox.ai.settings.enabled}
+            aiMode={inbox.ai?.settings.mode}
+            aiReadingEnabled={!!inbox.ai?.settings.personalization && !!inbox.ai.settings.readingSignals && !settings && !overlay && !issueReporter}
+            onAiFeedback={store.ai.feedback}
+            onAiReading={store.ai.reading}
             focusOperationId={sendFeedback?.threadId === currentMail.id ? sendFeedback.id : undefined}
             draft={currentDraft}
             account={route.account}
@@ -1903,6 +1915,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                 />
               )}
               {rowCount === 0 &&
+                !holdingMail &&
                 !(search && searchResult?.key === searchKey && (searchResult.loading || searchResult.error)) &&
                 !motion.hasExits &&
                 !(search && (!query || !searchSubmitted)) && (
@@ -1985,6 +1998,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
               account={accountEmail}
               accounts={inbox.accounts.map(account => account.email)}
               host={inbox.host}
+              aiActions={store.ai}
+              aiMailboxes={inbox.accounts}
               store={store}
               onboardingReturn={onboardingReturn}
               onOnboardingDone={() => {

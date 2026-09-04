@@ -80,6 +80,8 @@ export function createInbox(options: InboxOptions): Inbox {
     CREATE INDEX IF NOT EXISTS sdk_message_account ON sdk_messages(owner,account,deleted,received_at,id);
     CREATE INDEX IF NOT EXISTS sdk_message_inventory ON sdk_messages(owner,account,deleted,received_at DESC,id,generation);
     CREATE INDEX IF NOT EXISTS sdk_message_thread ON sdk_messages(owner,thread_id,deleted,received_at,id);
+    CREATE INDEX IF NOT EXISTS sdk_message_due_snooze ON sdk_messages(snoozed_until) WHERE deleted=0 AND snoozed_until IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS sdk_message_sync_states ON sdk_messages(account,generation,native_id,json_extract(confirmed,'$.isRead'),json_extract(confirmed,'$.isStarred')) WHERE deleted=0;
     CREATE TABLE IF NOT EXISTS sdk_thread_keys (account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(account,generation,native_id));
     CREATE TABLE IF NOT EXISTS sdk_native_keys (account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(account,generation,native_id));
     CREATE TABLE IF NOT EXISTS sdk_folders (id TEXT PRIMARY KEY, owner TEXT NOT NULL, account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(account,generation,native_id), FOREIGN KEY(account,owner) REFERENCES sdk_accounts(id,owner));
@@ -104,6 +106,7 @@ export function createInbox(options: InboxOptions): Inbox {
     CREATE TABLE IF NOT EXISTS sdk_memberships (owner TEXT NOT NULL, source TEXT NOT NULL, mailbox TEXT NOT NULL, message TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(mailbox,message), FOREIGN KEY(mailbox,owner,source) REFERENCES sdk_mailboxes(id,owner,source), FOREIGN KEY(message,owner,source) REFERENCES sdk_messages(id,owner,account));
     CREATE INDEX IF NOT EXISTS sdk_membership_message ON sdk_memberships(owner,source,message);
     CREATE INDEX IF NOT EXISTS sdk_membership_read ON sdk_memberships(owner,source,message,mailbox);
+    CREATE INDEX IF NOT EXISTS sdk_membership_due_snooze ON sdk_memberships(json_extract(data,'$.snoozedUntil')) WHERE json_extract(data,'$.snoozedUntil') IS NOT NULL;
     CREATE TABLE IF NOT EXISTS sdk_delivery_evidence (owner TEXT NOT NULL, source TEXT NOT NULL, message TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(message,kind,value), FOREIGN KEY(message,owner,source) REFERENCES sdk_messages(id,owner,account));
     CREATE TABLE IF NOT EXISTS sdk_connection_refresh (connection TEXT PRIMARY KEY, owner TEXT NOT NULL, lease TEXT NOT NULL, until INTEGER NOT NULL, FOREIGN KEY(connection,owner) REFERENCES sdk_connections(id,owner));
   `)
@@ -2108,10 +2111,13 @@ export function createInbox(options: InboxOptions): Inbox {
       return { items, total, state: page.state, nextCursor: page.offset + items.length < total ? token(owner, sequence(owner), `${page.hash}:${page.offset + items.length}`) : null }
     }),
     thread: (owner, id, query = {}) => run(() => {
-      ownerId(owner); const page = pagination(owner, query, `thread:${id}`)
+      ownerId(owner)
+      if (query.sort !== undefined && !['newest', 'oldest'].includes(query.sort)) throw new InboxError('VALIDATION', 'Invalid sort order.')
+      const page = pagination(owner, query, `thread:${id}`)
       const total = db.query<{ count: number }, [string, string]>('SELECT COUNT(*) count FROM sdk_messages WHERE owner=? AND thread_id=? AND deleted=0').get(owner, id)!.count
       if (!total) throw new InboxError('NOT_FOUND', 'Conversation not found.', 404)
-      const rows = db.query<MessageRow, [string, string, number, number]>('SELECT visible FROM sdk_messages WHERE owner=? AND thread_id=? AND deleted=0 ORDER BY received_at ASC,id ASC LIMIT ? OFFSET ?').all(owner, id, page.limit, page.offset)
+      const order = query.sort === 'newest' ? 'DESC' : 'ASC'
+      const rows = db.query<MessageRow, [string, string, number, number]>(`SELECT visible FROM sdk_messages WHERE owner=? AND thread_id=? AND deleted=0 ORDER BY received_at ${order},id ${order} LIMIT ? OFFSET ?`).all(owner, id, page.limit, page.offset)
       return { items: rows.map(summary), total, state: page.state, nextCursor: page.offset + rows.length < total ? token(owner, sequence(owner), `${page.hash}:${page.offset + rows.length}`) : null }
     }),
 

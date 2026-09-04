@@ -5,6 +5,8 @@ import type { InboxStore } from "./inbox";
 import type { HostConfiguration } from "./host";
 import ProviderConnections from "./ProviderConnections";
 import MailboxSettings from "./MailboxSettings";
+import AiTriageSettings from "./AiTriageSettings";
+import type { AiTriageActions } from "../../shared/ai-triage";
 import "./settings.css";
 import { attentionSplit, splitTemplates } from "../../shared/splits";
 import { splitRuleError } from "./mail-search";
@@ -23,6 +25,8 @@ export type SettingsProps = {
   onboardingReturn?: { providerId: string; connectionId: string | null } | null;
   /** Called when onboarding finished and the user should land back in the inbox. */
   onOnboardingDone?: () => void;
+  aiActions?: AiTriageActions;
+  aiMailboxes?: Array<{ id: string; name: string; email?: string }>;
 };
 
 const sections = [
@@ -43,7 +47,7 @@ const sections = [
   },
   {
     title: "Triage",
-    items: ["Get Me To Zero", "Bulk Actions", "Hide Empty Split Inboxes"],
+    items: ["AI triage", "Get Me To Zero", "Bulk Actions", "Hide Empty Split Inboxes"],
   },
   {
     title: "Writing",
@@ -115,6 +119,8 @@ export function Settings({
   store,
   onboardingReturn = null,
   onOnboardingDone,
+  aiActions,
+  aiMailboxes = [],
 }: SettingsProps) {
   const findPage = (value = "") =>
     [
@@ -427,6 +433,9 @@ export function Settings({
 
   let content: ReactNode;
   switch (page) {
+    case "AI triage":
+      content = <AiTriageSettings actions={aiActions} mailboxes={aiMailboxes} />;
+      break;
     case "Theme":
       content = (
         <div className="settings-theme-picker">
@@ -1496,7 +1505,7 @@ export function Settings({
         <Modal
           label={dialogTitle}
           onClose={closeDetail}
-          initialFocus={page === "Mailboxes" || page === "Add Accounts" ? "dialog" : "input"}
+          initialFocus={page === "Mailboxes" || page === "Add Accounts" || page === "AI triage" ? "dialog" : "input"}
           className={`settings-dialog settings-${page.toLowerCase().replaceAll(" ", "-")}-dialog ${page === "Split Inbox" ? "settings-split-dialog" : ""}`}
         >
           <header className="settings-dialog-header">
