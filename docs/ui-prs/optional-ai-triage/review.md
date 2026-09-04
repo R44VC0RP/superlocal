@@ -3,18 +3,18 @@
 ## Revisions and scope
 
 Review/deployed baseline: `b7f8e3c1252e6cb72fc92b4be8954d1285a28bd1`.
-Implementation: `73ed32bee05bc792e25db7dc111f5290ffa655ce`, including SDK
-`a298e0b6488be6ecbf7eb24859fdab67d0f67bcf`. Qualification head:
-`59ad8d6ab181d93510e0c7c8ae1e5a08411dc502` (test-only watchdog change).
-No applicable public changes intervened. The original Mac checkout's unpublished
-offline classifier and private README edit are excluded and untouched.
+Initial implementation: `73ed32bee05bc792e25db7dc111f5290ffa655ce`, including SDK
+`a298e0b6488be6ecbf7eb24859fdab67d0f67bcf`. Final application/qualification head:
+`b3927a361b657385c5de95067eef2cfa9131b026` (performance fix `7f4078d`, then
+resolved-arrival hold priority). No applicable public changes
+intervened. The original Mac checkout's unpublished offline classifier and
+private README edit are excluded and untouched.
 
-The user approved PR #9 and the single setup-heavy test's 30-second watchdog in
-the task conversation on September 4. This does **not** raise application latency
-budgets or the global test timeout. The stress case retains all 10,000 history
-items, 33 arrivals and signed-cursor/reserved-capacity assertions. It took
-5,411.79ms isolated and 4,457.83ms in the complete passing suite. This allowance
-is not an application performance fix.
+The user approved PR #9 and temporarily allowed a 30-second setup-test watchdog.
+**That temporary allowance has now been removed.** The full 10,000-history /
+33-arrival stress case passes its original default five seconds (4,658.73ms
+isolated). Its dataset, signed-cursor and reserved-capacity assertions are intact.
+Application budgets and the global test timeout were never raised.
 
 Deployment target is the existing hosted Docker installation only. AI remains
 off by default; installing a private provider key is not user opt-in. No merge,
@@ -43,14 +43,18 @@ The 900×900 capture is explicitly a responsive case. SuperMailSans is the
 existing internal family name for the selected Super Sans, not a replacement.
 
 Baseline assets: `index-DKT4qbWB.js` / `index-Bb0O4DVi.css`. The same baseline
-revision's hosted build uses `index-D6wJS4aX.js`. Candidate assets:
-`index-1CjlPl6e.js` / `index-CEstZs62.css`. They are unchanged between the original
-UI acceptance and the final backend/test qualification. Media were inspected;
-no real email, credentials, private logs or browser chrome are published.
+revision's hosted build uses `index-D6wJS4aX.js`. Original UI captures use
+`index-1CjlPl6e.js` / `index-CEstZs62.css`; final background-batching build uses
+`index-DIdh3Vm7.js`; the arrival-priority follow-up uses `index-RYlqcA7N.js`,
+both with the same CSS. The final AI-off capture was refreshed on
+that exact build and matching pristine fixture. Geometry/styles remain unchanged;
+9,272 pixels differ by at most 5/255 per RGB channel from the baseline (the earlier
+AI-off capture was pixel-identical). Media were inspected; no real email,
+credentials, private logs or browser chrome are published.
 
 | Before | After / expected difference |
 | --- | --- |
-| [Inbox](before-inbox.png) | [AI off](after-off-inbox.png): pixel-identical, difference bounding box is empty |
+| [Inbox](before-inbox.png) | [Final AI off](after-off-inbox.png): unchanged layout; low-amplitude RGB differences quantified above |
 | [Reader](before-reader.png) | [Explanation](after-assessment.png): optional assessment and local feedback overlay |
 | [Settings](before-settings.png) | [Preview settings over the same reader](after-preview-reader.png): new opt-in controls; saved older results are explicitly stale after disable/re-enable |
 
@@ -79,9 +83,13 @@ and retained exactly 82 earlier fictional inference attempts—no new paid calls
   recovery beyond 5,000 items, skipped-inventory byte budgets, priority under a
   full paused history lane, cancellation/stale results, private owner fences,
   pricing/usage uncertainty and bounded newest-thread context.
-- Complete web suite: **67 passed**. Host/SDK type checks, SDK build and optimized
-  web build passed. No new test files/dependencies/CI were added. The final change
-  affects one test watchdog only; unchanged expensive checks were not repeated.
+- Complete web suite: **67 passed**, including an extended real-SDK-backed case
+  proving background AI updates defer while a durable mail action is pending and
+  apply afterward without replacing unrelated conversations or fetching bodies.
+  Host/SDK type checks, SDK build and optimized web build passed. No new test
+  files/dependencies/CI were added. A final 3.44-second focused SDK-backed client
+  check also proves that a resolved incoming hold bypasses the background gate
+  while a durable action remains pending. Only affected checks were rerun.
 - SDK newest-first context: three focused cases / 106 assertions; default oldest
   order unchanged, indexed reverse traversal and owner/source/cursor boundaries.
 - Actual compatible provider: one direct fictional Responses call completed in
@@ -147,20 +155,55 @@ with a 100ms strict fictional response; no paid/cloud requests occurred. E sampl
 new mail synced through the real SDK, the queue continued draining, and the job
 paused after 1,398 completed assessments with no job failures.
 
-50k AI-enabled concurrency currently blocks release. With 10,000 historical
-threads queued, E samples were `[175.8,205.7,122.3,107.7,232.7]` and W samples
-`[132.3,60.7,102.5,466.5,59.1]`ms. The 466.5ms W action included a 407.5ms
-successful feedback request and a 25.2ms client rebuild. The reader stayed stable
-and processing continued without job failures, but several samples exceed the
-unchanged 150ms action budget. Profiling is in progress; user PR approval does
-not waive this result.
+### Final 50k AI-enabled concurrency — passed
+
+The first run failed: E `[175.8,205.7,122.3,107.7,232.7]`, W
+`[132.3,60.7,102.5,466.5,59.1]`ms. A bounded 90-second server profile found
+scan-heavy snooze wakeups, full confirmed-state JSON reads and repeated queue
+sorting. Indexes removed those scans/sorts, but a second run still failed because
+multiple historical AI page rebuilds competed with the action's next frames.
+
+The final fix coalesces background AI reconciliation into bounded 500-key batches,
+waits while a mail action is pending and allows a 50ms post-receipt frame interval.
+Explicit feedback and arrival hold expiry still reconcile immediately. Owner,
+settings, reset and shutdown fences clear pending batches. No polling interval,
+fixture, inference concurrency, action budget or logging requirement was relaxed.
+
+A **new complete pristine 50k copy**, not a partially drained smaller queue, was
+used for the final check with the same 100ms / concurrency-two in-memory inference
+transport and a full 10,000-thread history job. Final results:
+
+| Scenario | Raw samples (ms) | Median / p95 / max (ms) |
+| --- | --- | --- |
+| E | 132.9, 69.8, 70.6, 68.0, 70.8 | 70.6 / 132.9 / 132.9 |
+| W | 60.1, 57.3, 60.0, 62.7, 78.7 | 60.1 / 78.7 / 78.7 |
+| Cached open after arrival | 16.5, 16.4, 15.1, 17.0, 22.0 | 16.5 / 22.0 / 22.0 |
+| Navigation during active history | 2842.7, 3051.2, 2739.3, 3131.3, 2906.3 | 2906.3 / 3131.3 / 3131.3 |
+
+All meet unchanged budgets. Ten Undo samples had median91.9/max127.3ms. The reader
+URL remained stable and all Undo operations restored the original conversation.
+One new fictional reply synced through the actual mock adapter/SDK, leaving
+50,001 messages / 75,002 memberships; it remained unread with two active receiving
+memberships. W left **zero AI explicit-feedback records**. History continued
+processing with no job failures, then AI was disabled and its queue drained/cancelled
+without deleting mail. No paid or external inference calls were made in this run.
 
 ## Docker and private state
 
-One Linux ARM64 candidate build used the final application source, image
-`sha256:85ca2b25457ef94892de35404553b5e434f0ee4a646f1d7d0cd39357ec407a43`.
-The test-only watchdog file is excluded from its Docker context. Default command
-ran healthy as UID1000, with /persist0700 and private config/keys0600.
+Linux ARM64 images were built once per coherent application change. The initial
+image (`73ed32b`) established the broad persistence/authentication qualification.
+The `7f4078d` upgrade then preserved all 20 state fingerprints on the same retained
+volume while adding the four query indexes; 80 attempts, 320 messages, paired
+credentials and the authenticated owner scope survived unchanged.
+
+Final `b3927a3` image:
+`sha256:42cf099f439f1200b51dafab44f1faa6c13345b2e871449d3817abd7914ea92d`.
+Its default command is healthy as UID1000, with /persist0700 and private files0600.
+The final packaging smoke verified committed source hashes and served asset bytes:
+Docker emits `index-COnCIj6v.js` and the unchanged `index-CEstZs62.css`. Local
+`index-RYlqcA7N.js` is a separate minified build; the JS files are not byte-identical.
+The image contains the exact committed source. Unchanged database/authentication
+matrices were not repeated for the client-only arrival-hold follow-up.
 
 A genuine upgrade from the published b7 image to the candidate preserved the
 same fictional volume, config/keys/identity, Google sessions/scopes, connections,
