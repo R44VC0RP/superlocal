@@ -20,3 +20,18 @@ is unchanged between captures. No live mailbox was opened or mutated.
 Expected change: remove only the floating badge and its unused CSS. Keep the
 normal inbox/split/folder counts, sidebar, rows, and reader navigation unchanged.
 This is static visual removal; paired screenshots are the relevant evidence.
+
+## Verification
+
+- All 61 existing web tests pass. TypeScript and the optimized Vite build pass;
+  the existing large-chunk warning remains. No new tests or dependencies.
+- Candidate assets: `index-BnvlWz2W.js` / `index-Bb0O4DVi.css`, verified after a
+  full browser reload. The floating badge is absent from the DOM.
+- Inspected before/after images differ only in the badge's original 16 × 16
+  pixels at (1416, 8). Every rendered mail-row identity/bounding rectangle and
+  both split labels/counts match exactly.
+- Opening the folder drawer retains its legitimate Inbox count of 80.
+  At 900 × 800 the badge remains absent, split counts remain intact, and the
+  document has no horizontal overflow. These fixture controls were DOM-activated.
+- No changes to count derivation, mailbox state, reader shortcuts, API behavior,
+  loading, or animation; no new latency or large-mailbox performance claim.

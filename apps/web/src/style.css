@@ -605,20 +605,6 @@ kbd {
   flex: 1;
   overflow: hidden;
 }
-.notification-count {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  border-radius: 12px;
-  background: #d18083;
-  color: #fff;
-  width: 16px;
-  height: 16px;
-  font-size: 12px;
-  line-height: 16px;
-  text-align: center;
-  z-index: 2;
-}
 .recent-opens {
   height: 100%;
   display: flex;
@@ -1198,8 +1184,7 @@ kbd {
   background: transparent;
   border: 0;
 }
-.app:has(.empty-mailbox.inbox-zero) > .right-sidebar .sidebar-content,
-.app:has(.empty-mailbox.inbox-zero) > .right-sidebar .notification-count {
+.app:has(.empty-mailbox.inbox-zero) > .right-sidebar .sidebar-content {
   display: none;
 }
 .app:has(.empty-mailbox.inbox-zero):not(.settings-open):not(
