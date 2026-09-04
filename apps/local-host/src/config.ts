@@ -22,7 +22,7 @@ export interface LocalConfig {
   dataDir: string
   web: { port: number; origin: string; allowedOrigins: string[] }
   backend: { port: number }
-  auth: { method: 'loopback'; sessionHours: number }
+  auth: { method: 'loopback' | 'google'; sessionHours: number; allowedEmails?: string[] }
   allowProviderWrites: boolean
   providers: {
     mock: { enabled: boolean }
@@ -91,14 +91,25 @@ function bool(value: unknown, field: string): boolean {
   return value
 }
 
-function origin(value: unknown): string {
+function origin(value: unknown, google = false): string {
   try {
     if (typeof value !== 'string') invalid('web origin')
     const url = new URL(value)
     if (url.origin !== value || !['http:', 'https:'].includes(url.protocol) ||
-      !['localhost', '127.0.0.1', '[::1]', 'super.local'].includes(url.hostname)) invalid('web origin (use an exact loopback or super.local HTTP(S) origin)')
+      !['localhost', '127.0.0.1', '[::1]', 'super.local'].includes(url.hostname) && !(google && url.protocol === 'https:')) invalid('web origin')
     return value
-  } catch { return invalid('web origin (use an exact loopback or super.local HTTP(S) origin)') }
+  } catch { return invalid('web origin (public origins require Google authentication and HTTPS)') }
+}
+
+/** Exact addresses only: case/edge whitespace normalize; Gmail dots and plus tags do not. */
+export function normalizeAllowedEmails(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 256) invalid('auth.allowedEmails')
+  return [...new Set(value.map(email => {
+    if (typeof email !== 'string') invalid('auth.allowedEmails')
+    const normalized = email.trim().toLowerCase()
+    if (normalized.length > 254 || !/^[a-z0-9.!#$%&'+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,63}$/.test(normalized) || normalized.includes('..')) invalid('auth.allowedEmails (exact email addresses only)')
+    return normalized
+  }))]
 }
 
 function secretSource(value: unknown, field: string): SecretSource {
@@ -141,9 +152,6 @@ function userDataDir(environment: NodeJS.ProcessEnv): string {
 
 export function loadLocalConfig(options: { configPath?: string; environment?: NodeJS.ProcessEnv } = {}): LocalConfig {
   const environment = options.environment ?? process.env
-  if (environment.NODE_ENV?.trim().toLowerCase() === 'production') {
-    throw new LocalConfigurationError('LOCAL_PRODUCTION_REFUSED', 'This loopback development host cannot run with NODE_ENV=production.')
-  }
   const configPath = resolve(options.configPath ?? environment.SUPERLOCAL_CONFIG ?? join(ROOT_DIR, 'superlocal.local.json'))
   writePrivateJson(configPath, defaults())
   const input = record(readPrivateJson(configPath, 'superlocal.local.json'), 'root', ['version', 'instanceId', 'mode', 'dataDir', 'web', 'backend', 'auth', 'allowProviderWrites', 'providers'])
@@ -152,7 +160,14 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   if (input.mode !== 'mock' && input.mode !== 'real') invalid('mode')
   const web = record(input.web, 'web', ['port', 'origin', 'allowedOrigins'])
   const backend = record(input.backend, 'backend', ['port'])
-  const auth = record(input.auth, 'auth', ['method', 'sessionHours'])
+  const auth = record(input.auth, 'auth', ['method', 'sessionHours', 'allowedEmails'])
+  const authMethod = environment.SUPERLOCAL_AUTH_METHOD ?? auth.method
+  if (authMethod !== 'loopback' && authMethod !== 'google') invalid('auth.method')
+  if (authMethod === 'loopback' && environment.NODE_ENV?.trim().toLowerCase() === 'production') {
+    throw new LocalConfigurationError('LOCAL_PRODUCTION_REFUSED', 'This loopback development host cannot run with NODE_ENV=production.')
+  }
+  const allowedEmails = normalizeAllowedEmails(environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS === undefined ? auth.allowedEmails ?? [] :
+    environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS.trim() === '' ? [] : environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS.split(','))
   const writes = record(input.allowProviderWrites, 'allowProviderWrites', ['mock', 'real'])
   const providers = record(input.providers, 'providers', ['mock', 'gmail', 'inbound', 'imap'])
   const mock = record(providers.mock, 'providers.mock', ['enabled'])
@@ -175,14 +190,15 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   })
   if (new Set(imapServers.map(server => server.id)).size !== imapServers.length) invalid('unique IMAP preset ids')
   const oauth = record(gmail.oauth, 'providers.gmail.oauth', ['clientId', 'clientSecret', 'scopes'])
-  if (auth.method !== 'loopback' || typeof auth.sessionHours !== 'number' || !Number.isInteger(auth.sessionHours) || auth.sessionHours < 1 || auth.sessionHours > 24) invalid('auth (loopback, 1–24 sessionHours)')
+  if (typeof auth.sessionHours !== 'number' || !Number.isInteger(auth.sessionHours) || auth.sessionHours < 1 || auth.sessionHours > 24) invalid('auth (1–24 sessionHours)')
   if (!Array.isArray(oauth.scopes) || oauth.scopes.length > 64 || oauth.scopes.some(scope => typeof scope !== 'string' || !/^[\x21\x23-\x5b\x5d-\x7e]{1,2048}$/.test(scope)) ||
     !oauth.scopes.includes('openid') || !oauth.scopes.includes('email') || oauth.scopes.join(' ').length > 8192) invalid('providers.gmail.oauth.scopes')
   if (!Array.isArray(web.allowedOrigins) || web.allowedOrigins.length > 16) invalid('web.allowedOrigins')
   const webPort = port(environment.SUPERLOCAL_WEB_PORT ?? web.port, 'web.port')
   const apiPort = port(environment.SUPERLOCAL_API_PORT ?? backend.port, 'backend.port')
   if (webPort === apiPort) invalid('ports (web and backend must differ)')
-  const webOrigin = origin(environment.SUPERLOCAL_WEB_ORIGIN ?? web.origin ?? `http://localhost:${webPort}`)
+  const webOrigin = origin(environment.SUPERLOCAL_WEB_ORIGIN ?? web.origin ?? `http://localhost:${webPort}`, authMethod === 'google')
+  const allowedOrigins = web.allowedOrigins.map(value => origin(value, authMethod === 'google'))
   const configuredDataDir = environment.SUPERLOCAL_DATA_DIR ?? input.dataDir
   if (configuredDataDir !== null && (typeof configuredDataDir !== 'string' || !configuredDataDir.trim() || configuredDataDir.includes('\0'))) invalid('dataDir')
   const dataDir = configuredDataDir === null ? join(userDataDir(environment), 'superlocal', input.instanceId) : resolve(dirname(configPath), configuredDataDir as string)
@@ -191,8 +207,8 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   if (input.mode === 'mock' && !enabledMock) invalid('providers.mock.enabled (mock mode requires its offline provider)')
   return {
     configPath, instanceId: input.instanceId, mode: input.mode, dataDir,
-    web: { port: webPort, origin: webOrigin, allowedOrigins: [...new Set([webOrigin, `http://localhost:${webPort}`, `http://127.0.0.1:${webPort}`, ...web.allowedOrigins.map(origin)])] },
-    backend: { port: apiPort }, auth: { method: 'loopback', sessionHours: auth.sessionHours }, allowProviderWrites: policy[input.mode],
+    web: { port: webPort, origin: webOrigin, allowedOrigins: authMethod === 'google' ? [webOrigin] : [...new Set([webOrigin, `http://localhost:${webPort}`, `http://127.0.0.1:${webPort}`, ...allowedOrigins])] },
+    backend: { port: apiPort }, auth: { method: authMethod, sessionHours: auth.sessionHours, allowedEmails }, allowProviderWrites: policy[input.mode],
     providers: { mock: { enabled: enabledMock }, inbound: { enabled: bool(inbound.enabled, 'providers.inbound.enabled') },
       imap: { enabled: bool(imap.enabled, 'providers.imap.enabled'), servers: imapServers }, gmail: {
       enabled: bool(gmail.enabled, 'providers.gmail.enabled'), oauth: {

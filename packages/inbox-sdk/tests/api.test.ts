@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib'
 import { SaxesParser } from 'saxes'
@@ -15,7 +15,7 @@ import { createGoogleOAuthHost, type GoogleOAuthConfig, type OAuthAttempt } from
 import { createGoogleOAuthApi } from '../server/google-oauth-api'
 import { createGoogleOAuthClient } from '../server/google-client'
 import { createLocalHost } from '../../../apps/local-host/src/host'
-import { loadLocalConfig } from '../../../apps/local-host/src/config'
+import { loadLocalConfig, type LocalConfig } from '../../../apps/local-host/src/config'
 import { createAttentionFeedbackStore } from '../../../apps/local-host/src/attention-feedback'
 import { createSplitPreferencesStore } from '../../../apps/local-host/src/split-preferences'
 import { classifyAttention } from '../../../apps/shared/mail-attention'
@@ -311,6 +311,291 @@ describe('offline classification dataset', () => {
       expect(failure.message).not.toContain('private refusal marker')
       expect(failure.message).not.toContain('Fabricated source')
     }
+  })
+})
+
+describe('Google application authentication', () => {
+  async function fixture(allowedEmails = ['allowed@example.test'], gmail = false) {
+    const root = await mkdtemp(join(TEMP_ROOT, 'google-app-auth-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const initial = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    const config: LocalConfig = { ...initial, mode: 'real', dataDir: join(root, 'runtime'), auth: { method: 'google', sessionHours: 1, allowedEmails },
+      web: { ...initial.web, origin: 'https://app.example.test', allowedOrigins: ['https://app.example.test'] },
+      providers: { ...initial.providers, imap: { enabled: false, servers: [] }, gmail: { enabled: gmail, oauth: { ...initial.providers.gmail.oauth,
+        clientId: { env: 'FIXTURE_CLIENT_ID' }, clientSecret: { env: 'FIXTURE_CLIENT_SECRET' } } } } }
+    const environment = { FIXTURE_CLIENT_ID: 'fictional-shared-client', FIXTURE_CLIENT_SECRET: 'fictional-shared-secret' }
+    const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
+    const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'app-auth-test-key', alg: 'RS256', use: 'sig' }
+    const attempts = new Map<string, { challenge: string; claims: Record<string, unknown>; forged?: boolean }>()
+    let exchanges = 0, jwksRequests = 0
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      if (request.url === 'https://www.googleapis.com/oauth2/v3/certs') { jwksRequests++; return Response.json({ keys: [jwk] }) }
+      if (request.url !== 'https://oauth2.googleapis.com/token') throw new Error('Unexpected network in isolated Google fixture')
+      exchanges++
+      const body = new URLSearchParams(await request.text()), attempt = attempts.get(body.get('code') ?? '')
+      if (!attempt || body.get('client_id') !== environment.FIXTURE_CLIENT_ID || body.get('client_secret') !== environment.FIXTURE_CLIENT_SECRET ||
+        body.get('redirect_uri') !== `${config.web.origin}/api/auth/callback/google` || body.get('grant_type') !== 'authorization_code' ||
+        createHash('sha256').update(body.get('code_verifier') ?? '').digest('base64url') !== attempt.challenge) return Response.json({ error: 'invalid_grant' }, { status: 400 })
+      attempts.delete(body.get('code')!)
+      const now = Math.floor(Date.now() / 1000)
+      const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url')
+      const unsigned = `${encode({ alg: 'RS256', kid: jwk.kid })}.${encode({ iss: 'https://accounts.google.com', aud: environment.FIXTURE_CLIENT_ID, sub: 'google-allowed-subject', email: 'allowed@example.test', email_verified: true, name: 'Allowed Person', iat: now, exp: now + 3600, ...attempt.claims })}`
+      const signature = attempt.forged ? Buffer.alloc(256).toString('base64url') : sign('RSA-SHA256', Buffer.from(unsigned), privateKey).toString('base64url')
+      return Response.json({ access_token: 'synthetic-app-access-token', refresh_token: 'synthetic-app-refresh-token', token_type: 'Bearer', expires_in: 3600, scope: 'openid email profile', id_token: `${unsigned}.${signature}` })
+    }) as typeof fetch
+    cleanup.push(async () => { globalThis.fetch = originalFetch })
+    let host = await createLocalHost(config, environment)
+    cleanup.push(() => host.close())
+    const request = (path: string, options: { method?: string; cookie?: string; body?: string; origin?: string; headers?: Record<string, string> } = {}) => host.fetch(new Request(`http://localhost:${config.backend.port}${path}`, {
+      method: options.method ?? 'GET', headers: { Origin: options.origin ?? config.web.origin, ...(options.cookie ? { Cookie: options.cookie } : {}),
+        ...(options.body !== undefined ? { 'Content-Type': 'application/json', 'X-Superlocal': '1' } : {}), ...options.headers }, ...(options.body !== undefined ? { body: options.body } : {}),
+    }))
+    const cookie = (response: Response) => response.headers.getSetCookie().map(value => value.split(';')[0]!).join('; ')
+    const begin = async (claims: Record<string, unknown> = {}, options: { forged?: boolean; wrongChallenge?: boolean } = {}) => {
+      const response = await request('/host/auth/sign-in', { method: 'POST', body: '{}' })
+      expect(response.status).toBe(200)
+      const url = new URL((await response.json()).url), code = randomUUID()
+      attempts.set(code, { challenge: options.wrongChallenge ? 'invalid-challenge' : url.searchParams.get('code_challenge')!, claims, forged: options.forged })
+      return { url, code, cookie: cookie(response), callback: `/api/auth/callback/google?code=${code}&state=${url.searchParams.get('state')}` }
+    }
+    const login = async (claims: Record<string, unknown> = {}, options: { forged?: boolean; wrongChallenge?: boolean } = {}) => {
+      const attempt = await begin(claims, options)
+      const response = await request(attempt.callback, { cookie: attempt.cookie })
+      return { ...attempt, response, sessionCookie: cookie(response) }
+    }
+    return { root, config, environment, request, begin, login, cookie, get host() { return host }, get exchanges() { return exchanges }, get jwksRequests() { return jwksRequests },
+      async restart(next = config) { await host.close(); host = await createLocalHost(next, environment) },
+      authDb() { return new Database(join(config.dataDir, config.mode, 'auth.sqlite'), { readonly: true }) },
+    }
+  }
+
+  test('actual Better Auth Google code flow reuses Gmail credentials without mailbox scopes, preserves owner and persists across restart', async () => {
+    const f = await fixture([' ALLOWED@Example.Test '], true)
+    expect(await (await f.request('/host/auth')).json()).toEqual({ method: 'google', authenticated: false, user: null })
+    const initialOwner = f.host.owner, login = await f.login()
+    expect(login.response.status).toBe(302)
+    expect(login.response.headers.get('location')).toBe(`${f.config.web.origin}/`)
+    expect(login.url.origin).toBe('https://accounts.google.com')
+    expect(login.url.searchParams.get('client_id')).toBe(f.environment.FIXTURE_CLIENT_ID)
+    expect(login.url.searchParams.get('redirect_uri')).toBe(`${f.config.web.origin}/api/auth/callback/google`)
+    expect(login.url.searchParams.get('scope')!.split(' ').sort()).toEqual(['email', 'openid', 'profile'])
+    expect(login.url.searchParams.has('include_granted_scopes')).toBe(false)
+    expect(login.url.searchParams.get('code_challenge_method')).toBe('S256')
+    expect(login.url.searchParams.get('prompt')).toBe('select_account')
+    expect(f.exchanges).toBe(1); expect(f.jwksRequests).toBe(1)
+    expect(login.response.headers.getSetCookie().some(value => /session_token=.*HttpOnly/i.test(value) && /Secure/.test(value) && /SameSite=Lax/i.test(value))).toBe(true)
+    expect(login.response.headers.getSetCookie().some(value => /session_data=/.test(value))).toBe(false)
+    const status = await f.request('/host/auth', { cookie: login.sessionCookie })
+    expect(status.headers.get('cache-control')).toBe('no-store')
+    expect(await status.json()).toEqual({ method: 'google', authenticated: true, user: { name: 'Allowed Person', email: 'allowed@example.test' } })
+    expect((await f.request('/host/config', { cookie: login.sessionCookie })).status).toBe(200)
+    expect(await f.host.inbox.connections(f.host.owner)).toHaveLength(0)
+    const db = f.authDb()
+    try { expect(db.query('SELECT accessToken, refreshToken, idToken FROM account').get()).toEqual({ accessToken: null, refreshToken: null, idToken: null }) } finally { db.close() }
+    const keyMetadata = await stat(join(f.config.dataDir, f.config.mode, 'runtime-secrets.json'))
+    await f.restart()
+    expect(f.host.owner).toBe(initialOwner)
+    expect((await stat(join(f.config.dataDir, f.config.mode, 'runtime-secrets.json'))).mtimeMs).toBe(keyMetadata.mtimeMs)
+    expect((await f.request('/v1/accounts', { cookie: login.sessionCookie })).status).toBe(200)
+    const mailboxStart = await f.request('/host/providers/gmail/connect', { method: 'POST', body: '{}', cookie: login.sessionCookie })
+    expect(mailboxStart.status).toBe(200)
+    const mailboxRedirect = await f.request((await mailboxStart.json()).authorizeUrl, { cookie: login.sessionCookie })
+    const mailboxUrl = new URL(mailboxRedirect.headers.get('location')!)
+    expect(mailboxUrl.searchParams.get('client_id')).toBe(f.environment.FIXTURE_CLIENT_ID)
+    expect(mailboxUrl.searchParams.get('redirect_uri')).toBe(`${f.config.web.origin}/v1/oauth/google/callback`)
+    expect(mailboxUrl.searchParams.get('scope')).toContain('https://www.googleapis.com/auth/gmail.modify')
+    expect(await f.host.inbox.connections(f.host.owner)).toHaveLength(0)
+    for (const suffix of ['', '-wal', '-shm']) expect((await stat(join(f.config.dataDir, f.config.mode, `auth.sqlite${suffix}`))).mode & 0o777).toBe(0o600)
+  })
+
+  test('unlisted and unverified Google users, invalid subjects and empty allowlists never gain an auth user, session, or mail access', async () => {
+    const f = await fixture()
+    for (const claims of [{ email: 'unlisted@example.test' }, { email_verified: false }, { email_verified: 'true' }, { sub: '' }, { email: 'allowed+tag@example.test' }, { email: 'a.llowed@example.test' }]) {
+      const login = await f.login(claims)
+      expect(login.response.headers.get('location')).toBe(`${f.config.web.origin}/?auth=denied`)
+      expect((await f.request('/v1/accounts', { cookie: login.sessionCookie })).status).toBe(401)
+    }
+    await f.restart({ ...f.config, auth: { ...f.config.auth, allowedEmails: [] } })
+    const denied = await f.login()
+    expect(denied.response.headers.get('location')).toBe(`${f.config.web.origin}/?auth=denied`)
+    const db = f.authDb()
+    try { for (const table of ['user', 'session', 'account']) expect(db.query(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 0 }) } finally { db.close() }
+    expect(await f.host.inbox.connections(f.host.owner)).toHaveLength(0)
+  })
+
+  test('state cookie, replay, PKCE, signed Google identity and direct credential route boundaries fail closed', async () => {
+    const f = await fixture()
+    const attempt = await f.begin()
+    expect((await f.request(attempt.callback)).headers.get('location')).toBe(`${f.config.web.origin}/?auth=denied`)
+    expect(f.exchanges).toBe(0)
+    const wrongState = await f.begin()
+    expect((await f.request(wrongState.callback.replace(/state=.*/, 'state=forged'), { cookie: wrongState.cookie })).headers.get('location')).toBe(`${f.config.web.origin}/?auth=denied`)
+    expect(f.exchanges).toBe(0)
+    for (const [claims, options] of [[{}, { wrongChallenge: true }], [{}, { forged: true }], [{ aud: 'different-client' }, {}], [{ iss: 'https://evil.test' }, {}], [{ exp: 1 }, {}], [{ exp: undefined }, {}]] as const) {
+      const denied = await f.login(claims, options)
+      expect(denied.response.headers.get('location')).toBe(`${f.config.web.origin}/?auth=denied`)
+      expect((await f.request('/host/config', { cookie: denied.sessionCookie })).status).toBe(401)
+    }
+    const success = await f.login()
+    expect((await f.request(success.callback, { cookie: success.cookie })).headers.get('location')).toBe(`${f.config.web.origin}/?auth=denied`)
+    for (const path of ['/api/auth/sign-in/social', '/api/auth/sign-up/email', '/api/auth/sign-in/email', '/api/auth/link-social', '/api/auth/get-session', '/api/auth/token', '/api/auth/callback/google']) {
+      const response = await f.request(path, { method: 'POST', body: JSON.stringify({ provider: 'google', idToken: { token: 'forged' }, email: 'allowed@example.test' }) })
+      expect(response.status).toBe(path.endsWith('/callback/google') ? 405 : 404)
+    }
+    for (const body of [{ idToken: { token: 'forged' } }, { email: 'allowed@example.test' }, { callbackURL: 'https://evil.test', scopes: ['gmail.modify'] }, { provider: 'github' }]) {
+      expect((await f.request('/host/auth/sign-in', { method: 'POST', body: JSON.stringify(body) })).status).toBe(400)
+    }
+  })
+
+  test('installation gate covers local sessions, config, SDK, media, SSE and provider onboarding with exact origin checks', async () => {
+    const f = await fixture()
+    for (const path of ['/session', '/host/config', '/host/inbox-preferences', '/host/split-preferences', '/host/sender-domains/example.test', '/v1/accounts', '/v1/messages/fake/body', '/v1/media/fake', '/v1/events', '/host/providers/gmail/connect', '/v1/oauth/google/callback']) {
+      const response = await f.request(path, { ...(path === '/session' || path.endsWith('/connect') ? { method: 'POST', body: '{}' } : {}) })
+      expect(response.status).toBe(401); expect(response.headers.get('x-superlocal-auth')).toBe('required')
+      expect(await response.text()).not.toContain('fictional-shared')
+    }
+    expect((await f.request('/health')).status).toBe(200)
+    for (const path of ['/s%65ssion', '/session/', '/api/auth/sign-in%2fsocial', '/api/auth/%63allback/google', '/host/%61uth/sign-in']) expect((await f.request(path, { method: 'POST', body: '{}' })).status).toBe(400)
+    const login = await f.login()
+    for (const path of ['/v1/%63onnections', '/v1/accounts', '/v1/connections']) expect((await f.request(path, { method: 'POST', body: '{}', cookie: login.sessionCookie })).status).toBe(403)
+    for (const origin of ['http://localhost:5178', 'https://evil.test', 'https://app.example.test.evil.test']) {
+      expect((await f.request('/host/auth', { cookie: login.sessionCookie, origin })).status).toBe(403)
+      expect((await f.request('/host/auth/sign-in', { method: 'POST', body: '{}', origin })).status).toBe(403)
+      expect((await f.request('/host/config', { cookie: login.sessionCookie, origin })).status).toBe(403)
+    }
+    expect((await f.request('/host/auth/sign-in', { method: 'POST', body: '{}', headers: { 'X-Superlocal': '0' } })).status).toBe(403)
+    expect((await f.request('/host/config', { cookie: login.sessionCookie, headers: { Authorization: 'Bearer unrelated-sdk-token' } })).status).toBe(401)
+  })
+
+  test('logout revokes database sessions and open events; allowlist reload rejects existing cookies, but still permits logout', async () => {
+    const f = await fixture(), login = await f.login()
+    const events = await f.request('/v1/events', { cookie: login.sessionCookie })
+    expect(events.status).toBe(200)
+    const reader = events.body!.getReader()
+    await reader.read()
+    const signedOut = await f.request('/host/auth/sign-out', { method: 'POST', body: '{}', cookie: login.sessionCookie })
+    expect(signedOut.status).toBe(200)
+    expect(signedOut.headers.getSetCookie().some(value => /session_token=;/.test(value) && /Max-Age=0/.test(value))).toBe(true)
+    expect((await f.request('/host/config', { cookie: login.sessionCookie })).status).toBe(401)
+    await bounded((async () => { while (!(await reader.read()).done) {} })(), 'Google logout ends events')
+    const second = await f.login()
+    await f.restart({ ...f.config, auth: { ...f.config.auth, allowedEmails: ['someoneelse@example.test'] } })
+    expect(await (await f.request('/host/auth', { cookie: second.sessionCookie })).json()).toEqual({ method: 'google', authenticated: false, user: null })
+    expect((await f.request('/v1/accounts', { cookie: second.sessionCookie })).headers.get('x-superlocal-auth')).toBe('required')
+    expect((await f.request('/host/auth/sign-out', { method: 'POST', body: '{}', cookie: second.sessionCookie })).status).toBe(200)
+    await f.restart()
+    expect((await f.request('/host/config', { cookie: second.sessionCookie })).status).toBe(401)
+    const db = f.authDb(); try { expect(db.query('SELECT COUNT(*) AS n FROM session').get()).toEqual({ n: 0 }) } finally { db.close() }
+  })
+
+  test('Google mode enforces bounded auth uploads and shared rate limits regardless of forwarded client IP', async () => {
+    const f = await fixture()
+    expect((await f.request('/host/auth/sign-in', { method: 'POST', body: '{}'.padEnd(1025) })).status).toBe(413)
+    expect((await f.request('/host/auth/sign-in', { method: 'POST', body: '{}', headers: { 'Content-Encoding': 'gzip' } })).status).toBe(415)
+    const stalled = f.host.fetch(new Request(`${f.config.web.origin}/host/auth/sign-in`, { method: 'POST', headers: { Origin: f.config.web.origin, 'X-Superlocal': '1', 'Content-Type': 'application/json' }, body: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{')) } }) }))
+    expect((await bounded(stalled, 'Google auth body deadline')).status).toBe(408)
+    let limited = 0
+    for (let index = 0; index < 22; index++) {
+      const response = await f.request('/host/auth/sign-in', { method: 'POST', body: '{}', headers: { 'X-Forwarded-For': `192.0.2.${index}` } })
+      if (response.status === 429) limited++
+      else expect(response.status).toBe(200)
+    }
+    expect(limited).toBeGreaterThan(0)
+  })
+
+  test('bogus Google callback states cannot consume a rate-limit bucket needed by a valid sign-in', async () => {
+    const f = await fixture(), attempt = await f.begin()
+    for (let index = 0; index < 65; index++) {
+      const rejected = await f.request(`/api/auth/callback/google?code=bogus&state=bogus-${index}`)
+      expect(rejected.status).toBe(302)
+      expect(rejected.headers.get('location')).toBe(`${f.config.web.origin}/?auth=denied`)
+    }
+    expect(f.exchanges).toBe(0)
+    const callback = await f.request(attempt.callback, { cookie: attempt.cookie })
+    expect(callback.status).toBe(302)
+    expect(callback.headers.get('location')).toBe(`${f.config.web.origin}/`)
+    expect(f.exchanges).toBe(1)
+    expect((await f.request('/host/config', { cookie: f.cookie(callback) })).status).toBe(200)
+  })
+
+  test('every request rejects expired sessions, unverified stored users and missing or invalid Google account identities', async () => {
+    const f = await fixture(), login = await f.login()
+    const db = new Database(join(f.config.dataDir, f.config.mode, 'auth.sqlite'), { readwrite: true, create: false })
+    try {
+      for (const [invalidate, restore] of [
+        ['UPDATE user SET emailVerified = 0', 'UPDATE user SET emailVerified = 1'],
+        ["UPDATE account SET issuer = 'https://evil.test'", "UPDATE account SET issuer = 'https://accounts.google.com'"],
+        ["UPDATE account SET providerId = 'credential'", "UPDATE account SET providerId = 'google'"],
+        ["UPDATE account SET accountId = ''", "UPDATE account SET accountId = 'google-allowed-subject'"],
+      ]) {
+        db.exec(invalidate!)
+        expect((await f.request('/host/config', { cookie: login.sessionCookie })).status).toBe(401)
+        db.exec(restore!)
+        expect((await f.request('/host/config', { cookie: login.sessionCookie })).status).toBe(200)
+      }
+      db.exec("UPDATE session SET expiresAt = '2000-01-01T00:00:00.000Z'")
+      expect((await f.request('/host/config', { cookie: login.sessionCookie })).status).toBe(401)
+      const second = await f.login()
+      db.exec('DELETE FROM account')
+      expect((await f.request('/host/config', { cookie: second.sessionCookie })).status).toBe(401)
+    } finally { db.close() }
+  })
+
+  test('an external database revocation closes an already-open Google SSE session within the recheck bound', async () => {
+    const f = await fixture(), login = await f.login()
+    const events = await f.request('/v1/events', { cookie: login.sessionCookie })
+    expect(events.status).toBe(200)
+    const reader = events.body!.getReader()
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain('event: ready')
+    let ended = false
+    const remaining = (async () => { while (!(await reader.read()).done) {}; ended = true })()
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    expect(ended).toBe(false)
+    const db = new Database(join(f.config.dataDir, f.config.mode, 'auth.sqlite'), { readwrite: true, create: false })
+    try { db.exec('DELETE FROM session') } finally { db.close() }
+    expect((await f.request('/v1/accounts', { cookie: login.sessionCookie })).status).toBe(401)
+    const started = Date.now()
+    await bounded(remaining, 'externally revoked Google events')
+    expect(Date.now() - started).toBeLessThan(2000)
+  })
+
+  test('Google config supports explicit HTTPS production, exact email normalization, and never falls back when client settings or private DB safety fail', async () => {
+    const f = await fixture()
+    const environment = { NODE_ENV: 'production', SUPERLOCAL_AUTH_METHOD: 'google', SUPERLOCAL_WEB_ORIGIN: 'https://app.example.test', SUPERLOCAL_AUTH_ALLOWED_EMAILS: '  ALLOWED@Example.Test,allowed+tag@example.test' }
+    const config = loadLocalConfig({ configPath: f.config.configPath, environment })
+    expect(config.auth).toMatchObject({ method: 'google', allowedEmails: ['allowed@example.test', 'allowed+tag@example.test'] })
+    expect(config.web.allowedOrigins).toEqual(['https://app.example.test'])
+    for (const allowed of ['*@example.test', '@example.test', 'example.test', 'allowed@example.test,']) expect(() => loadLocalConfig({ configPath: f.config.configPath, environment: { ...environment, SUPERLOCAL_AUTH_ALLOWED_EMAILS: allowed } })).toThrow()
+    expect(() => loadLocalConfig({ configPath: f.config.configPath, environment: { NODE_ENV: 'production' } })).toThrow()
+    expect(() => loadLocalConfig({ configPath: f.config.configPath, environment: { ...environment, SUPERLOCAL_WEB_ORIGIN: 'http://public.example.test' } })).toThrow()
+    expect(() => loadLocalConfig({ configPath: f.config.configPath, environment: { SUPERLOCAL_WEB_ORIGIN: 'https://app.example.test' } })).toThrow()
+    await f.host.close()
+    await expect(createLocalHost(f.config, {})).rejects.toMatchObject({ code: 'LOCAL_GOOGLE_AUTH_NOT_CONFIGURED' })
+    const path = join(f.config.dataDir, f.config.mode, 'auth.sqlite')
+    await chmod(path, 0o644)
+    await expect(createLocalHost(f.config, f.environment)).rejects.toMatchObject({ code: 'LOCAL_AUTH_DATABASE_INVALID' })
+    await chmod(path, 0o600)
+    const hardlink = join(f.root, 'auth-hardlink.sqlite')
+    await link(path, hardlink)
+    await expect(createLocalHost(f.config, f.environment)).rejects.toMatchObject({ code: 'LOCAL_AUTH_DATABASE_INVALID' })
+    await rm(hardlink)
+    for (const suffix of ['-wal', '-shm', '-journal']) {
+      await rm(`${path}${suffix}`, { force: true })
+      await symlink(path, `${path}${suffix}`)
+      await expect(createLocalHost(f.config, f.environment)).rejects.toMatchObject({ code: 'LOCAL_AUTH_DATABASE_INVALID' })
+      await rm(`${path}${suffix}`)
+    }
+    const other = join(f.root, 'untouched.sqlite')
+    await writeFile(other, 'not-a-database', { mode: 0o600 })
+    await rm(path); await symlink(other, path)
+    await expect(createLocalHost(f.config, f.environment)).rejects.toMatchObject({ code: 'LOCAL_AUTH_DATABASE_INVALID' })
+    expect(await readFile(other, 'utf8')).toBe('not-a-database')
+    await rm(join(f.config.dataDir, f.config.mode, 'runtime-secrets.json'))
+    await expect(createLocalHost(f.config, f.environment)).rejects.toMatchObject({ code: 'LOCAL_AUTH_RUNTIME_MISSING' })
+    await expect(createLocalHost({ ...f.config, auth: { method: 'loopback', sessionHours: 1 } }, f.environment)).rejects.toMatchObject({ code: 'LOCAL_AUTH_RUNTIME_MISSING' })
+    await expect(stat(join(f.config.dataDir, f.config.mode, 'runtime-secrets.json'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 })
 

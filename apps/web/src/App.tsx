@@ -99,7 +99,7 @@ function readRoute(): Route {
   };
 }
 
-export default function App() {
+export default function App({ applicationUser, onSignOut }: { applicationUser?: { name: string; email: string }; onSignOut?: () => void } = {}) {
   const [route, setRoute] = useState<Route>(readRoute);
   const inbox = useInbox();
   const { store, mail, drafts } = inbox;
@@ -2093,6 +2093,9 @@ export default function App() {
           )}
         </div>
         <footer className="sidebar-footer">
+          {applicationUser && onSignOut && (
+            <button className="application-sign-out" type="button" title={`Sign out ${applicationUser.email}`} onClick={onSignOut}>Sign out</button>
+          )}
           <div>
             <IconButton
               name="QuestionSquircle"

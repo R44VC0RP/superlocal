@@ -7,6 +7,69 @@ import {
   writeSaved,
   writeText,
 } from "../src/storage.ts";
+import { AUTH_REQUIRED_EVENT, beginGoogleLogin, checkAuthenticationResponse, readApplicationAccess, signOutApplication } from "../src/application-auth.ts";
+
+test("application access fails closed and never infers a local session from invalid responses", async () => {
+  const original = globalThis.fetch;
+  let payload: unknown = { method: "loopback" };
+  globalThis.fetch = (async (_input, init) => {
+    assert.equal(init?.credentials, "include");
+    assert.equal(init?.cache, "no-store");
+    return Response.json(payload);
+  }) as typeof fetch;
+  try {
+    assert.deepEqual(await readApplicationAccess(), { method: "loopback" });
+    payload = { method: "google", authenticated: false, user: { email: "hidden@example.test" } };
+    assert.deepEqual(await readApplicationAccess(), { method: "google", authenticated: false, user: null });
+    payload = { method: "google", authenticated: true, user: { name: "Approved", email: "approved@example.test" } };
+    assert.deepEqual(await readApplicationAccess(), payload);
+    for (const invalid of [{}, null, { method: "google", authenticated: "true" }, { method: "google", authenticated: true }, { method: "google", authenticated: true, user: { email: "approved@example.test" } }]) {
+      payload = invalid;
+      await assert.rejects(readApplicationAccess());
+    }
+    globalThis.fetch = (async () => Response.json({ method: "loopback" }, { status: 503 })) as typeof fetch;
+    await assert.rejects(readApplicationAccess());
+  } finally { globalThis.fetch = original; }
+});
+
+test("Google login uses only the host flow and rejects unexpected destinations", async () => {
+  const original = globalThis.fetch;
+  let destination = "https://accounts.google.com/o/oauth2/v2/auth?client_id=fictional";
+  const requests: Array<{ path: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input, init) => {
+    requests.push({ path: String(input), init });
+    return String(input).endsWith("sign-out") ? new Response(null, { status: 204 }) : Response.json({ url: destination });
+  }) as typeof fetch;
+  try {
+    assert.equal(await beginGoogleLogin(), destination);
+    assert.equal(requests[0]!.path, "/host/auth/sign-in");
+    assert.equal(requests[0]!.init?.method, "POST");
+    assert.deepEqual(JSON.parse(String(requests[0]!.init?.body)), {});
+    for (const url of ["https://accounts.google.com.evil.test/login", "http://accounts.google.com/login", "https://user@accounts.google.com/login", "javascript:alert(1)", "/arbitrary-login"]) {
+      destination = url;
+      await assert.rejects(beginGoogleLogin());
+    }
+    await signOutApplication();
+    assert.equal(requests.at(-1)!.path, "/host/auth/sign-out");
+    assert.equal(requests.at(-1)!.init?.method, "POST");
+  } finally { globalThis.fetch = original; }
+});
+
+test("only an explicit host authentication challenge locks the application", () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "dispatchEvent");
+  const events: string[] = [];
+  Object.defineProperty(globalThis, "dispatchEvent", { configurable: true, value: (event: Event) => { events.push(event.type); return true; } });
+  try {
+    checkAuthenticationResponse(new Response(null, { status: 401 }));
+    checkAuthenticationResponse(new Response(null, { status: 500, headers: { "X-Superlocal-Auth": "required" } }));
+    assert.deepEqual(events, []);
+    checkAuthenticationResponse(new Response(null, { status: 401, headers: { "X-Superlocal-Auth": "required" } }));
+    assert.deepEqual(events, [AUTH_REQUIRED_EVENT]);
+  } finally {
+    if (previous) Object.defineProperty(globalThis, "dispatchEvent", previous);
+    else Reflect.deleteProperty(globalThis, "dispatchEvent");
+  }
+});
 
 test("stored state round-trips without affecting other keys", () => {
   const previous = Object.getOwnPropertyDescriptor(globalThis, "localStorage");

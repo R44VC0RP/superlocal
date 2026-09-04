@@ -7,6 +7,7 @@ import type {
 import type { Attachment, Draft, Mail, MailboxOption, Message } from "./data";
 import { escapeHTML, plainText } from "./mail-text";
 import { readSaved, writeSaved } from "./storage";
+import { checkAuthenticationResponse } from "./application-auth";
 import { matchesSearch } from "./mail-search";
 import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, type HostConfiguration, type InboxViewPreferences } from "./host";
 import { readSplitPreferences, writeSplitPreferences, readAttentionFeedback, recordAttentionFeedback, retractAttentionFeedback, InboxViewPreferencesError,
@@ -225,6 +226,7 @@ export class InboxStore {
       const finish = measureRequest(path, init?.method ?? "GET");
       try {
         const response = await fetch(input, init);
+        checkAuthenticationResponse(response);
         finish(response.status);
         console.info({ event: "inbox.request", method: init?.method ?? "GET", path, status: response.status, durationMs: Math.round(performance.now() - start), requestId: response.headers.get("x-request-id") });
         return response;
