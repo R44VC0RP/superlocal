@@ -409,7 +409,7 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     messages: (input: Query = {}, requestOptions: InboxRequestOptions = {}) => request<Result<'messages'>>(`/messages${queryString(input)}`, requestOptions),
     message: (id: string, requestOptions: InboxRequestOptions = {}) => request<Result<'message'>>(`/messages/${resourceId(id)}`, requestOptions),
     threads: (input: Query = {}, requestOptions: InboxRequestOptions = {}) => request<Result<'threads'>>(`/threads${queryString(input)}`, requestOptions),
-    thread: (id: string, input: Pick<Query, 'cursor' | 'limit'> = {}, requestOptions: InboxRequestOptions = {}) => request<Result<'thread'>>(`/threads/${resourceId(id)}${queryString(input)}`, requestOptions),
+    thread: (id: string, input: Pick<Query, 'cursor' | 'limit' | 'sort'> = {}, requestOptions: InboxRequestOptions = {}) => request<Result<'thread'>>(`/threads/${resourceId(id)}${queryString(input)}`, requestOptions),
     labels: (accountId?: string, requestOptions: InboxRequestOptions = {}) => request<Label[]>(`/labels${queryString({ accountId })}`, requestOptions),
     label: (id: string, requestOptions: InboxRequestOptions = {}) => request<Label>(`/labels/${resourceId(id)}`, requestOptions),
     createLabel: (accountId: string, name: string, requestOptions: InboxRequestOptions = {}) => write<Label>('/labels', 'POST', { accountId, name }, requestOptions),

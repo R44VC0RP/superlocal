@@ -68,7 +68,7 @@ const querySchema = z.strictObject({
 const mailboxQuery = querySchema.omit({ accountId: true }).extend({
   mailboxIds: z.array(id).min(1).max(50), done: z.boolean().optional(), snoozed: z.boolean().optional(),
 })
-const pageQuery = querySchema.pick({ cursor: true, limit: true })
+const pageQuery = querySchema.pick({ cursor: true, limit: true, sort: true })
 const accountQuery = querySchema.pick({ accountId: true })
 const folderQuery = z.strictObject({ cached: z.boolean().optional() })
 const changesQuery = z.strictObject({ since: opaque.optional(), limit: z.number().int().min(1).max(1000).optional() })

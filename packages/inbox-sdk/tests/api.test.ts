@@ -7505,3 +7505,145 @@ describe('authenticated message media', () => {
     expect(requests).toBe(2)
   })
 })
+
+describe('bounded thread ordering', () => {
+  test('thread newest pages expose the latest limited context through SDK/client/HTTP while oldest remains the default', async () => {
+    const h = await fixture()
+    const messages = Array.from({ length: 105 }, (_, index) => native(`context-${index}`, {
+      threadId: 'shared-native-thread', subject: `Context ${index}`,
+      receivedAt: new Date(EPOCH - (105 - index) * 60_000).toISOString(),
+    }))
+    const { account, box } = await h.seed('alice', 'thread-context', messages)
+    const other = await h.seed('alice', 'thread-context-other', [native('context-104', { threadId: 'shared-native-thread' })])
+    await h.seed('bob', 'thread-context-foreign', messages.slice(-1))
+    const threadId = (await h.page('alice', { accountId: account.id, limit: 1 })).items[0]!.threadId
+    const otherThreadId = (await h.page('alice', { accountId: other.account.id })).items[0]!.threadId
+    expect(otherThreadId).not.toBe(threadId)
+    const before = structuredClone(box.calls)
+    const wire = transport(h)
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' } })
+    const latest = await client.thread(threadId, { sort: 'newest', limit: 4 })
+    expect(latest.total).toBe(105)
+    expect(latest.items.map(message => message.subject)).toEqual(['Context 104', 'Context 103', 'Context 102', 'Context 101'])
+    expect(latest.items.every(message => message.accountId === account.id && message.threadId === threadId)).toBe(true)
+    expect(latest.nextCursor).not.toBeNull()
+    expect(await h.inbox.thread('alice', threadId, { sort: 'newest', limit: 4 })).toEqual(latest)
+    const oldest = await client.thread(threadId, { limit: 4 })
+    expect(oldest.items.map(message => message.subject)).toEqual(['Context 0', 'Context 1', 'Context 2', 'Context 3'])
+    expect((await client.thread(threadId, { sort: 'oldest', limit: 4 })).items).toEqual(oldest.items)
+    const defaults = await client.thread(threadId)
+    expect(defaults.items).toHaveLength(50)
+    expect(defaults.items[0]!.subject).toBe('Context 0')
+    expect(defaults.items.at(-1)!.subject).toBe('Context 49')
+    expect(oldest.state).toBe(latest.state)
+    expect(box.calls).toEqual(before)
+    const spec = await client.request<any>('/openapi.json')
+    const sortParameter = spec.paths['/v1/threads/{id}'].get.parameters.find((parameter: any) => parameter.name === 'sort')
+    expect(sortParameter).toMatchObject({
+      in: 'query', schema: { type: 'string', enum: ['newest', 'oldest'] },
+    })
+    expect(sortParameter.required ?? false).toBe(false)
+    await invalid(await h.request('bob', `/threads/${threadId}?sort=newest&limit=4`), 404)
+    await invalid(await h.request(null, `/threads/${threadId}?sort=newest&limit=4`), 401)
+    await expect(h.inbox.thread('bob', threadId, { sort: 'newest' })).rejects.toMatchObject({ code: 'NOT_FOUND', status: 404 })
+    await expect(h.inbox.thread('alice', 'missing-thread', { sort: 'newest' })).rejects.toMatchObject({ code: 'NOT_FOUND', status: 404 })
+  })
+
+  test('thread newest cursors preserve tied ordering, query/source/owner binding, restart continuity and state fences', async () => {
+    const h = await fixture()
+    const messages = Array.from({ length: 7 }, (_, index) => native(`thread-tie-${index}`, {
+      threadId: 'same-native-thread', receivedAt: new Date(EPOCH - Math.floor(index / 3) * 60_000).toISOString(),
+    }))
+    const { account } = await h.seed('alice', 'thread-cursors', messages)
+    const other = await h.seed('alice', 'thread-cursors-other', messages)
+    const foreign = await h.seed('bob', 'thread-cursors-foreign', messages)
+    const threadId = (await h.page('alice', { accountId: account.id })).items[0]!.threadId
+    const otherId = (await h.page('alice', { accountId: other.account.id })).items[0]!.threadId
+    const foreignId = (await h.page('bob', { accountId: foreign.account.id })).items[0]!.threadId
+    const wire = transport(h)
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' } })
+    const expected = (await h.inbox.thread('alice', threadId)).items.reverse()
+    const first = await client.thread(threadId, { sort: 'newest', limit: 2 })
+    expect(await client.thread(threadId, { limit: 2, sort: 'newest' })).toEqual(first)
+    const items = [...first.items]
+    let cursor = first.nextCursor
+    while (cursor) {
+      const page = await client.thread(threadId, { sort: 'newest', limit: 2, cursor })
+      expect(page.total).toBe(7)
+      expect(page.state).toBe(first.state)
+      items.push(...page.items); cursor = page.nextCursor
+      expect(items.length).toBeLessThanOrEqual(7)
+    }
+    expect(items).toEqual(expected)
+    expect(new Set(items.map(message => message.id)).size).toBe(7)
+    for (const query of [{ limit: 2 }, { sort: 'oldest' as const, limit: 2 }, { sort: 'newest' as const, limit: 3 }]) {
+      await expect(client.thread(threadId, { ...query, cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'INVALID_CURSOR', status: 400 })
+    }
+    await expect(client.thread(otherId, { sort: 'newest', limit: 2, cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    await expect(h.inbox.thread('bob', foreignId, { sort: 'newest', limit: 2, cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    await expect(client.thread(threadId, { sort: 'newest', cursor: 'invalid-cursor' })).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    for (const sort of ['', 'random', null, 42]) {
+      await expect(h.inbox.thread('alice', threadId, { sort: sort as Query['sort'] })).rejects.toMatchObject({ code: 'VALIDATION', status: 400 })
+      await invalid(await h.request('alice', `/threads/${threadId}?sort=${sort}`), 400)
+    }
+    for (const query of ['limit=0', 'limit=101', 'limit=1.5', 'accountId=other', 'owner=bob']) {
+      await invalid(await h.request('alice', `/threads/${threadId}?sort=newest&${query}`), 400)
+    }
+    await h.restart()
+    expect((await client.thread(threadId, { sort: 'newest', limit: 2, cursor: first.nextCursor! })).items).toEqual(expected.slice(2, 4))
+    await h.mutate('alice', [first.items[0]!.id], { isRead: true }, 'thread-cursor-state-change')
+    await expect(client.thread(threadId, { sort: 'newest', limit: 2, cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'STALE_CURSOR', status: 409 })
+    const changed = await client.thread(threadId, { sort: 'newest', limit: 2 })
+    expect(changed.state).not.toBe(first.state)
+    const database = new Database(h.database)
+    try { database.query("UPDATE sdk_meta SET value=? WHERE key='epoch'").run(randomUUID()) } finally { database.close() }
+    await h.restart()
+    await expect(client.thread(threadId, { sort: 'newest', limit: 2, cursor: changed.nextCursor! })).rejects.toMatchObject({ code: 'STALE_CURSOR', status: 409 })
+  })
+
+  test('thread newest reads materialize only the limit with indexed ordering inside a sparse 10,000-message cache', async () => {
+    const h = await fixture({ eventRetention: 20 })
+    const { account, box } = await h.seed('alice', 'thread-sparse', Array.from({ length: 10_000 }, (_, index) => native(`sparse-${index}`, {
+      threadId: index % 10 === 0 ? 'sparse-target' : `noise-${index}`,
+      receivedAt: new Date(EPOCH - (index % 10 === 0 ? 60_000 : 0)).toISOString(),
+      bodyText: `${BODY_SECRET}:${'x'.repeat(1024)}`,
+    })))
+    const database = new Database(h.database)
+    await h.restart(database)
+    const target = database.query<{ thread_id: string }, [string]>('SELECT thread_id FROM sdk_messages WHERE account=? AND native_id=\'sparse-0\'').get(account.id)!.thread_id
+    const expected = database.query<{ id: string }, [string]>('SELECT id FROM sdk_messages WHERE thread_id=? ORDER BY received_at DESC,id DESC LIMIT 4').all(target).map(row => row.id)
+    const query = database.query.bind(database)
+    const reads: Array<{ rows: unknown[]; plan: Array<{ detail: string }> }> = []
+    const trace = spyOn(database, 'query').mockImplementation(((sql: string) => {
+      const statement = query(sql)
+      return new Proxy(statement, {
+        get(statement, key) {
+          const value = Reflect.get(statement, key, statement)
+          if (key !== 'all' && key !== 'get') return typeof value === 'function' ? value.bind(statement) : value
+          return (...params: Parameters<typeof statement.all>) => {
+            const result = value.apply(statement, params)
+            reads.push({ rows: key === 'all' ? result : result ? [result] : [], plan: query<{ detail: string }, typeof params>(`EXPLAIN QUERY PLAN ${sql}`).all(...params) })
+            return result
+          }
+        },
+      })
+    }) as typeof database.query)
+    const before = structuredClone(box.calls)
+    try {
+      const result = await h.inbox.thread('alice', target, { sort: 'newest', limit: 4 })
+      expect(result.total).toBe(1000)
+      expect(result.items.map(message => message.id)).toEqual(expected)
+      expect(result.nextCursor).not.toBeNull()
+      expect(JSON.stringify(result)).not.toContain(BODY_SECRET)
+      expect(box.calls).toEqual(before)
+      const materialized = reads.flatMap(read => read.rows) as Array<Record<string, unknown>>
+      expect(materialized.filter(row => 'visible' in row)).toHaveLength(4)
+      expect(materialized.length).toBeLessThanOrEqual(10)
+      expect(materialized.some(row => 'body' in row || 'confirmed' in row)).toBe(false)
+      const plans = reads.flatMap(read => read.plan.map(row => row.detail))
+      expect(plans.length).toBeGreaterThan(0)
+      expect(plans.every(plan => !/\bSCAN\b|\bUSE TEMP B-TREE\b/.test(plan))).toBe(true)
+    } finally { trace.mockRestore() }
+  }, 30_000)
+})
+

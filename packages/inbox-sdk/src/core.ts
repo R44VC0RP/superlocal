@@ -2108,10 +2108,13 @@ export function createInbox(options: InboxOptions): Inbox {
       return { items, total, state: page.state, nextCursor: page.offset + items.length < total ? token(owner, sequence(owner), `${page.hash}:${page.offset + items.length}`) : null }
     }),
     thread: (owner, id, query = {}) => run(() => {
-      ownerId(owner); const page = pagination(owner, query, `thread:${id}`)
+      ownerId(owner)
+      if (query.sort !== undefined && !['newest', 'oldest'].includes(query.sort)) throw new InboxError('VALIDATION', 'Invalid sort order.')
+      const page = pagination(owner, query, `thread:${id}`)
       const total = db.query<{ count: number }, [string, string]>('SELECT COUNT(*) count FROM sdk_messages WHERE owner=? AND thread_id=? AND deleted=0').get(owner, id)!.count
       if (!total) throw new InboxError('NOT_FOUND', 'Conversation not found.', 404)
-      const rows = db.query<MessageRow, [string, string, number, number]>('SELECT visible FROM sdk_messages WHERE owner=? AND thread_id=? AND deleted=0 ORDER BY received_at ASC,id ASC LIMIT ? OFFSET ?').all(owner, id, page.limit, page.offset)
+      const order = query.sort === 'newest' ? 'DESC' : 'ASC'
+      const rows = db.query<MessageRow, [string, string, number, number]>(`SELECT visible FROM sdk_messages WHERE owner=? AND thread_id=? AND deleted=0 ORDER BY received_at ${order},id ${order} LIMIT ? OFFSET ?`).all(owner, id, page.limit, page.offset)
       return { items: rows.map(summary), total, state: page.state, nextCursor: page.offset + rows.length < total ? token(owner, sequence(owner), `${page.hash}:${page.offset + rows.length}`) : null }
     }),
 
