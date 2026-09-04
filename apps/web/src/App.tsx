@@ -140,7 +140,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const [mailFilter, setMailFilter] = useState<string | null>(null);
   const [availabilityRequest, setAvailabilityRequest] = useState(0);
   const [replyRequest, setReplyRequest] = useState(0);
-  const [replyFeedback, setReplyFeedback] = useState<{ id: string; threadId: string; scheduled?: string } | null>(null);
+  const [sendFeedback, setSendFeedback] = useState<{ id: string; threadId?: string; scheduled?: string } | null>(null);
   const [calendarInitialView, setCalendarInitialView] = useState<
     "day" | "week"
   >("week");
@@ -416,22 +416,25 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   useEffect(() => {
     setNoticeHovered(false);
   }, [notice]);
-  const replyOperation = replyFeedback ? inbox.operations[replyFeedback.id] : undefined;
+  const sendOperation = sendFeedback ? inbox.operations[sendFeedback.id] : undefined;
   useEffect(() => {
-    if (!replyFeedback || !replyOperation) return;
-    const operation = replyOperation;
+    if (!sendFeedback || !sendOperation) return;
+    const operation = sendOperation;
+    const noun = sendFeedback.threadId ? "Reply" : "Email";
     setNotice(previous => {
       if (previous && previous.operationId !== operation.id) return previous;
-      const text = operation.status === "succeeded" ? "Reply sent."
-        : operation.status === "cancelled" ? "Reply cancelled. Draft restored."
-        : operation.status === "failed" ? "Reply not sent. Draft restored."
-        : operation.status === "partial" ? "Reply sent to some recipients only."
-        : operation.status === "uncertain" ? "Reply delivery unconfirmed."
-        : replyFeedback.scheduled ? `Reply scheduled for ${displayDate(replyFeedback.scheduled)}` : "Sending reply…";
-      return { text, operationId: operation.id, scheduled: !!replyFeedback.scheduled,
+      // Immediate sends acknowledge acceptance; SDK state still controls Undo,
+      // scheduled delivery and any later failure or uncertain outcome.
+      const text = operation.status === "succeeded" ? `${noun} sent`
+        : operation.status === "cancelled" ? `${noun} cancelled. Draft restored.`
+        : operation.status === "failed" ? `${noun} not sent. Draft restored.`
+        : operation.status === "partial" ? `${noun} sent to some recipients only.`
+        : operation.status === "uncertain" ? `${noun} delivery unconfirmed.`
+        : sendFeedback.scheduled ? `${noun} scheduled for ${displayDate(sendFeedback.scheduled)}` : `${noun} sent`;
+      return { text, operationId: operation.id, scheduled: !!sendFeedback.scheduled,
         ...(operation.status === "pending" ? { undo: undoAction(() => store.undoSend(operation.id)) } : {}) };
     });
-  }, [replyFeedback, replyOperation?.status]);
+  }, [sendFeedback, sendOperation?.status]);
   useEffect(() => {
     setNoticeFading(false);
     if (!notice || noticeHovered) return;
@@ -830,14 +833,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       }
       const current = readRoute();
       if (conversation) {
-        setReplyFeedback({ id: operation.id, threadId: conversation.id, scheduled: when });
         if (current.draft === draft.id) navigate({ account: conversation.account, draft: undefined, thread: conversation.id, view: undefined });
       } else if (current.draft === draft.id) navigate({ draft: undefined, thread: undefined, view: undefined });
-      setNotice({
-        text: when ? `${conversation ? "Reply scheduled" : "Scheduled"} for ${new Date(when).toLocaleString()}` : operation.status === "succeeded" ? conversation ? "Reply sent." : "Message sent" : conversation ? "Sending reply…" : "Send queued in the inbox",
-        operationId: operation.id, scheduled: !!when,
-        ...(operation.status === "pending" ? { undo: undoAction(() => store.undoSend(operation.id)) } : {}),
-      });
+      setNotice(null);
+      setSendFeedback({ id: operation.id, threadId: conversation?.id, scheduled: when });
       return true;
     } catch (error) {
       actionError(error);
@@ -1609,7 +1608,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           <ThreadView
             key={currentMail.id}
             mail={currentMail}
-            focusOperationId={!currentDraft && replyFeedback?.threadId === currentMail.id ? replyFeedback.id : undefined}
+            focusOperationId={sendFeedback?.threadId === currentMail.id ? sendFeedback.id : undefined}
             draft={currentDraft}
             account={route.account}
             accounts={inbox.accounts}
