@@ -8512,5 +8512,7 @@ describe('AI triage service', () => {
     expect(decisions).toHaveLength(33)
     expect(decisions.every(item => item.state === 'ready')).toBe(true)
     expect(calls).toBe(33)
-  })
+    // The watchdog includes admitting 10k history items with cooperative yields.
+    // This approved setup allowance does not change the measured mail latency budgets.
+  }, 30000)
 })
