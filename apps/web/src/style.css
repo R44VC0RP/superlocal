@@ -137,15 +137,13 @@ textarea::placeholder {
   opacity: 1;
 }
 button:focus-visible,
-a:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 3px;
-  border-radius: 3px;
-}
+a:focus-visible,
+summary:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 select:focus-visible {
   outline: none;
+  filter: contrast(1.2);
 }
 input[type="checkbox"],
 input[type="radio"] {
@@ -1537,10 +1535,6 @@ kbd {
 .simple-form textarea {
   resize: vertical;
   min-height: 90px;
-}
-.simple-form input:focus,
-.simple-form textarea:focus {
-  border-color: var(--accent);
 }
 .help-options {
   padding: 14px 20px 24px;

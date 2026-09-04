@@ -107,8 +107,7 @@
 .aux-view button:focus-visible,
 .aux-editor button:focus-visible,
 .aux-view select:focus-visible {
-  outline: 2px solid var(--accent, #c7a5ee);
-  outline-offset: -2px;
+  outline: none;
 }
 .aux-view input,
 .aux-editor input,
@@ -863,9 +862,6 @@
   margin-top: 12px;
   padding: 5px 8px;
   font-size: 13px;
-}
-.calendar-meet input:focus {
-  border-color: var(--accent, #c7a5ee);
 }
 .calendar-meet input::placeholder {
   color: var(--muted, #bfbcb6);

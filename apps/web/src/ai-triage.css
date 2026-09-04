@@ -49,8 +49,7 @@
   color: var(--text);
 }
 .ai-details > summary:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: none;
 }
 .ai-details > :not(summary) {
   margin-top: 12px;
@@ -142,8 +141,7 @@
   color: var(--text);
 }
 .conversation-triage-trigger:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: none;
 }
 .conversation-triage-dialog {
   text-align: left;

@@ -113,8 +113,7 @@ button.settings-menu-row,
 .settings-dialog input:focus-visible,
 .settings-dialog select:focus-visible,
 .settings-dialog textarea:focus-visible {
-  outline: 2px solid var(--accent, #c7a5ee);
-  outline-offset: 2px;
+  outline: none;
 }
 
 .settings-main .toggle,
@@ -265,8 +264,7 @@ button.settings-menu-row,
   font-weight: 600;
 }
 .settings-theme-choice:has(input:focus-visible) {
-  outline: 2px solid var(--accent, #c7a5ee);
-  outline-offset: 2px;
+  outline: none;
 }
 .settings-theme-choice input {
   position: absolute;
@@ -512,8 +510,7 @@ button.settings-menu-row,
   cursor: pointer;
 }
 .settings-more-preferences summary:focus-visible {
-  outline: 2px solid var(--accent, #c7a5ee);
-  outline-offset: 2px;
+  outline: none;
 }
 .settings-dialog .settings-checkbox-row {
   display: flex;
@@ -574,8 +571,7 @@ button.settings-menu-row,
   cursor: pointer;
 }
 .settings-inline-select:focus-within {
-  outline: 2px solid var(--accent, #c7a5ee);
-  outline-offset: 2px;
+  outline: none;
   border-radius: 2px;
 }
 .settings-signatures-dialog .settings-dialog-body {
@@ -1049,8 +1045,7 @@ button.settings-menu-row,
   overflow: auto;
 }
 .mailbox-settings-list:focus-visible {
-  outline: 2px solid var(--text);
-  outline-offset: 2px;
+  outline: none;
 }
 .mailbox-source-group h4,
 .mailbox-source-group h5 {
