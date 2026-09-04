@@ -1961,7 +1961,6 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           title="Close sidebar"
           onClick={() => setMobileSidebar(false)}
         />
-        {inboxCount > 0 && <span className="notification-count">{inboxCount}</span>}
         <div
           className="sidebar-content"
           onClick={(event) => {
