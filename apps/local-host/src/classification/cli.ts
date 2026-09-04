@@ -1,5 +1,6 @@
+import { Database } from 'bun:sqlite'
 import { createHash } from 'node:crypto'
-import { closeSync, lstatSync, openSync, readFileSync, writeSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, writeSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { classifyEmail, InferenceError } from './inference'
@@ -8,7 +9,11 @@ import type { TrainingExample } from './model'
 import { preprocessingVersion, promptVersion, taxonomyVersion, validateClassification, validateClassificationInput, type ClassificationInput } from './schema'
 
 function readExamples(path: string): TrainingExample[] {
-  const rows = readFileSync(path, 'utf8').split('\n').filter(line => line.trim()).map(line => JSON.parse(line))
+  return parseExamples(readFileSync(path, 'utf8'))
+}
+
+function parseExamples(text: string): TrainingExample[] {
+  const rows = text.split('\n').filter(line => line.trim()).map(line => JSON.parse(line))
   for (const row of rows) validateClassification(row.classification, row.input)
   return rows
 }
@@ -16,6 +21,58 @@ function readExamples(path: string): TrainingExample[] {
 function savePrivate(path: string, value: unknown) {
   const fd = openSync(path, 'wx', 0o600)
   try { writeSync(fd, JSON.stringify(value) + '\n') } finally { closeSync(fd) }
+}
+
+/** OS-released SQLite lock: a crash cannot leave a stale PID/lock-file claim. No mail is stored here. */
+function refinementWriter(root: string): Database {
+  const path = resolve(root, 'writer.sqlite'), fd = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600)
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile() || stat.nlink !== 1 || stat.mode & 0o077 || process.getuid && stat.uid !== process.getuid()) throw new Error('REFINEMENT_PRIVATE_WRITER_REQUIRED')
+  } finally { closeSync(fd) }
+  const writer = new Database(path)
+  try { writer.exec('PRAGMA busy_timeout=0; BEGIN IMMEDIATE'); return writer }
+  catch (error) { writer.close(); throw new Error((error as { code?: string }).code === 'SQLITE_BUSY' ? 'REFINEMENT_WRITER_ACTIVE' : 'REFINEMENT_WRITER_FAILED') }
+}
+
+/** Append-only AI supervision; never imports records into the human review ledger. */
+export async function refineFile(inputPath: string, outputDirectory: string, options: Omit<import('./refinement').RefinementOptions, 'completed' | 'onResult'> & { resume?: boolean; progress?: (count: number) => void }) {
+  const { refinementProfile, refineExamples } = await import('./refinement')
+  if (lstatSync(inputPath).size > 128 * 1024 * 1024) throw new Error('REFINEMENT_INPUT_TOO_LARGE')
+  const inputText = readFileSync(inputPath, 'utf8'), inputHash = createHash('sha256').update(inputText).digest('hex')
+  const examples = inputText.split('\n').filter(line => line.trim()).map(line => { const row = JSON.parse(line); return { exampleId: row.exampleId, input: row.input, primary: row.primary ?? row.classification } })
+  if (!examples.length || examples.length > 5000 || new Set(examples.map(row => row.exampleId)).size !== examples.length) throw new Error('REFINEMENT_COHORT_INVALID')
+  for (const row of examples) { if (typeof row.exampleId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,199}$/.test(row.exampleId)) throw new Error('REFINEMENT_COHORT_INVALID'); validateClassification(row.primary, row.input) }
+  const profile = refinementProfile(options.model), root = privateDirectory(outputDirectory), history = resolve(root, 'records.jsonl'), manifestPath = resolve(root, 'manifest.json')
+  const writer = refinementWriter(root)
+  try {
+    const latest = new Map<string, import('./refinement').RefinementRecord>()
+    if (options.resume) {
+      for (const path of [manifestPath, history]) { const stat = lstatSync(path); if (!stat.isFile() || stat.isSymbolicLink() || stat.mode & 0o077 || process.getuid && stat.uid !== process.getuid()) throw new Error('REFINEMENT_PRIVATE_RESUME_REQUIRED') }
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+      if (manifest.version !== 1 || manifest.inputHash !== inputHash || JSON.stringify(manifest.profile) !== JSON.stringify(profile) || manifest.examples !== examples.length) throw new Error('REFINEMENT_RESUME_MISMATCH')
+      const previous = readFileSync(history, 'utf8')
+      if (previous && !previous.endsWith('\n')) throw new Error('REFINEMENT_CHECKPOINT_INCOMPLETE')
+      for (const line of previous.split('\n').filter(Boolean)) {
+        const row = JSON.parse(line)
+        if (latest.get(row.exampleId)?.status === 'succeeded') throw new Error('REFINEMENT_CHECKPOINT_CONFLICT')
+        latest.set(row.exampleId, row)
+      }
+    } else {
+      if (existsSync(history) || existsSync(manifestPath)) throw new Error('REFINEMENT_EXISTS_USE_RESUME')
+      savePrivate(manifestPath, { version: 1, inputHash, examples: examples.length, profile, createdAt: new Date().toISOString(), labelSource: 'llm', interpretation: 'AI review and adjudication, not human labels or independent ground truth.' })
+    }
+    const fd = openSync(history, options.resume ? 'a' : 'wx', 0o600)
+    try {
+      let checkpoints = 0
+      const records = await refineExamples(examples, { ...options, completed: [...latest.values()], onResult: record => {
+        writeSync(fd, JSON.stringify(record) + '\n'); fsyncSync(fd); options.progress?.(++checkpoints)
+      } })
+      return { examples: records.length, succeeded: records.filter(row => row.status === 'succeeded').length, failed: records.filter(row => row.status === 'failed').length,
+        unstarted: records.filter(row => row.status === 'unstarted').length, trainingEligible: records.filter(row => row.trainingEligible).length,
+        adjudicated: records.filter(row => row.adjudicated).length, labelSource: 'llm', recordsPath: history }
+    } finally { closeSync(fd) }
+  } finally { writer.close() }
 }
 
 export async function trainExport(inputDirectory: string, outputDirectory: string, options: { deferTest?: boolean } = {}) {
@@ -111,9 +168,11 @@ compare   --dataset /absolute/path/labels.sqlite --left pilot-v1 --right pilot-v
 review    --dataset /absolute/path/labels.sqlite --run pilot-v1 --input /private/reviews.jsonl
 export    --dataset /absolute/path/labels.sqlite --run pilot-v1 --out /private/new-export [--reviewed-only] [--development-run previous-pilot]
 train     --input /private/export-directory --out /private/new-model-directory [--defer-test]
-evaluate  --model-file /private/model/model.json --input /private/export/test.jsonl
-predict   --model-file /private/model/model.json --input /private/examples.jsonl --out /private/new-predictions
+evaluate  --model-file /private/model/model.json --input /private/export/test.jsonl [--policy-file /private/policy/policy.json]
+predict   --model-file /private/model/model.json --input /private/examples.jsonl --out /private/new-predictions [--policy-file /private/policy/policy.json]
+calibrate --model-file /private/model/model.json --input /private/calibration.jsonl --out /private/new-policy [--target-agreement .95] [--minimum-accepted 20] [--minimum-groups 5] [--lower-bound 0]
 audit     --input /private/blind-inputs.jsonl --out /private/new-audit --allow-email-upload [--model gpt-5.6-terra] [--concurrency 4]
+refine    --input /private/examples.jsonl --out /private/refinement --allow-email-upload [--model gpt-5.6-sol] [--concurrency 4] [--resume] [--retry-failed]
 
 prepare defaults to a separate classification/labels.sqlite beside the source database.
 Pass --dataset to override. Every run is an immutable selection and configuration.
@@ -123,8 +182,8 @@ fork reuses the exact frozen inputs to compare another model or revised taxonomy
 Concurrency is bounded to 1–64. A 429 stops new claims and releases throttled attempts for resume; retryAfterMs reports the provider cooldown.
 The explicitly read --key-file defaults to non-gittract.env in the project root (0600).
 Set OPENCODE_API_KEY in that file; optional OPENCODE_ORG_ID supports session tokens.
-Only label/audit upload email content, to the fixed OpenCode Responses endpoint with store:false.
-review input: one {"exampleId":"...","classification":{...}} record per line; corrections append.
+Only label/audit/refine upload email content, to the fixed OpenCode Responses endpoint with store:false.
+review is human-only: one {"exampleId":"...","classification":{...},"labelSource":"human"} attestation per line; corrections append. AI corrections belong in refine, not the human ledger.
 Exports contain private mail: 0600 files outside this checkout; existing exports are not overwritten.
 Unreviewed ambiguous/truncated results go to review.jsonl, not training files.
 --development-run is repeatable; previously explored sender components cannot enter validation/test.
@@ -135,7 +194,9 @@ It does not train time sensitivity or risk prediction yet. LLM-label scores are 
 predict runs locally without a key; each input line is a ClassificationInput or {input,exampleId}.
 predict/evaluate also accept opt-in plain-JSON word-TFIDF/SVM artifacts; inference needs no Python.
 predict reports abstainedActions separately: disabled/unsupported heads are not confident negative action labels.
+calibrate selects each type/action threshold separately from labeled calibration data, never the release test. Policies bind to exact model bytes and report group support and descriptive Wilson bounds; they are not accuracy guarantees. No qualifying threshold means abstention, not a default cutoff.
 audit sends only {exampleId,input} sources, never existing labels or predictions, to an independent LLM. It persists every success/failure/unstarted record; this is not human ground truth.
+refine accepts up to 5000 {exampleId,input,classification} records. A blind source-only pass precedes anonymous adjudication where needed. Every stage is private and append-only; --resume requires identical inputs/model/profile, and --retry-failed retries only the failed stage. Refinements remain LLM labels, never human reviews.
 `
 
 function credentials(path: string) {
@@ -157,16 +218,30 @@ async function main() {
     left: { type: 'string' }, right: { type: 'string' }, 'reviewed-only': { type: 'boolean' }, 'retry-failed': { type: 'boolean' }, help: { type: 'boolean' },
     'development-run': { type: 'string', multiple: true },
     'defer-test': { type: 'boolean' },
+    resume: { type: 'boolean' },
+    'policy-file': { type: 'string' }, 'target-agreement': { type: 'string', default: '0.95' }, 'minimum-accepted': { type: 'string', default: '20' }, 'minimum-groups': { type: 'string', default: '5' }, 'lower-bound': { type: 'string', default: '0' },
   } })
   if (values.help || !positionals.length) { console.log(help); return }
   const command = positionals[0]
-  if (positionals.length !== 1 || !['inventory', 'prepare', 'label', 'status', 'fork', 'compare', 'review', 'export', 'train', 'evaluate', 'predict', 'audit'].includes(command!)) throw new Error('UNKNOWN_COMMAND_USE_HELP')
+  if (positionals.length !== 1 || !['inventory', 'prepare', 'label', 'status', 'fork', 'compare', 'review', 'export', 'train', 'evaluate', 'predict', 'audit', 'refine', 'calibrate'].includes(command!)) throw new Error('UNKNOWN_COMMAND_USE_HELP')
   const required = (name: 'source' | 'run' | 'dataset' | 'out' | 'input' | 'left' | 'right' | 'from' | 'model-file'): string => {
     const value = values[name]
     if (!value?.trim()) throw new Error(`MISSING_${name.toUpperCase()}`)
     return value
   }
   const print = (value: unknown) => console.log(JSON.stringify(value, null, 2))
+  if (command === 'refine') {
+    if (!values['allow-email-upload']) throw new Error('EXPLICIT_ALLOW_EMAIL_UPLOAD_REQUIRED')
+    const controller = new AbortController(), stop = () => controller.abort()
+    process.once('SIGINT', stop); process.once('SIGTERM', stop)
+    try {
+      const result = await refineFile(required('input'), required('out'), { model: values.model ?? 'gpt-5.6-sol', ...credentials(values['key-file'] ?? resolve(import.meta.dir, '../../../../non-gittract.env')),
+        concurrency: Number(values.concurrency), signal: controller.signal, resume: values.resume, retryFailed: values['retry-failed'], progress: count => { if (count % 100 === 0) print({ persistedCheckpoints: count }) } })
+      print(result)
+      if (result.failed || result.unstarted) process.exitCode = 1
+    } finally { process.off('SIGINT', stop); process.off('SIGTERM', stop) }
+    return
+  }
   if (command === 'audit') {
     if (!values['allow-email-upload']) throw new Error('EXPLICIT_ALLOW_EMAIL_UPLOAD_REQUIRED')
     const { auditExamples, auditInputHash } = await import('./audit')
@@ -190,17 +265,38 @@ async function main() {
     return
   }
   if (command === 'train') { print(await trainExport(required('input'), required('out'), { deferTest: values['defer-test'] })); return }
-  if (command === 'evaluate' || command === 'predict') {
+  if (command === 'evaluate' || command === 'predict' || command === 'calibrate') {
     const savedText = readFileSync(required('model-file'), 'utf8'), saved = JSON.parse(savedText)
     const { evaluateClassifier, evaluatePredictions, predictClassifier } = await import('./model')
     const { validateLinearModel, predictLinearClassifier } = await import('./linear')
     const payload = saved.model ?? saved
     const linear = payload.engine === 'word-tfidf-linear-svc' ? validateLinearModel(payload) : null
     if (!linear && (saved.version !== 1 || saved.dataset?.taxonomyVersion !== taxonomyVersion)) throw new Error('MODEL_VERSION_MISMATCH')
-    const predict = (input: ClassificationInput) => linear ? predictLinearClassifier(linear, input) : predictClassifier(saved.model, input)
+    const { applyPolicy, calibratePolicy, validatePolicy } = await import('./policy')
+    const modelHash = createHash('sha256').update(savedText).digest('hex'), policyText = values['policy-file'] !== undefined ? readFileSync(values['policy-file'], 'utf8') : null
+    let policy: import('./policy').Policy | null = null
+    if (policyText !== null) {
+      let parsed: unknown
+      try { parsed = JSON.parse(policyText) } catch { throw new Error('CLASSIFIER_POLICY_INVALID') }
+      policy = validatePolicy(parsed, modelHash)
+    }
+    const rawPredict = (input: ClassificationInput) => linear ? predictLinearClassifier(linear, input) : predictClassifier(saved.model, input)
+    const rawInput = (p: ReturnType<typeof rawPredict>) => ({ rawPrimaryType: p.rawPrimaryType, typeScore: p.typeScore, actionScores: p.actionScores, eligible: p.eligible, eligibleActions: p.eligibleActions })
+    const predict = (input: ClassificationInput) => { const result = rawPredict(input); return policy ? { ...result, ...applyPolicy(policy, modelHash, rawInput(result)) } : result }
+    const metadata = linear ? { training: linear.training, warnings: ['UNCALIBRATED_SCORES', 'LINEAR_SVC_BASELINE', 'TEST_NOT_USED_FOR_SELECTION'] } : saved.model
+    if (command === 'calibrate') {
+      if (policy) throw new Error('CALIBRATION_REQUIRES_RAW_MODEL_NOT_POLICY')
+      const inputBytes = readFileSync(required('input')), rows = parseExamples(inputBytes.toString('utf8'))
+      const selected = calibratePolicy(rows.map(row => ({ exampleId: row.exampleId!, splitGroup: row.splitGroup!, truth: { primaryType: row.classification.primaryType, actions: row.classification.actions }, prediction: rawInput(rawPredict(row.input)) })),
+        { modelHash, dataHash: createHash('sha256').update(inputBytes).digest('hex'), targetAgreement: Number(values['target-agreement']), minAccepted: Number(values['minimum-accepted']), minGroups: Number(values['minimum-groups']), requireLowerBound: Number(values['lower-bound']) })
+      const directory = privateDirectory(required('out'))
+      savePrivate(resolve(directory, 'policy.json'), selected)
+      print({ samples: selected.samples, groups: selected.groups, criteria: selected.criteria, types: selected.types, actions: selected.actions, note: selected.note })
+      return
+    }
     if (command === 'evaluate') {
       const rows = readExamples(required('input'))
-      print(linear ? evaluatePredictions({ training: linear.training, warnings: ['UNCALIBRATED_SCORES', 'LINEAR_SVC_BASELINE', 'TEST_NOT_USED_FOR_SELECTION'] }, rows, rows.map(row => predictLinearClassifier(linear, row.input))) : evaluateClassifier(saved.model, rows))
+      print(linear || policy ? evaluatePredictions(metadata, rows, rows.map(row => predict(row.input))) : evaluateClassifier(saved.model, rows))
     }
     else {
       const rows = readFileSync(required('input'), 'utf8').split('\n').filter(line => line.trim()).map(line => JSON.parse(line))
@@ -212,7 +308,7 @@ async function main() {
       const root = privateDirectory(required('out'))
       const fd = openSync(resolve(root, 'predictions.jsonl'), 'wx', 0o600)
       try { for (const prediction of predictions) writeSync(fd, JSON.stringify(prediction) + '\n') } finally { closeSync(fd) }
-      savePrivate(resolve(root, 'manifest.json'), { version: 1, modelHash: createHash('sha256').update(savedText).digest('hex'), count: predictions.length, localOnly: true, scores: 'Uncalibrated model scores, not probabilities.' })
+      savePrivate(resolve(root, 'manifest.json'), { version: 1, modelHash, policyHash: policyText !== null ? createHash('sha256').update(policyText).digest('hex') : null, count: predictions.length, localOnly: true, scores: 'Uncalibrated model scores, not probabilities.' })
       print({ predicted: predictions.length, abstained: predictions.filter(row => row.abstained).length, localOnly: true })
     }
     return

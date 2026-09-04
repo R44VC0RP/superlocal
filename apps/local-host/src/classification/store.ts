@@ -108,6 +108,7 @@ export function createDataset(path: string) {
     CREATE TABLE IF NOT EXISTS attempts (id INTEGER PRIMARY KEY, run TEXT NOT NULL, example TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, outcome TEXT, error_code TEXT);
     CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY, run TEXT NOT NULL, example TEXT NOT NULL, classification_json TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(run,example) REFERENCES jobs(run,example));
     CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(run,status,lease_until);
+    CREATE INDEX IF NOT EXISTS jobs_completed_example ON jobs(example) WHERE status='completed';
     CREATE INDEX IF NOT EXISTS reviews_latest ON reviews(run,example,id DESC);
   `)
   const getRun = (id: string): RunRow => {
@@ -214,8 +215,9 @@ export function createDataset(path: string) {
       }
       return { left, right, overlappingCompleted: rows.length, changes }
     },
-    review(run: string, records: Array<{ exampleId: string; classification: unknown }>) {
+    review(run: string, records: Array<{ exampleId: string; classification: unknown; labelSource: 'human' }>) {
       this.assertCurrent(run)
+      if (!Array.isArray(records) || records.some(record => !record || record.labelSource !== 'human' || typeof record.exampleId !== 'string' || Object.keys(record).sort().join('|') !== 'classification|exampleId|labelSource')) throw new Error('REVIEW_HUMAN_ATTESTATION_REQUIRED')
       return db.transaction(() => {
         for (const record of records) {
           const row = db.query<{ input_json: string }, [string, string]>('SELECT input_json FROM examples e JOIN jobs j ON j.example=e.id WHERE j.run=? AND e.id=?').get(run, record.exampleId)
@@ -230,33 +232,34 @@ export function createDataset(path: string) {
       getRun(run)
       if (developmentRuns.length > 20 || new Set(developmentRuns).size !== developmentRuns.length) throw new Error('INVALID_DEVELOPMENT_RUNS')
       const senderKey = (sender: string | null, fallback: string, id: string) => `sender:${digest((sender || fallback).trim().toLowerCase() || id)}`
-      const developmentSenders = new Set<string>()
-      for (const previous of developmentRuns) {
-        getRun(previous)
-        const senders = db.query<{ id: string; sender: string | null; fallback: string }, [string]>("SELECT e.id,json_extract(e.original_json,'$.from.email') sender,json_extract(e.input_json,'$.from') fallback FROM jobs j JOIN examples e ON e.id=j.example WHERE j.run=?").all(previous)
-        for (const row of senders) developmentSenders.add(senderKey(row.sender, row.fallback, row.id))
-      }
       // Labeling failures and model disagreements must never change the cohort's split assignment.
-      const cohort = db.query<{ id: string; origin: string; source: string; thread: string; sender: string | null; input_json: string }, [string]>("SELECT e.id,e.origin,e.source,e.thread,json_extract(e.original_json,'$.from.email') sender,e.input_json FROM jobs j JOIN examples e ON e.id=j.example WHERE j.run=? ORDER BY e.id").all(run)
+      const readCohort = db.query<{ id: string; origin: string; source: string; thread: string; sender: string | null; input_json: string }, [string]>("SELECT e.id,e.origin,e.source,e.thread,json_extract(e.original_json,'$.from.email') sender,e.input_json FROM jobs j JOIN examples e ON e.id=j.example WHERE j.run=? ORDER BY e.id")
+      const cohort = readCohort.all(run), developmentSenders = new Set<string>()
       const parents = new Map<string, string>(), senders = new Map<string, string>()
       const normalizeTemplate = (value: string) => value.normalize('NFKC').toLowerCase()
         .replace(/https?:\/\/\S+|www\.\S+|[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+/gu, ' ')
         .replace(/\p{N}+/gu, '0').replace(/\s+/g, ' ').trim()
       const find = (key: string): string => { const parent = parents.get(key); if (!parent) { parents.set(key, key); return key }; if (parent === key) return key; const root = find(parent); parents.set(key, root); return root }
       const unite = (a: string, b: string) => { const x = find(a), y = find(b); if (x !== y) parents.set(x < y ? y : x, x < y ? x : y) }
-      for (const row of cohort) {
+      const add = (row: typeof cohort[number]) => {
         const input: ClassificationInput = JSON.parse(row.input_json), sender = senderKey(row.sender, input.from, row.id)
-        senders.set(row.id, sender)
         unite(sender, `thread:${row.origin}:${row.source}:${row.thread}`)
         unite(sender, `body:${digest(input.subject + '\n' + input.bodyText)}`)
         const template = normalizeTemplate(input.subject) + '\n' + normalizeTemplate(input.bodyText)
         if (template.length >= 80) unite(sender, `template:${digest(template)}`)
+        return sender
       }
-      const anchors = new Map<string, string>(), exposed = new Set<string>()
+      for (const row of cohort) senders.set(row.id, add(row))
+      // Historical rows need not remain selected in the new run. Their entire
+      // connected identity graph still fences previously explored content out.
+      for (const previous of developmentRuns) {
+        getRun(previous)
+        for (const row of readCohort.all(previous)) developmentSenders.add(add(row))
+      }
+      const anchors = new Map<string, string>(), exposed = new Set([...developmentSenders].map(find))
       for (const sender of senders.values()) {
         const root = find(sender), anchor = anchors.get(root)
         if (!anchor || sender < anchor) anchors.set(root, sender)
-        if (developmentSenders.has(sender)) exposed.add(root)
       }
       return cohort.map(row => {
         const root = find(senders.get(row.id)!), anchor = anchors.get(root)!, bucket = parseInt(digest(anchor).slice(0, 8), 16) % 100
@@ -267,7 +270,7 @@ export function createDataset(path: string) {
     export(run: string, directory: string, reviewedOnly = false, developmentRuns: string[] = []) {
       const config = JSON.parse(getRun(run).config_json) as RunConfiguration
       const root = privateDirectory(directory)
-      const rows = db.query<{ id: string; source: string; message: string; content_hash: string; input_json: string; result_json: string; reviewed: string | null }, [string]>(`SELECT e.id,e.source,e.message,e.content_hash,e.input_json,j.result_json,(SELECT classification_json FROM reviews r WHERE r.run=j.run AND r.example=j.example ORDER BY r.id DESC LIMIT 1) reviewed FROM jobs j JOIN examples e ON e.id=j.example WHERE j.run=? AND j.status='completed' ORDER BY e.id`).all(run)
+      const rows = db.query<{ id: string; source: string; message: string; content_hash: string; input_json: string; result_json: string; reviewed: string | null }, [string]>(`SELECT e.id,e.source,e.message,e.content_hash,e.input_json,j.result_json,(SELECT json_object('classification',json(classification_json),'reviewId',id,'createdAt',created_at) FROM reviews r WHERE r.run=j.run AND r.example=j.example ORDER BY r.id DESC LIMIT 1) reviewed FROM jobs j JOIN examples e ON e.id=j.example WHERE j.run=? AND j.status='completed' ORDER BY e.id`).all(run)
       const partition = new Map(this.partition(run, developmentRuns).map(row => [row.exampleId, row]))
       const descriptors = new Map<string, number>()
       let exported = 0, skipped = 0
@@ -276,9 +279,12 @@ export function createDataset(path: string) {
         for (const name of ['train', 'validation', 'test', 'review']) descriptors.set(name, openSync(resolve(root, `${name}.jsonl`), 'wx', 0o600))
         for (const row of rows) {
           const input: ClassificationInput = JSON.parse(row.input_json), result = JSON.parse(row.result_json)
-          const classification: Classification = row.reviewed ? JSON.parse(row.reviewed) : result.classification
+          const review = row.reviewed ? JSON.parse(row.reviewed) : null
+          const classification = validateClassification(review ? review.classification : result.classification, input)
           const labelSource = row.reviewed ? 'human' : 'llm'
-          const example = { exampleId: row.id, sourceId: row.source, messageId: row.message, contentHash: row.content_hash, input, classification, labelSource, model: result.model, responseId: result.responseId }
+          const example = { exampleId: row.id, sourceId: row.source, messageId: row.message, contentHash: row.content_hash, input, classification, labelSource,
+            model: review ? null : result.model, responseId: review ? null : result.responseId,
+            ...(review ? { review: { id: review.reviewId, createdAt: review.createdAt }, teacher: { model: result.model, responseId: result.responseId } } : {}) }
           writeSync(descriptors.get('review')!, JSON.stringify(example) + '\n')
           if ((reviewedOnly && !row.reviewed) || (!row.reviewed && (input.bodyTruncated || classification.certainty !== 'clear'))) { skipped++; continue }
           const { split, splitGroup } = partition.get(row.id)!
@@ -286,7 +292,7 @@ export function createDataset(path: string) {
           counts[split]++; exported++
         }
         const fd = openSync(resolve(root, 'manifest.json'), 'wx', 0o600)
-        try { writeSync(fd, JSON.stringify({ version: 1, run, createdAt: new Date().toISOString(), config, exported, skipped, counts, reviewedOnly, developmentRuns, splitPolicyVersion: 3, labelQuality: 'LLM labels are not ground truth; held-out LLM labels measure imitation, not accuracy.', sourceFormat: 'Decoded SDK text/HTML snapshots; not original RFC822 MIME.', splitPolicy: 'All selected snapshots, including failed/unlabeled entries. Connected sender/thread/exact-text/normalized-template components anchored to sender; hash 80/10/10. Templates normalize whitespace, URLs, addresses and digits (minimum80characters). Components containing senders from development runs are training-only. Other near-duplicate campaigns still require review.' }, null, 2) + '\n') } finally { closeSync(fd) }
+        try { writeSync(fd, JSON.stringify({ version: 1, run, createdAt: new Date().toISOString(), config, exported, skipped, counts, reviewedOnly, developmentRuns, splitPolicyVersion: 4, labelQuality: 'LLM labels are not ground truth; held-out LLM labels measure imitation, not accuracy.', sourceFormat: 'Decoded SDK text/HTML snapshots; not original RFC822 MIME.', splitPolicy: 'All selected snapshots, including failed/unlabeled entries. Connected sender/thread/exact-text/normalized-template components anchored to sender; hash 80/10/10. Templates normalize whitespace, URLs, addresses and digits (minimum80characters). The complete historical graph of development runs is training-only, including removed source rows and changed senders. Other near-duplicate campaigns still require review.' }, null, 2) + '\n') } finally { closeSync(fd) }
       } finally { for (const fd of descriptors.values()) closeSync(fd) }
       return { run, exported, skipped, counts, reviewExamples: rows.length, reviewedOnly }
     },

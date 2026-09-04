@@ -29,12 +29,14 @@ import { classifyAttention } from '../../../apps/shared/mail-attention'
 import { normalizeSplits } from '../../../apps/shared/splits'
 import { mailFacts } from '../src/mail-facts'
 import { createDataset, inventory, openMailSource } from '../../../apps/local-host/src/classification/store'
-import { labelRun, trainExport } from '../../../apps/local-host/src/classification/cli'
+import { labelRun, trainExport, refineFile } from '../../../apps/local-host/src/classification/cli'
 import { classifyEmail, InferenceError } from '../../../apps/local-host/src/classification/inference'
 import { sourceFactKeys, taxonomy, validateClassification, type Classification, type ClassificationInput } from '../../../apps/local-host/src/classification/schema'
-import { trainClassifier, predictClassifier, evaluateClassifier, evaluatePredictions, type TrainingExample } from '../../../apps/local-host/src/classification/model'
+import { trainClassifier, predictClassifier, evaluateClassifier, evaluatePredictions, validateModel, type TrainingExample } from '../../../apps/local-host/src/classification/model'
 import { validateLinearModel, predictLinearClassifier, type LinearModel } from '../../../apps/local-host/src/classification/linear'
 import { auditExamples, auditInputHash, compareAudits } from '../../../apps/local-host/src/classification/audit'
+import { refineExamples } from '../../../apps/local-host/src/classification/refinement'
+import { calibratePolicy, applyPolicy, validatePolicy, type PolicyRow } from '../../../apps/local-host/src/classification/policy'
 import { createMockHost } from '../../../apps/mock-api/src/host'
 import { createMockProviderDefinition } from '../../../apps/mock-api/src/provider'
 import { MockMailStore } from '../../../apps/mock-api/src/store'
@@ -73,7 +75,81 @@ afterEach(async () => {
 })
 
 describe('offline classification dataset', () => {
-  test('portable linear inference loads bounded JSON, ignores identities and measures abstentions consistently', () => {
+  test('per-label policies preserve source eligibility, reject model substitutions and require independent groups', () => {
+    const actions = Object.keys(taxonomy.actions) as Classification['actions']
+    const rows: PolicyRow[] = Array.from({ length: 80 }, (_, index) => ({ exampleId: `policy-${index}`, splitGroup: `group-${index % 8}`,
+      truth: { primaryType: index < 60 ? 'notification' : 'conversation', actions: [] },
+      prediction: { rawPrimaryType: index < 40 ? 'notification' : 'conversation', typeScore: 0.99, actionScores: Object.fromEntries(actions.map(a => [a, 0.99])) as Record<Classification['actions'][number], number>, eligible: true, eligibleActions: actions },
+    }))
+    const modelHash = 'a'.repeat(64), policy = calibratePolicy(rows, { modelHash, dataHash: 'b'.repeat(64), targetAgreement: 0.95, requireLowerBound: 0.9 })
+    expect(policy.types.notification).toMatchObject({ accepted: 40, correct: 40, groups: 8, status: 'selected' })
+    expect(policy.types.conversation.threshold).toBeNull()
+    expect(policy.actions.reply).toMatchObject({ threshold: null, status: 'no_positive_labels' })
+    expect(applyPolicy(policy, modelHash, rows[0]!.prediction)).toMatchObject({ primaryType: 'notification', abstained: false, actions: [], abstainedActions: actions })
+    expect(applyPolicy(policy, modelHash, { ...rows[0]!.prediction, eligible: false })).toMatchObject({ primaryType: 'unknown', abstained: true })
+    expect(applyPolicy(policy, modelHash, rows[50]!.prediction).primaryType).toBe('unknown')
+    expect(applyPolicy(policy, modelHash, { ...rows[0]!.prediction, typeScore: NaN }).primaryType).toBe('unknown')
+    expect(() => applyPolicy(policy, 'c'.repeat(64), rows[0]!.prediction)).toThrow('CLASSIFIER_POLICY_MODEL_MISMATCH')
+    expect(applyPolicy(validatePolicy(JSON.parse(JSON.stringify(policy)), modelHash), modelHash, rows[0]!.prediction)).toEqual(applyPolicy(policy, modelHash, rows[0]!.prediction))
+    expect(calibratePolicy(rows.map(row => ({ ...row, splitGroup: 'one-campaign' })), { modelHash, dataHash: 'b'.repeat(64) }).types.notification.threshold).toBeNull()
+    expect(() => calibratePolicy([rows[0]!, rows[0]!], { modelHash, dataHash: 'b'.repeat(64) })).toThrow('CLASSIFIER_POLICY_DUPLICATE_ID')
+    const forged = JSON.parse(JSON.stringify(policy)); forged.types.notification.lowerBound = 1
+    expect(() => validatePolicy(forged, modelHash)).toThrow('CLASSIFIER_POLICY_INVALID')
+  })
+
+  test('AI refinement persists blind stages, resumes only failed adjudication and never claims human labels', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'classification-refine-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const input: ClassificationInput = { subject: 'Weekly newsletter', bodyText: 'Our weekly digest. Save 20% on a subscription.', from: 'digest@example.test', to: [], cc: [], receivedAt: '2026-09-01T12:00:00Z', bodyTruncated: false, facts: {} }
+    const original: Classification = { primaryType: 'newsletter', secondaryTypes: [], actions: [], timeSensitivity: 'none', deadline: null, risk: 'none_observed', riskReasons: [], certainty: 'clear', evidence: [{ dimension: 'primaryType', label: 'newsletter', field: 'bodyText', quote: 'Our weekly digest.' }] }
+    const revised: Classification = { ...original, primaryType: 'promotion', evidence: [{ dimension: 'primaryType', label: 'promotion', field: 'bodyText', quote: 'Save 20%' }] }
+    const sourcePath = join(root, 'input.jsonl'), out = join(root, 'run')
+    await writeFile(sourcePath, JSON.stringify({ exampleId: 'fictional-refinement', input, classification: original }) + '\n', { mode: 0o600 })
+    let blindCalls = 0, adjudications = 0
+    const options = { model: 'gpt-5.6-sol', apiKey: 'fictional', concurrency: 1,
+      classifyDeliberately: async (source: ClassificationInput) => { blindCalls++; expect(source).toEqual(input); return { classification: revised, model: 'gpt-5.6-sol', responseId: 'blind_1', usage: { inputTokens: 10, outputTokens: 10 } } },
+      adjudicate: async (source: ClassificationInput, candidates: [Classification, Classification]) => { adjudications++; expect(source).toEqual(input); expect(new Set(candidates.map(x => x.primaryType))).toEqual(new Set(['newsletter', 'promotion'])); throw new InferenceError('INFERENCE_HTTP_ERROR', true, 429, 30_000) },
+    }
+    expect(await refineFile(sourcePath, out, options)).toMatchObject({ failed: 1, trainingEligible: 0, labelSource: 'llm' })
+    expect(blindCalls).toBe(1); expect(adjudications).toBe(1)
+    expect(await refineFile(sourcePath, out, { ...options, resume: true })).toMatchObject({ failed: 1 })
+    expect(blindCalls).toBe(1); expect(adjudications).toBe(1)
+    const success = await refineFile(sourcePath, out, { ...options, resume: true, retryFailed: true,
+      adjudicate: async () => { adjudications++; return { classification: revised, model: 'gpt-5.6-sol', responseId: 'review_1', usage: { inputTokens: 20, outputTokens: 10 } } },
+    })
+    expect(success).toMatchObject({ succeeded: 1, trainingEligible: 1, adjudicated: 1, labelSource: 'llm' })
+    expect(blindCalls).toBe(1); expect(adjudications).toBe(2)
+    const history = (await readFile(join(out, 'records.jsonl'), 'utf8')).trim().split('\n').map(x => JSON.parse(x))
+    expect(history).toHaveLength(3)
+    expect(history[0]).toMatchObject({ stage: 'adjudication', status: 'unstarted' })
+    expect(history[1]).toMatchObject({ status: 'failed', httpStatus: 429 })
+    expect(history[2]).toMatchObject({ selectedClassification: revised, labelSource: 'llm' })
+    expect((await stat(join(out, 'records.jsonl'))).mode & 0o777).toBe(0o600)
+    await expect(refineFile(sourcePath, out, { ...options, resume: true, model: 'different-model' })).rejects.toThrow('REFINEMENT_RESUME_MISMATCH')
+    await expect(refineExamples([{ exampleId: 'fictional-refinement', input, primary: original }], { ...options, completed: [{ ...history[2], trainingEligible: false }] })).rejects.toThrow('REFINEMENT_RESUME_INVALID')
+    let entered!: () => void, release!: () => void, concurrentCalls = 0
+    const started = new Promise<void>(resolve => { entered = resolve }), gate = new Promise<void>(resolve => { release = resolve })
+    const concurrent = { ...options, classifyDeliberately: async () => { concurrentCalls++; entered(); await gate; return { classification: original, model: 'gpt-5.6-sol', responseId: 'one-writer', usage: { inputTokens: 1, outputTokens: 1 } } } }
+    const active = refineFile(sourcePath, join(root, 'concurrent'), concurrent)
+    await started
+    try { await expect(refineFile(sourcePath, join(root, 'concurrent'), { ...concurrent, resume: true, classifyDeliberately: options.classifyDeliberately })).rejects.toThrow('REFINEMENT_WRITER_ACTIVE') }
+    finally { release(); await active }
+    expect(concurrentCalls).toBe(1)
+    expect(await refineFile(sourcePath, join(root, 'concurrent'), { ...concurrent, resume: true })).toMatchObject({ succeeded: 1 })
+    expect(concurrentCalls).toBe(1)
+    expect((await readFile(join(root, 'concurrent', 'records.jsonl'), 'utf8')).trim().split('\n')).toHaveLength(1)
+    const isolatedOut = join(root, 'process-lock'), modulePath = join(import.meta.dir, '../../../apps/local-host/src/classification/cli.ts')
+    const child = Bun.spawn([process.execPath, '--no-env-file', '-e', `import { refineFile } from ${JSON.stringify(modulePath)}; await refineFile(${JSON.stringify(sourcePath)}, ${JSON.stringify(isolatedOut)}, { model: 'gpt-5.6-sol', apiKey: 'fictional', classifyDeliberately: async () => { console.log('LOCKED'); await Bun.stdin.text(); throw new Error('stopped'); } })`], { stdin: 'pipe', stdout: 'pipe', stderr: 'ignore' })
+    try {
+      const reader = child.stdout.getReader(), first = await reader.read()
+      expect(new TextDecoder().decode(first.value)).toContain('LOCKED'); reader.releaseLock()
+      await expect(refineFile(sourcePath, isolatedOut, { ...concurrent, resume: true })).rejects.toThrow('REFINEMENT_WRITER_ACTIVE')
+    } finally { child.kill('SIGKILL'); await child.exited }
+    expect(await refineFile(sourcePath, isolatedOut, { ...concurrent, resume: true })).toMatchObject({ succeeded: 1 })
+    expect((await stat(join(isolatedOut, 'writer.sqlite'))).mode & 0o777).toBe(0o600)
+  })
+
+  test('portable linear inference loads bounded JSON, ignores identities and measures abstentions consistently', async () => {
     const actions = Object.keys(taxonomy.actions) as Classification['actions'], types = Object.keys(taxonomy.types)
     const sourceBooleans = [...sourceFactKeys, 'bodyTruncated'], width = 3 + sourceBooleans.length
     const coef = (index: number) => Array.from({ length: width }, (_, i) => Number(i === index) * 2)
@@ -114,6 +190,19 @@ describe('offline classification dataset', () => {
       (m: LinearModel) => { m.unicode.word = [[90, 65]] },
       (m: LinearModel) => { m.actions.pay.selection = { method: 'validation', threshold: 0, accepted: 30, precision: 1 } },
     ]) { const malformed = JSON.parse(saved); mutate(malformed); expect(() => validateLinearModel(malformed)).toThrow('CLASSIFIER_LINEAR_MODEL_INVALID') }
+    const root = await mkdtemp(join(TEMP_ROOT, 'classification-policy-cli-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const modelPath = join(root, 'model.json'), cliPath = join(import.meta.dir, '../../../apps/local-host/src/classification/cli.ts')
+    await writeFile(modelPath, saved, { mode: 0o600 })
+    const classification: Classification = { primaryType: 'transaction', secondaryTypes: [], actions: [], timeSensitivity: 'none', deadline: null, risk: 'none_observed', riskReasons: [], certainty: 'clear', evidence: [{ dimension: 'primaryType', label: 'transaction', field: 'subject', quote: 'PAY' }] }
+    const inputText = Array.from({ length: 20 }, (_, index) => JSON.stringify({ exampleId: `calibration-${index}`, splitGroup: `group-${index % 5}`, input, classification })).join('\n') + '\n'
+    const calibrated = Bun.spawn([process.execPath, '--no-env-file', cliPath, 'calibrate', '--model-file', modelPath, '--input', '/dev/stdin', '--out', join(root, 'policy')], { stdin: Buffer.from(inputText), stdout: 'ignore', stderr: 'pipe' })
+    expect({ exit: await calibrated.exited, stderr: await new Response(calibrated.stderr).text() }).toEqual({ exit: 0, stderr: '' })
+    const policy = JSON.parse(await readFile(join(root, 'policy', 'policy.json'), 'utf8'))
+    expect(policy).toMatchObject({ samples: 20, dataHash: createHash('sha256').update(inputText).digest('hex') })
+    const invalidPolicy = Bun.spawn([process.execPath, '--no-env-file', cliPath, 'predict', '--model-file', modelPath, '--input', '/dev/stdin', '--out', join(root, 'predictions'), '--policy-file', '/dev/null'], { stdin: Buffer.from(inputText), stdout: 'ignore', stderr: 'pipe' })
+    expect(await invalidPolicy.exited).toBe(1)
+    expect(await new Response(invalidPolicy.stderr).text()).toContain('CLASSIFIER_POLICY_INVALID')
   })
 
   test('blind auditing excludes teacher labels and accounts for failed, missing and changed-source examples', async () => {
@@ -184,6 +273,15 @@ describe('offline classification dataset', () => {
     expect(predictClassifier(guarded, examples[100]!.input).abstainedActions).toContain('reply')
     expect(JSON.stringify(evaluation)).not.toContain('sender100@example.test')
     expect(() => predictClassifier({ ...restored, version: 999 }, examples[100]!.input)).toThrow()
+    const impossible = JSON.parse(JSON.stringify(model))
+    impossible.selection.type = { method: 'validation', accepted: 40, precision: 1 }
+    expect(() => validateModel(impossible)).toThrow('CLASSIFIER_MODEL_INVALID')
+    const disabled = JSON.parse(JSON.stringify(model))
+    disabled.selection.type = { method: 'disabled', accepted: 0, precision: null }; disabled.thresholds.type = 0
+    expect(() => validateModel(disabled)).toThrow('CLASSIFIER_MODEL_INVALID')
+    disabled.thresholds.type = 1.01
+    expect(predictClassifier(disabled, examples[100]!.input)).toMatchObject({ primaryType: 'unknown', abstained: true, rawPrimaryType: 'conversation', eligible: true })
+    expect(predictClassifier(disabled, { ...examples[100]!.input, subject: '', bodyText: '' })).toMatchObject({ eligible: false, eligibleActions: [] })
   })
 
   test('snapshots canonical mail read-only, resumes without relabeling, preserves reviews and exports private grouped training data', async () => {
@@ -248,10 +346,14 @@ describe('offline classification dataset', () => {
     expect((await stat(datasetPath)).mode & 0o777).toBe(0o600)
     expect(() => dataset.export('pilot', out)).toThrow()
     const first = reviewRows.find(row => !row.input.bodyTruncated)
-    expect(() => dataset.review('pilot', [{ exampleId: first.exampleId, classification: first.classification }, { exampleId: 'missing', classification: first.classification }])).toThrow('REVIEW_EXAMPLE_NOT_FOUND')
+    expect(() => dataset.review('pilot', [{ exampleId: first.exampleId, classification: first.classification, labelSource: 'llm' } as any])).toThrow('REVIEW_HUMAN_ATTESTATION_REQUIRED')
+    expect(() => dataset.review('pilot', [{ exampleId: first.exampleId, classification: first.classification, labelSource: 'human' }, { exampleId: 'missing', classification: first.classification, labelSource: 'human' }])).toThrow('REVIEW_EXAMPLE_NOT_FOUND')
     expect(dataset.status('pilot').reviewed).toBe(0)
-    dataset.review('pilot', [{ exampleId: first.exampleId, classification: first.classification }])
+    dataset.review('pilot', [{ exampleId: first.exampleId, classification: first.classification, labelSource: 'human' }])
     expect(dataset.export('pilot', join(root, 'gold'), true)).toMatchObject({ exported: 1, reviewedOnly: true })
+    const reviewed = (await readFile(join(root, 'gold', 'review.jsonl'), 'utf8')).trim().split('\n').map(x => JSON.parse(x)).find(x => x.labelSource === 'human')
+    expect(reviewed).toMatchObject({ model: null, responseId: null, teacher: { model: 'gpt-5.6-sol', responseId: 'fictional-response' } })
+    expect(reviewed.review.id).toBeGreaterThan(0)
     expect(dataset.compare('pilot', 'pilot')).toMatchObject({ overlappingCompleted: 6, changes: {} })
     expect(dataset.fork('pilot', 'second-model', 'gpt-5.6-terra')).toMatchObject({ selected: 6 })
     expect(dataset.partition('second-model')).toEqual(frozenPartition)
@@ -279,6 +381,14 @@ describe('offline classification dataset', () => {
     inspect.close()
     expect(() => dataset.assertCurrent('pilot')).toThrow('RUN_VERSION_CHANGED')
     expect(writer.query<{ count: number }, []>('SELECT count(*) count FROM sdk_messages').get()!.count).toBe(8)
+    writer.query('UPDATE sdk_messages SET deleted=1').run()
+    writer.query(`INSERT INTO sdk_messages SELECT 'm8',owner,account,generation,'new8','fresh-thread',json_set(visible,'$.from.email','new-sender@example.test'),replace(body,'issue 5','issue 999'),'inbox',0 FROM sdk_messages WHERE id='m5'`).run()
+    writer.query(`INSERT INTO sdk_messages SELECT 'm9',owner,account,generation,'new9','same-thread',json_set(visible,'$.from.email','other-new@example.test','$.subject','New response'),?,'inbox',0 FROM sdk_messages WHERE id='m1'`).run(JSON.stringify({ bodyText: 'Fresh response.', bodyHtml: '' }))
+    dataset.prepare(source, { run: 'future', model: 'gpt-5.6-sol', seed: 'future', limit: 'all' })
+    const future = dataset.partition('future', ['pilot'])
+    expect(future).toHaveLength(2)
+    expect(future.every(row => row.split === 'train' && row.developmentExposed)).toBe(true)
+    expect(new Set(future.map(row => row.splitGroup)).size).toBe(1)
     const manifest = JSON.parse(await readFile(join(out, 'manifest.json'), 'utf8'))
     await writeFile(join(out, 'manifest.json'), JSON.stringify({ ...manifest, config: { ...manifest.config, preprocessingVersion: 'obsolete' } }))
     await expect(trainExport(out, join(root, 'bad-model'))).rejects.toThrow('DATASET_VERSION_MISMATCH')
