@@ -7723,7 +7723,7 @@ describe('bounded thread ordering', () => {
 
 import { inferAiTriage, loadAiInferenceConfig, prepareAiText, publicAiProvider, validateAiAssessment, type AiInferenceConfig } from '../../../apps/local-host/src/ai-inference'
 import { countAiTopicMatches, normalizeAiTopics, scoreAiTriage } from '../../../apps/local-host/src/ai-preferences'
-import type { AiAssessment, AiDecision, AiScoreSignals, AiTriageInput } from '../../../apps/shared/ai-triage'
+import { AI_INPUT_POLICY_VERSION, AI_PREFERENCE_VERSION, AI_TRIAGE_VERSION, type AiAssessment, type AiDecision, type AiScoreSignals, type AiTriageInput } from '../../../apps/shared/ai-triage'
 
 describe('AI triage inference and local scoring', () => {
   const configuration: AiInferenceConfig = {
@@ -7805,6 +7805,8 @@ describe('AI triage inference and local scoring', () => {
       [{ ...request.evidence[0]!, quote: 'Fabricated approval' }],
       [{ ...request.evidence[0]!, quote: '' }],
       [{ ...request.evidence[0]!, quote: 'Please  approve the proposal' }],
+      [{ ...request.evidence[0]!, quote: 'Please…approve the proposal' }],
+      [{ ...request.evidence[0]!, quote: 'Please\u00a0approve the proposal' }],
     ]) expect(() => validateAiAssessment({ ...request, evidence }, input)).toThrow('AI_EVIDENCE_INVALID')
     for (const field of ['type', 'response', 'action', 'urgency']) {
       expect(() => validateAiAssessment({ ...request, evidence: request.evidence.filter(item => item.field !== field) }, input)).toThrow('AI_EVIDENCE_REQUIRED')
@@ -7820,6 +7822,11 @@ describe('AI triage inference and local scoring', () => {
     expect(prepareAiText({ preview: 'Only the preview' })).toEqual({ text: 'Only the preview', truncated: true })
     expect(prepareAiText({ bodyText: 'abcd😀ef' }, 5)).toEqual({ text: 'abcd', truncated: true })
     expect(prepareAiText({})).toEqual({ text: '', truncated: false })
+    const unicode = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional offer – save 20%\nDetails', truncated: true }] }
+    const campaign: AiAssessment = { ...unknown, type: 'promotion', response: 'not_needed', urgency: 'none', risk: 'none_observed', certainty: 'clear',
+      evidence: [{ messageRef: 'message-1', quote: 'offer – save 20%\nDetails', field: 'type' }] }
+    expect(validateAiAssessment(campaign, unicode)).toEqual(campaign)
+    expect(() => validateAiAssessment({ ...campaign, evidence: [{ ...campaign.evidence[0]!, quote: 'offer – save 20% Details' }] }, unicode)).toThrow('AI_EVIDENCE_INVALID')
     expect(() => validateAiAssessment(unknown, { ...input, messages: [...input.messages, ...input.messages] })).toThrow('AI_INPUT_INVALID')
   })
 
@@ -7858,12 +7865,13 @@ describe('AI triage inference and local scoring', () => {
       { data: { ...response, output: [] }, outcome: 'invalid', code: 'AI_RESPONSE_INVALID' },
       { data: { ...response, output: [{ type: 'function_call', name: 'pay' }] }, outcome: 'invalid', code: 'AI_RESPONSE_INVALID' },
       { data: { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '{}' }] }] }, outcome: 'invalid', code: 'AI_ASSESSMENT_INVALID' },
+      { data: { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify({ ...request, evidence: [{ ...request.evidence[0]!, quote: 'Please  approve the proposal' }] }) }] }] }, outcome: 'invalid', code: 'AI_EVIDENCE_INVALID' },
       { data: { ...response, status: 'failed', error: { message: configuration.apiKey } }, outcome: 'error', code: 'AI_RESPONSE_FAILED' },
     ]
     for (const variant of variants) {
       const result = await inferAiTriage(input, configuration, { model: 'fixture-model', signal: new AbortController().signal,
         fetcher: (async () => Response.json(variant.data)) as unknown as typeof fetch })
-      expect(result).toMatchObject({ outcome: variant.outcome, code: variant.code, assessment: null,
+      expect(result).toMatchObject({ outcome: variant.outcome, code: variant.code, assessment: null, retryable: false,
         usage: { input: 1000, output: 100, cachedInput: 200, cacheWriteInput: 100, reasoningOutput: 40 } })
       expect(result.estimate?.minimumUsd).toBeGreaterThan(0)
       expect(JSON.stringify(result)).not.toContain(configuration.apiKey)
@@ -8187,6 +8195,61 @@ describe('AI triage service', () => {
     expect(uploaded).toHaveLength(calls)
   })
 
+  test('bounded campaign evidence preserves model clarity without clearing genuine uncertainty, requests, deadlines or risk', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const cases: Array<{ id: string; change: Partial<AiAssessment>; category: 'Important' | 'Other'; clear?: boolean }> = [
+      { id: 'promotion', change: {}, category: 'Other', clear: true },
+      { id: 'newsletter', change: { type: 'newsletter' }, category: 'Other', clear: true },
+      { id: 'cold', change: { type: 'cold_outreach' }, category: 'Other', clear: true },
+      { id: 'insufficient', change: { certainty: 'insufficient' }, category: 'Important' },
+      { id: 'ambiguous', change: { certainty: 'ambiguous' }, category: 'Important' },
+      { id: 'unknown-risk', change: { risk: 'unknown' }, category: 'Important' },
+      { id: 'action', change: { actions: ['review'] }, category: 'Important' },
+      { id: 'reply', change: { response: 'needed' }, category: 'Important' },
+      { id: 'deadline', change: { urgency: 'deadline', deadline: '2026-09-15' }, category: 'Important' },
+      { id: 'personal', change: { type: 'request', response: 'needed', actions: ['reply'] }, category: 'Important' },
+      { id: 'phishing', change: { risk: 'phishing_suspected' }, category: 'Other' },
+    ]
+    await h.seed('alice', 'ai-long-campaigns', cases.map(item => native(`campaign-${item.id}`, {
+      subject: item.id, bodyText: `${['action', 'reply', 'personal', 'deadline'].includes(item.id) ? 'Please reply and review by 2026-09-15.' : item.id === 'phishing' ? 'Enter your password on this suspicious sign-in page.' : 'Fictional offer. Read product details.'}\n${'Long fictional footer. '.repeat(300)}`,
+    })))
+    const uploaded: AiTriageInput[] = []
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async (_url, init) => {
+        const envelope = String(init?.body), input: AiTriageInput = JSON.parse(JSON.parse(envelope).input[0].content)
+        uploaded.push(input)
+        expect(Buffer.byteLength(envelope)).toBeLessThanOrEqual(32768)
+        const message = input.messages[0]!, item = cases.find(item => item.id === message.subject)!
+        const result: AiAssessment = { ...assessment, type: 'promotion', ...item.change, reason: item.id,
+          evidence: [{ messageRef: message.ref, quote: message.subject, field: 'type' }] }
+        const quote = message.text.split('\n')[0]!
+        if (result.response === 'needed') result.evidence.push({ messageRef: message.ref, quote, field: 'response' })
+        if (result.actions.length) result.evidence.push({ messageRef: message.ref, quote, field: 'action' })
+        if (result.urgency === 'deadline') result.evidence.push({ messageRef: message.ref, quote, field: 'urgency' })
+        if (result.risk === 'phishing_suspected') result.evidence.push({ messageRef: message.ref, quote, field: 'risk' })
+        return Response.json({ ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(result) }] }] })
+      }) as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start()
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true, personalization: false })
+    await service.process('alice', { id: 'ai-long-campaign-history', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs[0]?.status === 'running') await Bun.sleep(10) })(), 'bounded campaign classifications')
+    expect(uploaded).toHaveLength(cases.length)
+    expect(uploaded.every(input => input.messages.length === 1 && input.messages[0]!.truncated && Buffer.byteLength(input.messages[0]!.text) <= 3000)).toBe(true)
+    const decisions = (await service.results('alice')).decisions
+    for (const item of cases) {
+      const decision = decisions.find(decision => decision.assessment?.reason === item.id)!
+      expect(decision).toMatchObject({ state: 'ready', schemaVersion: AI_TRIAGE_VERSION, inputPolicyVersion: AI_INPUT_POLICY_VERSION,
+        assessment: { certainty: item.clear ? 'clear' : 'insufficient', ...item.change, ...(item.clear ? {} : { certainty: 'insufficient' }) },
+        score: { category: item.category, version: AI_PREFERENCE_VERSION } })
+    }
+    expect(decisions.find(item => item.assessment?.reason === 'promotion')!.score).toMatchObject({ score: -53, category: 'Other' })
+    expect(decisions.find(item => item.assessment?.reason === 'insufficient')!.score?.contributions).toContainEqual({ name: 'uncertainty_gate', value: 73 })
+    const request = decisions.find(item => item.assessment?.reason === 'personal')!
+    const manual = await service.feedback('alice', { sourceId: request.sourceId, threadId: request.threadId, revision: request.revision, id: 'ai-long-manual-other', category: 'Other' })
+    expect(manual).toMatchObject({ override: { category: 'Other' }, score: { category: 'Other' }, assessment: { response: 'needed', certainty: 'insufficient' } })
+  })
+
   test('feedback is revision-conditional and idempotent, manual clear removes its own vote, and a new reply changes the captured input', async () => {
     const h = await fixture(), database = new Database(':memory:')
     const { account, box } = await h.seed('alice', 'ai-feedback', [native('feedback-first', { threadId: 'feedback-thread' })])
@@ -8326,6 +8389,82 @@ describe('AI triage service', () => {
     expect((await service.results('alice')).decisions).toHaveLength(4)
     expect(calls).toBe(4)
     expect((await service.results('alice')).decisions.every(item => item.holdUntil === null)).toBe(true)
+  })
+
+  test('only a newly requested bounded history job refreshes affected legacy campaigns while restart and clear-cache reuse remain free', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const names = ['refresh-clear', 'refresh-insufficient', 'preserve-clear', 'preserve-ambiguous', 'preserve-manual', 'preserve-unknown']
+    const { account } = await h.seed('alice', 'ai-policy-migration', names.map(name => native(name, { subject: name, bodyText: 'A fictional product campaign with no personal request.' })))
+    const calls: string[] = []
+    const fetcher = (async (_url, init) => {
+      const input: AiTriageInput = JSON.parse(JSON.parse(String(init?.body)).input[0].content), message = input.messages[0]!
+      calls.push(message.subject)
+      const result: AiAssessment = { ...assessment, type: message.subject === 'preserve-unknown' ? 'unknown' : 'promotion',
+        certainty: message.subject === 'preserve-ambiguous' ? 'ambiguous' : ['refresh-insufficient', 'preserve-manual', 'preserve-unknown'].includes(message.subject) ? 'insufficient' : 'clear',
+        reason: message.subject, evidence: [{ messageRef: message.ref, quote: 'fictional product campaign', field: 'type' }] }
+      return Response.json({ ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(result) }] }] })
+    }) as typeof fetch
+    let service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start()
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true, personalization: false })
+    const initialJob = await service.process('alice', { id: 'ai-policy-before-upgrade', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs[0]?.status === 'running') await Bun.sleep(10) })(), 'policy migration seed')
+    expect(calls).toHaveLength(names.length)
+    const manual = (await service.results('alice')).decisions.find(item => item.assessment?.reason === 'preserve-manual')!
+    await service.feedback('alice', { sourceId: account.id, threadId: manual.threadId, revision: manual.revision, id: 'ai-policy-manual-choice', category: 'Other' })
+    await service.close()
+    // Recreate the legacy on-disk shape using only this fictional SDK-backed cache.
+    for (const row of database.query<{ data: string }, []>('SELECT data FROM local_ai_decisions').all()) {
+      const decision: AiDecision = JSON.parse(row.data)
+      delete decision.inputPolicyVersion
+      if (decision.assessment!.reason === 'refresh-clear') {
+        decision.assessment!.certainty = 'insufficient'
+        decision.score = scoreAiTriage(decision.assessment!, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 })
+      }
+      database.query('UPDATE local_ai_decisions SET data=? WHERE owner=? AND source=? AND thread=?').run(JSON.stringify(decision), 'alice', decision.sourceId, decision.threadId)
+      database.query('UPDATE local_ai_cache SET assessment=? WHERE owner=? AND hash=?').run(JSON.stringify(decision.assessment), 'alice', decision.inputHash!)
+    }
+    database.exec('ALTER TABLE local_ai_cache DROP COLUMN input_policy; ALTER TABLE local_ai_jobs DROP COLUMN input_policy')
+    const legacyJob = { ...initialJob, status: 'running', scanned: 0, queued: 0, completed: 0, failed: 0 }
+    database.query('UPDATE local_ai_jobs SET data=?,enumerated=0,examined=0,bytes=0 WHERE id=?').run(JSON.stringify(legacyJob), initialJob.id)
+    database.query('DELETE FROM local_ai_job_items WHERE job=?').run(initialJob.id)
+    const before = database.query<{ data: string }, []>('SELECT data FROM local_ai_decisions ORDER BY thread').all()
+    service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start()
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === initialJob.id)?.status === 'running') await Bun.sleep(10) })(), 'old history restart does not gain refresh consent')
+    expect(calls).toHaveLength(names.length)
+    expect(database.query<{ data: string }, []>('SELECT data FROM local_ai_decisions ORDER BY thread').all()).toEqual(before)
+    expect((await service.results('alice')).decisions.every(item => item.inputPolicyVersion === undefined)).toBe(true)
+    expect((await service.state('alice')).jobs[0]).toMatchObject({ scanned: 0, completed: 0 })
+    const original = (await service.results('alice')).decisions
+    const refresh = await service.process('alice', { id: 'ai-policy-explicit-refresh', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === refresh.id)?.status === 'running') await Bun.sleep(10) })(), 'explicit legacy campaign refresh')
+    expect(calls.slice(names.length).sort()).toEqual(['refresh-clear', 'refresh-insufficient'])
+    expect((await service.state('alice')).jobs.find(item => item.id === refresh.id)).toMatchObject({ scanned: 2, completed: 2, failed: 0 })
+    const current = (await service.results('alice')).decisions
+    for (const old of original) {
+      const decision = current.find(item => item.threadId === old.threadId)!
+      if (!old.assessment!.reason.startsWith('refresh-')) expect(decision).toEqual(old)
+      else {
+        expect(decision.inputHash).toBe(old.inputHash)
+        expect(decision).toMatchObject({ inputPolicyVersion: AI_INPUT_POLICY_VERSION, schemaVersion: AI_TRIAGE_VERSION,
+          assessment: { certainty: old.assessment!.reason === 'refresh-clear' ? 'clear' : 'insufficient' },
+          score: { category: old.assessment!.reason === 'refresh-clear' ? 'Other' : 'Important', version: AI_PREFERENCE_VERSION } })
+      }
+    }
+    // A real model-insufficient result under this policy must not be billed again.
+    const again = await service.process('alice', { id: 'ai-policy-repeat-refresh', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === again.id)?.status === 'running') await Bun.sleep(10) })(), 'repeat history skips current policy')
+    expect(calls).toHaveLength(names.length + 2)
+    // Clearing only a fictional saved decision forces the actual cache-hit path.
+    const clear = current.find(item => item.assessment?.reason === 'preserve-clear')!
+    database.query('DELETE FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?').run('alice', clear.sourceId, clear.threadId)
+    const reuse = await service.process('alice', { id: 'ai-policy-clear-cache-reuse', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === reuse.id)?.status === 'running') await Bun.sleep(10) })(), 'legacy clear assessment cache reuse')
+    expect(calls).toHaveLength(names.length + 2)
+    expect((await service.lookup('alice', [clear])).decisions[0]).toMatchObject({ inputHash: clear.inputHash, inputPolicyVersion: 'input-1', assessment: clear.assessment, score: clear.score })
+    expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: names.length + 2, completed: names.length + 2, reused: 1 })
   })
 
   test('stale context responses are not applied but retain priced usage, and model changes or job cancellation fence in-flight requests', async () => {
