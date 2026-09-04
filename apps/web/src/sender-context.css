@@ -25,7 +25,7 @@
 .sender-compose { display: flex; align-items: center; gap: 8px; min-height: 40px; color: var(--text); text-align: start; }
 .sender-compose .icon { color: var(--muted); }
 .sender-context :is(a, button, summary) { border-radius: 4px; }
-.sender-context :is(a, button, summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.sender-context :is(a, button, summary):focus-visible { outline: none; }
 .sender-context :is(a, button):hover { color: var(--text); }
 .sender-context button:disabled { opacity: 0.5; cursor: default; }
 .sender-context summary { list-style: none; display: flex; align-items: center; cursor: pointer; gap: 8px; min-height: 40px; }

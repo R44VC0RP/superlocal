@@ -162,8 +162,7 @@
 .thread-back-gutter:active .thread-back-arrow { transform: scale(0.96); }
 .message-view .thread-back-gutter:focus-visible { outline: none; }
 .thread-back-gutter:focus-visible .thread-back-arrow {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: none;
 }
 @media (prefers-reduced-motion: reduce) {
   .thread-back-gutter::before,
@@ -178,8 +177,7 @@
 .compose-view button:focus-visible,
 .message-modal button:focus-visible,
 .message-menu input:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: none;
 }
 .compose-view {
   min-width: 0;
@@ -1080,8 +1078,7 @@
   border-radius: 4px;
 }
 .thread-message:focus-visible {
-  outline: 1px solid var(--icon);
-  outline-offset: 2px;
+  outline: none;
 }
 .thread-message.is-expanded {
   position: relative;
@@ -1460,9 +1457,6 @@
 }
 .message-view .thread-message[data-message-canvas] .icon-button:hover {
   color: var(--text);
-}
-.message-view .thread-message[data-message-canvas] :is(button, a):focus-visible {
-  outline-color: var(--text);
 }
 .thread-message[data-message-canvas] .message-attachment,
 .thread-message[data-message-canvas] .thread-invitation button:not(.is-selected) {
