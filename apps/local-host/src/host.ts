@@ -1,5 +1,5 @@
 import { createHmac, randomBytes } from 'node:crypto'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { createMockHost, type MockHost } from '@superlocal/mock-api'
 import { createInbox, InboxError, type Inbox } from 'inbox-sdk'
 import { createInboxApi } from 'inbox-sdk/http'
@@ -13,33 +13,36 @@ import { createAttentionFeedbackStore } from './attention-feedback'
 import { isPerformanceSample } from '../../shared/performance'
 import { createPerformanceLog } from './performance-log'
 import { assertApplicationAuthRuntime, createApplicationAuth } from './application-auth'
+import { loadAiInferenceConfig, type AiInferenceConfig } from './ai-inference'
+import { createAiTriageService } from './ai-triage'
+import type { AiSettings, AiFeedbackInput, AiReadingInput, AiThreadKey } from '../../shared/ai-triage'
 
 const safeHeaders = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', Vary: 'Origin, Cookie' }
 function problem(status: number, code: string, error: string): Response {
   return Response.json({ code, error, retryable: status >= 500 }, { status, headers: safeHeaders })
 }
 
-async function jsonBody(request: Request, kind: 'connection' | 'preferences' | 'performance' = 'connection'): Promise<Record<string, unknown>> {
-  const limit = kind === 'performance' ? 32 * 1024 : kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
-  const description = kind === 'performance' ? 'Performance' : kind === 'preferences' ? 'Preferences' : 'Connection'
+async function jsonBody(request: Request, kind: 'connection' | 'preferences' | 'performance' | 'triage' = 'connection'): Promise<Record<string, unknown>> {
+  const limit = kind === 'triage' ? 64 * 1024 : kind === 'performance' ? 32 * 1024 : kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
+  const description = kind === 'triage' ? 'Triage' : kind === 'performance' ? 'Performance' : kind === 'preferences' ? 'Preferences' : 'Connection'
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) throw new InboxError('HOST_JSON_REQUIRED', 'Use application/json.', 415)
   const length = request.headers.get('content-length')
   if (length && (!/^\d+$/.test(length) || Number(length) > limit)) throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
-  if (request.headers.has('content-encoding') && (kind === 'performance' || request.headers.get('content-encoding') !== 'identity')) throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
+  if (request.headers.has('content-encoding') && (kind === 'performance' || kind === 'triage' || request.headers.get('content-encoding') !== 'identity')) throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
   if (!request.body) throw new InboxError('HOST_INVALID_INPUT', 'A JSON object is required.', 400)
   const reader = request.body.getReader()
   const chunks: Uint8Array[] = []
   let size = 0
   let expired = false
-  const timer = kind === 'performance' ? setTimeout(() => { expired = true; void reader.cancel().catch(() => {}) }, 2000) : undefined
+  const timer = kind === 'performance' || kind === 'triage' ? setTimeout(() => { expired = true; void reader.cancel().catch(() => {}) }, 2000) : undefined
   try {
     while (true) {
       const { value, done } = await reader.read()
-      if (expired) throw new InboxError('HOST_BODY_TIMEOUT', 'Performance input timed out.', 408)
+      if (expired) throw new InboxError('HOST_BODY_TIMEOUT', `${description} input timed out.`, 408)
       if (done) break
       size += value.byteLength
       if (size > limit) {
-        if (kind === 'performance') void reader.cancel().catch(() => {})
+        if (kind === 'performance' || kind === 'triage') void reader.cancel().catch(() => {})
         else await reader.cancel()
         throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
       }
@@ -99,6 +102,17 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     }
   } catch (error) { try { if (mock) await mock.close(); else await inbox?.close() } finally { applicationAuth?.close(); runtime.database.close() }; throw error }
   const liveInbox = inbox
+  let aiConfiguration: AiInferenceConfig | null = null
+  let aiConfigurationProblem: string | undefined
+  try { aiConfiguration = loadAiInferenceConfig(environment.SUPERLOCAL_AI_CONFIG ?? join(dirname(config.configPath), 'ai-inference.json')) }
+  catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined
+    aiConfigurationProblem = typeof code === 'string' && /^AI_CONFIG_[A-Z_]{1,60}$/.test(code) ? code : 'AI_CONFIG_INVALID'
+    console.warn(JSON.stringify({ event: 'local.ai', code: aiConfigurationProblem }))
+  }
+  let aiTriage: ReturnType<typeof createAiTriageService>
+  try { aiTriage = createAiTriageService({ database: runtime.database, inbox: liveInbox, configuration: aiConfiguration, configurationProblem: aiConfigurationProblem, sessionKey: runtime.sessionKey }) }
+  catch (error) { try { if (mock) await mock.close(); else await liveInbox.close() } finally { applicationAuth?.close(); runtime.database.close() }; throw error }
   const performanceLog = createPerformanceLog(runtime.dataDir, config.mode)
   const ownerContexts = new Map<string, {
     inboxPreferences: ReturnType<typeof createInboxViewPreferencesStore>
@@ -231,6 +245,41 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     const owner = identity.id
     const { inboxPreferences, splitPreferences, attentionFeedback, senderDomains } = contextFor(owner)
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
+    if (url.pathname === '/host/ai-triage' || url.pathname.startsWith('/host/ai-triage/')) {
+      const route = url.pathname.slice('/host/ai-triage'.length)
+      const reply = (value: unknown) => Response.json(value, { headers: safeHeaders })
+      if (request.method === 'GET') {
+        const paged = route === '/changes' || route === '/results'
+        if ([...url.searchParams.keys()].some(key => !paged || key !== 'after') || url.searchParams.getAll('after').length > 1) return problem(400, 'HOST_INVALID_INPUT', 'Unexpected triage query parameter.')
+        const raw = url.searchParams.get('after')
+        if (raw !== null && (!/^\d{1,16}$/.test(raw) || !Number.isSafeInteger(Number(raw)))) return problem(400, 'HOST_INVALID_INPUT', 'Invalid triage cursor.')
+        if (route === '') return reply(await aiTriage.state(owner))
+        if (route === '/changes') return reply(await aiTriage.changes(owner, Number(raw ?? 0)))
+        if (route === '/results') return reply(await aiTriage.results(owner, raw === null ? undefined : Number(raw)))
+        if (route === '/diagnostics') return reply(await aiTriage.diagnostics(owner))
+      } else {
+        if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Triage input belongs in the JSON body.')
+        const input = await jsonBody(request, 'triage')
+        if (route === '/settings' && request.method === 'PATCH') return reply(await aiTriage.configure(owner, input as unknown as AiSettings))
+        if (route === '/process' && request.method === 'POST') return reply(await aiTriage.process(owner, input as unknown as { id: string; scope: 'inbox' | 'all'; limit: number }))
+        if (route === '/lookup' && request.method === 'POST') {
+          if (Object.keys(input).join(',') !== 'keys' || !Array.isArray(input.keys) || input.keys.length > 100) return problem(400, 'HOST_INVALID_INPUT', 'Provide up to 100 triage identities.')
+          return reply(await aiTriage.lookup(owner, input.keys as AiThreadKey[]))
+        }
+        if (route === '/feedback' && request.method === 'POST') return reply(await aiTriage.feedback(owner, input as unknown as AiFeedbackInput))
+        if (route === '/reading' && request.method === 'POST') { await aiTriage.reading(owner, input as unknown as AiReadingInput); return reply({ accepted: true }) }
+        if (route === '/reading' && request.method === 'DELETE') {
+          if (Object.keys(input).length) return problem(400, 'HOST_INVALID_INPUT', 'Clearing reading signals takes no parameters.')
+          await aiTriage.clearReading(owner); return reply({ cleared: true })
+        }
+        const job = /^\/jobs\/([a-zA-Z0-9-]{16,80})$/.exec(route)
+        if (job && request.method === 'POST') {
+          if (Object.keys(input).join(',') !== 'action' || !['pause', 'resume', 'cancel'].includes(String(input.action))) return problem(400, 'HOST_INVALID_INPUT', 'Choose pause, resume or cancel.')
+          return reply(await aiTriage.control(owner, job[1]!, input.action as 'pause' | 'resume' | 'cancel'))
+        }
+      }
+      return problem(404, 'NOT_FOUND', 'Triage route not found.')
+    }
     if (url.pathname === '/host/performance') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Performance batches take no query parameters.')
       if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use POST for performance samples.')
@@ -267,7 +316,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       const descriptors: Array<Omit<HostProvider, 'connectionIds'>> = config.mode === 'mock'
         ? [{ id: 'mock', name: 'Offline mock', connection: 'none', enabled: true, ready: true }]
         : registrations.map(registration => registration.onboarding)
-      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true,
+      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true, aiTriage: aiConfiguration !== null,
         preferenceScope: createHmac('sha256', runtime.sessionKey).update(`split-preferences:${owner}`).digest('hex'),
         providers: descriptors.map(provider => ({ ...provider, connectionIds: connections.filter(connection => connection.providerId === provider.id).map(connection => connection.id) })) }, { headers: safeHeaders })
     }
@@ -297,7 +346,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
   }
 
   return {
-    config, inbox: liveInbox,
+    config, inbox: liveInbox, aiTriage,
     get owner() {
       if (applicationAuth) throw new InboxError('HOST_OWNER_REQUIRED', 'Google mail access requires an authenticated user owner.', 400)
       return owner
@@ -316,7 +365,12 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       void task.then(() => pending.delete(task), () => pending.delete(task))
       return task
     },
-    start() { if (!closed) liveInbox.start() },
+    start() {
+      if (!closed) {
+        liveInbox.start()
+        void Promise.resolve(aiTriage.start()).catch(() => console.warn(JSON.stringify({ event: 'local.ai', code: 'AI_START_FAILED' })))
+      }
+    },
     close() {
       if (closing) return closing
       closed = true
@@ -326,6 +380,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         await Promise.all([...ownerContexts.values()].map(context => context.senderDomains.close()))
         await Promise.allSettled([...pending])
         ownerContexts.clear()
+        await aiTriage.close()
         await performanceLog.close()
         try { if (mock) await mock.close(); else await liveInbox.close() } finally { applicationAuth?.close(); runtime.database.close() }
       })()

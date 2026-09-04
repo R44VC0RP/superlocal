@@ -38,9 +38,12 @@ export function selectMailView(
   const queryMatches = search && !serverMatches ? compileSearch(query) : undefined;
   const searchHidden = /in:(trash|spam)/i.test(query);
   const visibleMail: Mail[] = [];
+  const now = Date.now();
+  let holdingMail = false;
   let inboxCount = 0;
   for (const message of accountMail) {
     const inbox = inFolder(message, "Inbox");
+    if (!search && folder === "Inbox" && inbox && (message.aiHoldUntil ?? 0) > now) { holdingMail = true; continue; }
     const attention = inbox || filter === "Important" ? conversationAttention(message) : undefined;
     const matchesSplit = (name: string) => {
       const matcher = matchers.get(name)!;
@@ -60,6 +63,12 @@ export function selectMailView(
     if (filter === "Starred" && !message.starred) continue;
     if (filter === "Important" && attention !== "Important") continue;
     if (filter === "No reply" && !(message.messages.at(-1)?.outgoing ?? message.messages.at(-1)?.email === account)) continue;
+    const assessment = message.triage?.state === "ready" ? message.triage.assessment : null;
+    if (filter === "Needs reply" && assessment?.response !== "needed") continue;
+    if (filter === "Action requested" && !assessment?.actions.length) continue;
+    if (filter === "Time-sensitive" && assessment?.urgency !== "immediate" && assessment?.urgency !== "deadline") continue;
+    if (filter === "Suspicious" && assessment?.risk !== "spam_suspected" && assessment?.risk !== "phishing_suspected") continue;
+    if (filter === "Unassessed" && assessment) continue;
     if (search) {
       if ((message.folder === "Trash" || message.folder === "Spam") && !searchHidden) continue;
       if (!(serverMatches ? serverMatches.has(message.id) : queryMatches!(message))) continue;
@@ -108,6 +117,7 @@ export function selectMailView(
     totalHeight,
     rowHeight,
     inboxCount,
+    holdingMail,
   };
 }
 

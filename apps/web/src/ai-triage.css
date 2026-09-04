@@ -1,0 +1,156 @@
+.ai-triage-settings,
+.ai-settings-form {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.ai-settings-form fieldset {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+}
+.ai-triage-settings p,
+.conversation-triage-dialog p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.ai-section {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+.ai-section h3 {
+  margin: 0;
+  font: inherit;
+  font-weight: 600;
+}
+.ai-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+.ai-triage-settings select {
+  min-width: 0;
+  max-width: 65%;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+.ai-details > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.ai-details > summary:hover {
+  color: var(--text);
+}
+.ai-details > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.ai-details > :not(summary) {
+  margin-top: 12px;
+}
+.ai-key-values {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 6px 16px;
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.ai-key-values dt {
+  color: var(--muted);
+}
+.ai-key-values dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.ai-key-pair {
+  display: contents;
+}
+.ai-mailbox-options,
+.ai-feedback {
+  display: grid;
+  gap: 10px;
+}
+.ai-job {
+  display: grid;
+  gap: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.ai-table-scroll {
+  overflow: auto;
+  max-height: 320px;
+  scrollbar-width: thin;
+}
+.ai-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font: inherit;
+}
+.ai-table th,
+.ai-table td {
+  text-align: left;
+  vertical-align: top;
+  padding: 8px 8px 8px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.ai-table th {
+  font-weight: 500;
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+}
+.ai-table th:first-child {
+  width: 38%;
+}
+.ai-secondary {
+  display: block;
+  color: var(--muted);
+}
+.ai-clear-reading {
+  justify-self: start;
+}
+.conversation-triage-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 220px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--subtle);
+  font: var(--ui-small) / 20px var(--font);
+  cursor: pointer;
+}
+.conversation-triage-trigger span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-triage-trigger:hover {
+  color: var(--text);
+}
+.conversation-triage-trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.conversation-triage-dialog {
+  text-align: left;
+}
+.conversation-triage-dialog .ai-feedback textarea {
+  min-height: 64px;
+}
+.ai-score-reasons {
+  padding-left: 18px;
+}

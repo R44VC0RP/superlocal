@@ -2,6 +2,7 @@ import type { SplitPreferences } from "../../shared/splits";
 import type { MailboxMembership } from "inbox-sdk/types";
 import { configurePerformanceLogging, measureRequest } from "./browser-logs";
 import { privateFetch } from "./application-auth";
+import type { AiTriageActions, AiTriageState, AiDecisionPage, AiHistoryJob, AiDecision } from "../../shared/ai-triage";
 export type SavedSplitPreferences = SplitPreferences & { revision: number };
 export type AttentionFeedback = { id: string; createdAt: string; status: "pending" | "active" | "retracting" | "retracted" | "failed"; count: number; problem?: string; states?: MailboxMembership[] };
 export type AttentionFeedbackTarget = { sourceId: string; messageId: string; mailboxId: string; messageRevision: number; revision: number };
@@ -26,6 +27,7 @@ export type HostConfiguration = {
   allowProviderWrites: boolean;
   preferenceScope?: string;
   performanceLogging?: boolean;
+  aiTriage?: boolean;
   providers: HostProvider[];
 };
 
@@ -134,3 +136,41 @@ export async function recordAttentionFeedback(input: { id: string; targets: Atte
   }
 }
 export const retractAttentionFeedback = (id: string, signal: AbortSignal) => appRequest<AttentionFeedback>(`/host/attention-feedback/${encodeURIComponent(id)}/undo`, signal, "POST");
+
+/** Each store supplies its immutable owner transport and current abort signal. */
+export function createAiTriageClient(signal: () => AbortSignal, fetcher: typeof privateFetch = privateFetch): AiTriageActions {
+  async function call<T>(path: string, method = "GET", input?: unknown): Promise<T> {
+    const requestSignal = signal();
+    const finish = measureRequest(`/host/ai-triage${path}`, method);
+    let response: Response;
+    try {
+      response = await fetcher(`/host/ai-triage${path}`, { method, signal: requestSignal, credentials: "include", cache: "no-store",
+        ...(method === "GET" ? {} : { headers: { "Content-Type": "application/json", "X-Superlocal": "1" }, body: JSON.stringify(input ?? {}) }) });
+      finish(response.status);
+    } catch (error) { finish(0); throw error; }
+    const result = await response.json().catch(() => null);
+    requestSignal.throwIfAborted();
+    if (!response.ok || result === null || typeof result !== "object") {
+      const code = typeof result?.code === "string" && /^(?:AI_|HOST_)[A-Z_]{1,80}$/.test(result.code) ? result.code : "AI_REQUEST_FAILED";
+      const text = response.status === 412 ? "AI triage changed elsewhere. Reload before saving again."
+        : response.status === 429 ? "AI triage is at capacity. Existing mail is still available; try again later."
+        : response.status === 409 ? "This AI triage action is not available in the current state. Reload its settings."
+        : "AI triage could not complete this request. Your mail has not been changed.";
+      throw new InboxViewPreferencesError(text, response.status, code);
+    }
+    return result as T;
+  }
+  return {
+    state: () => call<AiTriageState>(""),
+    configure: input => call<AiTriageState>("/settings", "PATCH", input),
+    process: input => call<AiHistoryJob>("/process", "POST", input),
+    control: (id, action) => call<AiHistoryJob>(`/jobs/${encodeURIComponent(id)}`, "POST", { action }),
+    lookup: keys => call<AiDecisionPage>("/lookup", "POST", { keys }),
+    changes: after => call<AiDecisionPage>(`/changes?after=${encodeURIComponent(after)}`),
+    results: after => call<AiDecisionPage>(after === undefined ? "/results" : `/results?after=${encodeURIComponent(after)}`),
+    feedback: input => call<AiDecision>("/feedback", "POST", input),
+    reading: async input => { await call("/reading", "POST", input); },
+    clearReading: async () => { await call("/reading", "DELETE"); },
+    diagnostics: () => call<Awaited<ReturnType<AiTriageActions["diagnostics"]>>>("/diagnostics"),
+  };
+}

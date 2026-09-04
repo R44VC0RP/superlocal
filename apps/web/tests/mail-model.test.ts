@@ -5,11 +5,13 @@ import { accounts, seedMail, defaultPreferences, type Draft, type Mail } from ".
 import { matchesSearch, splitRuleError } from "../src/mail-search.ts";
 import { selectMailView } from "../src/mail-view.ts";
 import { classifyAttention, conversationAttention } from "../../shared/mail-attention.ts";
+import { AI_TRIAGE_VERSION, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
 import {
   advanceMail,
   appendOutgoing,
+  currentAiDecision,
   inFolder,
   moveMail,
   normalizeSchedule,
@@ -645,6 +647,221 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
   }
 });
+test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bounded arrival holds and aborted generations", async () => {
+  if (!process.versions.bun) {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "SDK-backed AI triage", "--timeout", "30000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output);
+    return;
+  }
+  const [{ createMockHost }, { InboxStore }, { bindApplicationScope }, fs, { tmpdir }, { join }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("../src/application-scope.ts"), import("node:fs/promises"), import("node:os"), import("node:path"),
+  ]);
+  const root = await fs.mkdtemp(join(tmpdir(), "ai-triage-client-"));
+  const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
+  const globals = ["location", "window", "document", "localStorage"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  let host: Awaited<ReturnType<typeof createMockHost>> | undefined, stop: (() => void) | undefined, releaseState: (() => void) | undefined;
+  let stateGate: Promise<void> | undefined, gatedStates = 0, bodyReads = 0, inventories = 0, aiRequests = 0, changeRequests = 0;
+  let decision: AiDecision | undefined, queuedChange: AiDecision | undefined;
+  let aiState: AiTriageState = { configured: false, provider: null, problemCode: null,
+    settings: { revision: 1, enabled: false, mode: "preview", model: "fixture-model", mailboxIds: null, personalization: false, readingSignals: false, interests: [] },
+    queue: { pending: 0, processing: 0, failed: 0 }, jobs: [], cursor: 0,
+    usage: { attempts: 0, completed: 0, failed: 0, reused: 0, unknownUsage: 0, unpriced: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0,
+      cacheWriteInputTokens: 0, reasoningOutputTokens: 0, estimatedMinimumUsd: 0, estimatedMaximumUsd: 0 } };
+  try {
+    console.info = () => {}; console.warn = () => {};
+    host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 31).toString("base64"), token: "fictional-ai-triage-client-token-for-tests", allowProviderWrites: true });
+    const nativeBox = host.store.mailboxes(host.owner)[0];
+    const source = { owner: host.owner, storeId: nativeBox.id, accountId: host.store.link(host.owner, nativeBox.id)!.accountId };
+    const native = host.store.receive(source, { from: "ai-fixture@example.test", to: nativeBox.email, subject: "AI client fixture", text: "Fictional incoming request.", isRead: false });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    const primary = (await host.inbox.mailboxes(host.owner)).find(box => box.sourceId === source.accountId)!;
+    const storage = new Map<string, string>();
+    Object.assign(globalThis, { location: new URL("http://localhost:41999"), window: new EventTarget(),
+      document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
+      localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+    });
+    const binding = bindApplicationScope("a".repeat(64));
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], preferenceScope: "fictional-ai-client" });
+      if (url.pathname === "/host/inbox-preferences") return Response.json({ revision: 1, unifiedMode: "all", includedMailboxIds: [], pinnedMailboxIds: [] });
+      if (url.pathname === "/host/split-preferences") return Response.json({ ...normalizeSplits({}), revision: 1 });
+      if (url.pathname === "/host/attention-feedback") return Response.json([]);
+      if (url.pathname.startsWith("/host/ai-triage")) {
+        aiRequests++;
+        assert.equal(new Headers(init?.headers).get("X-Superlocal-Scope"), binding.scope, "AI transport carries the store's immutable owner fence");
+        if (url.pathname === "/host/ai-triage") {
+          const value = structuredClone(aiState);
+          if (stateGate) { gatedStates++; await stateGate; }
+          return Response.json(value); // Deliberately ignore abort; the real scoped transport must fence late responses.
+        }
+        if (url.pathname.endsWith("/settings")) {
+          aiState = { ...aiState, settings: { ...JSON.parse(String(init?.body)), revision: aiState.settings.revision + 1 } };
+          return Response.json(aiState);
+        }
+        if (url.pathname.endsWith("/changes")) {
+          changeRequests++;
+          const decisions = queuedChange ? [queuedChange] : []; queuedChange = undefined;
+          return Response.json({ decisions, removed: [], cursor: aiState.cursor, hasMore: false, resetRequired: false });
+        }
+        if (url.pathname.endsWith("/lookup") || url.pathname.endsWith("/results")) {
+          if (url.pathname.endsWith("/lookup")) assert.deepEqual(JSON.parse(String(init?.body)).keys, [{ sourceId: decision!.sourceId, threadId: decision!.threadId }]);
+          return Response.json({ decisions: decision ? [decision] : [], removed: [], cursor: aiState.cursor, hasMore: false, resetRequired: false });
+        }
+        throw new Error(`Unexpected AI endpoint ${url.pathname}`);
+      }
+      if (/\/mailboxes\/[^/]+\/messages\/[^/]+$/.test(url.pathname)) bodyReads++;
+      if (url.pathname === "/v1/mailbox-snapshot") inventories++;
+      const headers = new Headers(init?.headers); headers.set("Authorization", "Bearer fictional-ai-triage-client-token-for-tests");
+      return host!.fetch(new Request(url, { ...init, headers }));
+    }) as typeof fetch;
+    const store = new InboxStore(); stop = store.start();
+    for (let attempt = 0; attempt < 800 && !store.getSnapshot().loaded; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(store.getSnapshot().loaded, true, "real SDK fixture loaded");
+    await store.retry();
+    assert.equal(aiRequests, 0, "a host without the optional AI capability performs no AI bootstrap requests");
+    const selected = store.getSnapshot().mail.find(mail => mail.account === primary.id && mail.subject === "AI client fixture")!;
+    assert.ok(selected?.sourceId && selected.sdkThreadId && selected.messages[0].bodyRevision);
+    const keys = [{ sourceId: selected.sourceId, threadId: selected.sdkThreadId }];
+    const baselineCategory = conversationAttention(selected);
+    assert.equal(baselineCategory, "Important");
+    assert.equal(selected.aiHoldUntil, undefined, "startup mail never waits for AI");
+    decision = { ...keys[0], revision: 1, settingsRevision: 1, state: "ready", mailboxIds: [primary.id], messageIds: selected.messages.map(message => message.id),
+      contextVersions: selected.messages.map(message => ({ messageId: message.id, bodyRevision: message.bodyRevision! })), latestMessageId: selected.messages.at(-1)!.id,
+      inputHash: "fictional-input", model: aiState.settings.model, schemaVersion: AI_TRIAGE_VERSION, updatedAt: new Date().toISOString(), holdUntil: null,
+      assessment: { type: "notification", response: "not_needed", actions: [], urgency: "routine", deadline: null, topics: [], risk: "none_observed", certainty: "clear", reason: "Fictional assessment", evidence: [] },
+      score: { category: "Other", score: 10, reasons: [], contributions: [], version: "fixture" }, override: null, problemCode: null };
+    for (const [configured, enabled] of [[false, true], [true, false]]) {
+      aiState = { ...aiState, configured, settings: { ...aiState.settings, revision: aiState.settings.revision + 1, enabled, mode: "apply" } };
+      await store.ai.state(); await store.ai.lookup(keys);
+      const unchanged = store.getSnapshot().mail.find(mail => mail.id === selected.id)!;
+      assert.equal(conversationAttention(unchanged), baselineCategory, `configured=${configured}, enabled=${enabled} does not sort`);
+      assert.equal(unchanged.triage, undefined);
+      assert.equal(unchanged.aiHoldUntil, undefined);
+      const subject = `AI inactive arrival ${configured}:${enabled}`;
+      host.store.receive(source, { from: "inactive-ai@example.test", to: nativeBox.email, subject, text: "Fictional arrival without enabled, configured AI." });
+      await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+      await store.retry();
+      const arrival = store.getSnapshot().mail.find(mail => mail.account === primary.id && mail.subject === subject)!;
+      assert.ok(arrival);
+      assert.equal(arrival.aiHoldUntil, undefined, "disabled or unconfigured AI never holds a new arrival");
+      assert.equal(selectMailView([arrival], primary.id, "Inbox", "Important", defaultPreferences, false, "", null).visibleMail.length, 1);
+    }
+    await store.ai.configure({ ...aiState.settings, enabled: true, mode: "preview" });
+    await store.ai.lookup(keys);
+    const preview = store.getSnapshot().mail.find(mail => mail.id === selected.id)!;
+    assert.equal(preview.triage?.state, "ready");
+    assert.equal(preview.attentionCategory, undefined, "explicit preview opt-in does not apply a score");
+    assert.equal(conversationAttention(preview), baselineCategory);
+    assert.equal(preview.aiHoldUntil, undefined);
+    host.store.receive(source, { from: "preview-ai@example.test", to: nativeBox.email, subject: "AI preview arrival", text: "Fictional arrival during preview." });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    await store.retry();
+    const previewArrival = store.getSnapshot().mail.find(mail => mail.account === primary.id && mail.subject === "AI preview arrival")!;
+    assert.ok(previewArrival);
+    assert.equal(previewArrival.aiHoldUntil, undefined, "preview never holds a new arrival");
+    const beforeApply = new Map(store.getSnapshot().mail.map(mail => [mail.id, mail]));
+    const beforeAiBodies = bodyReads, beforeAiInventories = inventories;
+    await store.ai.configure({ ...aiState.settings, mode: "apply" });
+    const applied = store.getSnapshot().mail.find(mail => mail.id === selected.id)!;
+    assert.equal(applied.attentionCategory, "Other");
+    assert.equal(conversationAttention(applied), "Other");
+    assert.notStrictEqual(applied, preview);
+    for (const mail of store.getSnapshot().mail) {
+      if (mail.sourceId === selected.sourceId && mail.sdkThreadId === selected.sdkThreadId) assert.equal(mail.attentionCategory, "Other", "individual and Unified views receive the same decision");
+      else assert.strictEqual(mail, beforeApply.get(mail.id), "AI apply preserves every unrelated conversation identity");
+    }
+    assert.equal(bodyReads, beforeAiBodies, "AI apply never hydrates SDK bodies");
+    assert.equal(inventories, beforeAiInventories, "AI apply never rescans the SDK inventory");
+    await store.loadThread(selected.id);
+    const cached = store.getSnapshot(), cachedReads = bodyReads;
+    for (let index = 0; index < 3; index++) await store.loadThread(selected.id);
+    assert.equal(bodyReads, cachedReads);
+    assert.strictEqual(store.getSnapshot(), cached, "cached opens publish no replacement model with AI enabled");
+
+    // Only the app-owned AI HTTP boundary is controlled; all mail continues
+    // through the actual offline provider, SDK persistence, summaries and deltas.
+    decision = { ...decision, revision: 2, score: { ...decision.score!, category: "Important", score: 90 } };
+    queuedChange = decision; aiState = { ...aiState, cursor: 2 };
+    const beforeChanges = changeRequests, unaffected = new Map(store.getSnapshot().mail.filter(mail => mail.sdkThreadId !== selected.sdkThreadId).map(mail => [mail.id, mail]));
+    for (let attempt = 0; attempt < 400 && store.getSnapshot().mail.find(mail => mail.id === selected.id)?.triage?.revision !== 2; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(changeRequests > beforeChanges, "background AI changes transport ran");
+    assert.equal(store.getSnapshot().mail.find(mail => mail.id === selected.id)?.attentionCategory, "Important");
+    for (const [id, mail] of unaffected) assert.strictEqual(store.getSnapshot().mail.find(value => value.id === id), mail);
+    assert.equal(bodyReads, cachedReads);
+    assert.equal(inventories, beforeAiInventories);
+
+    host.store.receive(source, { from: "ai-fixture@example.test", to: nativeBox.email, subject: "AI client fixture", threadId: native.threadId,
+      text: "Fictional new reply in the open conversation.", isRead: false });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    await store.retry();
+    const replied = store.getSnapshot().mail.find(mail => mail.id === selected.id)!;
+    assert.equal(replied.messages.length, selected.messages.length + 1);
+    assert.equal(replied.triage?.state, "stale");
+    assert.equal(replied.attentionCategory, undefined);
+    assert.equal(replied.aiHoldUntil, undefined, "a new reply never hides an already-open conversation");
+    assert.equal(selectMailView([replied], primary.id, "Inbox", "Important", defaultPreferences, false, "", null).visibleMail.length, 1);
+
+    host.store.receive(source, { from: "new-ai-fixture@example.test", to: nativeBox.email, subject: "Bounded AI arrival", text: "Fictional new conversation awaiting assessment.", isRead: false });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    const holdStart = Date.now();
+    await store.retry();
+    const arriving = store.getSnapshot().mail.find(mail => mail.account === primary.id && mail.subject === "Bounded AI arrival")!;
+    assert.ok(arriving.aiHoldUntil && arriving.aiHoldUntil > Date.now(), "a genuinely new Inbox conversation receives a short presentation hold");
+    assert.ok(arriving.aiHoldUntil - Date.now() <= 1500);
+    assert.ok(arriving.aiHoldUntil >= holdStart);
+    const held = selectMailView([arriving], primary.id, "Inbox", "Important", defaultPreferences, false, "", null);
+    assert.equal(held.holdingMail, true); assert.equal(held.visibleMail.length, 0);
+    assert.equal(selectMailView([arriving], primary.id, "Inbox", "Important", defaultPreferences, true, "", null, new Set([arriving.id])).visibleMail.length, 1);
+    await new Promise(resolve => setTimeout(resolve, Math.max(0, arriving.aiHoldUntil! - Date.now())));
+    const released = store.getSnapshot().mail.find(mail => mail.id === arriving.id)!;
+    const fallback = selectMailView([released], primary.id, "Inbox", "Important", defaultPreferences, false, "", null);
+    assert.equal(fallback.holdingMail, false);
+    assert.equal(fallback.visibleMail.length, 1, "deadline releases unassessed mail without waiting for inference");
+    assert.equal(conversationAttention(released), "Important");
+    assert.equal(inventories, beforeAiInventories, "reply and arrival holds use bounded SDK deltas");
+
+    const currentAi = store.getSnapshot().ai;
+    aiState = { ...aiState, settings: { ...aiState.settings, revision: 999, model: "obsolete-owner-model" } };
+    stateGate = new Promise(resolve => { releaseState = resolve; });
+    const obsolete = store.ai.state();
+    const rejected = assert.rejects(obsolete, error => error instanceof DOMException && error.name === "AbortError");
+    for (let attempt = 0; attempt < 100 && !gatedStates; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(gatedStates);
+    stop(); stop = undefined;
+    const stopped = store.getSnapshot();
+    releaseState!(); stateGate = undefined;
+    await rejected;
+    assert.strictEqual(store.getSnapshot(), stopped, "a late state response cannot publish into a stopped generation");
+    assert.strictEqual(store.getSnapshot().ai, currentAi);
+    const ownerBoundStore = new InboxStore(), beforeOwnerLock = ownerBoundStore.getSnapshot();
+    const previouslyGated = gatedStates;
+    stateGate = new Promise(resolve => { releaseState = resolve; });
+    const ownerRead = ownerBoundStore.ai.state();
+    const rejectedOwner = assert.rejects(ownerRead, error => error instanceof DOMException && error.name === "AbortError");
+    for (let attempt = 0; attempt < 100 && gatedStates === previouslyGated; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(gatedStates > previouslyGated);
+    binding.lock();
+    releaseState!(); stateGate = undefined;
+    await rejectedOwner;
+    assert.strictEqual(ownerBoundStore.getSnapshot(), beforeOwnerLock, "late AI state is rejected on owner lock even when the store controller remains active");
+    const requestsAtLock = aiRequests;
+    await assert.rejects(ownerBoundStore.ai.lookup(keys), error => error instanceof DOMException && error.name === "AbortError");
+    assert.equal(aiRequests, requestsAtLock, "a locked owner cannot dispatch AI requests");
+  } finally {
+    releaseState?.(); stop?.(); await host?.close(); await fs.rm(root, { recursive: true, force: true });
+    globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
+  }
+});
+
 test("custom filters implement exact sender addresses, OR, parentheses, negation, and stable cached-only matches", () => {
   const john = { ...inbox, from: "John", email: "john@doe.com", subject: "Planning", messages: [] };
   assert.equal(matchesSearch(john, "(from:john@doe.com OR from:jane@doe.com) subject:Planning", false), true);
@@ -694,6 +911,141 @@ test("seed migration preserves customized names, aliases, filters and ordering",
   assert.equal(renamed.splitRules["My Github"], "from:notifications@github.com");
   const reordered = ["Important", "Calendar", "Github", "Inbound", "Other"];
   assert.deepEqual(normalizeSplits({ splits: reordered }).splits, reordered);
+});
+
+test("AI triage fences ready decisions by source, thread, receiving mailbox, confirmed latest message, body and model", () => {
+  const mail: Mail = { ...inbox, id: "box:thread", account: "box", mailboxId: "box", sourceId: "source", sdkThreadId: "thread",
+    messages: [{ ...inbox.messages[0], id: "earlier", bodyRevision: "body-1", outgoing: false },
+      { ...inbox.messages[0], id: "latest", bodyRevision: "body-2", outgoing: false }] };
+  const decision: AiDecision = { sourceId: "source", threadId: "thread", revision: 1, settingsRevision: 1, state: "ready", mailboxIds: ["box"],
+    messageIds: ["earlier", "latest"], contextVersions: [{ messageId: "earlier", bodyRevision: "body-1" }, { messageId: "latest", bodyRevision: "body-2" }],
+    latestMessageId: "latest", inputHash: "fictional-input", model: "fixture-model", schemaVersion: AI_TRIAGE_VERSION, updatedAt: deadline, holdUntil: null,
+    assessment: null, score: { category: "Other", score: 10, reasons: [], contributions: [], version: "fixture" },
+    override: { category: "Other", inputHash: "fictional-input", at: deadline }, problemCode: null };
+  const before = structuredClone({ mail, decision });
+  assert.strictEqual(currentAiDecision(mail, decision, decision.model), decision);
+  assert.equal(currentAiDecision(mail, undefined, decision.model), undefined);
+  for (const changed of [{ sourceId: "other-source" }, { sdkThreadId: "other-thread" }, { mailboxId: "unrelated-box", account: "unrelated-box" }, { operationId: "unsent-operation" }]) {
+    assert.equal(currentAiDecision({ ...mail, ...changed }, decision, decision.model), undefined, JSON.stringify(changed));
+  }
+  for (const [label, candidate, value, model] of [
+    ["later confirmed incoming", { ...mail, messages: [...mail.messages, { ...mail.messages[1], id: "new-reply" }] }, decision, decision.model],
+    ["later confirmed outgoing", { ...mail, messages: [...mail.messages, { ...mail.messages[1], id: "sent-reply", outgoing: true }] }, decision, decision.model],
+    ["earlier context body changed", { ...mail, messages: mail.messages.map((message, index) => index ? message : { ...message, bodyRevision: "changed-body" }) }, decision, decision.model],
+    ["latest body changed", { ...mail, messages: mail.messages.map((message, index) => index ? { ...message, bodyRevision: "changed-body" } : message) }, decision, decision.model],
+    ["model changed", mail, decision, "different-model"],
+    ["older decision latest", mail, { ...decision, latestMessageId: "earlier" }, decision.model],
+  ] satisfies Array<[string, Mail, AiDecision, string]>) {
+    const stale = currentAiDecision(candidate, value, model);
+    assert.equal(stale?.state, "stale", label);
+    assert.equal(stale?.score, null, `${label} cannot change sorting`);
+    assert.equal(stale?.override, null, `${label} cannot retain an override for the old input`);
+  }
+  for (const sendStatus of ["pending", "processing", "uncertain"] as const) {
+    const pending = { ...mail.messages[1], id: "unsent-reply", outgoing: true, pending: true, sendStatus };
+    assert.strictEqual(currentAiDecision({ ...mail, messages: [...mail.messages, pending] }, decision, decision.model), decision, `${sendStatus} is not a confirmed latest reply`);
+    assert.equal(currentAiDecision({ ...mail, messages: [...mail.messages, pending] }, { ...decision, latestMessageId: pending.id }, decision.model)?.state, "stale");
+  }
+  assert.deepEqual({ mail, decision }, before, "validation never mutates shared inputs");
+});
+
+test("AI triage unified merging invalidates a score when another receiving view has the newest reply", () => {
+  const boxes = ["a", "b"].map(id => ({ id, sourceId: "source", name: id, email: `${id}@example.test`, canSend: true }));
+  const decision: AiDecision = { sourceId: "source", threadId: "thread", revision: 1, settingsRevision: 1, state: "ready", mailboxIds: ["a"],
+    messageIds: ["old"], contextVersions: [{ messageId: "old", bodyRevision: "old-body" }], latestMessageId: "old", inputHash: "old-input",
+    model: "fixture-model", schemaVersion: AI_TRIAGE_VERSION, updatedAt: deadline, holdUntil: null, assessment: null,
+    score: { category: "Other", score: 10, reasons: [], contributions: [], version: "fixture" }, override: null, problemCode: null };
+  const first: Mail = { ...inbox, id: "a:thread", sourceId: "source", sdkThreadId: "thread", account: "a", mailboxId: "a", locations: ["Inbox"],
+    receivedAt: Date.parse(deadline) + 3000, triage: decision, attentionCategory: "Other",
+    messages: [{ ...inbox.messages[0], id: "old", bodyRevision: "old-body", receivedAt: deadline, outgoing: false, nativeFolder: "inbox",
+      memberships: [{ mailboxId: "a", messageId: "old", revision: 1, done: false, snoozedUntil: null }] }] };
+  const later: Mail = { ...first, id: "b:thread", account: "b", mailboxId: "b", receivedAt: Date.parse(deadline) + 2000, triage: undefined, attentionCategory: undefined,
+    messages: [{ ...first.messages[0], id: "new-reply", bodyRevision: "new-body", receivedAt: new Date(Date.parse(deadline) + 2000).toISOString(),
+      memberships: [{ mailboxId: "b", messageId: "new-reply", revision: 1, done: false, snoozedUntil: null }] }] };
+  for (const copies of [[first, later], [later, first]]) {
+    const merged = unifiedMail(copies, ["a", "b"], boxes)[0];
+    assert.equal(merged.messages.at(-1)?.id, "new-reply");
+    assert.equal(merged.triage?.state, "stale");
+    assert.equal(merged.triage?.score, null);
+    assert.equal(merged.attentionCategory, undefined);
+    assert.equal(conversationAttention(merged), "Important", "new unassessed reply is never hidden by a receiving alias's old score");
+    assert.equal(currentAiDecision(merged, { ...decision, mailboxIds: ["unrelated-box"] }, decision.model), undefined);
+  }
+  assert.equal(unifiedMail([first, later], ["a"], boxes)[0].attentionCategory, "Other", "an excluded receiving view does not change the included conversation");
+});
+
+test("AI triage categories partition eligible Inbox without overriding Done, snooze, or native Spam", () => {
+  const now = Date.now();
+  const preferences = { ...defaultPreferences, ...normalizeSplits({ splits: ["Important", "Other"] }) };
+  const values: Mail[] = ["eligible", "done", "snoozed", "spam", "outgoing", "pending"].map(kind => ({ ...inbox, id: kind, account: "box", mailboxId: "box",
+    sourceId: "source", sdkThreadId: kind, folder: kind === "done" ? "Done" : kind === "snoozed" ? "Reminders" : kind === "spam" ? "Spam" : "Inbox",
+    locations: [kind === "done" ? "Done" : kind === "snoozed" ? "Reminders" : kind === "spam" ? "Spam" : "Inbox"], attentionCategory: "Other",
+    messages: [{ ...inbox.messages[0], id: kind, outgoing: kind === "outgoing", pending: kind === "pending", nativeFolder: kind === "spam" ? "spam" : "inbox",
+      memberships: [{ mailboxId: "box", messageId: kind, revision: 1, done: kind === "done", snoozedUntil: kind === "snoozed" ? new Date(now + 60_000).toISOString() : null }] }] }));
+  const other = selectMailView(values, "box", "Inbox", "Other", preferences, false, "", null);
+  assert.deepEqual(other.visibleMail.map(mail => mail.id), ["eligible"]);
+  assert.deepEqual(other.splitCounts, { Important: 2, Other: 1 });
+  for (const value of values.slice(1)) assert.equal(conversationAttention(value, now), "Important", `${value.id} is not eligible for the AI Inbox override`);
+  for (const [folder, id] of [["Done", "done"], ["Reminders", "snoozed"], ["Spam", "spam"]]) {
+    assert.deepEqual(selectMailView(values, "box", folder, "Other", preferences, false, "", null).visibleMail.map(mail => mail.id), [id]);
+  }
+  assert.deepEqual(selectMailView(values, "box", "Inbox", "Important", preferences, false, "", null).visibleMail.map(mail => mail.id), ["outgoing", "pending"]);
+});
+
+test("AI triage filters distinguish requested replies and actions from the legacy outgoing No reply filter", () => {
+  const decision: AiDecision = { sourceId: "source", threadId: "thread", revision: 1, settingsRevision: 1, state: "ready", mailboxIds: ["box"], messageIds: ["message"],
+    contextVersions: [{ messageId: "message", bodyRevision: "body" }], latestMessageId: "message", inputHash: "input", model: "fixture-model", schemaVersion: AI_TRIAGE_VERSION,
+    updatedAt: deadline, holdUntil: null, assessment: { type: "request", response: "needed", actions: [], urgency: "routine", deadline: null, topics: [], risk: "none_observed", certainty: "clear", reason: "Fictional request", evidence: [] },
+    score: { category: "Important", score: 80, reasons: [], contributions: [], version: "fixture" }, override: null, problemCode: null };
+  const base: Mail = { ...inbox, account: "box", mailboxId: "box", sourceId: "source", sdkThreadId: "thread", locations: ["Inbox"], triage: decision,
+    messages: [{ ...inbox.messages[0], id: "message", bodyRevision: "body", outgoing: false, nativeFolder: "inbox" }] };
+  const values: Mail[] = [
+    { ...base, id: "needs-reply" },
+    { ...base, id: "review", triage: { ...decision, assessment: { ...decision.assessment!, response: "not_needed", actions: ["review"] } } },
+    { ...base, id: "deadline", triage: { ...decision, assessment: { ...decision.assessment!, response: "optional", urgency: "deadline", deadline } } },
+    { ...base, id: "immediate", triage: { ...decision, assessment: { ...decision.assessment!, response: "unknown", urgency: "immediate" } } },
+    { ...base, id: "phishing", triage: { ...decision, assessment: { ...decision.assessment!, response: "not_needed", risk: "phishing_suspected" } } },
+    { ...base, id: "spam", triage: { ...decision, assessment: { ...decision.assessment!, response: "not_needed", risk: "spam_suspected" } } },
+    { ...base, id: "waiting", messages: [{ ...base.messages[0], outgoing: true }], triage: { ...decision, assessment: { ...decision.assessment!, response: "waiting" } } },
+    { ...base, id: "unassessed", triage: undefined },
+    ...(["pending", "processing", "failed", "stale"] as const).map(state => ({ ...base, id: state, triage: { ...decision, state } })),
+  ];
+  for (const [filter, expected] of [
+    ["Needs reply", ["needs-reply"]], ["Action requested", ["review"]], ["Time-sensitive", ["deadline", "immediate"]],
+    ["Suspicious", ["phishing", "spam"]], ["No reply", ["waiting"]], ["Unassessed", ["unassessed", "pending", "processing", "failed", "stale"]],
+  ] as const) {
+    assert.deepEqual(selectMailView(values, "box", "All Mail", "Important", defaultPreferences, false, "", filter).visibleMail.map(mail => mail.id), expected, filter);
+  }
+});
+
+test("AI triage holds only future Inbox presentation, preserves search and other folders, and releases at expiry", () => {
+  const now = Date.now(), realNow = Date.now;
+  const preferences = { ...defaultPreferences, ...normalizeSplits({ splits: ["Important", "Other"] }) };
+  const held: Mail = { ...inbox, id: "held", account: "box", folder: "Inbox", locations: ["Inbox", "Sent"], split: "Important", aiHoldUntil: now + 1500,
+    messages: [{ ...inbox.messages[0], nativeFolder: "inbox", outgoing: false }] };
+  try {
+    Date.now = () => now;
+    const hidden = selectMailView([held], "box", "Inbox", "Important", preferences, false, "", null);
+    assert.deepEqual(hidden.visibleMail, []);
+    assert.equal(hidden.holdingMail, true, "a held new arrival suppresses the ordinary empty Inbox state");
+    assert.deepEqual(hidden.splitCounts, { Important: 0, Other: 0 });
+    for (const folder of ["Sent", "All Mail"]) {
+      const view = selectMailView([held], "box", folder, "Important", preferences, false, "", null);
+      assert.deepEqual(view.visibleMail, [held], folder);
+      assert.equal(view.holdingMail, false);
+    }
+    const search = selectMailView([held], "box", "Inbox", "Important", preferences, true, "", null, new Set([held.id]));
+    assert.deepEqual(search.visibleMail, [held]);
+    assert.equal(search.holdingMail, false);
+    Date.now = () => now + 1500;
+    const released = selectMailView([held], "box", "Inbox", "Important", preferences, false, "", null);
+    assert.deepEqual(released.visibleMail, [held], "the row releases at, not after, the hold deadline");
+    assert.equal(released.holdingMail, false);
+    assert.equal(released.inboxCount, 1);
+    for (const aiHoldUntil of [undefined, 0, now - 1, Number.NaN]) {
+      assert.equal(selectMailView([{ ...held, aiHoldUntil }], "box", "Inbox", "Important", preferences, false, "", null).visibleMail.length, 1);
+    }
+  } finally { Date.now = realNow; }
 });
 
 const due = Date.parse(deadline);

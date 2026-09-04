@@ -10,13 +10,14 @@ import { getApplicationStorage } from "./storage";
 import { createScopedFetch } from "./application-auth";
 import { getApplicationScope } from "./application-scope";
 import { matchesSearch } from "./mail-search";
-import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, type HostConfiguration, type InboxViewPreferences } from "./host";
+import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, createAiTriageClient, type HostConfiguration, type InboxViewPreferences } from "./host";
 import { readSplitPreferences, writeSplitPreferences, readAttentionFeedback, recordAttentionFeedback, retractAttentionFeedback, InboxViewPreferencesError,
   type SavedSplitPreferences, type AttentionFeedback, type AttentionFeedbackTarget } from "./host";
-import { UNIFIED_ACCOUNT, unifiedMail, unifiedThreadId } from "./mail-model";
+import { UNIFIED_ACCOUNT, unifiedMail, unifiedThreadId, currentAiDecision } from "./mail-model";
 import type { SenderHistoryMessage } from "./sender-context";
 import { classifyAttention, conversationAttention } from "../../shared/mail-attention";
 import { normalizeSplits, type SplitPreferences } from "../../shared/splits";
+import type { AiTriageActions, AiTriageState, AiDecision, AiDecisionPage } from "../../shared/ai-triage";
 
 type Edit = { draft: Draft; revision: number; version: number; error?: string };
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
@@ -68,10 +69,12 @@ export type InboxSnapshot = {
   live: "connecting" | "live" | "polling";
   policy: Policy | null;
   host: HostConfiguration | null;
+  ai: AiTriageState | null;
+  aiError: string | null;
   operations: Readonly<Record<string, Operation>>;
 };
 
-const initial: InboxSnapshot = { accounts: [], mailboxes: [], sources: [], viewPreferences: null, splitPreferences: null, attentionFeedback: [], mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, loaded: false, refreshing: false, pending: 0, unsaved: false, error: null, issues: [], live: "connecting", policy: null, host: null, operations: {} };
+const initial: InboxSnapshot = { accounts: [], mailboxes: [], sources: [], viewPreferences: null, splitPreferences: null, attentionFeedback: [], mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, loaded: false, refreshing: false, pending: 0, unsaved: false, error: null, issues: [], live: "connecting", policy: null, host: null, ai: null, aiError: null, operations: {} };
 const MAX_ISSUES = 4;
 /** A problem stays visible until its recovery has held this long, so ready/error flapping never re-announces. */
 const RESOLVE_HOLD_MS = 10_000;
@@ -221,7 +224,156 @@ export class InboxStore {
   private dismissals = new Map<string, number>();
   private following = false;
   private wake?: () => void;
+  private aiDecisions = new Map<string, AiDecision>();
+  private aiCursor = 0;
+  private aiEpoch = 0;
+  private aiInitialLoaded = false;
+  private aiStateAt = 0;
+  private aiPollTimer?: ReturnType<typeof setTimeout>;
+  private aiPollPromise?: Promise<void>;
+  private aiHoldTimer?: ReturnType<typeof setTimeout>;
+  private aiHolds = new Map<string, { until: number; latestMessageId: string }>();
+  private knownThreads = new Set<string>();
+  private readonly aiTransport = createAiTriageClient(() => AbortSignal.any([this.controller.signal, this.applicationScope.signal]), (input, init) => this.fetch(input, init));
   readonly client: InboxClient;
+
+  readonly ai: AiTriageActions = {
+    ...this.aiTransport,
+    state: async () => {
+      const generation = this.generation;
+      const value = await this.aiTransport.state();
+      if (generation === this.generation) this.receiveAiState(value);
+      return value;
+    },
+    configure: async input => {
+      const generation = this.generation;
+      const value = await this.aiTransport.configure(input);
+      if (generation === this.generation) { this.receiveAiState(value); this.scheduleAi(0); }
+      return value;
+    },
+    process: async input => { const job = await this.aiTransport.process(input); this.aiStateAt = 0; this.scheduleAi(0); return job; },
+    control: async (id, action) => { const job = await this.aiTransport.control(id, action); this.aiStateAt = 0; this.scheduleAi(0); return job; },
+    lookup: async keys => {
+      const epoch = this.aiEpoch, generation = this.generation;
+      const page = await this.aiTransport.lookup(keys);
+      if (epoch === this.aiEpoch && generation === this.generation) this.receiveAiPage(page);
+      return page;
+    },
+    results: async after => {
+      const epoch = this.aiEpoch, generation = this.generation;
+      const page = await this.aiTransport.results(after);
+      if (epoch === this.aiEpoch && generation === this.generation) this.receiveAiPage(page);
+      return page;
+    },
+    feedback: async input => {
+      const epoch = this.aiEpoch, generation = this.generation;
+      const decision = await this.aiTransport.feedback(input);
+      if (epoch === this.aiEpoch && generation === this.generation) this.receiveAiPage({ decisions: [decision], removed: [], cursor: this.aiCursor, hasMore: false, resetRequired: false });
+      this.aiStateAt = 0; this.scheduleAi(0);
+      return decision;
+    },
+    clearReading: async () => { await this.aiTransport.clearReading(); this.aiStateAt = 0; this.scheduleAi(0); },
+  };
+
+  private receiveAiState(value: AiTriageState) {
+    if (this.controller.signal.aborted || this.applicationScope.signal.aborted || !value?.settings || !Number.isSafeInteger(value.settings.revision) || !Number.isSafeInteger(value.cursor)) return;
+    const previous = this.state.ai;
+    if (previous && value.settings.revision < previous.settings.revision) return;
+    const changed = JSON.stringify(previous?.settings) !== JSON.stringify(value.settings) || previous?.configured !== value.configured;
+    this.aiStateAt = Date.now();
+    if (JSON.stringify(previous) !== JSON.stringify(value) || this.state.aiError) this.publish({ ai: value, aiError: null });
+    if (changed) {
+      this.aiEpoch++; this.aiInitialLoaded = false;
+      const threads = new Set([...this.aiDecisions.keys(), ...this.aiHolds.keys()]);
+      if (!previous || previous.configured !== value.configured || previous.settings.enabled !== value.settings.enabled || previous.settings.model !== value.settings.model || JSON.stringify(previous.settings.mailboxIds) !== JSON.stringify(value.settings.mailboxIds)) this.aiDecisions.clear();
+      if (!value.configured || !value.settings.enabled || value.settings.mode !== "apply") this.aiHolds.clear();
+      if (this.state.loaded && threads.size) this.rebuild(threads);
+    }
+    if (!this.aiPollPromise) this.scheduleAi(0);
+  }
+
+  private receiveAiPage(page: AiDecisionPage) {
+    if (this.controller.signal.aborted || this.applicationScope.signal.aborted) return;
+    if (!Array.isArray(page.decisions) || page.decisions.length > 1000 || !Array.isArray(page.removed) || page.removed.length > 1000 || !Number.isSafeInteger(page.cursor) || page.cursor < 0) throw new Error("Invalid AI triage page.");
+    const threads = new Set<string>();
+    for (const value of page.removed) {
+      const key = nativeKey(value.sourceId, value.threadId);
+      if (this.aiDecisions.delete(key)) threads.add(key);
+      if (this.aiHolds.delete(key)) threads.add(key);
+    }
+    for (const decision of page.decisions) {
+      if (!decision || typeof decision.sourceId !== "string" || typeof decision.threadId !== "string" || !Number.isSafeInteger(decision.revision) || !Array.isArray(decision.contextVersions) || decision.contextVersions.length > 8) throw new Error("Invalid AI triage decision.");
+      const key = nativeKey(decision.sourceId, decision.threadId), previous = this.aiDecisions.get(key);
+      if (previous && previous.revision > decision.revision || previous && JSON.stringify(previous) === JSON.stringify(decision)) continue;
+      if (!previous && this.aiDecisions.size >= 100_000) throw new Error("AI triage cache capacity reached.");
+      this.aiDecisions.set(key, decision); threads.add(key);
+      const hold = this.aiHolds.get(key);
+      if (hold && decision.latestMessageId === hold.latestMessageId && ["ready", "failed"].includes(decision.state)) this.aiHolds.delete(key);
+    }
+    if (this.state.loaded && threads.size) this.rebuild(threads);
+  }
+
+  private scheduleAi(delay = 1000) {
+    clearTimeout(this.aiPollTimer);
+    if (!this.started || this.controller.signal.aborted || !(this.state.host?.aiTriage || this.state.ai?.configured)) return;
+    this.aiPollTimer = setTimeout(() => void this.pollAi(), delay);
+  }
+
+  private pollAi(): Promise<void> {
+    if (this.aiPollPromise) return this.aiPollPromise;
+    const signal = this.controller.signal, generation = this.generation;
+    const work = (async () => {
+      if (!this.state.ai || Date.now() - this.aiStateAt > 15_000) await this.ai.state();
+      if (signal.aborted || generation !== this.generation || !this.state.ai?.configured || !this.state.ai.settings.enabled) return;
+      const epoch = this.aiEpoch;
+      if (!this.aiInitialLoaded) {
+        const baseline = this.state.ai.cursor;
+        let after: number | undefined;
+        for (let pages = 0; pages < 1000; pages++) {
+          const page = await this.aiTransport.results(after);
+          if (signal.aborted || generation !== this.generation || epoch !== this.aiEpoch) return;
+          this.receiveAiPage(page);
+          if (!page.hasMore) { this.aiCursor = baseline; this.aiInitialLoaded = true; break; }
+          if (page.cursor <= (after ?? -1)) throw new Error("AI triage cursor did not advance.");
+          after = page.cursor;
+          await pause(0, signal);
+        }
+        if (!this.aiInitialLoaded) throw new Error("AI triage result inventory exceeds the limit.");
+      }
+      for (let pages = 0; pages < 20; pages++) {
+        const page = await this.aiTransport.changes(this.aiCursor);
+        if (signal.aborted || generation !== this.generation || epoch !== this.aiEpoch) return;
+        if (page.resetRequired) {
+          this.aiInitialLoaded = false;
+          const threads = new Set(this.aiDecisions.keys()); this.aiDecisions.clear();
+          if (threads.size) this.rebuild(threads);
+          return;
+        }
+        this.receiveAiPage(page);
+        if (page.cursor < this.aiCursor || page.hasMore && page.cursor === this.aiCursor) throw new Error("AI triage cursor did not advance.");
+        this.aiCursor = page.cursor;
+        if (!page.hasMore) break;
+        await pause(0, signal);
+      }
+      if (this.state.aiError) this.publish({ aiError: null });
+    })().catch(() => {
+      if (!signal.aborted && generation === this.generation) this.publish({ aiError: "AI triage is temporarily unavailable. Existing mail and sorting remain usable." });
+    }).finally(() => {
+      if (this.aiPollPromise !== work) return;
+      this.aiPollPromise = undefined;
+      this.scheduleAi(this.state.aiError ? 5000 : this.state.ai?.settings.enabled ? 1000 : 15_000);
+    });
+    this.aiPollPromise = work; return work;
+  }
+
+  private releaseAiHolds() {
+    clearTimeout(this.aiHoldTimer);
+    const now = Date.now(), threads = new Set<string>();
+    for (const [key, hold] of this.aiHolds) if (hold.until <= now) { this.aiHolds.delete(key); threads.add(key); }
+    if (threads.size) this.rebuild(threads);
+    const next = Math.min(...[...this.aiHolds.values()].map(hold => hold.until));
+    if (Number.isFinite(next)) this.aiHoldTimer = setTimeout(() => this.releaseAiHolds(), Math.max(0, next - Date.now()));
+  }
 
   constructor() {
     this.client = createInboxClient({ baseUrl: location.origin, fetch: (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -428,7 +580,7 @@ export class InboxStore {
         }
         if (generation !== this.generation) return;
         await this.refresh();
-        if (generation === this.generation) void this.follow(generation);
+        if (generation === this.generation) { void this.follow(generation); this.scheduleAi(0); }
       } catch (error) { if (generation === this.generation) this.fail(error, "connect"); }
     })();
     return () => {
@@ -436,6 +588,7 @@ export class InboxStore {
       this.started = false; this.generation++; this.controller.abort();
       this.client.clearCache();
       clearTimeout(this.refreshTimer);
+      clearTimeout(this.aiPollTimer); clearTimeout(this.aiHoldTimer); this.aiPollPromise = undefined; this.aiHolds.clear();
       for (const timer of this.saveTimers.values()) clearTimeout(timer);
       for (const timer of this.issueHolds.values()) clearTimeout(timer);
       this.saveTimers.clear(); this.issueHolds.clear(); this.loadingThreads.clear(); this.refreshPromise = undefined; this.updatesPromise = undefined; this.folderDiscovery = undefined;
@@ -559,6 +712,7 @@ export class InboxStore {
           if (generation !== this.generation || this.mailboxCursor !== baseline) { this.updateAgain = true; continue; }
           if (meta.reset) { await this.bootstrap(); this.updateAgain = true; continue; }
           const changed = new Map<string, MailboxMessageSummary | null>(), threads = meta.threads;
+          const arrivals = new Set(page.events.filter(event => event.type === "mail.changed" && event.change === "created" && event.reason === "arrival" && event.accountId).map(event => nativeKey(event.accountId!, event.entityId)));
           let historyChanged = false;
           const historyFacts = (row?: MailboxMessageSummary) => row && [row.threadId, row.from, row.to, row.cc, row.subject, row.receivedAt, row.folder, row.memberships.map(state => state.mailboxId)];
           for (const received of page.upserts) {
@@ -579,6 +733,15 @@ export class InboxStore {
               if (receipt && state.revision >= receipt.state.revision) this.membershipReceipts.delete(receiptKey);
             }
             if (previous && JSON.stringify(previous) === JSON.stringify(row)) continue;
+            const threadKey = nativeKey(row.sourceId, row.threadId);
+            if (!previous && arrivals.has(key) && !this.knownThreads.has(threadKey) && this.aiHolds.size < 256 && row.folder === "inbox" && !row.folderIds.includes("sent")
+              && this.state.ai?.configured && this.state.ai.settings.enabled && this.state.ai.settings.mode === "apply"
+              && (this.state.ai.settings.mailboxIds === null || row.memberships.some(member => this.state.ai!.settings.mailboxIds!.includes(member.mailboxId)))) {
+              // Only genuinely new conversations get a small presentation hold.
+              // Cached mail, history imports, existing readers and send receipts never wait.
+              this.aiHolds.set(threadKey, { until: Date.now() + 1500, latestMessageId: row.id });
+            }
+            this.knownThreads.add(threadKey);
             historyChanged ||= JSON.stringify(historyFacts(previous)) !== JSON.stringify(historyFacts(row));
             if (previous) threads.add(nativeKey(previous.sourceId, previous.threadId));
             threads.add(nativeKey(row.sourceId, row.threadId)); changed.set(key, row); this.messageRows.set(key, row);
@@ -606,6 +769,7 @@ export class InboxStore {
           for (const thread of this.reconcileFlags()) threads.add(thread);
           if (threads.size || meta.sending) this.rebuild(threads, changed.size > 0, meta.sending, historyChanged);
           else if (this.calendarKey !== displayTimes().key) this.rebuild();
+          if (this.aiHolds.size) { this.releaseAiHolds(); this.scheduleAi(0); }
           this.mailboxCursor = { ...baseline, state: page.state };
           this.updateAgain ||= page.hasMore;
           this.resolve("snapshot");
@@ -674,6 +838,7 @@ export class InboxStore {
       if (!same(splitPreferences, this.state.splitPreferences) && (splitPreferences?.revision ?? 0) >= (this.state.splitPreferences?.revision ?? 0)) patch.splitPreferences = splitPreferences;
       if (feedbackEpoch === this.feedbackEpoch && !same(feedback, this.state.attentionFeedback)) patch.attentionFeedback = feedback;
       if (Object.keys(patch).length) this.publish(patch);
+      this.scheduleAi(0);
     }
     const drafts = new Map(this.rawDrafts);
     if (force) { const current = await this.client.drafts(undefined, { signal }); drafts.clear(); for (const draft of current) drafts.set(draft.id, draft); }
@@ -1035,7 +1200,24 @@ export class InboxStore {
     const included = this.unifiedMailboxIds();
     labelNames[UNIFIED_ACCOUNT] = [...new Set(included.flatMap(id => labelNames[id] ?? []))];
     mail.push(...unifiedMail(mail, included, accounts));
-    for (const conversation of mail) conversation.split = conversationAttention(conversation);
+    if (!onlyThreads) this.knownThreads.clear();
+    const ai = this.state.ai;
+    for (const conversation of mail) {
+      if (conversation.sourceId && conversation.sdkThreadId && !conversation.operationId) {
+        const key = nativeKey(conversation.sourceId, conversation.sdkThreadId);
+        this.knownThreads.add(key);
+        if (ai?.configured && ai.settings.enabled) {
+          const triage = currentAiDecision(conversation, this.aiDecisions.get(key), ai.settings.model);
+          if (triage) {
+            conversation.triage = triage;
+            if (ai.settings.mode === "apply" && triage.state === "ready" && triage.score) conversation.attentionCategory = triage.score.category;
+          }
+          const hold = this.aiHolds.get(key);
+          if (hold && hold.until > Date.now() && ai.settings.mode === "apply" && triage?.state !== "ready") conversation.aiHoldUntil = hold.until;
+        }
+      }
+      conversation.split = conversationAttention(conversation);
+    }
     if (onlyThreads) {
       const updated = new Map(mail.map(conversation => [conversation.id, conversation]));
       let next: Mail[];
