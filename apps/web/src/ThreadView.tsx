@@ -29,6 +29,10 @@ type ThreadComment = {
   createdAt: string;
 };
 
+function messageKey(message?: Mail["messages"][number]): string {
+  return message?.operationId || message?.id || "";
+}
+
 function messageCanvasStyle(background: MessageCanvasColor): CSSProperties {
   const luminance = (color: readonly number[]) => color.reduce((sum, channel, index) => {
     const value = channel / 255;
@@ -104,8 +108,9 @@ export default function ThreadView({
   onImageSettings,
 }: ThreadViewProps) {
   const [expanded, setExpanded] = useState<string[]>([
-    mail.messages.at(-1)?.id || "",
+    messageKey(mail.messages.at(-1)),
   ]);
+  const manuallyExpanded = useRef(false);
   const [details, setDetails] = useState<string[]>([]);
   const [messageCanvases, setMessageCanvases] = useState<Record<string, MessageCanvasColor | null>>({});
   const [response, setResponse] = useState("");
@@ -124,12 +129,13 @@ export default function ThreadView({
   const backGutter = useRef<HTMLButtonElement>(null);
   const reply = useRef<HTMLDivElement>(null);
   const commentInput = useRef<HTMLTextAreaElement>(null);
-  const activeMessage = useRef(mail.messages.at(-1)?.id || "");
+  const activeMessage = useRef(messageKey(mail.messages.at(-1)));
   const scrollToMessage = useRef("");
   const scrollToComment = useRef(false);
-  const revealedReply = useRef("");
+  // A previous send is not a new focus request when this reader is reopened.
+  const revealedReply = useRef(focusOperationId || "");
   const replyResult = focusOperationId ? mail.messages.find(message => message.operationId === focusOperationId) : undefined;
-  const replyFocusKey = replyResult ? `${mail.id}:${replyResult.id}` : "";
+  const replyFocusKey = focusOperationId || "";
   const metadataMailbox = useRef(mail.mailboxId ?? account).current;
   const metadataThread = mail.sdkThreadId ? `${metadataMailbox}:${mail.sdkThreadId}` : mail.id;
   const commentKey = `comments:${encodeURIComponent(metadataMailbox)}:${encodeURIComponent(metadataThread)}`;
@@ -214,11 +220,12 @@ export default function ThreadView({
   }, [commentState.comments]);
 
   useLayoutEffect(() => {
-    setExpanded([mail.messages.at(-1)?.id || ""]);
+    setExpanded([messageKey(mail.messages.at(-1))]);
+    manuallyExpanded.current = false;
     setMessageCanvases({});
-    revealedReply.current = "";
+    revealedReply.current = focusOperationId || "";
     setPendingCommentDelete(null);
-    activeMessage.current = mail.messages.at(-1)?.id || "";
+    activeMessage.current = messageKey(mail.messages.at(-1));
     scrollToMessage.current = "";
     setDetails([]);
     setSnippetRequest(0);
@@ -233,13 +240,27 @@ export default function ThreadView({
   }, [mail.id, metadataThread]);
 
   useLayoutEffect(() => {
+    if (draft) {
+      revealedReply.current = replyFocusKey;
+      // Undo removes the automatic outgoing card before restoring its draft.
+      const keys = new Set(mail.messages.map(messageKey));
+      const latest = messageKey(mail.messages.at(-1));
+      if (!manuallyExpanded.current && latest && !expanded.some(key => keys.has(key))) {
+        setExpanded([latest]);
+        if (!keys.has(activeMessage.current)) activeMessage.current = latest;
+      }
+      return;
+    }
     if (!replyResult || revealedReply.current === replyFocusKey) return;
     revealedReply.current = replyFocusKey;
-    setExpanded(previous => [...new Set([...previous.filter(id => mail.messages.some(message => message.id === id)), replyResult.id])]);
-    activeMessage.current = replyResult.id;
+    const key = messageKey(replyResult);
+    const keys = new Set(mail.messages.map(messageKey));
+    const preserveExpansion = manuallyExpanded.current;
+    setExpanded(previous => preserveExpansion ? [...new Set([...previous.filter(id => keys.has(id)), key])] : [key]);
+    activeMessage.current = key;
     const node = scroller.current?.querySelector<HTMLElement>(`[data-thread-message="${CSS.escape(replyResult.id)}"]`);
     node?.scrollIntoView({ block: "end", behavior: "auto" });
-  }, [replyFocusKey]);
+  }, [replyFocusKey, replyResult?.id, draft?.id]);
 
   useEffect(() => {
     if (draft && !popOut) reply.current?.scrollIntoView({ block: "nearest" });
@@ -294,7 +315,7 @@ export default function ThreadView({
       "[data-thread-message]",
     );
     const messageId =
-      focusedMessage?.dataset.threadMessage || activeMessage.current;
+      focusedMessage?.dataset.threadMessage || mail.messages.find(message => messageKey(message) === activeMessage.current)?.id;
     const messageIndex = mail.messages.findIndex(
       (message) => message.id === messageId,
     );
@@ -363,8 +384,10 @@ export default function ThreadView({
         else if (messageId) revealMessage(messageId);
         else return;
       } else if (event.shiftKey && key === "h" && messageId) {
+        const expandedKey = messageKey(mail.messages.find(message => message.id === messageId));
+        manuallyExpanded.current = true;
         setExpanded((all) =>
-          all.includes(messageId) ? all : [...all, messageId],
+          all.includes(expandedKey) ? all : [...all, expandedKey],
         );
         setDetails((all) =>
           all.includes(messageId)
@@ -374,10 +397,11 @@ export default function ThreadView({
       } else if (event.shiftKey && key === "n") {
         const last = mail.messages.at(-1);
         if (!last) return;
-        activeMessage.current = last.id;
+        activeMessage.current = messageKey(last);
         scrollToMessage.current = last.id;
         // Messages have no unread flag; reveal existing content rather than infer it.
-        setExpanded(mail.messages.map((message) => message.id));
+        manuallyExpanded.current = true;
+        setExpanded(mail.messages.map(messageKey));
       } else if (!event.shiftKey && key === "m" && commentInput.current) {
         commentInput.current.focus();
       } else if (key === " ") {
@@ -423,16 +447,19 @@ export default function ThreadView({
   }
 
   function revealMessage(id: string) {
-    activeMessage.current = id;
+    const key = messageKey(mail.messages.find(message => message.id === id));
+    activeMessage.current = key;
     scrollToMessage.current = id;
-    setExpanded((all) => (all.includes(id) ? [...all] : [...all, id]));
+    manuallyExpanded.current = true;
+    setExpanded((all) => (all.includes(key) ? [...all] : [...all, key]));
   }
 
   function toggleAllMessages() {
+    manuallyExpanded.current = true;
     setExpanded(
       expanded.length === mail.messages.length
-        ? [mail.messages.at(-1)?.id || ""]
-        : mail.messages.map((message) => message.id),
+        ? [messageKey(mail.messages.at(-1))]
+        : mail.messages.map(messageKey),
     );
   }
 
@@ -600,7 +627,8 @@ export default function ThreadView({
             </div>
           )}
           {mail.messages.map((message, index) => {
-            const open = expanded.includes(message.id) || !!replyResult && message.id === replyResult.id && revealedReply.current !== replyFocusKey;
+            const key = messageKey(message);
+            const open = expanded.includes(key) || !draft && !!replyResult && message.id === replyResult.id && revealedReply.current !== replyFocusKey;
             const showDetails = details.includes(message.id);
             const canvas = open && message.loaded !== false && message.bodyFormat !== "text" ? messageCanvases[message.id] : null;
             const sent =
@@ -610,7 +638,7 @@ export default function ThreadView({
               message.body.includes("meeting-invite");
             return (
               <article
-                key={message.operationId || message.id}
+                key={key}
                 data-thread-message={message.id}
                 data-send-operation={message.operationId}
                 data-send-status={message.sendStatus}
@@ -618,12 +646,12 @@ export default function ThreadView({
                 style={canvas ? messageCanvasStyle(canvas) : undefined}
                 tabIndex={-1}
                 onFocusCapture={() => {
-                  activeMessage.current = message.id;
+                  activeMessage.current = key;
                 }}
                 onPointerDownCapture={() => {
-                  activeMessage.current = message.id;
+                  activeMessage.current = key;
                 }}
-                className={`thread-message ${open ? "is-expanded" : "is-collapsed"} ${(replyResult && !draft ? message.id === replyResult.id : index === mail.messages.length - 1) ? "is-final" : ""}`}
+                className={`thread-message ${open ? "is-expanded" : "is-collapsed"} ${index === mail.messages.length - 1 ? "is-final" : ""}`}
                 aria-label={`Message from ${message.from}`}
               >
                 {!open ? (
@@ -632,7 +660,10 @@ export default function ThreadView({
                     className="thread-collapsed-row"
                     aria-expanded={false}
                     title="Expand message (O)"
-                    onClick={() => setExpanded([...expanded, message.id])}
+                    onClick={() => {
+                      manuallyExpanded.current = true;
+                      setExpanded([...expanded, key]);
+                    }}
                   >
                     <strong>{sent ? "Me" : message.from}</strong>
                     <span>{message.bodyFormat === "text" ? message.bodyText : plainText(message.body)}</span>
@@ -718,11 +749,12 @@ export default function ThreadView({
                             name="ChevronUp"
                             title="Collapse message"
                             size={12}
-                            onClick={() =>
+                            onClick={() => {
+                              manuallyExpanded.current = true;
                               setExpanded(
-                                expanded.filter((id) => id !== message.id),
-                              )
-                            }
+                                expanded.filter((id) => id !== key),
+                              );
+                            }}
                           />
                         )}
                       </div>
@@ -763,7 +795,7 @@ export default function ThreadView({
                         text={message.bodyText}
                         format={message.bodyFormat}
                         fontSize={preferences.fontSize}
-                        onActivate={() => { activeMessage.current = message.id; }}
+                        onActivate={() => { activeMessage.current = key; }}
                         onKeyboard={event => bodyKeyboard(event, message.id)}
                         onImageSettings={onImageSettings}
                         onCanvasColor={color => setMessageCanvases(all => {
