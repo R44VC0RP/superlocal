@@ -3,6 +3,7 @@ import type { MailboxMembership } from "inbox-sdk/types";
 import { configurePerformanceLogging, measureRequest } from "./browser-logs";
 import { privateFetch } from "./application-auth";
 import type { AiTriageActions, AiTriageState, AiDecisionPage, AiHistoryJob, AiDecision } from "../../shared/ai-triage";
+import { CATEGORY_BATCH_LIMIT, CATEGORY_RESPONSE_LIMIT, categoryErrorMessages, isCategoryEntry, type CategoryErrorCode, type CategoryEntry, type CategoryPage, type CategoryReceipt, type CategoryTransport } from "../../shared/attention-overrides";
 export type SavedSplitPreferences = SplitPreferences & { revision: number };
 export type AttentionFeedback = { id: string; createdAt: string; status: "pending" | "active" | "retracting" | "retracted" | "failed"; count: number; problem?: string; states?: MailboxMembership[] };
 export type AttentionFeedbackTarget = { sourceId: string; messageId: string; mailboxId: string; messageRevision: number; revision: number };
@@ -28,6 +29,7 @@ export type HostConfiguration = {
   preferenceScope?: string;
   performanceLogging?: boolean;
   aiTriage?: boolean;
+  attentionOverrides?: boolean;
   providers: HostProvider[];
 };
 
@@ -136,6 +138,51 @@ export async function recordAttentionFeedback(input: { id: string; targets: Atte
   }
 }
 export const retractAttentionFeedback = (id: string, signal: AbortSignal) => appRequest<AttentionFeedback>(`/host/attention-feedback/${encodeURIComponent(id)}/undo`, signal, "POST");
+
+export class CategoryRequestError extends InboxViewPreferencesError {
+  declare readonly code: CategoryErrorCode;
+  constructor(code: CategoryErrorCode, status: number) { super(categoryErrorMessages[code], status, code); }
+}
+
+/** Local choices use the store's immutable owner transport, never AI settings. */
+export function createCategoryTransport(signal: () => AbortSignal, fetcher: typeof privateFetch = privateFetch): CategoryTransport {
+  async function call(path: string, method = "GET", input?: unknown): Promise<Record<string, unknown>> {
+    const requestSignal = signal(), finish = measureRequest(`/host/attention-overrides${path}`, method);
+    let response: Response;
+    try {
+      response = await fetcher(`/host/attention-overrides${path}`, { method, signal: requestSignal, credentials: "include", cache: "no-store",
+        ...(method === "GET" ? {} : { headers: { "Content-Type": "application/json", "X-Superlocal": "1" }, body: JSON.stringify(input ?? {}) }) });
+      finish(response.status);
+    } catch (error) { finish(0); throw error; }
+    const text = await response.text(); requestSignal.throwIfAborted();
+    if (new TextEncoder().encode(text).length > CATEGORY_RESPONSE_LIMIT) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+    const result = (() => { try { return JSON.parse(text); } catch { return null; } })();
+    if (!response.ok) {
+      const code = result && typeof result.code === "string" && Object.hasOwn(categoryErrorMessages, result.code) ? result.code as CategoryErrorCode : "HOST_CATEGORY_UNAVAILABLE";
+      throw new CategoryRequestError(code, response.status);
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result) || !Array.isArray(result.entries) || result.entries.length > CATEGORY_BATCH_LIMIT || !result.entries.every(isCategoryEntry)) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+    return result;
+  }
+  const receipt = async (path: string, id: string, input?: unknown): Promise<CategoryReceipt> => {
+    const result = await call(path, "POST", input);
+    if (result.id !== id || typeof result.retracted !== "boolean" || !(result.entries as unknown[]).length) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+    return result as CategoryReceipt;
+  };
+  return {
+    changes: async after => {
+      const result = await call(`?after=${after}`);
+      if (!Number.isSafeInteger(result.cursor) || Number(result.cursor) < 0 || typeof result.hasMore !== "boolean" || typeof result.resetRequired !== "boolean") throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+      return result as CategoryPage;
+    },
+    lookup: async keys => {
+      const result = await call("/lookup", "POST", { keys });
+      return { entries: result.entries as CategoryEntry[] };
+    },
+    classify: input => receipt("", input.id, input),
+    undo: id => receipt(`/${encodeURIComponent(id)}/undo`, id),
+  };
+}
 
 /** Each store supplies its immutable owner transport and current abort signal. */
 export function createAiTriageClient(signal: () => AbortSignal, fetcher: typeof privateFetch = privateFetch): AiTriageActions {

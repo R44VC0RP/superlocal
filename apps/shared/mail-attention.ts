@@ -2,10 +2,11 @@ import type { MailFacts } from '../../packages/inbox-sdk/src/contracts'
 
 export const ATTENTION_VERSION = 'baseline-1'
 export type AttentionDecision = { category: 'Important' | 'Other'; reason: string; version: string }
-export function conversationAttention(mail: { split: string; attentionCategory?: AttentionDecision['category']; messages: Array<{ pending?: boolean; outgoing?: boolean; nativeFolder?: string; attention?: AttentionDecision; memberships?: Array<{ done: boolean; snoozedUntil: string | null }> }> }, now = Date.now()): AttentionDecision['category'] {
+export function conversationAttention(mail: { split: string; attentionCategory?: AttentionDecision['category']; attentionOverride?: { override: { category: AttentionDecision['category'] } | null }; messages: Array<{ pending?: boolean; outgoing?: boolean; nativeFolder?: string; attention?: AttentionDecision; memberships?: Array<{ done: boolean; snoozedUntil: string | null }> }> }, now = Date.now()): AttentionDecision['category'] {
   const eligible = mail.messages.filter(message => !message.pending && !message.outgoing && (!message.nativeFolder || message.nativeFolder === 'inbox')
     && (!message.memberships?.length || message.memberships.some(state => !state.done && (!state.snoozedUntil || Date.parse(state.snoozedUntil) <= now))))
   if (!eligible.length) return 'Important'
+  if (mail.attentionOverride?.override) return mail.attentionOverride.override.category
   if (mail.attentionCategory) return mail.attentionCategory
   if (!eligible.some(message => message.attention)) return eligible.some(message => message.nativeFolder || message.memberships) ? 'Important' : mail.split === 'Other' ? 'Other' : 'Important'
   return eligible.every(message => message.attention?.category === 'Other') ? 'Other' : 'Important'

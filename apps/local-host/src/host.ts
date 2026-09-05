@@ -10,6 +10,7 @@ import { openLocalRuntime } from './runtime'
 import { createSenderDomainHost } from './sender-domains'
 import { createSplitPreferencesStore } from './split-preferences'
 import { createAttentionFeedbackStore } from './attention-feedback'
+import { createAttentionOverridesStore } from './attention-overrides'
 import { isPerformanceSample } from '../../shared/performance'
 import { createPerformanceLog } from './performance-log'
 import { assertApplicationAuthRuntime, createApplicationAuth } from './application-auth'
@@ -22,19 +23,19 @@ function problem(status: number, code: string, error: string): Response {
   return Response.json({ code, error, retryable: status >= 500 }, { status, headers: safeHeaders })
 }
 
-async function jsonBody(request: Request, kind: 'connection' | 'preferences' | 'performance' | 'triage' = 'connection'): Promise<Record<string, unknown>> {
-  const limit = kind === 'triage' ? 64 * 1024 : kind === 'performance' ? 32 * 1024 : kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
-  const description = kind === 'triage' ? 'Triage' : kind === 'performance' ? 'Performance' : kind === 'preferences' ? 'Preferences' : 'Connection'
+async function jsonBody(request: Request, kind: 'connection' | 'preferences' | 'performance' | 'triage' | 'category' = 'connection'): Promise<Record<string, unknown>> {
+  const limit = (kind === 'triage' || kind === 'category') ? 64 * 1024 : kind === 'performance' ? 32 * 1024 : kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
+  const description = kind === 'category' ? 'Category' : kind === 'triage' ? 'Triage' : kind === 'performance' ? 'Performance' : kind === 'preferences' ? 'Preferences' : 'Connection'
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) throw new InboxError('HOST_JSON_REQUIRED', 'Use application/json.', 415)
   const length = request.headers.get('content-length')
   if (length && (!/^\d+$/.test(length) || Number(length) > limit)) throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
-  if (request.headers.has('content-encoding') && (kind === 'performance' || kind === 'triage' || request.headers.get('content-encoding') !== 'identity')) throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
+  if (request.headers.has('content-encoding') && (kind === 'performance' || (kind === 'triage' || kind === 'category') || request.headers.get('content-encoding') !== 'identity')) throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
   if (!request.body) throw new InboxError('HOST_INVALID_INPUT', 'A JSON object is required.', 400)
   const reader = request.body.getReader()
   const chunks: Uint8Array[] = []
   let size = 0
   let expired = false
-  const timer = kind === 'performance' || kind === 'triage' ? setTimeout(() => { expired = true; void reader.cancel().catch(() => {}) }, 2000) : undefined
+  const timer = kind === 'performance' || (kind === 'triage' || kind === 'category') ? setTimeout(() => { expired = true; void reader.cancel().catch(() => {}) }, 2000) : undefined
   try {
     while (true) {
       const { value, done } = await reader.read()
@@ -42,7 +43,7 @@ async function jsonBody(request: Request, kind: 'connection' | 'preferences' | '
       if (done) break
       size += value.byteLength
       if (size > limit) {
-        if (kind === 'performance' || kind === 'triage') void reader.cancel().catch(() => {})
+        if (kind === 'performance' || (kind === 'triage' || kind === 'category')) void reader.cancel().catch(() => {})
         else await reader.cancel()
         throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
       }
@@ -118,6 +119,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     inboxPreferences: ReturnType<typeof createInboxViewPreferencesStore>
     splitPreferences: ReturnType<typeof createSplitPreferencesStore>
     attentionFeedback: ReturnType<typeof createAttentionFeedbackStore>
+    attentionOverrides: ReturnType<typeof createAttentionOverridesStore>
     senderDomains: ReturnType<typeof createSenderDomainHost>
   }>()
   function contextFor(owner: string) {
@@ -130,6 +132,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         inboxPreferences: createInboxViewPreferencesStore(runtime.database, liveInbox, owner),
         splitPreferences: createSplitPreferencesStore(runtime.database, owner),
         attentionFeedback: createAttentionFeedbackStore(runtime.database, liveInbox, owner),
+        attentionOverrides: createAttentionOverridesStore(runtime.database, liveInbox, owner),
         senderDomains: createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' }),
       }
       ownerContexts.set(owner, context)
@@ -243,7 +246,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     }
     if (!ownsMailboxAuthorization(request, identity.id)) return problem(404, 'NOT_FOUND', 'OAuth attempt not found.')
     const owner = identity.id
-    const { inboxPreferences, splitPreferences, attentionFeedback, senderDomains } = contextFor(owner)
+    const { inboxPreferences, splitPreferences, attentionFeedback, attentionOverrides, senderDomains } = contextFor(owner)
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
     if (url.pathname === '/host/ai-triage' || url.pathname.startsWith('/host/ai-triage/')) {
       const route = url.pathname.slice('/host/ai-triage'.length)
@@ -279,6 +282,23 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         }
       }
       return problem(404, 'NOT_FOUND', 'Triage route not found.')
+    }
+    if (url.pathname === '/host/attention-overrides' || url.pathname.startsWith('/host/attention-overrides/')) {
+      const route = url.pathname.slice('/host/attention-overrides'.length)
+      const reply = (value: unknown) => Response.json(value, { headers: safeHeaders })
+      if (request.method === 'GET' && route === '') {
+        const after = url.searchParams.get('after') ?? '0'
+        if ([...url.searchParams.keys()].some(key => key !== 'after') || url.searchParams.getAll('after').length > 1 || !/^\d{1,16}$/.test(after) || !Number.isSafeInteger(Number(after))) return problem(400, 'HOST_CATEGORY_INVALID', 'Invalid category cursor.')
+        return reply(await attentionOverrides.changes(Number(after)))
+      }
+      if (url.search) return problem(400, 'HOST_CATEGORY_INVALID', 'Category input belongs in the JSON body.')
+      if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use GET or POST for category choices.')
+      const input = await jsonBody(request, 'category')
+      if (route === '') return reply(await attentionOverrides.classify(input))
+      if (route === '/lookup' && Object.keys(input).join(',') === 'keys') return reply(await attentionOverrides.lookup(input.keys))
+      const undo = /^\/([a-zA-Z0-9-]{16,80})\/undo$/.exec(route)
+      if (undo && Object.keys(input).length === 0) return reply(await attentionOverrides.undo(undo[1]!))
+      return problem(400, 'HOST_CATEGORY_INVALID', 'Invalid category request.')
     }
     if (url.pathname === '/host/performance') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Performance batches take no query parameters.')
@@ -316,7 +336,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       const descriptors: Array<Omit<HostProvider, 'connectionIds'>> = config.mode === 'mock'
         ? [{ id: 'mock', name: 'Offline mock', connection: 'none', enabled: true, ready: true }]
         : registrations.map(registration => registration.onboarding)
-      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true, aiTriage: aiConfiguration !== null,
+      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true, aiTriage: aiConfiguration !== null, attentionOverrides: true,
         preferenceScope: createHmac('sha256', runtime.sessionKey).update(`split-preferences:${owner}`).digest('hex'),
         providers: descriptors.map(provider => ({ ...provider, connectionIds: connections.filter(connection => connection.providerId === provider.id).map(connection => connection.id) })) }, { headers: safeHeaders })
     }

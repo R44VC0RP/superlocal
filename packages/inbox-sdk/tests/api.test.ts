@@ -19,6 +19,8 @@ import { createGoogleOAuthClient } from '../server/google-client'
 import { createLocalHost } from '../../../apps/local-host/src/host'
 import { loadLocalConfig, type LocalConfig } from '../../../apps/local-host/src/config'
 import { createAttentionFeedbackStore } from '../../../apps/local-host/src/attention-feedback'
+import { createAttentionOverridesStore, CATEGORY_STORAGE_LIMITS } from '../../../apps/local-host/src/attention-overrides'
+import { isCategoryCommand, isCategoryEntry, type CategoryCommand, type CategoryContext, type CategoryEntry } from '../../../apps/shared/attention-overrides'
 import { createSplitPreferencesStore } from '../../../apps/local-host/src/split-preferences'
 import { classifyAttention } from '../../../apps/shared/mail-attention'
 import { normalizeSplits } from '../../../apps/shared/splits'
@@ -750,6 +752,7 @@ describe('Google application authentication', () => {
       ['/host/config', 'GET'], ['/v1/accounts', 'GET'], ['/v1/events', 'GET'], ['/v1/policy', 'GET'], ['/host/inbox-preferences', 'GET'], ['/host/split-preferences', 'GET'], ['/host/attention-feedback', 'GET'],
       ['/host/sender-domains/example.test', 'GET'], ['/v1/mailbox-snapshot', 'POST', '{}'], ['/v1/drafts', 'POST', '{}'], ['/v1/policy', 'PATCH', '{"remoteImages":false}'],
       ['/host/split-preferences', 'PUT', '{}'], ['/host/attention-feedback', 'POST', '{}'], ['/host/providers/gmail/connect', 'POST', '{}'], ['/v1/accounts/foreign', 'DELETE'],
+      ['/host/attention-overrides?after=0', 'GET'], ['/host/attention-overrides', 'POST', '{}'], ['/host/attention-overrides/lookup', 'POST', '{}'], ['/host/attention-overrides/00000000-0000-0000-0000-000000000000/undo', 'POST', '{}'],
     ]) {
       const response = await f.request(path!, { method, body, cookie: b.sessionCookie, scope })
       expect(response.status).toBe(409)
@@ -1220,6 +1223,280 @@ describe('Attention baseline and explicit feedback', () => {
       expect(store.write({ ...renamed, splits: ['Important', 'Other'], splitRules: {} }).splits).toEqual(['Important', 'Other'])
       expect(normalizeSplits({ ...legacy, splitRules: { Github: 'from:custom@example.test', John: 'from:john@doe.com' } }).splits).toContain('Github')
     } finally { database.close() }
+  })
+})
+
+describe('explicit non-AI category overrides', () => {
+  test('unassessed categories persist independent of AI and mail state, replay exact receipts and conditionally Undo', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account, box } = await h.seed('alice', 'manual-category', [native('category-one'), native('category-two')])
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const rows = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items
+    const targets = rows.map(message => ({ ifRevision: 0, context: { sourceId: account.id, threadId: message.threadId, sourceGeneration: account.generation, mailboxIds: [mailbox.id], latestMessageId: message.id,
+      messages: [{ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: message.memberships.map(state => ({ mailboxId: state.mailboxId, revision: state.revision })) }] } }))
+    const database = new Database(join(h.directory, 'manual-category.sqlite'))
+    cleanup.push(async () => { database.close() })
+    let store = createAttentionOverridesStore(database, h.inbox, 'alice')
+    const calls = structuredClone(box.calls), baseline = await h.inbox.changes('alice')
+    const body = spyOn(h.inbox, 'mailboxMessage').mockImplementation(async () => { throw new Error('Manual categories must not hydrate bodies') })
+    const thread = spyOn(h.inbox, 'thread').mockImplementation(async () => { throw new Error('Manual categories must not invent a head CAS or read thread bodies') })
+    const input: CategoryCommand = { id: 'manual-category-command-001', category: 'Other', targets }
+    let coerced = 0
+    for (const category of [['Other'], ['Important'], { category: 'Other' }, { toString: () => { coerced++; return 'Other' } }, null, 0]) {
+      expect(isCategoryCommand({ ...input, category })).toBe(false)
+      expect(isCategoryEntry({ sourceId: account.id, threadId: targets[0]!.context.threadId, revision: 1, override: { category, context: targets[0]!.context } })).toBe(false)
+      await expect(store.classify({ ...input, category })).rejects.toMatchObject({ code: 'HOST_CATEGORY_INVALID', status: 400 })
+    }
+    expect(coerced).toBe(0)
+    expect((await store.changes(0)).entries).toEqual([])
+    const other = await store.classify(input)
+    expect(other.entries.every(entry => entry.override?.category === 'Other')).toBe(true)
+    expect(await store.classify(input)).toEqual(other)
+    await expect(store.classify({ ...input, category: 'Important' })).rejects.toMatchObject({ code: 'HOST_CATEGORY_IDEMPOTENCY_CONFLICT', status: 409 })
+    const important = await store.classify({ ...input, id: 'manual-category-command-002', category: 'Important', targets: targets.map((target, index) => ({ ...target, ifRevision: other.entries[index]!.revision })) })
+    expect(important.entries.every(entry => entry.override?.category === 'Important')).toBe(true)
+    expect(await store.classify(input)).toEqual(other)
+    expect((await store.lookup(targets.map(target => ({ sourceId: account.id, threadId: target.context.threadId })))).entries).toEqual(important.entries)
+    await expect(store.undo(input.id)).rejects.toMatchObject({ code: 'HOST_CATEGORY_UNDO_CONFLICT', status: 412 })
+    const restored = await store.undo(important.id)
+    expect(restored.retracted).toBe(true)
+    expect(restored.entries.every(entry => entry.override?.category === 'Other')).toBe(true)
+    expect(await store.undo(important.id)).toEqual(restored)
+    expect((await store.changes(important.entries.at(-1)!.revision)).entries).toEqual(restored.entries)
+    expect((await h.inbox.changes('alice')).state).toBe(baseline.state)
+    expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.map(row => row.memberships)).toEqual(rows.map(row => row.memberships))
+    expect(box.calls).toEqual(calls)
+    expect(body).not.toHaveBeenCalled(); expect(thread).not.toHaveBeenCalled()
+    body.mockRestore(); thread.mockRestore()
+    await h.restart()
+    store = createAttentionOverridesStore(database, h.inbox, 'alice')
+    expect((await store.changes(0)).entries).toEqual(restored.entries)
+    expect(await store.undo(important.id)).toEqual(restored)
+    const foreign = createAttentionOverridesStore(database, h.inbox, 'bob')
+    expect((await foreign.changes(0)).entries).toEqual([])
+    await expect(foreign.classify({ ...input, id: 'manual-category-foreign-01' })).rejects.toMatchObject({ code: 'HOST_CATEGORY_NOT_FOUND', status: 404 })
+    await expect(foreign.undo(input.id)).rejects.toMatchObject({ code: 'HOST_CATEGORY_NOT_FOUND', status: 404 })
+    expect(JSON.stringify(restored)).not.toContain(BODY_SECRET)
+    expect(JSON.stringify(restored)).not.toContain(rows[0]!.subject)
+  })
+
+  test('category context admission fences memberships, bodies and source generations without absorbing concurrent replies', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const seed = native('category-captured', { threadId: 'category-thread' })
+    const { account, box } = await h.seed('alice', 'category-context', [seed])
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const message = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items[0]!
+    const context: CategoryContext = { sourceId: account.id, threadId: message.threadId, sourceGeneration: account.generation, mailboxIds: [mailbox.id], latestMessageId: message.id,
+      messages: [{ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: [{ mailboxId: mailbox.id, revision: message.memberships[0]!.revision }] }] }
+    const database = new Database(':memory:')
+    cleanup.push(async () => { database.close() })
+    const store = createAttentionOverridesStore(database, h.inbox, 'alice')
+    const input: CategoryCommand = { id: 'category-context-command-01', category: 'Other', targets: [{ context, ifRevision: 0 }] }
+    for (const changed of [{ ...context, sourceGeneration: context.sourceGeneration + 1 }, { ...context, messages: [{ ...context.messages[0]!, revision: 999 }] },
+      { ...context, messages: [{ ...context.messages[0]!, bodyRevision: 'changed-content' }] }, { ...context, messages: [{ ...context.messages[0]!, memberships: [{ mailboxId: mailbox.id, revision: 999 }] }] }]) {
+      await expect(store.classify({ ...input, targets: [{ context: changed, ifRevision: 0 }] })).rejects.toMatchObject({ code: 'HOST_CATEGORY_CONTEXT_CHANGED', status: 412 })
+    }
+    expect((await store.changes(0)).entries).toEqual([])
+    box.put(native('category-new-reply', { threadId: 'category-thread', receivedAt: new Date(EPOCH + 60_000).toISOString() }))
+    await h.sync('alice', account.id)
+    const accepted = await store.classify(input)
+    expect(accepted.entries[0]!.override!.context).toEqual(context)
+    expect(accepted.entries[0]!.override!.context.messages).toHaveLength(1)
+    const latest = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items[0]!
+    expect(latest.id).not.toBe(context.latestMessageId)
+    expect(latest.memberships[0]!.done).toBe(false)
+    const undone = await store.undo(input.id)
+    expect(undone.entries[0]!.override).toBeNull()
+    expect((await store.changes(accepted.entries[0]!.revision)).entries).toEqual(undone.entries)
+    expect(await store.classify(input)).toEqual(undone)
+    expect(box.calls.mutate).toHaveLength(0)
+    await h.inbox.updateMailbox('alice', mailbox.id, { status: 'detached' }, mailbox.revision)
+    await expect(store.classify({ ...input, id: 'category-detached-command' })).rejects.toMatchObject({ code: 'HOST_CATEGORY_NOT_FOUND', status: 404 })
+  })
+
+  test('category pages and commands remain bounded with interleaved updates, atomic conflicts and sanitized SDK failures', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account } = await h.seed('alice', 'category-pages', Array.from({ length: 103 }, (_, index) => native(`category-${index}`)))
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const rows: MailboxMessageSummary[] = []
+    let cursor: string | undefined
+    do { const page = await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id], limit: 100, cursor }); rows.push(...page.items); cursor = page.nextCursor ?? undefined } while (cursor)
+    const targets = rows.map(message => ({ ifRevision: 0, context: { sourceId: account.id, threadId: message.threadId, sourceGeneration: account.generation, mailboxIds: [mailbox.id], latestMessageId: message.id,
+      messages: [{ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: [{ mailboxId: mailbox.id, revision: message.memberships[0]!.revision }] }] } }))
+    const database = new Database(':memory:')
+    cleanup.push(async () => { database.close() })
+    const store = createAttentionOverridesStore(database, h.inbox, 'alice')
+    await expect(store.classify({ id: 'category-oversized-command', category: 'Other', targets: targets.slice(0, 51) })).rejects.toMatchObject({ code: 'HOST_CATEGORY_INVALID' })
+    for (let offset = 0; offset < targets.length; offset += 50) await store.classify({ id: `category-page-command-${offset}`, category: 'Other', targets: targets.slice(offset, offset + 50) })
+    const first = await store.changes(0)
+    expect(first.entries).toHaveLength(50); expect(first.hasMore).toBe(true)
+    const selected = first.entries[0]!, target = targets.find(target => target.context.threadId === selected.threadId)!
+    const newChoice = await store.classify({ id: 'category-interleaved-command', category: 'Important', targets: [{ ...target, ifRevision: selected.revision }] })
+    const entries = new Map(first.entries.map(entry => [entry.threadId, entry]))
+    let after = first.cursor, hasMore = true
+    while (hasMore) {
+      const page = await store.changes(after)
+      expect(page.entries.length).toBeLessThanOrEqual(50)
+      for (const entry of page.entries) entries.set(entry.threadId, entry)
+      expect(page.cursor).toBeGreaterThanOrEqual(after)
+      after = page.cursor; hasMore = page.hasMore
+    }
+    expect(entries.size).toBe(103)
+    expect(entries.get(selected.threadId)).toEqual(newChoice.entries[0])
+    expect((await store.changes(after)).entries).toEqual([])
+    expect((await store.changes(after + 1)).resetRequired).toBe(true)
+    const before = await store.lookup(targets.slice(0, 2).map(target => ({ sourceId: account.id, threadId: target.context.threadId })))
+    await expect(store.classify({ id: 'category-atomic-conflict-01', category: 'Important', targets: targets.slice(0, 2).map((target, index) => ({ ...target, ifRevision: index ? 999999 : before.entries[0]!.revision })) })).rejects.toMatchObject({ status: 412 })
+    expect(await store.lookup(targets.slice(0, 2).map(target => ({ sourceId: account.id, threadId: target.context.threadId })))).toEqual(before)
+    const guard = spyOn(h.inbox, 'mailboxMessageSummary').mockImplementation(async () => { throw new Error(`private failure ${BODY_SECRET}`) })
+    try {
+      await expect(store.classify({ id: 'category-safe-error-command', category: 'Other', targets: [target] })).rejects.toMatchObject({ code: 'HOST_CATEGORY_UNAVAILABLE', message: 'Category changes are temporarily unavailable.' })
+    } finally { guard.mockRestore() }
+  })
+
+  test('category storage admits by owner/global key, command and actual retained byte budgets without eviction or per-action scans', async () => {
+    const h = await fixture({ allowProviderWrites: false }), owner = 'alice'
+    const { account } = await h.seed(owner, 'category-quota', [native('quota-one'), native('quota-two')])
+    const mailbox = (await h.inbox.mailboxes(owner)).find(value => value.sourceId === account.id)!
+    const rows = (await h.inbox.mailboxMessages(owner, { mailboxIds: [mailbox.id] })).items
+    const targets = rows.map(message => ({ ifRevision: 0, context: { sourceId: account.id, threadId: message.threadId, sourceGeneration: account.generation, mailboxIds: [mailbox.id], latestMessageId: message.id,
+      messages: [{ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: [{ mailboxId: mailbox.id, revision: message.memberships[0]!.revision }] }] } }))
+    const database = new Database(':memory:')
+    cleanup.push(async () => { database.close() })
+    const store = createAttentionOverridesStore(database, h.inbox, owner)
+    const original: CategoryCommand = { id: 'category-quota-original-01', category: 'Important', targets: [targets[0]!] }
+    const accepted = await store.classify(original)
+    const usage = () => ({ owner: database.query<{ key_count: number; command_count: number; byte_count: number }, [string]>('SELECT key_count,command_count,byte_count FROM local_category_storage_owner WHERE owner=?').get(owner)!,
+      global: database.query<{ key_count: number; command_count: number; byte_count: number }, []>('SELECT key_count,command_count,byte_count FROM local_category_storage_global WHERE id=1').get()! })
+    const physical = () => {
+      const entries = database.query<{ owner: string; source: string; thread: string; data: string; stored_bytes: number }, []>('SELECT owner,source,thread,data,stored_bytes FROM local_category_overrides').all()
+      const commands = database.query<{ owner: string; id: string; fingerprint: string; receipt: string; before_entries: string; stored_bytes: number }, []>('SELECT owner,id,fingerprint,receipt,before_entries,stored_bytes FROM local_category_commands').all()
+      let size = 0
+      for (const entry of entries) { const bytes = [entry.owner, entry.source, entry.thread, entry.data].reduce((sum, value) => sum + Buffer.byteLength(value), 0); expect(entry.stored_bytes).toBe(bytes); size += bytes }
+      for (const command of commands) { const bytes = [command.owner, command.id, command.fingerprint, command.receipt, command.before_entries].reduce((sum, value) => sum + Buffer.byteLength(value), 0); expect(command.stored_bytes).toBe(bytes); size += bytes }
+      return { key_count: entries.length, command_count: commands.length, byte_count: size }
+    }
+    expect(usage()).toEqual({ owner: physical(), global: physical() })
+    const baseline = usage(), revision = accepted.entries[0]!.revision
+    const reset = () => {
+      database.query('UPDATE local_category_storage_owner SET key_count=?,command_count=?,byte_count=? WHERE owner=?').run(baseline.owner.key_count, baseline.owner.command_count, baseline.owner.byte_count, owner)
+      database.query('UPDATE local_category_storage_global SET key_count=?,command_count=?,byte_count=? WHERE id=1').run(baseline.global.key_count, baseline.global.command_count, baseline.global.byte_count)
+    }
+    // Simulate other retained commands/keys without generating 500k mail fixtures.
+    for (const scope of ['owner', 'global'] as const) for (const [field, limit] of [['key_count', CATEGORY_STORAGE_LIMITS[scope].keys], ['command_count', CATEGORY_STORAGE_LIMITS[scope].commands], ['byte_count', CATEGORY_STORAGE_LIMITS[scope].bytes]] as const) {
+      reset()
+      database.query(`UPDATE local_category_storage_${scope} SET ${field}=? WHERE ${scope === 'owner' ? 'owner=?' : 'id=1'}`).run(...(scope === 'owner' ? [limit, owner] : [limit]))
+      const full = usage()
+      await expect(store.classify({ id: `category-quota-${scope}-${field.replaceAll('_', '-')}`, category: 'Other', targets: [targets[1]!] })).rejects.toMatchObject({ code: 'HOST_CATEGORY_STORAGE_FULL', status: 409 })
+      expect(usage()).toEqual(full)
+      expect((await store.changes(revision)).entries).toEqual([])
+      expect(await store.classify(original)).toEqual(accepted)
+      expect(physical().command_count).toBe(1)
+    }
+    reset()
+    const input: CategoryCommand = { id: 'category-quota-byte-edge-01', category: 'Other', targets: [{ ...targets[0]!, ifRevision: revision }] }
+    const next: CategoryEntry = { ...accepted.entries[0]!, revision: revision + 1, override: { category: 'Other', context: targets[0]!.context } }
+    const nextReceipt = JSON.stringify({ id: input.id, retracted: false, entries: [next] }), before = JSON.stringify(accepted.entries)
+    const newEntryBytes = [owner, next.sourceId, next.threadId, JSON.stringify(next)].reduce((sum, value) => sum + Buffer.byteLength(value), 0)
+    const commandBytes = [owner, input.id, '0'.repeat(64), nextReceipt, before].reduce((sum, value) => sum + Buffer.byteLength(value), 0)
+    const oldBytes = database.query<{ stored_bytes: number }, []>('SELECT stored_bytes FROM local_category_overrides').get()!.stored_bytes
+    const growth = newEntryBytes - oldBytes + commandBytes
+    expect(growth).toBeGreaterThan(Buffer.byteLength(JSON.stringify(input)))
+    database.query('UPDATE local_category_storage_owner SET byte_count=? WHERE owner=?').run(CATEGORY_STORAGE_LIMITS.owner.bytes - growth + 1, owner)
+    await expect(store.classify(input)).rejects.toMatchObject({ code: 'HOST_CATEGORY_STORAGE_FULL', status: 409 })
+    expect(physical().command_count).toBe(1)
+    database.query('UPDATE local_category_storage_owner SET byte_count=?,key_count=?,command_count=? WHERE owner=?').run(CATEGORY_STORAGE_LIMITS.owner.bytes - growth, CATEGORY_STORAGE_LIMITS.owner.keys, CATEGORY_STORAGE_LIMITS.owner.commands - 1, owner)
+    database.query('UPDATE local_category_storage_global SET byte_count=?,key_count=?,command_count=? WHERE id=1').run(CATEGORY_STORAGE_LIMITS.global.bytes - growth, CATEGORY_STORAGE_LIMITS.global.keys, CATEGORY_STORAGE_LIMITS.global.commands - 1)
+    const query = database.query.bind(database), exec = database.exec.bind(database)
+    const queryGuard = spyOn(database, 'query').mockImplementation(((sql: string) => { if (/\b(?:COUNT|SUM)\s*\(/i.test(sql)) throw new Error('Category actions must use maintained counters'); return query(sql) }) as typeof database.query)
+    const execGuard = spyOn(database, 'exec').mockImplementation(((sql: string) => { if (/\b(?:COUNT|SUM)\s*\(/i.test(sql)) throw new Error('Restart must not rescan migrated category data'); return exec(sql) }) as typeof database.exec)
+    try {
+      const changed = await store.classify(input)
+      expect(usage()).toEqual({ owner: { key_count: CATEGORY_STORAGE_LIMITS.owner.keys, command_count: CATEGORY_STORAGE_LIMITS.owner.commands, byte_count: CATEGORY_STORAGE_LIMITS.owner.bytes },
+        global: { key_count: CATEGORY_STORAGE_LIMITS.global.keys, command_count: CATEGORY_STORAGE_LIMITS.global.commands, byte_count: CATEGORY_STORAGE_LIMITS.global.bytes } })
+      const restarted = createAttentionOverridesStore(database, h.inbox, owner)
+      expect(await restarted.classify(input)).toEqual(changed)
+      await expect(restarted.classify({ ...input, id: 'category-quota-no-eviction', targets: [{ ...targets[0]!, ifRevision: changed.entries[0]!.revision }] })).rejects.toMatchObject({ code: 'HOST_CATEGORY_STORAGE_FULL' })
+      database.query('UPDATE local_category_storage_owner SET key_count=key_count+1,command_count=command_count+1,byte_count=byte_count+1 WHERE owner=?').run(owner)
+      database.query('UPDATE local_category_storage_global SET key_count=key_count+1,command_count=command_count+1,byte_count=byte_count+1 WHERE id=1').run()
+      const over = usage(), physicalBeforeUndo = physical()
+      expect(await restarted.classify(input)).toEqual(changed)
+      const undone = await restarted.undo(input.id)
+      expect(undone.entries[0]!.override!.category).toBe('Important')
+      const undoGrowth = physical().byte_count - physicalBeforeUndo.byte_count
+      expect(undoGrowth).toBeGreaterThan(0)
+      expect(usage()).toEqual({ owner: { ...over.owner, byte_count: over.owner.byte_count + undoGrowth }, global: { ...over.global, byte_count: over.global.byte_count + undoGrowth } })
+      const afterUndo = usage()
+      expect(await restarted.undo(input.id)).toEqual(undone)
+      expect(await restarted.classify(input)).toEqual(undone)
+      expect(usage()).toEqual(afterUndo)
+      expect(physical().command_count).toBe(2)
+      expect((await h.inbox.mailboxMessageSummary(owner, mailbox.id, rows[0]!.id)).memberships[0]!.done).toBe(false)
+    } finally { queryGuard.mockRestore(); execGuard.mockRestore() }
+  })
+
+  test('category byte-count migration preserves existing receipts and accurately accounts legacy JSON and Undo tombstones', async () => {
+    const h = await fixture({ allowProviderWrites: false }), owner = 'alice'
+    const { account } = await h.seed(owner, 'category-legacy-quota')
+    const mailbox = (await h.inbox.mailboxes(owner)).find(value => value.sourceId === account.id)!
+    const message = (await h.inbox.mailboxMessages(owner, { mailboxIds: [mailbox.id] })).items[0]!
+    const context: CategoryContext = { sourceId: account.id, threadId: message.threadId, sourceGeneration: account.generation, mailboxIds: [mailbox.id], latestMessageId: message.id,
+      messages: [{ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: [{ mailboxId: mailbox.id, revision: message.memberships[0]!.revision }] }] }
+    const input: CategoryCommand = { id: 'category-prequota-command', category: 'Other', targets: [{ context, ifRevision: 0 }] }
+    const entry: CategoryEntry = { sourceId: account.id, threadId: message.threadId, revision: 1, override: { category: 'Other', context } }
+    const receipt = { id: input.id, retracted: false, entries: [entry] }, receiptText = JSON.stringify(receipt, null, 2)
+    const beforeText = JSON.stringify([{ sourceId: account.id, threadId: message.threadId, revision: 0, override: null }], null, 2), data = JSON.stringify(entry, null, 2)
+    const fingerprint = createHash('sha256').update(JSON.stringify(input)).digest('hex')
+    const database = new Database(':memory:')
+    cleanup.push(async () => { database.close() })
+    database.exec(`CREATE TABLE local_category_clock (owner TEXT PRIMARY KEY, head INTEGER NOT NULL) STRICT;
+      CREATE TABLE local_category_overrides (owner TEXT NOT NULL, source TEXT NOT NULL, thread TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(owner,source,thread)) STRICT;
+      CREATE TABLE local_category_commands (owner TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL, receipt TEXT NOT NULL, before_entries TEXT NOT NULL, PRIMARY KEY(owner,id)) STRICT;`)
+    database.query('INSERT INTO local_category_clock VALUES (?,1)').run(owner)
+    database.query('INSERT INTO local_category_overrides VALUES (?,?,?,?,?)').run(owner, account.id, message.threadId, 1, data)
+    database.query('INSERT INTO local_category_commands VALUES (?,?,?,?,?)').run(owner, input.id, fingerprint, receiptText, beforeText)
+    const store = createAttentionOverridesStore(database, h.inbox, owner)
+    const usage = () => database.query<{ key_count: number; command_count: number; byte_count: number }, []>('SELECT key_count,command_count,byte_count FROM local_category_storage_global WHERE id=1').get()!
+    const initialBytes = [owner, account.id, message.threadId, data, owner, input.id, fingerprint, receiptText, beforeText].reduce((sum, value) => sum + Buffer.byteLength(value), 0)
+    expect(usage()).toEqual({ key_count: 1, command_count: 1, byte_count: initialBytes })
+    expect(await store.classify(input)).toEqual(receipt)
+    expect(database.query<{ receipt: string }, []>('SELECT receipt FROM local_category_commands').get()!.receipt).toBe(receiptText)
+    expect(database.query<{ stored_bytes: number }, []>('SELECT stored_bytes FROM local_category_overrides').get()!.stored_bytes).toBe([owner, account.id, message.threadId, data].reduce((sum, value) => sum + Buffer.byteLength(value), 0))
+    const undone = await store.undo(input.id)
+    expect(undone.entries[0]!.override).toBeNull()
+    const raw = database.query<{ data: string }, []>('SELECT data FROM local_category_overrides').get()!.data
+    const nextBytes = [owner, account.id, message.threadId, raw, owner, input.id, fingerprint, JSON.stringify(undone), beforeText].reduce((sum, value) => sum + Buffer.byteLength(value), 0)
+    expect(usage()).toEqual({ key_count: 1, command_count: 1, byte_count: nextBytes })
+    const restarted = createAttentionOverridesStore(database, h.inbox, owner)
+    expect(await restarted.classify(input)).toEqual(undone)
+    expect(await restarted.undo(input.id)).toEqual(undone)
+    expect(usage()).toEqual({ key_count: 1, command_count: 1, byte_count: nextBytes })
+  })
+
+  test('category HTTP routes retain session, Origin, bounded JSON, privacy and durable command guards', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'category-host-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
+    cleanup.push(() => host.close())
+    const base = `http://localhost:${config.backend.port}`, origin = config.web.origin
+    const session = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
+    const headers = { Origin: origin, Cookie: session.headers.get('set-cookie')!.split(';')[0]!, 'Content-Type': 'application/json' }
+    const request = (path: string, body?: unknown, extra: Record<string, string> = {}) => host.fetch(new Request(`${base}${path}`, { headers: { ...headers, ...extra }, ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }) }))
+    expect((await host.fetch(new Request(`${base}/host/attention-overrides`))).status).toBe(401)
+    expect((await request('/host/config')).status).toBe(200)
+    expect((await (await request('/host/config')).json()).attentionOverrides).toBe(true)
+    expect(await (await request('/host/attention-overrides?after=0')).json()).toEqual({ entries: [], cursor: 0, hasMore: false, resetRequired: false })
+    expect((await request('/host/attention-overrides', {}, { Origin: 'https://evil.test' })).status).toBe(403)
+    expect((await request('/host/attention-overrides?after=0&after=1')).status).toBe(400)
+    expect((await request('/host/attention-overrides?after=-1')).status).toBe(400)
+    expect((await request('/host/attention-overrides', {}, { 'Content-Type': 'text/plain' })).status).toBe(415)
+    expect((await request('/host/attention-overrides', {}, { 'Content-Encoding': 'identity' })).status).toBe(415)
+    expect((await request('/host/attention-overrides', {}, { 'Content-Length': '65537' })).status).toBe(413)
+    const invalid = await request('/host/attention-overrides', { id: BODY_SECRET, owner: 'foreign', body: BODY_SECRET })
+    expect(invalid.status).toBe(400); expect(await invalid.text()).not.toContain(BODY_SECRET)
+    expect((await request('/host/attention-overrides/lookup', { keys: [], owner: 'foreign' })).status).toBe(400)
+    expect((await request('/host/attention-overrides/00000000-0000-0000-0000-000000000000/undo', {})).status).toBe(404)
   })
 })
 

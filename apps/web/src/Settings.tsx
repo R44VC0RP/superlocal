@@ -28,6 +28,9 @@ export type SettingsProps = {
   onboardingReturn?: { providerId: string; connectionId: string | null } | null;
   /** Clears the completed onboarding return without leaving the settings page. */
   onOnboardingDone?: () => void;
+  onStartZero?: () => void;
+  zeroReady?: boolean;
+  zeroResumable?: boolean;
   aiActions?: AiTriageActions;
   aiMailboxes?: Array<{ id: string; name: string; email?: string }>;
 };
@@ -90,6 +93,9 @@ export function Settings({
   onboardingReturn = null,
   onOnboardingDone,
   aiActions,
+  onStartZero,
+  zeroReady = false,
+  zeroResumable = false,
   aiMailboxes = [],
 }: SettingsProps) {
   const [entry, setEntry] = useState("");
@@ -1151,18 +1157,10 @@ export function Settings({
     case "Get Me To Zero":
       content = (
         <>
-          {select(
-            "inboxZeroAge",
-            "Focus on conversations from",
-            [
-              "The last week",
-              "The last month",
-              "The last three months",
-              "All time",
-            ],
-            "All time",
-          )}
-          {checkbox("celebrateInboxZero", "Celebrate Inbox Zero", true)}
+          <p className="settings-note">Work through all unhandled Important conversations, including already-read mail. Review routine groups first, then handle, snooze or move the rest. No AI scan is required.</p>
+          <button type="button" className="settings-button zero-settings-entry" disabled={!zeroReady || !onStartZero} onClick={onStartZero}>
+            {zeroResumable ? "Resume cleanup" : "Get me to zero"}
+          </button>
         </>
       );
       break;

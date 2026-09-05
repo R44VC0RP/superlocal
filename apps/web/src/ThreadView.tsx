@@ -25,6 +25,9 @@ import { readText, writeText } from "./storage";
 import { getQuickReplies } from "./quick-replies";
 import type { AiDecision, AiFeedbackInput, AiReadingInput } from "../../shared/ai-triage";
 import ConversationTriage from "./ConversationTriage";
+import ConversationCategory from "./ConversationCategory";
+import { currentCategoryOverride } from "./mail-model";
+import type { AttentionCategory } from "../../shared/attention-overrides";
 import { useReadingEngagement } from "./use-reading-engagement";
 
 type ThreadComment = {
@@ -90,6 +93,7 @@ type ThreadViewProps = {
   aiDecision?: AiDecision;
   aiEnabled?: boolean;
   aiMode?: "preview" | "apply";
+  onCategory?: (category: AttentionCategory) => Promise<() => Promise<void>>;
   onAiFeedback?: (input: AiFeedbackInput) => Promise<AiDecision>;
   onAiReading?: (input: AiReadingInput) => Promise<void>;
   aiReadingEnabled?: boolean;
@@ -121,10 +125,12 @@ export default function ThreadView({
   aiDecision,
   aiEnabled = false,
   aiMode = "preview",
+  onCategory,
   onAiFeedback,
   onAiReading,
   aiReadingEnabled = false,
 }: ThreadViewProps) {
+  const explicitCategory = currentCategoryOverride(mail, mail.attentionOverride?.override)?.category;
   const [expanded, setExpanded] = useState<string[]>([
     messageKey(mail.messages.at(-1)),
   ]);
@@ -607,7 +613,7 @@ export default function ThreadView({
           </div>
         </div>
         <div className="message-column thread-toolbar">
-          {aiEnabled && <ConversationTriage
+          {explicitCategory && onCategory ? <ConversationCategory category={explicitCategory} onChange={onCategory} disabled={!supportsAction("done")} /> : aiEnabled && <ConversationTriage
             key={JSON.stringify([mail.sourceId, mail.sdkThreadId])}
             decision={aiDecision?.sourceId === mail.sourceId && aiDecision?.threadId === mail.sdkThreadId ? aiDecision : undefined}
             mode={aiMode}
