@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Icon, IconButton, Key, Modal } from "./components";
 import type { Mail, MailboxOption } from "./data";
 import { UNIFIED_ACCOUNT } from "./mail-model";
@@ -58,6 +58,30 @@ export default function MailCommandDialog({
   const [reminderCondition, setReminderCondition] = useState("If no reply");
   const commandInput = useRef<HTMLInputElement>(null);
   const results = useRef<HTMLDivElement>(null);
+  const commandListId = useId();
+  const opener = useRef<HTMLElement | null>(null);
+  const restoreOnDismiss = useRef(false);
+
+  useLayoutEffect(() => {
+    if (open) {
+      const active = document.activeElement;
+      // Capture before focusing the input; Modal's later effect sees the input instead.
+      if (active instanceof HTMLElement && !commandInput.current?.closest('[role="dialog"]')?.contains(active)) {
+        opener.current = active;
+      }
+      restoreOnDismiss.current = false;
+      return;
+    }
+    const target = opener.current;
+    opener.current = null;
+    if (!restoreOnDismiss.current) return;
+    restoreOnDismiss.current = false;
+    // Commands own destination focus. Even a dismissal must not override a new focus target.
+    if (document.activeElement && document.activeElement !== document.body) return;
+    if (target?.isConnected && !target.matches(":disabled") && !target.closest('[inert], [aria-disabled="true"]')) {
+      target.focus({ preventScroll: true });
+    }
+  }, [open]);
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -68,12 +92,6 @@ export default function MailCommandDialog({
   useEffect(() => {
     setMenuIndex(0);
   }, [query, mode, open]);
-
-  useEffect(() => {
-    results.current
-      ?.querySelector<HTMLElement>(`[data-command-index="${menuIndex}"]`)
-      ?.scrollIntoView({ block: "nearest" });
-  }, [menuIndex, open]);
 
   const commandItems = commands.filter((item) =>
     `${item.label} ${item.detail}`.toLowerCase().includes(query.toLowerCase()),
@@ -98,6 +116,19 @@ export default function MailCommandDialog({
       })),
   ];
   const filteredAccounts = accountChoices.filter(account => `${account.name} ${account.detail}`.toLowerCase().includes(query.toLowerCase()));
+  const optionCount = (mode === "command" ? commandItems : mode === "label" ? labelOptions : mode === "remind" ? reminderOptions : filteredAccounts).length;
+  const activeIndex = optionCount ? Math.min(Math.max(menuIndex, 0), optionCount - 1) : -1;
+
+  useEffect(() => {
+    results.current
+      ?.querySelector<HTMLElement>(`[data-command-index="${activeIndex}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, query, mode, open]);
+
+  function dismiss() {
+    restoreOnDismiss.current = true;
+    onClose();
+  }
 
   function createLabel() {
     if (!canCreateLabel) return;
@@ -118,7 +149,7 @@ export default function MailCommandDialog({
               ? "Labels"
                : "Mailboxes"
       }
-      onClose={onClose}
+      onClose={dismiss}
       className={`app-modal command-modal ${mode === "accounts" ? `accounts-modal ${query ? "has-query" : ""}` : ""}`}
     >
       <div className="command-header">
@@ -146,12 +177,16 @@ export default function MailCommandDialog({
                     : "Add or remove label"
                  : "Mailboxes"}
         </span>
-        <IconButton name="Close" title="Close" onClick={onClose} />
+        <IconButton name="Close" title="Close" onClick={dismiss} />
       </div>
       <div className="command-input">
         <input
           ref={commandInput}
-          autoFocus
+          role={mode === "command" ? "combobox" : undefined}
+          aria-autocomplete={mode === "command" ? "list" : undefined}
+          aria-expanded={mode === "command" ? true : undefined}
+          aria-controls={mode === "command" ? commandListId : undefined}
+          aria-activedescendant={mode === "command" && activeIndex >= 0 ? `${commandListId}-${activeIndex}` : undefined}
           aria-label={
             mode === "command"
               ? "Search commands"
@@ -167,37 +202,28 @@ export default function MailCommandDialog({
           }
           value={query}
           placeholder={mode === "remind" ? "Try: 8 am, 3 days, aug 7" : mode === "accounts" ? "Search mailboxes…" : ""}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setMenuIndex(0);
+          }}
           onKeyDown={(e) => {
             if (e.key === "ArrowDown") {
               e.preventDefault();
-              setMenuIndex((i) =>
-                Math.min(
-                  (mode === "command"
-                    ? commandItems
-                    : mode === "label"
-                      ? labelOptions
-                      : mode === "remind"
-                        ? reminderOptions
-                        : filteredAccounts
-                  ).length - 1,
-                  i + 1,
-                ),
-              );
+              setMenuIndex(Math.min(optionCount - 1, activeIndex + 1));
             }
             if (e.key === "ArrowUp") {
               e.preventDefault();
-              setMenuIndex((i) => Math.max(0, i - 1));
+              setMenuIndex(Math.max(0, activeIndex - 1));
             }
             if (e.key === "Enter") {
               e.preventDefault();
-              if (mode === "command") commandItems[menuIndex]?.run();
+              if (mode === "command") commandItems[activeIndex]?.run();
               else if (mode === "remind")
-                onRemind(query || reminderOptions[menuIndex] || "tomorrow");
-              else if (mode === "accounts" && filteredAccounts[menuIndex])
-                  onAccount(filteredAccounts[menuIndex].id);
-              else if (mode === "label" && labelOptions[menuIndex]) {
-                onLabel(labelOptions[menuIndex]);
+                onRemind(query || reminderOptions[activeIndex] || "tomorrow");
+              else if (mode === "accounts" && filteredAccounts[activeIndex])
+                  onAccount(filteredAccounts[activeIndex].id);
+              else if (mode === "label" && labelOptions[activeIndex]) {
+                onLabel(labelOptions[activeIndex]);
                 onClose();
               } else if (
                 mode === "label" &&
@@ -223,20 +249,28 @@ export default function MailCommandDialog({
         )}
       </div>
       <div className="command-results" ref={results}>
-        {mode === "command" &&
-          commandItems.map((item, i) => (
-            <button
-              key={item.label}
-              data-command-index={i}
-              className={`command-option ${i === menuIndex ? "active" : ""}`}
-              onMouseMove={() => setMenuIndex(i)}
-              onClick={item.run}
-            >
-              <Icon name={item.icon} />
-              <span>{item.label}</span>
-              {item.key && <Key>{item.key}</Key>}
-            </button>
-          ))}
+        {mode === "command" && (
+          <div id={commandListId} role="listbox" aria-label="Commands">
+            {commandItems.map((item, i) => (
+              <div
+                key={item.label}
+                id={`${commandListId}-${i}`}
+                role="option"
+                aria-selected={i === activeIndex}
+                data-command-index={i}
+                className={`command-option ${i === activeIndex ? "active" : ""}`}
+                style={{ cursor: "pointer" }}
+                onMouseDown={(e) => e.preventDefault()}
+                onMouseMove={() => setMenuIndex(i)}
+                onClick={item.run}
+              >
+                <Icon name={item.icon} />
+                <span>{item.label}</span>
+                {item.key && <Key>{item.key}</Key>}
+              </div>
+            ))}
+          </div>
+        )}
         {mode === "command" && !commandItems.length && (
           <p className="no-options">No commands found.</p>
         )}
@@ -244,7 +278,7 @@ export default function MailCommandDialog({
           <>
             {reminderOptions.map((time, i) => (
               <button
-                className={`command-option reminder-option ${i === menuIndex ? "active" : ""}`}
+                className={`command-option reminder-option ${i === activeIndex ? "active" : ""}`}
                 key={time}
                 data-command-index={i}
                 onClick={() => onRemind(`${time}${i < 3 ? ", 8:00 AM" : ""}`)}
@@ -276,7 +310,7 @@ export default function MailCommandDialog({
           <>
             {labelOptions.map((label, i) => (
               <button
-                className={`command-option label-option ${i === menuIndex ? "active" : ""}`}
+                className={`command-option label-option ${i === activeIndex ? "active" : ""}`}
                 data-command-index={i}
                 key={label}
                 onClick={() => onLabel(label)}
@@ -298,7 +332,7 @@ export default function MailCommandDialog({
             )}
             <div className="label-done">
               {!canCreateLabel && <p className="settings-note">Choose an individual mailbox to create or rename labels.</p>}
-              <button className="primary-button" onClick={onClose}>
+              <button className="primary-button" onClick={dismiss}>
                 Done
               </button>
             </div>
@@ -307,7 +341,7 @@ export default function MailCommandDialog({
         {mode === "accounts" &&
           filteredAccounts.map((account, i) => (
             <button
-              className={`command-option account-option ${i === menuIndex ? "active" : ""}`}
+              className={`command-option account-option ${i === activeIndex ? "active" : ""}`}
               key={account.id}
               data-command-index={i}
               onMouseMove={() => setMenuIndex(i)}

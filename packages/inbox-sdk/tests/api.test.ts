@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
+import { DomUtils, parseDocument } from 'htmlparser2'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -3528,6 +3529,120 @@ describe('blob privacy and draft editing', () => {
     await invalid(await h.request('bob', `/mailboxes/${mailbox.id}/messages/${id}`), 404)
   })
 
+  test('quoted history annotations select only bounded trailing provider quotes and retain current inline replies', async () => {
+    const cases = [
+      { id: 'yahoo', html: '<div>Current answer</div><div class="yahoo-signature">Current signature</div><p class="yahoo-quoted-begin">On Friday, Alice wrote:</p>\n <blockquote class="iosymail">Old reply</blockquote>', marked: ['On Friday, Alice wrote:', 'Old reply'], visible: ['Current answer', 'Current signature'] },
+      { id: 'gmail', html: '<div class="gmail_quote"><div>New nested answer</div><div class="gmail_quote"><div class="gmail_attr">On Friday, Alice wrote:</div>\n<blockquote class="gmail_quote">Old reply</blockquote></div></div>', marked: ['On Friday, Alice wrote:', 'Old reply'], visible: ['New nested answer'] },
+      { id: 'cite', html: '<main><p>Current answer</p><div><blockquote type="CITE">Old reply</blockquote></div></main>', marked: ['Old reply'], visible: ['Current answer'] },
+      { id: 'inline', html: '<p>Current answer</p><blockquote type="cite">First old question</blockquote><p>New inline answer</p><blockquote type="cite">Final old question</blockquote>', marked: ['Final old question'], visible: ['Current answer', 'First old question', 'New inline answer'] },
+      { id: 'bottom', html: '<p>Current answer</p><blockquote type="cite">Old reply</blockquote><p>New bottom answer</p>', marked: [], visible: ['Current answer', 'Old reply', 'New bottom answer'] },
+      { id: 'ancestor-bottom', html: '<p>Current answer</p><div><blockquote type="cite">Old reply</blockquote></div><div><p>New bottom answer</p></div>', marked: [], visible: ['Current answer', 'Old reply', 'New bottom answer'] },
+      { id: 'generic', html: '<p>Current answer</p><blockquote>Literary quotation</blockquote>', marked: [], visible: ['Current answer', 'Literary quotation'] },
+      { id: 'gmail-container', html: '<p>Current answer</p><div class="gmail_quote"><p>New nested answer</p><blockquote>Unclassified quotation</blockquote></div>', marked: [], visible: ['Current answer', 'New nested answer', 'Unclassified quotation'] },
+      { id: 'outlook', html: '<p>Current answer</p><div id="divRplyFwdMsg">From: Alice</div><p>Unbounded old reply</p>', marked: [], visible: ['Current answer', 'From: Alice', 'Unbounded old reply'] },
+      { id: 'yahoo-unpaired', html: '<p>Current answer</p><blockquote class="iosymail">Unpaired old reply</blockquote>', marked: [], visible: ['Current answer', 'Unpaired old reply'] },
+      { id: 'yahoo-inline', html: '<p>Current answer</p><p class="yahoo-quoted-begin">On Friday, Alice wrote:</p><p>New inline answer</p><blockquote class="iosymail">Old reply</blockquote>', marked: [], visible: ['Current answer', 'On Friday, Alice wrote:', 'New inline answer', 'Old reply'] },
+      { id: 'quote-only', html: '<blockquote type="cite">Old reply</blockquote>', marked: [], visible: ['Old reply'] },
+      { id: 'gmail-quote-only', html: '<div class="gmail_attr">On Friday, Alice wrote:</div><blockquote class="gmail_quote">Old reply</blockquote>', marked: [], visible: ['On Friday, Alice wrote:', 'Old reply'] },
+      { id: 'signature-only', html: '<div class="yahoo-signature">Current signature</div><p class="yahoo-quoted-begin">On Friday, Alice wrote:</p><blockquote class="iosymail">Old reply</blockquote>', marked: [], visible: ['Current signature', 'On Friday, Alice wrote:', 'Old reply'] },
+      { id: 'nested-quote-only', html: '<blockquote type="cite">Old reply<blockquote type="cite">Older reply</blockquote></blockquote>', marked: [], visible: ['Old reply', 'Older reply'] },
+      { id: 'nested-signature-only', html: '<div class="yahoo-signature">Current signature<blockquote type="cite">Old reply</blockquote></div>', marked: [], visible: ['Current signature', 'Old reply'] },
+      { id: 'nested-attribution-only', html: '<div class="gmail_attr">On Friday, Alice wrote:<blockquote type="cite">Old reply</blockquote></div>', marked: [], visible: ['On Friday, Alice wrote:', 'Old reply'] },
+      { id: 'empty-quote', html: '<p>Current answer</p><blockquote type="cite"><br></blockquote>', marked: [], visible: ['Current answer'] },
+      { id: 'spoof', html: '<p class="openmail-quoted-history" data-inbox-quoted-history="true">Current answer</p><div data-inbox-quoted-history="true">New nested answer</div><blockquote class="openmail-quoted-history" data-inbox-quoted-history="true">Literary quotation</blockquote>', marked: [], visible: ['Current answer', 'New nested answer', 'Literary quotation'] },
+    ]
+    const h = await fixture()
+    const { box } = await h.seed('alice', 'quoted-history', cases.map(item => native(item.id, { bodyHtml: item.html })))
+    const rows = (await h.page()).items
+    for (const item of cases) {
+      const row = rows.find(row => row.subject === `Subject ${item.id}`)!
+      const message = await (await h.request('alice', `/messages/${row.id}`)).json() as Message
+      for (const html of [message.bodyHtml, message.bodyDocument!.html]) {
+        const document = parseDocument(html)
+        const marked = DomUtils.findAll(node => node.attribs['data-inbox-quoted-history'] === 'true', document.children)
+        expect(marked.map(node => DomUtils.textContent(node))).toEqual(item.marked)
+        expect(marked.length).toBeLessThanOrEqual(2)
+        if (marked.length === 2) {
+          expect(marked[0]!.parent).toBe(marked[1]!.parent)
+          expect(DomUtils.nextElementSibling(marked[0]!)).toBe(marked[1]!)
+        }
+        for (const text of [...item.visible, ...item.marked]) expect(DomUtils.textContent(document)).toContain(text)
+        for (const node of marked) DomUtils.removeElement(node)
+        for (const text of item.visible) expect(DomUtils.textContent(document)).toContain(text)
+        for (const text of item.marked) expect(DomUtils.textContent(document)).not.toContain(text)
+      }
+      expect(message.isRead).toBe(false)
+    }
+    expect(box.calls.mutate).toEqual([])
+  })
+
+  test('quoted history annotations preserve media privacy and never step over later image or CSS content', async () => {
+    const h = await fixture()
+    const inline: Attachment = { id: 'quoted-inline', filename: 'quoted.png', contentType: 'image/png', size: 4, url: `https://provider.example.test/private?token=${SECRET}`, inline: true, contentId: 'quoted@example.test' }
+    const quote = '<blockquote type="cite">Old reply<img src="cid:quoted@example.test"><img src="https://assets.example.test/history.png" width="200" height="100"><img src="https://tracker.example.test/pixel" width="1" height="1"><a href="https://example.test/original">Original link</a></blockquote>'
+    const cases = [
+      { id: 'inside', html: `<p data-inbox-quoted-history="true" onclick="unsafe()">Current answer</p>${quote}<script>unsafe()</script>` },
+      { id: 'later-image', html: `<p>Current answer</p>${quote}<img src="cid:quoted@example.test" alt="New diagram">` },
+      { id: 'later-ancestor-image', html: `<p>Current answer</p><div>${quote}</div><img src="https://assets.example.test/current.png" alt="New diagram">` },
+      { id: 'later-background', html: `<p>Current answer</p>${quote}<div style="background-image:url(https://assets.example.test/current.png);height:120px"></div>` },
+      { id: 'later-stylesheet', html: `<html><head><style>.poster{background-image:url(https://assets.example.test/current.png);height:120px}</style></head><body><p>Current answer</p>${quote}<div class="poster"></div></body></html>` },
+    ]
+    const { box } = await h.seed('alice', 'quoted-media', cases.map(item => native(item.id, { bodyHtml: item.html, attachments: [inline] })))
+    const rows = (await h.page()).items
+    for (const remoteImages of [false, true]) {
+      await h.inbox.setPolicy('alice', { remoteImages })
+      for (const item of cases) {
+        const row = rows.find(row => row.subject === `Subject ${item.id}`)!
+        const message = await h.inbox.message('alice', row.id)
+        expect(message.attachments).toHaveLength(1)
+        expect(message.attachments[0]).toMatchObject({ filename: 'quoted.png', contentId: 'quoted@example.test', inline: true })
+        for (const html of [message.bodyHtml, message.bodyDocument!.html]) {
+          const document = parseDocument(html)
+          const marked = DomUtils.findAll(node => node.attribs['data-inbox-quoted-history'] === 'true', document.children)
+          expect(marked.map(node => node.name)).toEqual(item.id === 'inside' ? ['blockquote'] : [])
+          const old = DomUtils.findAll(node => node.name === 'blockquote', document.children)[0]!
+          expect(DomUtils.textContent(old)).toBe('Old replyOriginal link')
+          const images = DomUtils.findAll(node => node.name === 'img', old.children)
+          expect(images[0]!.attribs.src).toBe(`/v1/blobs/${message.attachments[0]!.id}`)
+          if (remoteImages) expect(images[1]!.attribs.src).toMatch(/^\/v1\/messages\/[^/]+\/media\/[A-Za-z\d_-]{43}$/)
+          else {
+            expect(images[1]!.attribs.src).toBeUndefined()
+            expect(images[1]!.attribs['data-openmail-src']).toBe('https://assets.example.test/history.png')
+          }
+          expect(images[2]!.attribs.src).toBeUndefined()
+          expect(DomUtils.findAll(node => node.name === 'a', old.children)[0]!.attribs.href).toBe('https://example.test/original')
+          expect(html).not.toContain('unsafe()')
+          expect(html).not.toContain(SECRET)
+          for (const node of marked) DomUtils.removeElement(node)
+          expect(DomUtils.textContent(document)).toContain('Current answer')
+        }
+      }
+    }
+    expect(box.calls.mutate).toEqual([])
+    expect(box.calls.attachment).toEqual([])
+  })
+
+  test('quoted history annotation bounds fail visible without truncating deeply nested or large mail', async () => {
+    const h = await fixture()
+    const cases = [
+      { id: 'deep', html: '<p>Current answer</p>' + '<div>'.repeat(70) + '<blockquote type="cite">Old reply</blockquote>' + '</div>'.repeat(70) },
+      { id: 'events', html: '<p>Current answer</p>' + '<span>Retained text</span>'.repeat(7_000) + '<blockquote type="cite">Old reply</blockquote>' },
+      { id: 'bytes', html: '<p>Current answer ' + 'x'.repeat(1_048_576) + '</p><blockquote type="cite">Old reply</blockquote>' },
+    ]
+    await h.seed('alice', 'quoted-bounds', cases.map(item => native(item.id, { bodyHtml: item.html })))
+    for (const row of (await h.page()).items) {
+      const message = await h.inbox.message('alice', row.id)
+      for (const html of [message.bodyHtml, message.bodyDocument!.html]) {
+        const document = parseDocument(html)
+        expect(DomUtils.findAll(node => node.attribs['data-inbox-quoted-history'] === 'true', document.children)).toEqual([])
+        expect(DomUtils.textContent(document)).toContain('Current answer')
+        expect(DomUtils.textContent(document)).toContain('Old reply')
+        if (row.subject === 'Subject events') expect(DomUtils.textContent(document).match(/Retained text/g)).toHaveLength(7_000)
+        if (row.subject === 'Subject bytes') expect(DomUtils.textContent(document)).toContain('x'.repeat(1_048_576))
+      }
+    }
+  })
+
   test('email backgrounds follow image policy while retaining safe layout and authenticated inline resources', async () => {
     const h = await fixture()
     const inline: Attachment = { id: 'background-part', filename: 'cover.png', contentType: 'image/png', size: 4, url: 'https://upstream.example.test/cover.png', inline: true, contentId: 'cover@example.test' }
@@ -3571,7 +3686,7 @@ describe('blob privacy and draft editing', () => {
 
   test('plain email reads preserve exact text and use it when HTML is empty or noncontent', async () => {
     const h = await fixture()
-    const bodyText = '\n  Literal <tags> & symbols\r\n\tquoted > reply\nhttps://example.test/path(test).\ntrailing  \n'
+    const bodyText = '\n  Literal <tags> & symbols\r\n\tquoted > reply\nOn Friday, Alice wrote:\n> Original question\nNew inline answer\nhttps://example.test/path(test).\ntrailing  \n'
     const variants = ['', '  \n ', '<html><head><script>unsafe()</script></head><body><div> </div></body></html>', '<img src="https://tracker.example.test/pixel" width="1" height="1" alt="Tracking pixel">']
     const { account, box } = await h.connect('alice', 'plain-email', [
       ...variants.map((bodyHtml, index) => native(`plain-${index}`, { bodyHtml, bodyText })),

@@ -34,6 +34,26 @@ const method = (provider: HostProvider) =>
 const statusLabel = (source: Account) =>
   source.status === "reconnect_required" ? "Sign-in required" : source.status === "disconnected" ? "Disconnected" : "Connected";
 
+// Account sync problems are codes, not provider messages. Unknown codes stay generic.
+function syncProblemLabel(code: string): string {
+  switch (code) {
+    case "AUTHENTICATION": return "Couldn’t sync mail: the provider rejected sign-in.";
+    case "AUTHORIZATION": return "Couldn’t sync mail: the provider denied access.";
+    case "CREDENTIALS_REVOKED": return "Couldn’t sync mail: provider access was revoked.";
+    case "CREDENTIALS_UNAVAILABLE": return "Couldn’t sync mail: sign-in credentials are unavailable.";
+    case "RECONNECT_REQUIRED": return "Couldn’t sync mail: the provider requires sign-in.";
+    case "NOT_FOUND": return "Couldn’t sync mail: requested mail data was not found.";
+    case "RATE_LIMITED": return "Couldn’t sync mail: the provider’s request limit was reached.";
+    case "INVALID_CURSOR": return "Couldn’t sync mail: the saved sync position is no longer valid.";
+    case "UNSUPPORTED_OPERATION": return "Couldn’t sync mail: the provider does not support this sync operation.";
+    case "VALIDATION": return "Couldn’t sync mail: the sync request was not accepted.";
+    case "NETWORK": return "Couldn’t sync mail: communication with the provider failed.";
+    case "UPSTREAM": return "Couldn’t sync mail: the provider response could not be processed.";
+    case "INVALID_PROVIDER": return "Couldn’t sync mail: the mail provider is not available.";
+    default: return "Couldn’t sync mail.";
+  }
+}
+
 export default function ProviderConnections({ host, store, resume, onStepChange, onDone, onBeforeRedirect }: {
   host: HostConfiguration | null;
   store: InboxStore;
@@ -248,6 +268,7 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
                 <span className="mailbox-row-label" title={`${source.email || source.name} · ${owner.name}`}>
                   <span>{source.email || source.name}</span>
                   <small className={attention || incomplete ? "provider-attention" : ""}>{owner.name} · {incomplete ? "Setup not finished" : statusLabel(source)}</small>
+                  {source.status === "connected" && source.sync.problem && <small>{syncProblemLabel(source.sync.problem)}</small>}
                 </span>
                 {writable && incomplete && <button type="button" className="settings-text-button" onClick={() => setUp(owner, [connectionId])}>Finish setup</button>}
                 {writable && owner.reconnect && <button type="button" className="settings-text-button" onClick={() => {

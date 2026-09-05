@@ -12,6 +12,7 @@ import {
   type PointerEvent,
 } from "react";
 import { flushSync } from "react-dom";
+import { ApiError } from "inbox-sdk/client";
 import {
   defaultPreferences,
   displayDate,
@@ -228,10 +229,21 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   );
   const [mobileViewport, setMobileViewport] = useState(() => matchMedia("(max-width: 700px)").matches);
   const searchInput = useRef<HTMLInputElement>(null);
+  const searchFocus = useRef<HTMLElement | null>(null);
+  const restoreSearchFocus = useRef(false);
   const list = useRef<HTMLDivElement>(null);
-  const listScroll = useRef(0);
+  // Positions live only for this mounted App; never retain mail or virtual windows.
+  const listPositions = useRef(new Map<string, { current: number }>());
   const sequence = useRef({ key: "", time: 0 });
   const searchOrigin = useRef<Route | null>(null);
+  const searchHistoryStates = useRef(new Map<number, { search: boolean; query: string; submitted: boolean; origin: Route | null; filter: string | null }>());
+  useLayoutEffect(() => {
+    // Search history is owner-lifetime state, not persistent query data in history.state.
+    const states = searchHistoryStates.current;
+    states.delete(historyPosition.current);
+    states.set(historyPosition.current, { search, query, submitted: searchSubmitted, origin: searchOrigin.current, filter: mailFilter });
+    if (states.size > 64) states.delete(states.keys().next().value!);
+  }, [route, search, query, searchSubmitted, mailFilter, settings]);
   const isUnified = route.account === UNIFIED_ACCOUNT;
   const accountOptions = (inbox.viewPreferences?.pinnedMailboxIds ?? []).filter(id => inbox.accounts.some(account => account.id === id));
   const unifiedMailboxIds = useMemo(() => inbox.viewPreferences?.unifiedMode === "all" ? inbox.accounts.map(account => account.id)
@@ -241,6 +253,39 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const accountEmail = activeAccount?.email ?? "";
   const deferredQuery = useDeferredValue(query);
   const resultQuery = searchSubmitted ? query : deferredQuery;
+  const listViewKey = JSON.stringify([route.account, route.folder, route.split, mailFilter,
+    search ? searchSubmitted ? "results" : "suggestions" : "list", search && searchSubmitted ? resultQuery : null]);
+  const listScroll = useMemo(() => listPositions.current.get(listViewKey) ?? { current: 0 }, [listViewKey]);
+  useLayoutEffect(() => {
+    const positions = listPositions.current;
+    positions.delete(listViewKey);
+    positions.set(listViewKey, listScroll);
+    if (positions.size > 32) positions.delete(positions.keys().next().value!);
+  }, [listViewKey, listScroll]);
+  const restoreListPosition = useCallback((root: HTMLDivElement, top: number) => {
+    root.scrollTop = top;
+    if (root.scrollTop > 0) {
+      const highlighted = root.querySelector<HTMLElement>('[data-highlighted="true"]');
+      const inView = (row: HTMLElement) => row.offsetTop >= root.scrollTop && row.offsetTop + row.offsetHeight <= root.scrollTop + root.clientHeight;
+      if (!highlighted || !inView(highlighted)) {
+        const row = [...root.querySelectorAll<HTMLElement>(":scope > [aria-rowindex]")].find(inView);
+        if (row) {
+          const index = Number(row.getAttribute("aria-rowindex")) - 1;
+          pointerHighlight.current = index;
+          setHighlight(index);
+        }
+      }
+    }
+  }, []);
+  const attachList = useCallback((root: HTMLDivElement | null) => {
+    list.current = root;
+    if (!root) return;
+    restoreListPosition(root, listScroll.current);
+    return () => {
+      listScroll.current = root.scrollTop;
+      list.current = null;
+    };
+  }, [listScroll, restoreListPosition]);
   const accountMail = useMemo(
     () => mail.filter((message) => message.account === route.account),
     [mail, route.account],
@@ -257,7 +302,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     void store.search(route.account, resultQuery, controller.signal).then(ids => {
       if (!controller.signal.aborted) setSearchResult({ key: searchKey, ids, loading: false });
     }).catch(error => {
-      if (!controller.signal.aborted) setSearchResult({ key: searchKey, ids: new Set(), loading: false, error: error instanceof Error ? error.message : "Search failed." });
+      if (!controller.signal.aborted) setSearchResult({ key: searchKey, ids: new Set(), loading: false, error: error instanceof ApiError && ["VALIDATION", "INVALID_QUERY"].includes(error.code)
+        ? "Check your search terms and filters. Try a word or a filter with a value, such as from:alex."
+        : error instanceof Error ? error.message : "Search failed." });
     });
     return () => controller.abort();
   }, [store, search, searchSubmitted, route.account, resultQuery, searchKey, searchVersion]);
@@ -364,6 +411,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const dark =
     !["Light", "light"].includes(preferences.theme) &&
     (!["System", "Match System"].includes(preferences.theme) || systemDark);
+  // Capture before a newly virtualized child can reveal its initial highlight.
+  const searchScrollTop = listScroll.current;
   const motion = useMailMotion(list, {
     rowsKey: search && !searchSubmitted ? `suggestions:${query}` : rowsKey,
     viewKey: `${route.account}:${route.folder}:${route.split}:${search ? `search:${searchSubmitted ? resultQuery : "suggestions"}` : "list"}:${route.thread || route.draft || route.view || ""}`,
@@ -372,10 +421,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     focused: !navigation && !searchFocused,
   });
   useLayoutEffect(() => {
-    const root = list.current;
-    if (!root) return;
-    root.scrollTop = listScroll.current;
-  }, [route.thread, route.draft, route.view, search, searchSubmitted]);
+    if (!search || !searchSubmitted || searchResult?.key !== searchKey || searchResult.loading || searchResult.error || !list.current) return;
+    restoreListPosition(list.current, searchScrollTop);
+    listScroll.current = list.current.scrollTop;
+  }, [search, searchSubmitted, searchKey, searchResult, listScroll, restoreListPosition]);
 
   const storageFailure = () =>
     setNotice({
@@ -441,6 +490,16 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       }
       return;
     }
+    const searchState = nextIndex === null ? undefined : searchHistoryStates.current.get(nextIndex);
+    const searchChanged = search !== (searchState?.search ?? false) || query !== (searchState?.query ?? "") || searchSubmitted !== (searchState?.submitted ?? false) || mailFilter !== (searchState?.filter ?? null);
+    if (searchChanged) setSelected([]);
+    if (searchChanged || next.account !== route.account || next.folder !== route.folder || next.split !== route.split) setHighlight(0);
+    restoreSearchFocus.current = false;
+    searchOrigin.current = searchState?.origin ?? null;
+    setSearch(searchState?.search ?? false);
+    setQuery(searchState?.query ?? "");
+    setSearchSubmitted(searchState?.submitted ?? false);
+    setMailFilter(searchState?.filter ?? null);
     historyPosition.current = nextIndex ?? historyPosition.current + 1;
     if (nextIndex === null) history.replaceState({ ...history.state, superlocalIndex: historyPosition.current }, "");
     if (!settingsOpen.current && nextPage !== null) rememberSettingsFocus();
@@ -506,13 +565,31 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (search) searchInput.current?.focus();
   }, [search]);
   useEffect(() => {
+    if (search || !restoreSearchFocus.current) return;
+    restoreSearchFocus.current = false;
+    const opener = searchFocus.current;
+    searchFocus.current = null;
+    if (settings || overlay || navigation || issueReporter) return;
+    // Closing search remounts its trigger. Other navigation must keep its own focus.
+    if (document.activeElement && document.activeElement !== document.body) return;
+    const target = opener?.isConnected && opener !== document.body && opener !== document.documentElement &&
+      opener.getClientRects().length && !opener.matches(":disabled") && !opener.closest('[inert], [aria-disabled="true"]')
+      ? opener
+      : document.querySelector<HTMLElement>(".mail-workspace .search-trigger");
+    target?.focus({ preventScroll: true });
+  }, [search, settings, overlay, navigation, issueReporter]);
+  const highlightedView = useRef(listViewKey);
+  useEffect(() => {
+    const viewChanged = highlightedView.current !== listViewKey;
+    highlightedView.current = listViewKey;
     const pointer = pointerHighlight.current === highlight;
     pointerHighlight.current = null;
-    if (pointer) return;
+    // A reset selection in another view must not undo its restored viewport.
+    if (viewChanged || pointer) return;
     list.current
       ?.querySelector<HTMLElement>('[data-highlighted="true"]')
       ?.scrollIntoView({ block: "nearest" });
-  }, [highlight]);
+  }, [highlight, listViewKey]);
 
   function navigate(patch: Partial<Route>, preserveSettings = false) {
     if (!preserveSettings && !leaveSettings()) return false;
@@ -542,8 +619,6 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   ) {
     if (!leaveSettings()) return;
     motion.prepare("switch");
-    listScroll.current = 0;
-    if (list.current) list.current.scrollTop = 0;
     navigate({
       folder,
       split,
@@ -718,6 +793,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setOverlay(null);
   }
   function startSearch(floatingDraftId?: string) {
+    if (!leaveSettings()) return;
+    searchFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    restoreSearchFocus.current = false;
     motion.prepare("search");
     searchOrigin.current = route;
     flushSync(() => {
@@ -732,6 +810,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     searchInput.current?.focus();
   }
   function closeSearch() {
+    restoreSearchFocus.current = true;
     motion.prepare("return");
     setSearchFocused(false);
     setSearchSubmitted(false);
@@ -1363,8 +1442,6 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (!leaveSettings()) return;
     motion.prepare("switch");
     setMailFilter(null);
-    listScroll.current = 0;
-    if (list.current) list.current.scrollTop = 0;
     setOverlay(null);
     navigate({
       account,
@@ -1465,6 +1542,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         );
         break;
       case "jump":
+        if (intent.edge === "top") {
+          listScroll.current = 0;
+          if (list.current) list.current.scrollTop = 0;
+        }
         setHighlight(intent.edge === "top" ? 0 : Math.max(0, rowCount - 1));
         break;
       case "drawerNavigate": {
@@ -1538,8 +1619,6 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         motion.prepare("switch");
         setMailFilter((value) => (value === intent.name ? null : intent.name));
         setHighlight(0);
-        listScroll.current = 0;
-        if (list.current) list.current.scrollTop = 0;
         break;
       case "navigateConversation":
         if (currentMail) navigateThread(intent.delta);
@@ -1677,6 +1756,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         preferences={preferences}
         onChange={updatePreferences}
         onClose={closeSettings}
+        onSectionChange={openSettings}
         onExitGuardChange={setSettingsExitGuard}
         initialPage={settingsPage}
         jumpRequest={settingsJumpRequest}
@@ -1904,6 +1984,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                       <IconButton
                         name="Search"
                         title="Search (/)"
+                        className="search-trigger"
                         onClick={() => startSearch()}
                       />
                     </>
@@ -1912,8 +1993,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
               )}
             </header>
             <div
+              key={listViewKey}
               className="mail-list animated-mail-list"
-              ref={list}
+              ref={attachList}
               role="table"
               tabIndex={-1}
               aria-rowcount={rowCount}

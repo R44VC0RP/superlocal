@@ -260,7 +260,11 @@ export function Modal({
     <div
       className="modal-backdrop"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) {
+          // Do not let the backdrop's default focus action undo dismissal focus restoration.
+          e.preventDefault();
+          onClose();
+        }
       }}
     >
       <div

@@ -16,6 +16,7 @@ export type SettingsProps = {
   preferences: Preferences;
   onChange: (patch: Partial<Preferences>) => void;
   onClose: () => void;
+  onSectionChange?: (section: string) => void;
   initialPage?: string;
   jumpRequest?: number;
   onExitGuardChange?: (guard: (() => boolean) | null) => void;
@@ -78,6 +79,7 @@ export function Settings({
   preferences,
   onChange,
   onClose,
+  onSectionChange,
   initialPage,
   jumpRequest = 0,
   onExitGuardChange,
@@ -1323,7 +1325,7 @@ export function Settings({
         <div className="settings-content">
           <nav className="settings-jumps" aria-label="Jump to settings">
             {[["AI triage", "AI triage"], ["Mailboxes", "Mailboxes"], ["Accounts", "Add Accounts"], ["Appearance", "Theme"], ["Inbox", "Split Inbox"], ["Writing", "Signatures"], ["Workflow", "Blocked Senders"], ["Calendar", "Calendar Settings"], ["Advanced", "Backtick as Escape"], ["Shortcuts", "Shortcuts"]].map(([label, name]) => (
-              <a key={name} href={sectionHref(name)} onClick={event => { if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; event.preventDefault(); jumpTo(name); }}>{label}</a>
+              <a key={name} href={sectionHref(name)} onClick={event => { if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; event.preventDefault(); if (onSectionChange) onSectionChange(name); else jumpTo(name); }}>{label}</a>
             ))}
           </nav>
           {sections.map(name => (

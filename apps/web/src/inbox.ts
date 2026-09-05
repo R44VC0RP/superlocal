@@ -19,7 +19,8 @@ import { classifyAttention, conversationAttention } from "../../shared/mail-atte
 import { normalizeSplits, type SplitPreferences } from "../../shared/splits";
 import type { AiTriageActions, AiTriageState, AiDecision, AiDecisionPage } from "../../shared/ai-triage";
 
-type Edit = { draft: Draft; revision: number; version: number; error?: string };
+type Edit = { draft: Draft; revision: number; version: number; error?: string; errorKind?: "recipients" };
+class DraftRecipientError extends Error {}
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
 type Sending = { ref: SendReference; operation: Operation; draft: SdkDraft };
 type Flag = "isRead" | "isStarred";
@@ -440,7 +441,7 @@ export class InboxStore {
     this.state = { ...this.state, ...patch }; this.listeners.forEach(listener => listener());
   }
   private requestOptions() { return { signal: this.controller.signal }; }
-  private fail(error: unknown, action: string) {
+  private fail(error: unknown, action: string, key?: string) {
     if (this.controller.signal.aborted || error instanceof DOMException && error.name === "AbortError") return;
     const code = failureCode(error);
     console.warn({ event: "inbox.action", action, code });
@@ -449,13 +450,13 @@ export class InboxStore {
       this.publish({ loading: false, refreshing: false, error: detail });
       this.raise({ scope: "snapshot", code, title: this.state.loaded ? "Couldn't refresh the inbox" : "Couldn't open the inbox", detail, retry: true });
     } else if (action === "load-thread") this.raise({ scope: "thread", code, title: "Couldn't load this conversation", detail, retry: true });
-    else if (action === "save-draft") this.raise({ scope: "draft", code, title: "Draft not saved", detail, retry: false });
+    else if (action === "save-draft") this.raise({ key, scope: "draft", code, title: "Draft not saved", detail, retry: false });
     // Other actions are user-initiated: their caller shows the failure once, so no persistent notice is added.
   }
-  private raise(issue: Pick<InboxIssue, "scope" | "code" | "title" | "retry"> & { detail?: string }) {
+  private raise(issue: Pick<InboxIssue, "scope" | "code" | "title" | "retry"> & { key?: string; detail?: string }) {
     if (this.controller.signal.aborted) return;
-    // One slot per problem: live updates, the snapshot, the open conversation, and the draft each stay a single notice whatever the code.
-    const key = issue.scope === "storage" ? `storage:${issue.code}` : issue.scope, now = Date.now();
+    // One slot per problem: live updates, the snapshot, the open conversation, and each draft stay a single notice whatever the code.
+    const key = issue.key ?? (issue.scope === "storage" ? `storage:${issue.code}` : issue.scope), now = Date.now();
     clearTimeout(this.issueHolds.get(key)); this.issueHolds.delete(key);
     const existing = this.state.issues.find(item => item.key === key);
     if (existing) {
@@ -1338,6 +1339,12 @@ export class InboxStore {
     this.loadingThreads.set(key, work); return work;
   };
 
+  private retireDraftIssue(id: string, issue: InboxIssue | undefined) {
+    // An authoritative recovery retires only its captured incident, never a newer failure or pending writing.
+    if (!issue || issue.key !== `draft:${id}` || this.edits.has(id) || this.saves.has(id) || !this.state.issues.includes(issue)) return;
+    clearTimeout(this.issueHolds.get(issue.key)); this.issueHolds.delete(issue.key);
+    this.publish({ issues: this.state.issues.filter(item => item !== issue) });
+  }
   private saveRecovery() {
     const recovery = Object.fromEntries([...this.edits].map(([id, edit]) => [id, { draft: edit.draft, revision: edit.revision }]));
     this.recovery = recovery;
@@ -1349,10 +1356,11 @@ export class InboxStore {
     if (!raw) return;
     this.popouts.set(draft.id, draft.popOut ?? false);
     if (old && contentKey(old) === contentKey(draft)) { this.rebuild(); return; }
-    const previous = this.edits.get(draft.id);
-    this.edits.set(draft.id, { draft: { ...draft, updated: Date.now() }, revision: previous?.revision ?? raw.revision, version: (previous?.version ?? 0) + 1, ...(previous?.error ? { error: previous.error } : {}) });
+    const previous = this.edits.get(draft.id), complete = completeRecipients(draft);
+    const error = previous?.error && !(previous.errorKind === "recipients" && complete) ? { error: previous.error, errorKind: previous.errorKind } : {};
+    this.edits.set(draft.id, { draft: { ...draft, updated: Date.now() }, revision: previous?.revision ?? raw.revision, version: (previous?.version ?? 0) + 1, ...error });
     this.saveRecovery(); this.rebuild(); clearTimeout(this.saveTimers.get(draft.id));
-    if (completeRecipients(draft) && !previous?.error) this.saveTimers.set(draft.id, setTimeout(() => void this.flushDraft(draft.id).catch(() => {}), 450));
+    if (complete && !error.error) this.saveTimers.set(draft.id, setTimeout(() => void this.flushDraft(draft.id).catch(() => {}), 450));
   };
 
   private async uploadFile(file: Attachment, sourceId: string): Promise<BlobInfo> {
@@ -1380,11 +1388,13 @@ export class InboxStore {
   flushDraft = (id: string): Promise<SdkDraft> => {
     const existing = this.saves.get(id); if (existing) return existing.then(() => this.edits.has(id) ? this.flushDraft(id) : this.rawDrafts.get(id)!);
     clearTimeout(this.saveTimers.get(id)); this.saveTimers.delete(id);
+    const issue = this.state.issues.find(issue => issue.key === `draft:${id}`);
+    let recovered = false;
     const work = (async () => {
       while (this.edits.has(id)) {
         const edit = this.edits.get(id)!;
-        if (edit.error) throw new Error(edit.error);
-        if (!completeRecipients(edit.draft)) throw new Error("Complete the recipient address before saving this draft.");
+        if (edit.error && edit.errorKind !== "recipients") throw new Error(edit.error);
+        if (!completeRecipients(edit.draft)) throw new DraftRecipientError("Complete the recipient address before saving this draft.");
         const raw = this.rawDrafts.get(id); if (!raw) throw new Error("This draft is no longer active.");
         const input = await this.draftInput(edit.draft, raw.accountId);
         const saved = await this.client.updateDraft(id, input, edit.revision, this.requestOptions());
@@ -1393,14 +1403,20 @@ export class InboxStore {
         const current = this.edits.get(id);
         if (current?.version === edit.version) this.edits.delete(id);
         else if (current) current.revision = saved.revision;
-        this.saveRecovery(); this.rebuild(); this.resolve("draft");
+        this.saveRecovery(); this.rebuild(); recovered = true;
       }
       const saved = this.rawDrafts.get(id); if (!saved) throw new Error("This draft is no longer active."); return saved;
     })().catch(error => {
       const edit = this.edits.get(id);
-      if (edit) edit.error = error instanceof ApiError && error.status === 412 ? "This draft changed elsewhere. Your writing has been kept; reload or copy it before replacing the newer draft." : error instanceof Error ? error.message : "Draft save failed.";
-      this.fail(error, "save-draft"); this.rebuild(); throw error;
-    }).finally(() => { this.saves.delete(id); this.rebuild(); });
+      if (edit) {
+        edit.error = error instanceof ApiError && error.status === 412 ? "This draft changed elsewhere. Your writing has been kept; reload or copy it before replacing the newer draft." : error instanceof Error ? error.message : "Draft save failed.";
+        edit.errorKind = error instanceof DraftRecipientError ? "recipients" : undefined;
+      }
+      this.fail(error, "save-draft", `draft:${id}`); this.rebuild(); throw error;
+    }).finally(() => { this.saves.delete(id); this.rebuild(); }).then(saved => {
+      if (recovered) this.retireDraftIssue(id, issue);
+      return saved;
+    });
     this.saves.set(id, work); this.rebuild(); return work;
   };
 
@@ -1442,11 +1458,14 @@ export class InboxStore {
     await this.client.deleteDraft(id, raw.revision, this.requestOptions()); this.draftEpoch++; this.rawDrafts.delete(id); this.edits.delete(id); this.saveRecovery(); this.rebuild();
   };
   reloadDraft = async (id: string) => {
+    const issue = this.state.issues.find(issue => issue.key === `draft:${id}`);
     const raw = await this.client.draft(id, this.requestOptions()); this.draftEpoch++; this.edits.delete(id); this.rawDrafts.set(id, raw); this.saveRecovery(); this.rebuild();
+    this.retireDraftIssue(id, issue);
   };
 
   submit = async (draft: Draft, sendAt?: string): Promise<Operation> => {
     if (!this.state.host?.allowProviderWrites) throw new Error("Sending is disabled by this read-only host.");
+    const issue = this.state.issues.find(issue => issue.key === `draft:${draft.id}`);
     this.editDraft(draft); const raw = await this.flushDraft(draft.id);
     const previous = this.references.filter(ref => ref.draftId === draft.id).at(-1);
     const previousStatus = previous && this.operations.get(previous.id)?.status;
@@ -1462,6 +1481,7 @@ export class InboxStore {
     this.draftEpoch++; this.rawDrafts.delete(raw.id); this.edits.delete(raw.id); this.saveRecovery();
     this.operations.set(operation.id, operation);
     this.sending.set(operation.id, { ref, operation, draft: raw }); this.rebuild(); this.scheduleRefresh();
+    this.retireDraftIssue(raw.id, issue);
     return operation;
   };
 

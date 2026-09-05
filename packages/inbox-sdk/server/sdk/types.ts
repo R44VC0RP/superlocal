@@ -530,10 +530,11 @@ export async function providerJson<T>(
   url: string,
   init: RequestInit = {},
   timeoutMs?: number,
+  maxBytes?: number,
 ): Promise<T> {
   const response = await providerRequest(provider, fetcher, url, init, timeoutMs)
-  if (response.status === 204 || response.headers.get('content-length') === '0') return undefined as T
-  const body = new TextDecoder().decode(await providerBytes(provider, response))
+  if (response.status === 204 || maxBytes === undefined && response.headers.get('content-length') === '0') return undefined as T
+  const body = new TextDecoder().decode(await providerBytes(provider, response, maxBytes))
   if (!body.trim()) return undefined as T
   try {
     return JSON.parse(body) as T
@@ -545,10 +546,31 @@ export async function providerJson<T>(
   }
 }
 
-export async function providerBytes(provider: InboxProviderType, response: Response): Promise<Uint8Array> {
+export async function providerBytes(provider: InboxProviderType, response: Response, maxBytes?: number): Promise<Uint8Array> {
   try {
-    return new Uint8Array(await response.arrayBuffer())
+    if (maxBytes === undefined) return new Uint8Array(await response.arrayBuffer())
+    const reader = response.body?.getReader()
+    if (!reader) return new Uint8Array()
+    const chunks: Uint8Array[] = []
+    let size = 0
+    try {
+      for (;;) {
+        const next = await reader.read()
+        if (next.done) break
+        size += next.value.byteLength
+        if (size > maxBytes) {
+          await reader.cancel().catch(() => {})
+          throw new ProviderError(provider, 'UPSTREAM', `${provider} response exceeds the supported size limit`, { status: response.status })
+        }
+        chunks.push(next.value)
+      }
+    } finally { reader.releaseLock() }
+    const bytes = new Uint8Array(size)
+    let offset = 0
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+    return bytes
   } catch (cause) {
+    if (maxBytes !== undefined && cause instanceof ProviderError) throw cause
     throw new ProviderError(provider, 'NETWORK', `${provider} response body was interrupted`, {
       status: response.status,
       retryable: true,

@@ -82,9 +82,11 @@ interface InboundSnapshot {
 
 const SNAPSHOT_TTL_MS = 15 * 60_000
 const MAX_SNAPSHOTS = 4
-const MAX_SNAPSHOT_ITEMS = 10_000
-const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+const MAX_SNAPSHOT_ITEMS = 20_000
+const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 const MAX_SCAN_PAGES = 200
+const SCAN_LOOKAHEAD = 4
+const MAX_LISTING_BYTES = 4 * 1024 * 1024
 const MAX_MAILBOX_SCOPE_INPUTS = 5_000
 const MAX_RECEIVING_SOURCES = 1_000
 const SOURCE_HEAD_CONCURRENCY = 4
@@ -238,7 +240,7 @@ export class InboundProvider implements InboxProvider {
     return headers
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  private async request<T>(path: string, init: RequestInit = {}, maxBytes?: number): Promise<T> {
     const signal = init.signal ? AbortSignal.any([init.signal, this.requests.signal]) : this.requests.signal
     const cancelled = () => new ProviderError('inbound', 'NETWORK', this.requests.signal.aborted
       ? 'Inbound provider is disconnected' : 'Inbound request was cancelled', { retryable: true })
@@ -265,6 +267,7 @@ export class InboundProvider implements InboxProvider {
         signal,
       },
       this.timeoutMs,
+      maxBytes,
     )
     if (signal.aborted) throw cancelled()
     return result
@@ -489,7 +492,7 @@ export class InboundProvider implements InboxProvider {
   }
 
   private async emailPage(path: string, expectedOffset: number, signal?: AbortSignal): Promise<InboundEmailList> {
-    const result = await this.request<InboundEmailList>(path, { signal })
+    const result = await this.request<InboundEmailList>(path, { signal }, MAX_LISTING_BYTES)
     if (!result || typeof result !== 'object' || !Array.isArray(result.data) ||
       !result.pagination || typeof result.pagination !== 'object' ||
       typeof result.pagination.has_more !== 'boolean' ||
@@ -615,14 +618,14 @@ export class InboundProvider implements InboxProvider {
             throw new ProviderCursorExpiredError('inbound', 'Inbound returned inconsistent snapshot totals')
           }
           total += seed.pagination.total
-          if (total > MAX_SNAPSHOT_ITEMS) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeds 10000 records; select a narrower scope')
+          if (total > MAX_SNAPSHOT_ITEMS) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeds 20000 records; select a narrower scope')
           const pinned = { data: seed.data.map(email => this.snapshotSummary(email)), pagination: {
             offset: 0, limit: 1, total: seed.pagination.total, has_more: seed.pagination.has_more,
           } }
           // Reserve head metadata for the snapshot lifetime, even after a seed is consumed.
           const bytes = JSON.stringify(pinned).length * 2
           if (snapshot.bytes + bytes > MAX_SNAPSHOT_BYTES) {
-            throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its bounded metadata cache')
+            throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
           }
           snapshot.bytes += bytes
           source.total = seed.pagination.total
@@ -677,7 +680,7 @@ export class InboundProvider implements InboxProvider {
       descriptorBytes += JSON.stringify({ params: params.toString(), domain, address, ids: [],
         total: MAX_SNAPSHOT_ITEMS, complete: false }).length * 2
       if (descriptorBytes > MAX_SNAPSHOT_BYTES) {
-        throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its bounded metadata cache')
+        throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
       }
       sources.push({ params, domain, address, ids: [], complete: false })
     }
@@ -706,7 +709,7 @@ export class InboundProvider implements InboxProvider {
     const scope = JSON.stringify([this.accountId, kind, connectionMode, scopes ?? null, options.folder ?? null,
       options.search ?? null, options.unreadOnly ?? false, sources.map(source => source.params.toString())])
     const bytes = descriptorBytes + scope.length * 2
-    if (bytes > MAX_SNAPSHOT_BYTES) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its bounded metadata cache')
+    if (bytes > MAX_SNAPSHOT_BYTES) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
     if (snapshot) {
       if (snapshot.scope !== scope) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot query or receiving grants changed')
       snapshot.expiresAt = Date.now() + SNAPSHOT_TTL_MS
@@ -732,42 +735,90 @@ export class InboundProvider implements InboxProvider {
     let matched = 0
     let foundHead = source.ids.length === 0
     let total: number | undefined
-    for (;;) {
+    type PageRead = { page: InboundEmailList } | { error: unknown }
+    const pages = new Map<number, Promise<PageRead>>()
+    let cancel = new AbortController()
+    let failure: { error: unknown } | undefined
+    let sequential = false
+    const start = (at: number) => {
+      if (budget.requests >= MAX_SCAN_PAGES) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot verification exceeded its bounded scan')
+      budget.requests++
       const params = new URLSearchParams(source.params)
-      params.set('offset', String(offset)); params.set('limit', '100')
-      const seed = source.seed
-      if (!seed && ++budget.requests > MAX_SCAN_PAGES) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot verification exceeded its bounded scan')
-      const page = seed ?? await this.emailPage(`/emails?${params}`, offset)
-      source.seed = undefined
-      if (page.data.length > page.pagination.limit || (total !== undefined && total !== page.pagination.total) ||
-        page.data.length !== Math.min(page.pagination.limit, page.pagination.total - offset) ||
-        page.pagination.has_more !== (offset + page.data.length < page.pagination.total)) {
-        throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot changed during enumeration')
-      }
-      total = page.pagination.total
-      for (const email of page.data) {
-        if (!foundHead) {
-          if (email.id !== source.ids[0]) { skippedHeads++; continue }
-          foundHead = true
-          if (total - skippedHeads !== source.total) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot membership changed')
-        }
-        if (matched < source.ids.length) {
-          if (email.id !== source.ids[matched++]) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot prefix changed')
-          continue
-        }
-        if (known.has(email.id)) {
-          throw new ProviderCursorExpiredError('inbound', 'Inbound returned duplicate snapshot records')
-        }
-        known.add(email.id)
-        const summary = this.snapshotSummary(email)
-        pendingBytes += JSON.stringify(summary).length * 2
-        if (snapshot.bytes + pendingBytes > MAX_SNAPSHOT_BYTES) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its bounded metadata cache')
-        pending.push(summary)
-        if (pending.length === size) break
-      }
-      if (pending.length === size || !page.pagination.has_more) break
-      offset += page.pagination.limit
+      params.set('offset', String(at)); params.set('limit', '100')
+      const controller = cancel
+      pages.set(at, this.emailPage(`/emails?${params}`, at, controller.signal).then(
+        page => ({ page }),
+        error => {
+          if (!controller.signal.aborted) { failure ??= { error }; controller.abort() }
+          return { error }
+        },
+      ))
     }
+    const settle = async () => {
+      cancel.abort()
+      await Promise.all(pages.values())
+      pages.clear()
+    }
+    try {
+      for (;;) {
+        const seed = source.seed
+        let page: InboundEmailList
+        if (seed) page = seed
+        else {
+          if (!pages.has(offset)) start(offset)
+          const result = await pages.get(offset)!
+          pages.delete(offset)
+          if (failure) throw failure.error
+          if ('error' in result) throw result.error
+          page = result.page
+        }
+        source.seed = undefined
+        if (page.data.length > page.pagination.limit || (total !== undefined && total !== page.pagination.total) ||
+          page.data.length !== Math.min(page.pagination.limit, page.pagination.total - offset) ||
+          page.pagination.has_more !== (offset + page.data.length < page.pagination.total)) {
+          throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot changed during enumeration')
+        }
+        total = page.pagination.total
+        for (const email of page.data) {
+          if (!foundHead) {
+            if (email.id !== source.ids[0]) { skippedHeads++; continue }
+            foundHead = true
+            if (total - skippedHeads !== source.total) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot membership changed')
+          }
+          if (matched < source.ids.length) {
+            if (email.id !== source.ids[matched++]) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot prefix changed')
+            continue
+          }
+          if (known.has(email.id)) {
+            throw new ProviderCursorExpiredError('inbound', 'Inbound returned duplicate snapshot records')
+          }
+          known.add(email.id)
+          const summary = this.snapshotSummary(email)
+          pendingBytes += JSON.stringify(summary).length * 2
+          if (snapshot.bytes + pendingBytes > MAX_SNAPSHOT_BYTES) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
+          pending.push(summary)
+          if (pending.length === size) break
+        }
+        if (pending.length === size || !page.pagination.has_more) break
+        offset += page.pagination.limit
+        if (!seed && page.pagination.limit !== 100) {
+          // Guessed offsets are no longer valid; settle them before following the actual limit.
+          await settle()
+          if (failure) throw failure.error
+          cancel = new AbortController()
+          sequential = true
+        }
+        if (foundHead && !sequential) {
+          const target = skippedHeads + source.ids.length + Math.min(size, source.total! - source.ids.length)
+          let next = pages.size ? Math.max(...pages.keys()) + 100 : offset
+          // Per scan: both in-flight responses and completed, unconsumed pages occupy a slot.
+          while (next < target && pages.size < SCAN_LOOKAHEAD && budget.requests < MAX_SCAN_PAGES) {
+            start(next)
+            next += 100
+          }
+        }
+      }
+    } finally { await settle() }
     if (!foundHead || matched !== source.ids.length || !pending.length || source.ids.length + pending.length > source.total!) {
       throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot ended before its pinned membership was enumerated')
     }
@@ -780,8 +831,11 @@ export class InboundProvider implements InboxProvider {
       }
       const summary = this.snapshotSummary(email)
       const bytes = JSON.stringify(summary).length * 2
-      if (snapshot.entries.length >= MAX_SNAPSHOT_ITEMS || snapshot.bytes + bytes > MAX_SNAPSHOT_BYTES) {
-        throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its bounded metadata cache')
+      if (snapshot.entries.length >= MAX_SNAPSHOT_ITEMS) {
+        throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeds 20000 records; select a narrower scope')
+      }
+      if (snapshot.bytes + bytes > MAX_SNAPSHOT_BYTES) {
+        throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
       }
       const recipient = this.deliveryRecipient(summary)
       const domainMatches = !source.domain || !recipient || recipient.split('@')[1] === source.domain
@@ -900,7 +954,7 @@ export class InboundProvider implements InboxProvider {
           const summary = this.snapshotSummary({ ...entry.summary,
             thread_id: (await this.getRawMessage(entry.summary.id, snapshot.connectionMode)).thread_id ?? null })
           const bytes = (JSON.stringify(summary).length - JSON.stringify(entry.summary).length) * 2
-          if (snapshot.bytes + bytes > MAX_SNAPSHOT_BYTES) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its bounded metadata cache')
+          if (snapshot.bytes + bytes > MAX_SNAPSHOT_BYTES) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
           snapshot.bytes += bytes
           entry.summary = summary
         }
