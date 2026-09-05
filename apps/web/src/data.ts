@@ -1,6 +1,7 @@
 import type { MailboxMembership, SendingIdentities } from "inbox-sdk/types";
 import type { AttentionDecision } from "../../shared/mail-attention";
 import type { AiDecision, AiCategory } from "../../shared/ai-triage";
+import type { CategoryEntry } from "../../shared/attention-overrides";
 
 export type LoadSendingIdentities = (mailboxId: string, input?: { refresh?: boolean }) => Promise<SendingIdentities>;
 
@@ -65,6 +66,9 @@ export type Mail = {
   triage?: AiDecision;
   /** A validated, opted-in local decision; never a provider folder mutation. */
   attentionCategory?: AiCategory;
+  /** Explicit captured-context choice, independent of AI opt-in. */
+  attentionOverride?: CategoryEntry;
+  sourceGeneration?: number;
   aiHoldUntil?: number;
   opened?: string;
   muted?: boolean;

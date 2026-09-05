@@ -10,14 +10,16 @@ import { getApplicationStorage } from "./storage";
 import { createScopedFetch } from "./application-auth";
 import { getApplicationScope } from "./application-scope";
 import { matchesSearch } from "./mail-search";
-import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, createAiTriageClient, type HostConfiguration, type InboxViewPreferences } from "./host";
+import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, createAiTriageClient, type HostConfiguration, type InboxViewPreferences, createCategoryTransport, CategoryRequestError } from "./host";
 import { readSplitPreferences, writeSplitPreferences, readAttentionFeedback, recordAttentionFeedback, retractAttentionFeedback, InboxViewPreferencesError,
   type SavedSplitPreferences, type AttentionFeedback, type AttentionFeedbackTarget } from "./host";
-import { UNIFIED_ACCOUNT, unifiedMail, unifiedThreadId, currentAiDecision } from "./mail-model";
+import { UNIFIED_ACCOUNT, unifiedMail, unifiedThreadId, currentAiDecision, currentCategoryOverride } from "./mail-model";
 import type { SenderHistoryMessage } from "./sender-context";
 import { classifyAttention, conversationAttention } from "../../shared/mail-attention";
 import { normalizeSplits, type SplitPreferences } from "../../shared/splits";
 import type { AiTriageActions, AiTriageState, AiDecision, AiDecisionPage } from "../../shared/ai-triage";
+
+import { CATEGORY_BATCH_LIMIT, CATEGORY_MEMBERSHIP_LIMIT, CATEGORY_BODY_LIMIT, categoryKey, categoryErrorMessages, isCategoryContext, type AttentionCategory, type CategoryContext, type CategoryEntry, type CategoryCommand, type CategoryReceipt, type CategoryErrorCode } from "../../shared/attention-overrides";
 
 type Edit = { draft: Draft; revision: number; version: number; error?: string; errorKind?: "recipients" };
 class DraftRecipientError extends Error {}
@@ -33,6 +35,13 @@ type FlagWrite = {
 };
 /** Already shown by the store; callers must not add a second toast. */
 export class InboxActionError extends Error {}
+export class InboxClassificationError extends InboxActionError {
+  constructor(readonly code: CategoryErrorCode, readonly completed: number, readonly remaining: number,
+    readonly retry?: () => Promise<() => Promise<void>>, readonly undoCompleted?: () => Promise<void>) {
+    super(categoryErrorMessages[code]);
+    this.name = "InboxClassificationError";
+  }
+}
 /** A coalesced background problem. Repeats of the same key update one issue instead of adding another notice. */
 export type InboxIssue = {
   key: string;
@@ -239,6 +248,11 @@ export class InboxStore {
   private aiRebuildThreads = new Set<string>();
   private aiRebuildAfter = 0;
   private knownThreads = new Set<string>();
+  private categories = new Map<string, CategoryEntry>();
+  private categoryCursor = 0;
+  private categoryEpoch = 0;
+  private categoryReads?: Promise<void>;
+  private readonly categoryTransport = createCategoryTransport(() => AbortSignal.any([this.controller.signal, this.applicationScope.signal]), (input, init) => this.fetch(input, init));
   private readonly aiTransport = createAiTriageClient(() => AbortSignal.any([this.controller.signal, this.applicationScope.signal]), (input, init) => this.fetch(input, init));
   readonly client: InboxClient;
 
@@ -280,6 +294,57 @@ export class InboxStore {
     clearReading: async () => { await this.aiTransport.clearReading(); this.aiStateAt = 0; this.scheduleAi(0); },
   };
 
+  private receiveCategories(entries: CategoryEntry[]) {
+    const threads = new Set<string>();
+    for (const entry of entries) {
+      const key = categoryKey(entry), previous = this.categories.get(key);
+      if (previous && previous.revision >= entry.revision) continue;
+      if (!previous && this.categories.size >= 100_000) throw new CategoryRequestError("HOST_CATEGORY_TOO_LARGE", 413);
+      this.categories.set(key, entry);
+      if (this.knownThreads.has(key)) threads.add(key);
+    }
+    if (threads.size) this.rebuild(threads);
+  }
+
+  /** Sparse saved choices only. Cross-tab changes catch up on mail events/focus/Retry,
+   * not a new poller. Receipts reconcile immediately; no SDK inventory is restarted. */
+  private readCategories(): Promise<void> {
+    if (this.categoryReads) return this.categoryReads;
+    if (!this.state.host?.attentionOverrides || this.controller.signal.aborted) return Promise.resolve();
+    const signal = this.controller.signal, generation = this.generation, epoch = this.categoryEpoch;
+    const work = (async () => {
+      let resets = 0;
+      for (let pages = 0; pages < 2001; pages++) {
+        while (this.state.pending) await pause(25, signal);
+        const page = await this.categoryTransport.changes(this.categoryCursor);
+        signal.throwIfAborted();
+        if (generation !== this.generation || epoch !== this.categoryEpoch) return;
+        if (page.resetRequired) {
+          if (resets++) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+          const threads = new Set(this.categories.keys()); this.categories.clear(); this.categoryCursor = 0;
+          if (threads.size) this.rebuild(threads);
+          continue;
+        }
+        if (page.cursor < this.categoryCursor || page.hasMore && page.cursor === this.categoryCursor) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+        this.receiveCategories(page.entries); this.categoryCursor = page.cursor;
+        if (!page.hasMore) {
+          if (this.state.issues.some(issue => issue.key === "storage:categories")) this.publish({ issues: this.state.issues.filter(issue => issue.key !== "storage:categories") });
+          return;
+        }
+        await pause(0, signal);
+      }
+      throw new CategoryRequestError("HOST_CATEGORY_TOO_LARGE", 413);
+    })().catch(() => {
+      if (!signal.aborted && generation === this.generation) this.raise({ key: "storage:categories", scope: "storage", code: "HOST_CATEGORY_UNAVAILABLE", title: "Couldn't load saved categories", detail: "Retry to check saved choices. Existing mail remains available.", retry: true });
+    }).finally(() => {
+      if (this.categoryReads !== work) return;
+      this.categoryReads = undefined;
+      if (!signal.aborted && generation === this.generation && epoch !== this.categoryEpoch) void this.readCategories();
+    });
+    this.categoryReads = work;
+    return work;
+  }
+
   private receiveAiState(value: AiTriageState) {
     if (this.controller.signal.aborted || this.applicationScope.signal.aborted || !value?.settings || !Number.isSafeInteger(value.settings.revision) || !Number.isSafeInteger(value.cursor)) return;
     const previous = this.state.ai;
@@ -320,7 +385,9 @@ export class InboxStore {
       for (const key of releasedHolds) { threads.delete(key); this.aiRebuildThreads.delete(key); }
       this.rebuild(releasedHolds);
     }
-    if (this.state.loaded && threads.size) {
+    // The initial SDK model exists before catch-up marks it loaded. Retain
+    // these invalidations: an unchanged catch-up will not rebuild it for us.
+    if (threads.size) {
       if (background) {
         for (const key of threads) {
           if (!this.aiRebuildThreads.has(key) && this.aiRebuildThreads.size >= 100_000) throw new Error("AI triage reconciliation capacity reached.");
@@ -650,6 +717,7 @@ export class InboxStore {
       for (const timer of this.saveTimers.values()) clearTimeout(timer);
       for (const timer of this.issueHolds.values()) clearTimeout(timer);
       this.saveTimers.clear(); this.issueHolds.clear(); this.loadingThreads.clear(); this.refreshPromise = undefined; this.updatesPromise = undefined; this.folderDiscovery = undefined;
+      this.categoryReads = undefined;
       this.wake?.();
     };
   };
@@ -836,6 +904,7 @@ export class InboxStore {
           } else if (this.state.error) this.publish({ error: null });
         } while (this.updateAgain && !signal.aborted);
         timing({ pages, messages });
+        void this.readCategories();
       } catch (error) { timing({ pages, messages, outcome: "error" }); throw error; }
     })().finally(() => {
       if (this.updatesPromise !== work) return;
@@ -1092,7 +1161,7 @@ export class InboxStore {
       for (const write of this.flagWrites) for (const target of write.targets) if (!this.messageRows.has(nativeKey(target.sourceId, target.messageId))) {
         this.summaryFences.set(nativeKey(target.sourceId, target.messageId), { epoch: flagEpoch, revision: 0, removed: "absent" });
       }
-      if (this.mailboxCursor && this.mailboxCursor.scopeState !== baseline?.scopeState) { this.bodyEpoch++; this.details.clear(); }
+      if (this.mailboxCursor && this.mailboxCursor.scopeState !== baseline?.scopeState) { this.bodyEpoch++; this.details.clear(); this.categoryCursor = 0; this.categoryEpoch++; }
       this.mailboxCursor = baseline;
       this.reconcileFlags();
       for (const [key, receipt] of this.membershipReceipts) {
@@ -1120,6 +1189,7 @@ export class InboxStore {
         loading: !this.state.loaded && this.catchingUp, loaded: this.state.loaded || !this.catchingUp, refreshing: this.catchingUp, error: null }); this.rebuild();
       this.resolve("snapshot");
       if (baseline) this.scheduleRefresh();
+      void this.readCategories();
       void this.discoverFolders();
     };
     const work = (async () => {
@@ -1229,7 +1299,7 @@ export class InboxStore {
             ...(operation?.accountId === source.id ? { operationId: operation.id, sendStatus: operation.status } : {}),
             attachments: detail?.attachments.map(info => this.file(info)), };
         });
-        mail.push({ id: viewThreadId(box.id, thread), account: box.id, sourceId: source.id, mailboxId: box.id, sdkThreadId: thread, accountEmail: source.email,
+        mail.push({ id: viewThreadId(box.id, thread), account: box.id, sourceId: source.id, sourceGeneration: source.generation, mailboxId: box.id, sdkThreadId: thread, accountEmail: source.email,
           from: latest.from.name || latest.from.email, email: latest.from.email, to: addresses(latest.to), toAddresses: latest.to.map(person => person.email), subject: rows[0].subject,
           snippet: latest.preview, ...displayTime(latest.receivedAt), receivedAt: Date.parse(latest.receivedAt), split: "Important",
           folder: hidden ?? (locations.includes("Inbox") ? "Inbox" : done ? "Done" : reminders.length ? "Reminders" : locations[0] ?? "Auto Archived"), locations, unread: rows.some(row => !row.isRead), starred: rows.some(row => row.isStarred), labels: names, messages,
@@ -1265,10 +1335,15 @@ export class InboxStore {
     mail.push(...unifiedMail(mail, included, accounts));
     if (!onlyThreads) this.knownThreads.clear();
     const ai = this.state.ai;
+    const connectedSources = new Set(this.sourceAccounts.filter(source => source.status === "connected").map(source => source.id));
     for (const conversation of mail) {
       if (conversation.sourceId && conversation.sdkThreadId && !conversation.operationId) {
         const key = nativeKey(conversation.sourceId, conversation.sdkThreadId);
         this.knownThreads.add(key);
+        if (connectedSources.has(conversation.sourceId)) {
+          const entry = this.categories.get(key);
+          if (currentCategoryOverride(conversation, entry?.override)) conversation.attentionOverride = entry;
+        }
         if (ai?.configured && ai.settings.enabled) {
           const triage = currentAiDecision(conversation, this.aiDecisions.get(key), ai.settings.model);
           if (triage) {
@@ -1279,6 +1354,7 @@ export class InboxStore {
           if (hold && hold.until > Date.now() && ai.settings.mode === "apply" && triage?.state !== "ready") conversation.aiHoldUntil = hold.until;
         }
       }
+      if (conversation.attentionOverride?.override) conversation.aiHoldUntil = undefined;
       conversation.split = conversationAttention(conversation);
     }
     if (onlyThreads) {
@@ -1854,6 +1930,169 @@ export class InboxStore {
     catch (error) { timing({ queueMs, outcome: "error" }); this.scheduleRefresh(); this.fail(error, action); throw error; }
     finally { release(); this.aiRebuildAfter = Date.now() + 50; this.publish({ pending: Math.max(0, this.state.pending - 1) }); }
   }
+  /** Freeze user-selected context before any queue or network await. */
+  classify = (mails: Mail[], category: AttentionCategory): Promise<() => Promise<void>> => {
+    type Group = { id: string; targets: CategoryCommand["targets"]; input?: CategoryCommand; receipt?: CategoryReceipt; uncertain?: boolean };
+    const groups: Group[] = [], signal = this.controller.signal, generation = this.generation;
+    const revisionKnown = new Set<string>();
+    const failure = (code: CategoryErrorCode, completed = 0, remaining = mails.length, retry?: () => Promise<() => Promise<void>>, undo?: () => Promise<void>) => {
+      const error = new InboxClassificationError(code, completed, remaining, retry, undo);
+      this.raise({ scope: "action", code, title: "Couldn't change category", detail: error.message, retry: false });
+      return error;
+    };
+    try {
+      if (!this.state.host?.attentionOverrides) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+      if (!mails.length || !["Important", "Other"].includes(category)) throw new CategoryRequestError("HOST_CATEGORY_INVALID", 400);
+      const selected = new Map<string, Mail[]>(), current = new Map(this.state.mail.map(mail => [mail.id, mail]));
+      for (const mail of mails) {
+        const source = this.sourceAccounts.find(source => source.id === mail.sourceId);
+        if (!source || source.status !== "connected" || source.generation !== mail.sourceGeneration || !mail.sdkThreadId || mail.operationId || !current.has(mail.id)) throw new CategoryRequestError("HOST_CATEGORY_CONTEXT_CHANGED", 412);
+        if (!mail.messages.some(message => !message.pending && !message.outgoing && message.nativeFolder === "inbox" && message.memberships?.some(state => !state.done && (!state.snoozedUntil || Date.parse(state.snoozedUntil) <= Date.now())))) throw new CategoryRequestError("HOST_CATEGORY_CONTEXT_CHANGED", 412);
+        const key = nativeKey(source.id, mail.sdkThreadId), copies = selected.get(key) ?? [];
+        copies.push(mail); selected.set(key, copies);
+      }
+      for (const [key, copies] of selected) {
+        const first = copies[0], messages = new Map<string, Message>();
+        for (const mail of copies) for (const message of mail.messages) {
+          if (message.pending) continue;
+          const previous = messages.get(message.id);
+          if (previous && (previous.revision !== message.revision || previous.bodyRevision !== message.bodyRevision)) throw new CategoryRequestError("HOST_CATEGORY_CONTEXT_CHANGED", 412);
+          const memberships = new Map((previous?.memberships ?? []).map(state => [state.mailboxId, state]));
+          for (const state of message.memberships ?? []) {
+            if (memberships.has(state.mailboxId) && memberships.get(state.mailboxId)!.revision !== state.revision) throw new CategoryRequestError("HOST_CATEGORY_CONTEXT_CHANGED", 412);
+            memberships.set(state.mailboxId, state);
+          }
+          messages.set(message.id, { ...message, memberships: [...memberships.values()] });
+        }
+        const received = [...messages.values()].sort((a, b) => (a.receivedAt ?? "").localeCompare(b.receivedAt ?? "") || a.id.localeCompare(b.id));
+        const context: CategoryContext = {
+          sourceId: first.sourceId!, threadId: first.sdkThreadId!, sourceGeneration: first.sourceGeneration!,
+          mailboxIds: [...new Set(copies.flatMap(mail => mail.mailboxIds ?? [mail.mailboxId ?? mail.account]))].sort(),
+          latestMessageId: received.at(-1)?.id ?? "",
+          messages: received.map(message => ({ messageId: message.id, revision: message.revision ?? 0, bodyRevision: message.bodyRevision ?? null,
+            memberships: (message.memberships ?? []).map(state => ({ mailboxId: state.mailboxId, revision: state.revision })).sort((a, b) => a.mailboxId.localeCompare(b.mailboxId)) })),
+        };
+        const memberships = context.messages.reduce((sum, message) => sum + message.memberships.length, 0);
+        if (memberships > CATEGORY_MEMBERSHIP_LIMIT) throw new CategoryRequestError("HOST_CATEGORY_TOO_LARGE", 413);
+        if (!isCategoryContext(context)) throw new CategoryRequestError("HOST_CATEGORY_INVALID", 400);
+        for (const mail of copies) if (!currentCategoryOverride(current.get(mail.id)!, { category, context })) throw new CategoryRequestError("HOST_CATEGORY_CONTEXT_CHANGED", 412);
+        const previous = this.categories.get(key);
+        if (previous) revisionKnown.add(key);
+        const target = { context, ifRevision: previous?.revision ?? 0 };
+        let group = groups.at(-1);
+        const fits = (group: Group) => group.targets.length <= CATEGORY_BATCH_LIMIT
+          && group.targets.reduce((sum, target) => sum + target.context.messages.reduce((sum, message) => sum + message.memberships.length, 0), 0) <= CATEGORY_MEMBERSHIP_LIMIT
+          && new TextEncoder().encode(JSON.stringify({ id: group.id, category, targets: group.targets })).length <= CATEGORY_BODY_LIMIT - 2048;
+        if (!group) { group = { id: crypto.randomUUID(), targets: [] }; groups.push(group); }
+        group.targets.push(target);
+        if (!fits(group)) {
+          group.targets.pop();
+          if (!group.targets.length) throw new CategoryRequestError("HOST_CATEGORY_TOO_LARGE", 413);
+          group = { id: crypto.randomUUID(), targets: [target] }; groups.push(group);
+          if (!fits(group)) throw new CategoryRequestError("HOST_CATEGORY_TOO_LARGE", 413);
+        }
+      }
+    } catch (error) { return Promise.reject(failure(error instanceof CategoryRequestError ? error.code : "HOST_CATEGORY_INVALID")); }
+    // Only preceding own flag receipts may advance canonical revisions before a
+    // command is first prepared. Never re-read/rebase mail after a lost response.
+    const keys = new Set(groups.flatMap(group => group.targets.flatMap(target => target.context.messages.map(message => nativeKey(target.context.sourceId, message.messageId)))));
+    const flags = [...this.flagWrites].filter(write => write.targets.some(target => keys.has(nativeKey(target.sourceId, target.messageId))));
+    const edges = new Map([...keys].map(key => [key, new Map(this.flagRevisions.get(key))]));
+    let preparedFlags = false, retired = false, running: Promise<() => Promise<void>> | undefined;
+    const total = groups.reduce((sum, group) => sum + group.targets.length, 0);
+    const check = () => { signal.throwIfAborted(); this.applicationScope.signal.throwIfAborted(); if (generation !== this.generation) throw new DOMException("Request cancelled", "AbortError"); };
+    const undo = async () => {
+      retired = true;
+      await this.act("undo-category", async () => {
+        let problem: unknown;
+        for (const group of [...groups].reverse()) {
+          if (!group.receipt || group.receipt.retracted) continue;
+          try {
+            check();
+            let receipt: CategoryReceipt;
+            try { receipt = await this.categoryTransport.undo(group.id); }
+            catch (error) {
+              check();
+              if (error instanceof CategoryRequestError && error.status < 500 && ![408, 425, 429].includes(error.status)) throw error;
+              receipt = await this.categoryTransport.undo(group.id);
+            }
+            check(); this.receiveCategories(receipt.entries); group.receipt = receipt;
+          } catch (error) { problem ??= error; }
+        }
+        if (problem) {
+          check();
+          throw failure(problem instanceof CategoryRequestError ? problem.code : "HOST_CATEGORY_ACK_PENDING");
+        }
+      }, false);
+    };
+    const resume = (): Promise<() => Promise<void>> => {
+      if (running) return running;
+      const task = this.act("category", async () => {
+        try {
+          check();
+          if (retired) throw new CategoryRequestError("HOST_CATEGORY_CONFLICT", 412);
+          if (!preparedFlags) {
+            await Promise.allSettled(flags.flatMap(write => write.promise ? [write.promise] : [])); check();
+            for (const write of flags) for (const edge of write.operation?.mutationRevisions ?? []) {
+              if (edge.after > edge.before && write.targets.some(target => target.messageId === edge.messageId)) edges.get(nativeKey(write.targets[0].sourceId, edge.messageId))?.set(edge.before, edge.after);
+            }
+            for (const group of groups) for (const target of group.targets) for (const message of target.context.messages) {
+              const links = edges.get(nativeKey(target.context.sourceId, message.messageId));
+              while (links?.has(message.revision)) message.revision = links.get(message.revision)!;
+            }
+            preparedFlags = true;
+          }
+          for (const group of groups) {
+            if (group.receipt) continue;
+            if (!group.input) {
+              const missing = group.targets.filter(target => !revisionKnown.has(categoryKey(target.context)));
+              if (missing.length) {
+                const result = await this.categoryTransport.lookup(missing.map(target => ({ sourceId: target.context.sourceId, threadId: target.context.threadId }))); check();
+                if (result.entries.length !== missing.length) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+                const found = new Map(result.entries.map(entry => [categoryKey(entry), entry]));
+                for (const target of missing) {
+                  const entry = found.get(categoryKey(target.context));
+                  if (!entry) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+                  target.ifRevision = entry.revision;
+                }
+                this.receiveCategories(result.entries);
+              }
+              group.input = structuredClone({ id: group.id, category, targets: group.targets });
+            }
+            let receipt: CategoryReceipt;
+            try { receipt = await this.categoryTransport.classify(group.input); }
+            catch (error) {
+              check();
+              if (error instanceof CategoryRequestError && error.status < 500 && ![408, 425, 429].includes(error.status)) throw error;
+              group.uncertain = true;
+              receipt = await this.categoryTransport.classify(group.input);
+            }
+            check();
+            if (receipt.entries.length !== group.targets.length || new Set(receipt.entries.map(categoryKey)).size !== group.targets.length || receipt.entries.some(entry => !group.targets.some(target => categoryKey(target.context) === categoryKey(entry)))) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+            this.receiveCategories(receipt.entries);
+            if (receipt.retracted) throw new CategoryRequestError("HOST_CATEGORY_CONFLICT", 412);
+            group.receipt = receipt; group.uncertain = false;
+          }
+          return undo;
+        } catch (error) {
+          check();
+          const completed = groups.filter(group => group.receipt && !group.receipt.retracted).reduce((sum, group) => sum + group.targets.length, 0);
+          const uncertain = groups.some(group => group.uncertain && !group.receipt);
+          // The host checks durable IDs before capacity: storage-full explicitly
+          // rejects this new command, even if an earlier transport response was lost.
+          const recoverable = !retired && !(error instanceof CategoryRequestError && error.code === "HOST_CATEGORY_STORAGE_FULL")
+            && (uncertain || !(error instanceof CategoryRequestError) || error.status >= 500 || [408, 425, 429].includes(error.status));
+          const code = recoverable ? "HOST_CATEGORY_ACK_PENDING" : error instanceof CategoryRequestError ? error.code : "HOST_CATEGORY_UNAVAILABLE";
+          throw failure(code, completed, total - completed, recoverable ? resume : undefined, completed ? undo : undefined);
+        }
+      }, false);
+      running = task;
+      void task.finally(() => { if (running === task) running = undefined; }).catch(() => {});
+      return task;
+    };
+    return resume();
+  };
+
   private done(selected: Mail[], done: boolean): Promise<() => Promise<void>> {
     const targets = new Map<string, MailboxStateTarget>();
     try {
@@ -1984,7 +2223,8 @@ export class InboxStore {
             const row = await this.client.mailboxMessage(boxId, id, this.requestOptions());
             const before = row.memberships.find(state => state.mailboxId === boxId)!;
             const saved = await this.client.setMailboxState(boxId, id, action === "remind" ? { snoozedUntil: value ?? null } : { done: action === "done", snoozedUntil: null }, before.revision, this.requestOptions());
-            undo.push(() => this.client.setMailboxState(boxId, id, { done: before.done, snoozedUntil: before.snoozedUntil }, saved.revision, this.requestOptions()));
+            this.receiveMemberships([saved]);
+            undo.push(async () => { this.receiveMemberships([await this.client.setMailboxState(boxId, id, { done: before.done, snoozedUntil: before.snoozedUntil }, saved.revision, this.requestOptions())]); });
           }
         }
       }

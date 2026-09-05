@@ -19,6 +19,8 @@ import { createGoogleOAuthClient } from '../server/google-client'
 import { createLocalHost } from '../../../apps/local-host/src/host'
 import { loadLocalConfig, type LocalConfig } from '../../../apps/local-host/src/config'
 import { createAttentionFeedbackStore } from '../../../apps/local-host/src/attention-feedback'
+import { createAttentionOverridesStore, CATEGORY_STORAGE_LIMITS } from '../../../apps/local-host/src/attention-overrides'
+import { isCategoryCommand, isCategoryEntry, type CategoryCommand, type CategoryContext, type CategoryEntry } from '../../../apps/shared/attention-overrides'
 import { createSplitPreferencesStore } from '../../../apps/local-host/src/split-preferences'
 import { classifyAttention } from '../../../apps/shared/mail-attention'
 import { normalizeSplits } from '../../../apps/shared/splits'
@@ -750,6 +752,7 @@ describe('Google application authentication', () => {
       ['/host/config', 'GET'], ['/v1/accounts', 'GET'], ['/v1/events', 'GET'], ['/v1/policy', 'GET'], ['/host/inbox-preferences', 'GET'], ['/host/split-preferences', 'GET'], ['/host/attention-feedback', 'GET'],
       ['/host/sender-domains/example.test', 'GET'], ['/v1/mailbox-snapshot', 'POST', '{}'], ['/v1/drafts', 'POST', '{}'], ['/v1/policy', 'PATCH', '{"remoteImages":false}'],
       ['/host/split-preferences', 'PUT', '{}'], ['/host/attention-feedback', 'POST', '{}'], ['/host/providers/gmail/connect', 'POST', '{}'], ['/v1/accounts/foreign', 'DELETE'],
+      ['/host/attention-overrides?after=0', 'GET'], ['/host/attention-overrides', 'POST', '{}'], ['/host/attention-overrides/lookup', 'POST', '{}'], ['/host/attention-overrides/00000000-0000-0000-0000-000000000000/undo', 'POST', '{}'],
     ]) {
       const response = await f.request(path!, { method, body, cookie: b.sessionCookie, scope })
       expect(response.status).toBe(409)
@@ -1220,6 +1223,280 @@ describe('Attention baseline and explicit feedback', () => {
       expect(store.write({ ...renamed, splits: ['Important', 'Other'], splitRules: {} }).splits).toEqual(['Important', 'Other'])
       expect(normalizeSplits({ ...legacy, splitRules: { Github: 'from:custom@example.test', John: 'from:john@doe.com' } }).splits).toContain('Github')
     } finally { database.close() }
+  })
+})
+
+describe('explicit non-AI category overrides', () => {
+  test('unassessed categories persist independent of AI and mail state, replay exact receipts and conditionally Undo', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account, box } = await h.seed('alice', 'manual-category', [native('category-one'), native('category-two')])
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const rows = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items
+    const targets = rows.map(message => ({ ifRevision: 0, context: { sourceId: account.id, threadId: message.threadId, sourceGeneration: account.generation, mailboxIds: [mailbox.id], latestMessageId: message.id,
+      messages: [{ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: message.memberships.map(state => ({ mailboxId: state.mailboxId, revision: state.revision })) }] } }))
+    const database = new Database(join(h.directory, 'manual-category.sqlite'))
+    cleanup.push(async () => { database.close() })
+    let store = createAttentionOverridesStore(database, h.inbox, 'alice')
+    const calls = structuredClone(box.calls), baseline = await h.inbox.changes('alice')
+    const body = spyOn(h.inbox, 'mailboxMessage').mockImplementation(async () => { throw new Error('Manual categories must not hydrate bodies') })
+    const thread = spyOn(h.inbox, 'thread').mockImplementation(async () => { throw new Error('Manual categories must not invent a head CAS or read thread bodies') })
+    const input: CategoryCommand = { id: 'manual-category-command-001', category: 'Other', targets }
+    let coerced = 0
+    for (const category of [['Other'], ['Important'], { category: 'Other' }, { toString: () => { coerced++; return 'Other' } }, null, 0]) {
+      expect(isCategoryCommand({ ...input, category })).toBe(false)
+      expect(isCategoryEntry({ sourceId: account.id, threadId: targets[0]!.context.threadId, revision: 1, override: { category, context: targets[0]!.context } })).toBe(false)
+      await expect(store.classify({ ...input, category })).rejects.toMatchObject({ code: 'HOST_CATEGORY_INVALID', status: 400 })
+    }
+    expect(coerced).toBe(0)
+    expect((await store.changes(0)).entries).toEqual([])
+    const other = await store.classify(input)
+    expect(other.entries.every(entry => entry.override?.category === 'Other')).toBe(true)
+    expect(await store.classify(input)).toEqual(other)
+    await expect(store.classify({ ...input, category: 'Important' })).rejects.toMatchObject({ code: 'HOST_CATEGORY_IDEMPOTENCY_CONFLICT', status: 409 })
+    const important = await store.classify({ ...input, id: 'manual-category-command-002', category: 'Important', targets: targets.map((target, index) => ({ ...target, ifRevision: other.entries[index]!.revision })) })
+    expect(important.entries.every(entry => entry.override?.category === 'Important')).toBe(true)
+    expect(await store.classify(input)).toEqual(other)
+    expect((await store.lookup(targets.map(target => ({ sourceId: account.id, threadId: target.context.threadId })))).entries).toEqual(important.entries)
+    await expect(store.undo(input.id)).rejects.toMatchObject({ code: 'HOST_CATEGORY_UNDO_CONFLICT', status: 412 })
+    const restored = await store.undo(important.id)
+    expect(restored.retracted).toBe(true)
+    expect(restored.entries.every(entry => entry.override?.category === 'Other')).toBe(true)
+    expect(await store.undo(important.id)).toEqual(restored)
+    expect((await store.changes(important.entries.at(-1)!.revision)).entries).toEqual(restored.entries)
+    expect((await h.inbox.changes('alice')).state).toBe(baseline.state)
+    expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.map(row => row.memberships)).toEqual(rows.map(row => row.memberships))
+    expect(box.calls).toEqual(calls)
+    expect(body).not.toHaveBeenCalled(); expect(thread).not.toHaveBeenCalled()
+    body.mockRestore(); thread.mockRestore()
+    await h.restart()
+    store = createAttentionOverridesStore(database, h.inbox, 'alice')
+    expect((await store.changes(0)).entries).toEqual(restored.entries)
+    expect(await store.undo(important.id)).toEqual(restored)
+    const foreign = createAttentionOverridesStore(database, h.inbox, 'bob')
+    expect((await foreign.changes(0)).entries).toEqual([])
+    await expect(foreign.classify({ ...input, id: 'manual-category-foreign-01' })).rejects.toMatchObject({ code: 'HOST_CATEGORY_NOT_FOUND', status: 404 })
+    await expect(foreign.undo(input.id)).rejects.toMatchObject({ code: 'HOST_CATEGORY_NOT_FOUND', status: 404 })
+    expect(JSON.stringify(restored)).not.toContain(BODY_SECRET)
+    expect(JSON.stringify(restored)).not.toContain(rows[0]!.subject)
+  })
+
+  test('category context admission fences memberships, bodies and source generations without absorbing concurrent replies', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const seed = native('category-captured', { threadId: 'category-thread' })
+    const { account, box } = await h.seed('alice', 'category-context', [seed])
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const message = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items[0]!
+    const context: CategoryContext = { sourceId: account.id, threadId: message.threadId, sourceGeneration: account.generation, mailboxIds: [mailbox.id], latestMessageId: message.id,
+      messages: [{ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: [{ mailboxId: mailbox.id, revision: message.memberships[0]!.revision }] }] }
+    const database = new Database(':memory:')
+    cleanup.push(async () => { database.close() })
+    const store = createAttentionOverridesStore(database, h.inbox, 'alice')
+    const input: CategoryCommand = { id: 'category-context-command-01', category: 'Other', targets: [{ context, ifRevision: 0 }] }
+    for (const changed of [{ ...context, sourceGeneration: context.sourceGeneration + 1 }, { ...context, messages: [{ ...context.messages[0]!, revision: 999 }] },
+      { ...context, messages: [{ ...context.messages[0]!, bodyRevision: 'changed-content' }] }, { ...context, messages: [{ ...context.messages[0]!, memberships: [{ mailboxId: mailbox.id, revision: 999 }] }] }]) {
+      await expect(store.classify({ ...input, targets: [{ context: changed, ifRevision: 0 }] })).rejects.toMatchObject({ code: 'HOST_CATEGORY_CONTEXT_CHANGED', status: 412 })
+    }
+    expect((await store.changes(0)).entries).toEqual([])
+    box.put(native('category-new-reply', { threadId: 'category-thread', receivedAt: new Date(EPOCH + 60_000).toISOString() }))
+    await h.sync('alice', account.id)
+    const accepted = await store.classify(input)
+    expect(accepted.entries[0]!.override!.context).toEqual(context)
+    expect(accepted.entries[0]!.override!.context.messages).toHaveLength(1)
+    const latest = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items[0]!
+    expect(latest.id).not.toBe(context.latestMessageId)
+    expect(latest.memberships[0]!.done).toBe(false)
+    const undone = await store.undo(input.id)
+    expect(undone.entries[0]!.override).toBeNull()
+    expect((await store.changes(accepted.entries[0]!.revision)).entries).toEqual(undone.entries)
+    expect(await store.classify(input)).toEqual(undone)
+    expect(box.calls.mutate).toHaveLength(0)
+    await h.inbox.updateMailbox('alice', mailbox.id, { status: 'detached' }, mailbox.revision)
+    await expect(store.classify({ ...input, id: 'category-detached-command' })).rejects.toMatchObject({ code: 'HOST_CATEGORY_NOT_FOUND', status: 404 })
+  })
+
+  test('category pages and commands remain bounded with interleaved updates, atomic conflicts and sanitized SDK failures', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account } = await h.seed('alice', 'category-pages', Array.from({ length: 103 }, (_, index) => native(`category-${index}`)))
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const rows: MailboxMessageSummary[] = []
+    let cursor: string | undefined
+    do { const page = await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id], limit: 100, cursor }); rows.push(...page.items); cursor = page.nextCursor ?? undefined } while (cursor)
+    const targets = rows.map(message => ({ ifRevision: 0, context: { sourceId: account.id, threadId: message.threadId, sourceGeneration: account.generation, mailboxIds: [mailbox.id], latestMessageId: message.id,
+      messages: [{ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: [{ mailboxId: mailbox.id, revision: message.memberships[0]!.revision }] }] } }))
+    const database = new Database(':memory:')
+    cleanup.push(async () => { database.close() })
+    const store = createAttentionOverridesStore(database, h.inbox, 'alice')
+    await expect(store.classify({ id: 'category-oversized-command', category: 'Other', targets: targets.slice(0, 51) })).rejects.toMatchObject({ code: 'HOST_CATEGORY_INVALID' })
+    for (let offset = 0; offset < targets.length; offset += 50) await store.classify({ id: `category-page-command-${offset}`, category: 'Other', targets: targets.slice(offset, offset + 50) })
+    const first = await store.changes(0)
+    expect(first.entries).toHaveLength(50); expect(first.hasMore).toBe(true)
+    const selected = first.entries[0]!, target = targets.find(target => target.context.threadId === selected.threadId)!
+    const newChoice = await store.classify({ id: 'category-interleaved-command', category: 'Important', targets: [{ ...target, ifRevision: selected.revision }] })
+    const entries = new Map(first.entries.map(entry => [entry.threadId, entry]))
+    let after = first.cursor, hasMore = true
+    while (hasMore) {
+      const page = await store.changes(after)
+      expect(page.entries.length).toBeLessThanOrEqual(50)
+      for (const entry of page.entries) entries.set(entry.threadId, entry)
+      expect(page.cursor).toBeGreaterThanOrEqual(after)
+      after = page.cursor; hasMore = page.hasMore
+    }
+    expect(entries.size).toBe(103)
+    expect(entries.get(selected.threadId)).toEqual(newChoice.entries[0])
+    expect((await store.changes(after)).entries).toEqual([])
+    expect((await store.changes(after + 1)).resetRequired).toBe(true)
+    const before = await store.lookup(targets.slice(0, 2).map(target => ({ sourceId: account.id, threadId: target.context.threadId })))
+    await expect(store.classify({ id: 'category-atomic-conflict-01', category: 'Important', targets: targets.slice(0, 2).map((target, index) => ({ ...target, ifRevision: index ? 999999 : before.entries[0]!.revision })) })).rejects.toMatchObject({ status: 412 })
+    expect(await store.lookup(targets.slice(0, 2).map(target => ({ sourceId: account.id, threadId: target.context.threadId })))).toEqual(before)
+    const guard = spyOn(h.inbox, 'mailboxMessageSummary').mockImplementation(async () => { throw new Error(`private failure ${BODY_SECRET}`) })
+    try {
+      await expect(store.classify({ id: 'category-safe-error-command', category: 'Other', targets: [target] })).rejects.toMatchObject({ code: 'HOST_CATEGORY_UNAVAILABLE', message: 'Category changes are temporarily unavailable.' })
+    } finally { guard.mockRestore() }
+  })
+
+  test('category storage admits by owner/global key, command and actual retained byte budgets without eviction or per-action scans', async () => {
+    const h = await fixture({ allowProviderWrites: false }), owner = 'alice'
+    const { account } = await h.seed(owner, 'category-quota', [native('quota-one'), native('quota-two')])
+    const mailbox = (await h.inbox.mailboxes(owner)).find(value => value.sourceId === account.id)!
+    const rows = (await h.inbox.mailboxMessages(owner, { mailboxIds: [mailbox.id] })).items
+    const targets = rows.map(message => ({ ifRevision: 0, context: { sourceId: account.id, threadId: message.threadId, sourceGeneration: account.generation, mailboxIds: [mailbox.id], latestMessageId: message.id,
+      messages: [{ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: [{ mailboxId: mailbox.id, revision: message.memberships[0]!.revision }] }] } }))
+    const database = new Database(':memory:')
+    cleanup.push(async () => { database.close() })
+    const store = createAttentionOverridesStore(database, h.inbox, owner)
+    const original: CategoryCommand = { id: 'category-quota-original-01', category: 'Important', targets: [targets[0]!] }
+    const accepted = await store.classify(original)
+    const usage = () => ({ owner: database.query<{ key_count: number; command_count: number; byte_count: number }, [string]>('SELECT key_count,command_count,byte_count FROM local_category_storage_owner WHERE owner=?').get(owner)!,
+      global: database.query<{ key_count: number; command_count: number; byte_count: number }, []>('SELECT key_count,command_count,byte_count FROM local_category_storage_global WHERE id=1').get()! })
+    const physical = () => {
+      const entries = database.query<{ owner: string; source: string; thread: string; data: string; stored_bytes: number }, []>('SELECT owner,source,thread,data,stored_bytes FROM local_category_overrides').all()
+      const commands = database.query<{ owner: string; id: string; fingerprint: string; receipt: string; before_entries: string; stored_bytes: number }, []>('SELECT owner,id,fingerprint,receipt,before_entries,stored_bytes FROM local_category_commands').all()
+      let size = 0
+      for (const entry of entries) { const bytes = [entry.owner, entry.source, entry.thread, entry.data].reduce((sum, value) => sum + Buffer.byteLength(value), 0); expect(entry.stored_bytes).toBe(bytes); size += bytes }
+      for (const command of commands) { const bytes = [command.owner, command.id, command.fingerprint, command.receipt, command.before_entries].reduce((sum, value) => sum + Buffer.byteLength(value), 0); expect(command.stored_bytes).toBe(bytes); size += bytes }
+      return { key_count: entries.length, command_count: commands.length, byte_count: size }
+    }
+    expect(usage()).toEqual({ owner: physical(), global: physical() })
+    const baseline = usage(), revision = accepted.entries[0]!.revision
+    const reset = () => {
+      database.query('UPDATE local_category_storage_owner SET key_count=?,command_count=?,byte_count=? WHERE owner=?').run(baseline.owner.key_count, baseline.owner.command_count, baseline.owner.byte_count, owner)
+      database.query('UPDATE local_category_storage_global SET key_count=?,command_count=?,byte_count=? WHERE id=1').run(baseline.global.key_count, baseline.global.command_count, baseline.global.byte_count)
+    }
+    // Simulate other retained commands/keys without generating 500k mail fixtures.
+    for (const scope of ['owner', 'global'] as const) for (const [field, limit] of [['key_count', CATEGORY_STORAGE_LIMITS[scope].keys], ['command_count', CATEGORY_STORAGE_LIMITS[scope].commands], ['byte_count', CATEGORY_STORAGE_LIMITS[scope].bytes]] as const) {
+      reset()
+      database.query(`UPDATE local_category_storage_${scope} SET ${field}=? WHERE ${scope === 'owner' ? 'owner=?' : 'id=1'}`).run(...(scope === 'owner' ? [limit, owner] : [limit]))
+      const full = usage()
+      await expect(store.classify({ id: `category-quota-${scope}-${field.replaceAll('_', '-')}`, category: 'Other', targets: [targets[1]!] })).rejects.toMatchObject({ code: 'HOST_CATEGORY_STORAGE_FULL', status: 409 })
+      expect(usage()).toEqual(full)
+      expect((await store.changes(revision)).entries).toEqual([])
+      expect(await store.classify(original)).toEqual(accepted)
+      expect(physical().command_count).toBe(1)
+    }
+    reset()
+    const input: CategoryCommand = { id: 'category-quota-byte-edge-01', category: 'Other', targets: [{ ...targets[0]!, ifRevision: revision }] }
+    const next: CategoryEntry = { ...accepted.entries[0]!, revision: revision + 1, override: { category: 'Other', context: targets[0]!.context } }
+    const nextReceipt = JSON.stringify({ id: input.id, retracted: false, entries: [next] }), before = JSON.stringify(accepted.entries)
+    const newEntryBytes = [owner, next.sourceId, next.threadId, JSON.stringify(next)].reduce((sum, value) => sum + Buffer.byteLength(value), 0)
+    const commandBytes = [owner, input.id, '0'.repeat(64), nextReceipt, before].reduce((sum, value) => sum + Buffer.byteLength(value), 0)
+    const oldBytes = database.query<{ stored_bytes: number }, []>('SELECT stored_bytes FROM local_category_overrides').get()!.stored_bytes
+    const growth = newEntryBytes - oldBytes + commandBytes
+    expect(growth).toBeGreaterThan(Buffer.byteLength(JSON.stringify(input)))
+    database.query('UPDATE local_category_storage_owner SET byte_count=? WHERE owner=?').run(CATEGORY_STORAGE_LIMITS.owner.bytes - growth + 1, owner)
+    await expect(store.classify(input)).rejects.toMatchObject({ code: 'HOST_CATEGORY_STORAGE_FULL', status: 409 })
+    expect(physical().command_count).toBe(1)
+    database.query('UPDATE local_category_storage_owner SET byte_count=?,key_count=?,command_count=? WHERE owner=?').run(CATEGORY_STORAGE_LIMITS.owner.bytes - growth, CATEGORY_STORAGE_LIMITS.owner.keys, CATEGORY_STORAGE_LIMITS.owner.commands - 1, owner)
+    database.query('UPDATE local_category_storage_global SET byte_count=?,key_count=?,command_count=? WHERE id=1').run(CATEGORY_STORAGE_LIMITS.global.bytes - growth, CATEGORY_STORAGE_LIMITS.global.keys, CATEGORY_STORAGE_LIMITS.global.commands - 1)
+    const query = database.query.bind(database), exec = database.exec.bind(database)
+    const queryGuard = spyOn(database, 'query').mockImplementation(((sql: string) => { if (/\b(?:COUNT|SUM)\s*\(/i.test(sql)) throw new Error('Category actions must use maintained counters'); return query(sql) }) as typeof database.query)
+    const execGuard = spyOn(database, 'exec').mockImplementation(((sql: string) => { if (/\b(?:COUNT|SUM)\s*\(/i.test(sql)) throw new Error('Restart must not rescan migrated category data'); return exec(sql) }) as typeof database.exec)
+    try {
+      const changed = await store.classify(input)
+      expect(usage()).toEqual({ owner: { key_count: CATEGORY_STORAGE_LIMITS.owner.keys, command_count: CATEGORY_STORAGE_LIMITS.owner.commands, byte_count: CATEGORY_STORAGE_LIMITS.owner.bytes },
+        global: { key_count: CATEGORY_STORAGE_LIMITS.global.keys, command_count: CATEGORY_STORAGE_LIMITS.global.commands, byte_count: CATEGORY_STORAGE_LIMITS.global.bytes } })
+      const restarted = createAttentionOverridesStore(database, h.inbox, owner)
+      expect(await restarted.classify(input)).toEqual(changed)
+      await expect(restarted.classify({ ...input, id: 'category-quota-no-eviction', targets: [{ ...targets[0]!, ifRevision: changed.entries[0]!.revision }] })).rejects.toMatchObject({ code: 'HOST_CATEGORY_STORAGE_FULL' })
+      database.query('UPDATE local_category_storage_owner SET key_count=key_count+1,command_count=command_count+1,byte_count=byte_count+1 WHERE owner=?').run(owner)
+      database.query('UPDATE local_category_storage_global SET key_count=key_count+1,command_count=command_count+1,byte_count=byte_count+1 WHERE id=1').run()
+      const over = usage(), physicalBeforeUndo = physical()
+      expect(await restarted.classify(input)).toEqual(changed)
+      const undone = await restarted.undo(input.id)
+      expect(undone.entries[0]!.override!.category).toBe('Important')
+      const undoGrowth = physical().byte_count - physicalBeforeUndo.byte_count
+      expect(undoGrowth).toBeGreaterThan(0)
+      expect(usage()).toEqual({ owner: { ...over.owner, byte_count: over.owner.byte_count + undoGrowth }, global: { ...over.global, byte_count: over.global.byte_count + undoGrowth } })
+      const afterUndo = usage()
+      expect(await restarted.undo(input.id)).toEqual(undone)
+      expect(await restarted.classify(input)).toEqual(undone)
+      expect(usage()).toEqual(afterUndo)
+      expect(physical().command_count).toBe(2)
+      expect((await h.inbox.mailboxMessageSummary(owner, mailbox.id, rows[0]!.id)).memberships[0]!.done).toBe(false)
+    } finally { queryGuard.mockRestore(); execGuard.mockRestore() }
+  })
+
+  test('category byte-count migration preserves existing receipts and accurately accounts legacy JSON and Undo tombstones', async () => {
+    const h = await fixture({ allowProviderWrites: false }), owner = 'alice'
+    const { account } = await h.seed(owner, 'category-legacy-quota')
+    const mailbox = (await h.inbox.mailboxes(owner)).find(value => value.sourceId === account.id)!
+    const message = (await h.inbox.mailboxMessages(owner, { mailboxIds: [mailbox.id] })).items[0]!
+    const context: CategoryContext = { sourceId: account.id, threadId: message.threadId, sourceGeneration: account.generation, mailboxIds: [mailbox.id], latestMessageId: message.id,
+      messages: [{ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: [{ mailboxId: mailbox.id, revision: message.memberships[0]!.revision }] }] }
+    const input: CategoryCommand = { id: 'category-prequota-command', category: 'Other', targets: [{ context, ifRevision: 0 }] }
+    const entry: CategoryEntry = { sourceId: account.id, threadId: message.threadId, revision: 1, override: { category: 'Other', context } }
+    const receipt = { id: input.id, retracted: false, entries: [entry] }, receiptText = JSON.stringify(receipt, null, 2)
+    const beforeText = JSON.stringify([{ sourceId: account.id, threadId: message.threadId, revision: 0, override: null }], null, 2), data = JSON.stringify(entry, null, 2)
+    const fingerprint = createHash('sha256').update(JSON.stringify(input)).digest('hex')
+    const database = new Database(':memory:')
+    cleanup.push(async () => { database.close() })
+    database.exec(`CREATE TABLE local_category_clock (owner TEXT PRIMARY KEY, head INTEGER NOT NULL) STRICT;
+      CREATE TABLE local_category_overrides (owner TEXT NOT NULL, source TEXT NOT NULL, thread TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(owner,source,thread)) STRICT;
+      CREATE TABLE local_category_commands (owner TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL, receipt TEXT NOT NULL, before_entries TEXT NOT NULL, PRIMARY KEY(owner,id)) STRICT;`)
+    database.query('INSERT INTO local_category_clock VALUES (?,1)').run(owner)
+    database.query('INSERT INTO local_category_overrides VALUES (?,?,?,?,?)').run(owner, account.id, message.threadId, 1, data)
+    database.query('INSERT INTO local_category_commands VALUES (?,?,?,?,?)').run(owner, input.id, fingerprint, receiptText, beforeText)
+    const store = createAttentionOverridesStore(database, h.inbox, owner)
+    const usage = () => database.query<{ key_count: number; command_count: number; byte_count: number }, []>('SELECT key_count,command_count,byte_count FROM local_category_storage_global WHERE id=1').get()!
+    const initialBytes = [owner, account.id, message.threadId, data, owner, input.id, fingerprint, receiptText, beforeText].reduce((sum, value) => sum + Buffer.byteLength(value), 0)
+    expect(usage()).toEqual({ key_count: 1, command_count: 1, byte_count: initialBytes })
+    expect(await store.classify(input)).toEqual(receipt)
+    expect(database.query<{ receipt: string }, []>('SELECT receipt FROM local_category_commands').get()!.receipt).toBe(receiptText)
+    expect(database.query<{ stored_bytes: number }, []>('SELECT stored_bytes FROM local_category_overrides').get()!.stored_bytes).toBe([owner, account.id, message.threadId, data].reduce((sum, value) => sum + Buffer.byteLength(value), 0))
+    const undone = await store.undo(input.id)
+    expect(undone.entries[0]!.override).toBeNull()
+    const raw = database.query<{ data: string }, []>('SELECT data FROM local_category_overrides').get()!.data
+    const nextBytes = [owner, account.id, message.threadId, raw, owner, input.id, fingerprint, JSON.stringify(undone), beforeText].reduce((sum, value) => sum + Buffer.byteLength(value), 0)
+    expect(usage()).toEqual({ key_count: 1, command_count: 1, byte_count: nextBytes })
+    const restarted = createAttentionOverridesStore(database, h.inbox, owner)
+    expect(await restarted.classify(input)).toEqual(undone)
+    expect(await restarted.undo(input.id)).toEqual(undone)
+    expect(usage()).toEqual({ key_count: 1, command_count: 1, byte_count: nextBytes })
+  })
+
+  test('category HTTP routes retain session, Origin, bounded JSON, privacy and durable command guards', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'category-host-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
+    cleanup.push(() => host.close())
+    const base = `http://localhost:${config.backend.port}`, origin = config.web.origin
+    const session = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
+    const headers = { Origin: origin, Cookie: session.headers.get('set-cookie')!.split(';')[0]!, 'Content-Type': 'application/json' }
+    const request = (path: string, body?: unknown, extra: Record<string, string> = {}) => host.fetch(new Request(`${base}${path}`, { headers: { ...headers, ...extra }, ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }) }))
+    expect((await host.fetch(new Request(`${base}/host/attention-overrides`))).status).toBe(401)
+    expect((await request('/host/config')).status).toBe(200)
+    expect((await (await request('/host/config')).json()).attentionOverrides).toBe(true)
+    expect(await (await request('/host/attention-overrides?after=0')).json()).toEqual({ entries: [], cursor: 0, hasMore: false, resetRequired: false })
+    expect((await request('/host/attention-overrides', {}, { Origin: 'https://evil.test' })).status).toBe(403)
+    expect((await request('/host/attention-overrides?after=0&after=1')).status).toBe(400)
+    expect((await request('/host/attention-overrides?after=-1')).status).toBe(400)
+    expect((await request('/host/attention-overrides', {}, { 'Content-Type': 'text/plain' })).status).toBe(415)
+    expect((await request('/host/attention-overrides', {}, { 'Content-Encoding': 'identity' })).status).toBe(415)
+    expect((await request('/host/attention-overrides', {}, { 'Content-Length': '65537' })).status).toBe(413)
+    const invalid = await request('/host/attention-overrides', { id: BODY_SECRET, owner: 'foreign', body: BODY_SECRET })
+    expect(invalid.status).toBe(400); expect(await invalid.text()).not.toContain(BODY_SECRET)
+    expect((await request('/host/attention-overrides/lookup', { keys: [], owner: 'foreign' })).status).toBe(400)
+    expect((await request('/host/attention-overrides/00000000-0000-0000-0000-000000000000/undo', {})).status).toBe(404)
   })
 })
 
@@ -8581,13 +8858,14 @@ describe('AI triage inference and local scoring', () => {
     ref: 'message-1', direction: 'incoming', toSelf: true, receivedAt: new Date(EPOCH - 60_000).toISOString(),
     subject: 'Please approve the proposal', text: 'Please reply with approval by 2026-09-15.', truncated: false,
   }] }
-  const unknown: AiAssessment = { type: 'unknown', response: 'unknown', actions: [], urgency: 'unknown', deadline: null,
+  const unknown: AiAssessment = { type: 'unknown', response: 'unknown', task: 'unknown', actions: [], urgency: 'unknown', deadline: null,
     topics: [], risk: 'unknown', certainty: 'insufficient', reason: 'Insufficient evidence.', evidence: [] }
-  const request: AiAssessment = { type: 'request', response: 'needed', actions: ['reply', 'approve'], urgency: 'deadline',
+  const request: AiAssessment = { type: 'request', response: 'needed', task: 'required', actions: ['reply', 'approve'], urgency: 'deadline',
     deadline: '2026-09-15', topics: ['Proposal'], risk: 'none_observed', certainty: 'clear', reason: 'A reply is requested.',
     evidence: [
       { messageRef: 'message-1', quote: 'Please approve the proposal', field: 'type' },
       { messageRef: 'message-1', quote: 'Please reply with approval', field: 'response' },
+      { messageRef: 'message-1', quote: 'Please approve the proposal', field: 'task' },
       { messageRef: 'message-1', quote: 'Please reply with approval', field: 'action' },
       { messageRef: 'message-1', quote: 'by 2026-09-15', field: 'urgency' },
     ],
@@ -8641,6 +8919,7 @@ describe('AI triage inference and local scoring', () => {
     expect(validateAiAssessment(unknown, empty)).toEqual(unknown)
     for (const changed of [
       { ...request, category: 'Important' }, { ...request, confidence: 0.99 }, { ...request, response: 'certainly' },
+      { ...request, task: undefined }, { ...request, task: 'assigned' }, { ...request, task: null }, { ...request, actions: [] },
       { ...request, actions: ['reply', 'reply'] }, { ...request, topics: ['AI', 'ai'] }, { ...request, reason: '' },
     ]) expect(() => validateAiAssessment(changed, input)).toThrow('AI_ASSESSMENT_INVALID')
     for (const evidence of [
@@ -8651,9 +8930,17 @@ describe('AI triage inference and local scoring', () => {
       [{ ...request.evidence[0]!, quote: 'Please…approve the proposal' }],
       [{ ...request.evidence[0]!, quote: 'Please\u00a0approve the proposal' }],
     ]) expect(() => validateAiAssessment({ ...request, evidence }, input)).toThrow('AI_EVIDENCE_INVALID')
-    for (const field of ['type', 'response', 'action', 'urgency']) {
+    for (const field of ['type', 'response', 'task', 'action', 'urgency']) {
       expect(() => validateAiAssessment({ ...request, evidence: request.evidence.filter(item => item.field !== field) }, input)).toThrow('AI_EVIDENCE_REQUIRED')
     }
+    const legacy = { ...request }
+    delete legacy.task
+    expect(() => validateAiAssessment(legacy, input)).toThrow('AI_ASSESSMENT_INVALID')
+    const sentOnly: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, direction: 'outgoing' }] }
+    expect(() => validateAiAssessment(request, sentOnly)).toThrow('AI_EVIDENCE_REQUIRED')
+    const mixed: AiTriageInput = { ...input, messages: [...input.messages, { ...input.messages[0]!, ref: 'sent', direction: 'outgoing' }] }
+    expect(() => validateAiAssessment({ ...request, evidence: request.evidence.map(item => item.field === 'task' ? { ...item, messageRef: 'sent' } : item) }, mixed)).toThrow('AI_EVIDENCE_REQUIRED')
+    expect(() => validateAiAssessment({ ...request, evidence: request.evidence.map(item => item.field === 'task' ? { ...item, quote: 'You are assigned to approve' } : item) }, input)).toThrow('AI_EVIDENCE_INVALID')
     expect(() => validateAiAssessment({ ...unknown, risk: 'phishing_suspected' }, input)).toThrow('AI_EVIDENCE_REQUIRED')
     for (const deadline of ['tomorrow', 'September 15', '2026-02-30']) {
       const relative = { ...input, messages: [{ ...input.messages[0]!, text: `Please reply with approval by ${deadline}.` }] }
@@ -8666,7 +8953,7 @@ describe('AI triage inference and local scoring', () => {
     expect(prepareAiText({ bodyText: 'abcd😀ef' }, 5)).toEqual({ text: 'abcd', truncated: true })
     expect(prepareAiText({})).toEqual({ text: '', truncated: false })
     const unicode = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional offer – save 20%\nDetails', truncated: true }] }
-    const campaign: AiAssessment = { ...unknown, type: 'promotion', response: 'not_needed', urgency: 'none', risk: 'none_observed', certainty: 'clear',
+    const campaign: AiAssessment = { ...unknown, type: 'promotion', response: 'not_needed', task: 'none', urgency: 'none', risk: 'none_observed', certainty: 'clear',
       evidence: [{ messageRef: 'message-1', quote: 'offer – save 20%\nDetails', field: 'type' }] }
     expect(validateAiAssessment(campaign, unicode)).toEqual(campaign)
     expect(() => validateAiAssessment({ ...campaign, evidence: [{ ...campaign.evidence[0]!, quote: 'offer – save 20% Details' }] }, unicode)).toThrow('AI_EVIDENCE_INVALID')
@@ -8684,7 +8971,11 @@ describe('AI triage inference and local scoring', () => {
         expect(init?.redirect).toBe('error')
         const sent = JSON.parse(String(init?.body))
         expect(sent).toMatchObject({ model: 'fixture-model', store: false, stream: false, tools: [], tool_choice: 'none', truncation: 'disabled' })
-        expect(sent.text.format).toMatchObject({ type: 'json_schema', strict: true, schema: { additionalProperties: false } })
+        expect(sent.text.format).toMatchObject({ type: 'json_schema', name: 'triage_result_v2', strict: true, schema: {
+          additionalProperties: false, properties: { task: { type: 'string', enum: ['required', 'optional', 'none', 'unknown'] } },
+        } })
+        expect(sent.text.format.schema.required).toContain('task')
+        expect(sent.text.format.schema.properties.evidence.items.properties.field.enum).toContain('task')
         expect(sent.instructions).not.toContain(injection)
         expect(sent.instructions).toContain('untrusted data')
         expect(sent.input).toEqual([{ role: 'user', content: JSON.stringify(hostile) }])
@@ -8702,7 +8993,10 @@ describe('AI triage inference and local scoring', () => {
   })
 
   test('invalid refused incomplete and empty responses retain nullable measured usage without treating unknown counts as free', async () => {
+    const legacy = { ...request }
+    delete legacy.task
     const variants = [
+      { data: { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(legacy) }] }] }, outcome: 'invalid', code: 'AI_ASSESSMENT_INVALID' },
       { data: { ...response, status: 'incomplete' }, outcome: 'incomplete', code: 'AI_RESPONSE_INCOMPLETE' },
       { data: { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'refusal', refusal: configuration.apiKey }] }] }, outcome: 'refused', code: 'AI_RESPONSE_REFUSED' },
       { data: { ...response, output: [] }, outcome: 'invalid', code: 'AI_RESPONSE_INVALID' },
@@ -8791,20 +9085,204 @@ describe('AI triage inference and local scoring', () => {
     expect(calls).toBe(0)
   })
 
+  test('reply-only promotional offers cannot claim a required task outside email even with exact incoming evidence', async () => {
+    const quote = 'Reply if you would like our product brochure.'
+    const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional product brochure', text: quote }] }
+    const assessment: AiAssessment = { ...request, type: 'promotion', response: 'optional', task: 'required', actions: ['reply'],
+      urgency: 'routine', deadline: null, reason: 'A brochure is offered on request.', evidence: [
+        { messageRef: 'message-1', quote: 'Fictional product brochure', field: 'type' },
+        { messageRef: 'message-1', quote, field: 'task' },
+        { messageRef: 'message-1', quote, field: 'action' },
+      ] }
+    expect(() => validateAiAssessment(assessment, source)).toThrow('AI_ASSESSMENT_INVALID')
+    const result = await inferAiTriage(source, configuration, { model: 'fixture-model', signal: new AbortController().signal,
+      fetcher: (async () => Response.json({ ...response,
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(assessment) }] }],
+      })) as unknown as typeof fetch })
+    expect(result).toMatchObject({ outcome: 'invalid', code: 'AI_ASSESSMENT_INVALID', assessment: null })
+    const optional = validateAiAssessment({ ...assessment, task: 'optional' }, source)
+    expect(scoreAiTriage(optional, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 })).toMatchObject({ category: 'Other', score: -32 })
+  })
+
+  test('grounded required work outside email survives notification inference and negative affinity without inventing a reply', async () => {
+    const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
+    const disliked: AiScoreSignals = { ...neutral, explicitAffinity: -1, learnedTopicAffinity: -1 }
+    const fixtures = [
+      { subject: 'Aurora Notes submission requires correction', text: 'Your submission could not be processed. You must correct the listed issues and upload a new build.',
+        quote: 'You must correct the listed issues and upload a new build.', action: 'investigate' },
+      { subject: 'Review assigned in fictional/aurora', text: 'You have been assigned to review pull request #42 in fictional/aurora. Please review the changes.',
+        quote: 'You have been assigned to review pull request #42 in fictional/aurora.', action: 'review' },
+    ] as const
+    for (const fixture of fixtures) {
+      const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject: fixture.subject, text: fixture.text }] }
+      const assessment: AiAssessment = { ...request, type: 'notification', response: 'not_needed', task: 'required', actions: [fixture.action],
+        urgency: 'routine', deadline: null, topics: [], reason: 'Required work remains outside email; no email reply is requested.', evidence: [
+          { messageRef: 'message-1', quote: fixture.subject, field: 'type' },
+          { messageRef: 'message-1', quote: fixture.quote, field: 'task' },
+          { messageRef: 'message-1', quote: fixture.quote, field: 'action' },
+        ] }
+      let calls = 0
+      const result = await inferAiTriage(source, configuration, { model: 'fixture-model', signal: new AbortController().signal,
+        fetcher: (async (_url, init) => {
+          calls++
+          expect(JSON.parse(String(init?.body)).input).toEqual([{ role: 'user', content: JSON.stringify(source) }])
+          return Response.json({ ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(assessment) }] }] })
+        }) as typeof fetch })
+      expect(calls).toBe(1)
+      expect(result).toMatchObject({ outcome: 'completed', assessment })
+      expect(result.assessment!.response).toBe('not_needed')
+      expect(scoreAiTriage(result.assessment!, neutral)).toMatchObject({ category: 'Important', score: 20, version: AI_PREFERENCE_VERSION })
+      expect(scoreAiTriage(result.assessment!, disliked)).toMatchObject({ category: 'Important', score: 20 })
+      expect(scoreAiTriage(result.assessment!, disliked, { override: 'Other' })).toMatchObject({ category: 'Other', score: 20 })
+      for (const risk of ['spam_suspected', 'phishing_suspected'] as const) {
+        const risky = { ...result.assessment!, risk }
+        expect(scoreAiTriage(risky, neutral)).toMatchObject({ category: 'Other', score: -100 })
+        expect(scoreAiTriage(risky, neutral, { override: 'Important' })).toMatchObject({ category: 'Important', score: -100 })
+      }
+      const original = structuredClone(result.assessment!)
+      scoreAiTriage(result.assessment!, disliked)
+      expect(result.assessment).toEqual(original)
+      const otherWork = validateAiAssessment({ ...result.assessment!, actions: ['other'] }, source)
+      expect(scoreAiTriage(otherWork, disliked).category).toBe('Important')
+    }
+  })
+
+  test('explicit optional and absent tasks do not inherit personal-type action floors while unknown responsibility stays reviewable', () => {
+    const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
+    const fixtures: Array<{ type: AiAssessment['type']; task: AiAssessment['task']; response: AiAssessment['response']; quote: string; expected: number }> = [
+      { type: 'promotion', task: 'optional', response: 'not_needed', quote: 'Browse our new offers if you are interested.', expected: -48 },
+      { type: 'newsletter', task: 'optional', response: 'not_needed', quote: 'You can review this weekly digest at your leisure.', expected: -23 },
+      { type: 'notification', task: 'none', response: 'not_needed', quote: 'Morgan was assigned to review pull request #42. You are watching this repository.', expected: -8 },
+      { type: 'conversation', task: 'optional', response: 'not_needed', quote: 'You can review my notes if you would like; no action is needed.', expected: 7 },
+      { type: 'conversation', task: 'none', response: 'waiting', quote: 'Morgan will review the changes and send an update. Nothing else is needed from you.', expected: 5 },
+    ]
+    for (const fixture of fixtures) {
+      const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional update', text: fixture.quote }] }
+      const assessment = validateAiAssessment({ ...request, type: fixture.type, response: fixture.response, task: fixture.task, actions: ['review'],
+        urgency: 'routine', deadline: null, evidence: [
+          { messageRef: 'message-1', quote: 'Fictional update', field: 'type' },
+          { messageRef: 'message-1', quote: fixture.quote, field: 'action' },
+        ] }, source)
+      const score = scoreAiTriage(assessment, neutral)
+      expect(score).toMatchObject({ category: 'Other', score: fixture.expected })
+      expect(score.contributions.some(item => item.name === 'requested_actions' || item.name === 'actionability_gate')).toBe(false)
+    }
+    const ambiguous: AiAssessment = { ...unknown, type: 'notification', response: 'not_needed', task: 'unknown', urgency: 'routine',
+      risk: 'none_observed', certainty: 'clear' }
+    expect(scoreAiTriage(ambiguous, neutral)).toMatchObject({ category: 'Important', score: 20 })
+    expect(scoreAiTriage({ ...ambiguous, task: 'none' }, neutral)).toMatchObject({ category: 'Other', score: -8 })
+    const replyOnly = validateAiAssessment({ ...request, task: 'none', actions: ['reply'], evidence: request.evidence.filter(item => item.field !== 'task') }, input)
+    expect(scoreAiTriage(replyOnly, { ...neutral, explicitAffinity: -1, learnedTopicAffinity: -1 }).category).toBe('Important')
+  })
+
+  test('clear task-aware mail without obligations stays Other despite type optional replies reported urgency or affinity', () => {
+    const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
+    const rich: AiScoreSignals = { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 }
+    const base: AiAssessment = { ...request, type: 'notification', response: 'not_needed', task: 'none', actions: [], urgency: 'routine', deadline: null }
+    const fixtures: Array<{ assessment: AiAssessment; signals: AiScoreSignals; quote: string; previousScore: number }> = [
+      { assessment: { ...base, type: 'request' }, signals: neutral, quote: 'Your request is complete. Nothing remains for you to do.', previousScore: 24 },
+      { assessment: { ...base, type: 'conversation', response: 'optional' }, signals: neutral, quote: 'Reply if you would like a summary; no response is needed.', previousScore: 23 },
+      { assessment: { ...base, urgency: 'immediate' }, signals: neutral, quote: 'Your urgent access issue is resolved. Nothing remains for you to do.', previousScore: 37 },
+      { assessment: base, signals: { ...neutral, correspondenceDays: 14 }, quote: 'A routine update; no action is needed.', previousScore: 20 },
+      { assessment: base, signals: { ...neutral, explicitAffinity: 1 }, quote: 'A routine update; no action is needed.', previousScore: 72 },
+      { assessment: base, signals: { ...neutral, interestMatches: 1 }, quote: 'A routine update; no action is needed.', previousScore: 42 },
+      { assessment: { ...base, type: 'newsletter', task: 'optional' }, signals: rich, quote: 'Browse this weekly digest if interested.', previousScore: 199 },
+      { assessment: { ...base, type: 'conversation', response: 'waiting' }, signals: rich, quote: 'Morgan will send the update. Nothing else is needed from you.', previousScore: 227 },
+    ]
+    for (const fixture of fixtures) {
+      const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional update', text: fixture.quote }] }
+      const evidence: AiAssessment['evidence'] = [{ messageRef: 'message-1', quote: 'Fictional update', field: 'type' }]
+      if (fixture.assessment.urgency === 'immediate') evidence.push({ messageRef: 'message-1', quote: fixture.quote, field: 'urgency' })
+      const assessment = validateAiAssessment({ ...fixture.assessment, evidence }, source)
+      const result = scoreAiTriage(assessment, fixture.signals)
+      expect(result).toMatchObject({ category: 'Other', score: 19, version: 'preference-3' })
+      expect(result.contributions).toContainEqual({ name: 'no_obligation_gate', value: 19 - fixture.previousScore })
+      expect(result.contributions.reduce((sum, item) => sum + item.value, 0)).toBe(result.score)
+      expect(result.contributions.some(item => item.name === 'actionability_gate')).toBe(false)
+      expect(scoreAiTriage(assessment, fixture.signals, { override: 'Important' })).toMatchObject({ category: 'Important', score: 19 })
+    }
+    const quote = 'Your submission with deadline 2026-09-15 is complete. No further action is needed.'
+    const completedDeadline = validateAiAssessment({ ...base, urgency: 'deadline', deadline: '2026-09-15', evidence: [
+      { messageRef: 'message-1', quote, field: 'type' }, { messageRef: 'message-1', quote, field: 'urgency' },
+    ] }, { ...input, messages: [{ ...input.messages[0]!, text: quote }] })
+    expect(scoreAiTriage(completedDeadline, neutral)).toMatchObject({ category: 'Other', score: 19 })
+    expect(scoreAiTriage({ ...base, evidence: [] }, { ...neutral, readingSeconds: 1_000_000 })).toMatchObject({ category: 'Other', score: -4 })
+  })
+
+  test('task-aware obligations remain Important across genres while risk uncertainty and manual overrides keep precedence', () => {
+    const disliked: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: -1, interestMatches: 0, learnedTopicAffinity: -1 }
+    for (const type of ['notification', 'newsletter', 'promotion', 'cold_outreach'] as const) {
+      for (const task of ['none', 'required'] as const) {
+        const quote = task === 'required' ? 'You must review the agreement to complete your requested delivery.' : 'Please reply to confirm the address for your requested delivery.'
+        const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional delivery follow-up', text: quote }] }
+        const assessment = validateAiAssessment({ ...request, type, task, response: task === 'required' ? 'not_needed' : 'needed',
+          actions: task === 'required' ? ['review'] : ['reply'], urgency: 'routine', deadline: null, evidence: [
+            { messageRef: 'message-1', quote: 'Fictional delivery follow-up', field: 'type' },
+            { messageRef: 'message-1', quote, field: task === 'required' ? 'task' : 'response' },
+            { messageRef: 'message-1', quote, field: 'action' },
+          ] }, source)
+        expect(scoreAiTriage(assessment, disliked)).toMatchObject({ category: 'Important', score: 20, version: 'preference-3' })
+        expect(scoreAiTriage(assessment, disliked, { override: 'Other' })).toMatchObject({ category: 'Other', score: 20 })
+      }
+    }
+    const noTask: AiAssessment = { ...request, type: 'notification', response: 'not_needed', task: 'none', actions: [], urgency: 'routine', deadline: null }
+    for (const change of [{ certainty: 'ambiguous' }, { certainty: 'insufficient' }, { type: 'unknown' }, { response: 'unknown' }, { task: 'unknown' }] as const) {
+      const score = scoreAiTriage({ ...noTask, ...change }, disliked)
+      expect(score).toMatchObject({ category: 'Important', score: 20 })
+      expect(score.contributions.some(item => item.name === 'no_obligation_gate')).toBe(false)
+    }
+    const rich: AiScoreSignals = { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 }
+    for (const risk of ['spam_suspected', 'phishing_suspected'] as const) {
+      expect(scoreAiTriage({ ...noTask, risk }, rich)).toMatchObject({ category: 'Other', score: -100 })
+      expect(scoreAiTriage({ ...noTask, risk }, rich, { override: 'Important' })).toMatchObject({ category: 'Important', score: -100 })
+    }
+    const quote = 'You must investigate this unauthorized account change immediately.'
+    const security = validateAiAssessment({ ...noTask, task: 'required', actions: ['investigate'], urgency: 'immediate', evidence: [
+      { messageRef: 'message-1', quote, field: 'type' }, { messageRef: 'message-1', quote, field: 'task' },
+      { messageRef: 'message-1', quote, field: 'action' }, { messageRef: 'message-1', quote, field: 'urgency' },
+    ] }, { ...input, messages: [{ ...input.messages[0]!, text: quote }] })
+    expect(scoreAiTriage(security, disliked)).toMatchObject({ category: 'Important', score: 20 })
+  })
+
+  test('retained legacy task absence keeps its numeric scoring and evidence unchanged instead of becoming new unknown or required work', () => {
+    const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
+    const fixtures: Array<{ type: AiAssessment['type']; response: AiAssessment['response']; expected: number }> = [
+      { type: 'notification', response: 'not_needed', expected: -8 },
+      { type: 'conversation', response: 'waiting', expected: 20 },
+      { type: 'request', response: 'not_needed', expected: 32 },
+      { type: 'promotion', response: 'not_needed', expected: -48 },
+      { type: 'notification', response: 'unknown', expected: 20 },
+    ]
+    for (const fixture of fixtures) {
+      const legacy: AiAssessment = { ...request, type: fixture.type, response: fixture.response, actions: ['review'], urgency: 'routine', deadline: null }
+      delete legacy.task
+      legacy.evidence = legacy.evidence.filter(item => item.field !== 'task')
+      const original = structuredClone(legacy)
+      const score = scoreAiTriage(legacy, neutral)
+      expect(score).toMatchObject({ score: fixture.expected, category: fixture.expected >= 20 ? 'Important' : 'Other', version: 'preference-2' })
+      expect(legacy).toEqual(original)
+      expect(legacy).not.toHaveProperty('task')
+    }
+    const legacy: AiAssessment = { ...request, type: 'promotion', response: 'not_needed', actions: [], urgency: 'routine', deadline: null }
+    delete legacy.task
+    expect(scoreAiTriage(legacy, { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 })).toMatchObject({ category: 'Important', score: 174, version: 'preference-2' })
+    expect(scoreAiTriage({ ...legacy, type: 'notification', urgency: 'immediate' }, neutral)).toMatchObject({ category: 'Important', score: 37, version: 'preference-2' })
+  })
+
   test('deterministic scoring preserves needs-reply and uncertainty, distinguishes promotion from spam, and caps weak reading affinity', () => {
     const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
     const rich: AiScoreSignals = { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 }
     expect(scoreAiTriage(request, neutral).category).toBe('Important')
     const disliked: AiScoreSignals = { ...neutral, explicitAffinity: -1, learnedTopicAffinity: -1 }
-    const invoice: AiAssessment = { ...request, type: 'invoice', response: 'needed', urgency: 'routine', deadline: null, actions: ['reply'] }
+    const invoice: AiAssessment = { ...request, type: 'invoice', response: 'needed', task: 'none', urgency: 'routine', deadline: null, actions: ['reply'] }
     expect(scoreAiTriage(invoice, disliked).category).toBe('Important')
     expect(scoreAiTriage(invoice, disliked, { override: 'Other' }).category).toBe('Other')
     expect(scoreAiTriage({ ...invoice, risk: 'phishing_suspected' }, disliked).category).toBe('Other')
-    expect(scoreAiTriage({ ...request, response: 'not_needed', actions: [], urgency: 'immediate' }, neutral).category).toBe('Important')
+    expect(scoreAiTriage({ ...request, response: 'not_needed', task: 'none', actions: [], urgency: 'immediate' }, neutral)).toMatchObject({ category: 'Other', score: 19 })
     expect(scoreAiTriage(unknown, neutral).category).toBe('Important')
-    const promotion: AiAssessment = { ...unknown, type: 'promotion', response: 'not_needed', urgency: 'none', risk: 'unsolicited', certainty: 'clear' }
+    const promotion: AiAssessment = { ...unknown, type: 'promotion', response: 'not_needed', task: 'none', urgency: 'none', risk: 'unsolicited', certainty: 'clear' }
     expect(scoreAiTriage(promotion, neutral).category).toBe('Other')
-    expect(scoreAiTriage(promotion, rich).category).toBe('Important')
+    expect(scoreAiTriage(promotion, rich)).toMatchObject({ category: 'Other', score: 19 })
     for (const risk of ['spam_suspected', 'phishing_suspected'] as const) {
       const assessment = { ...request, risk }, original = structuredClone(assessment)
       expect(scoreAiTriage(assessment, rich)).toMatchObject({ category: 'Other', score: -100 })
@@ -8841,11 +9319,597 @@ describe('AI triage service', () => {
       outputPerMillion: 8, cachedInputPerMillion: 0.5, cacheWriteInputPerMillion: 3,
     } })),
   }
-  const assessment: AiAssessment = { type: 'other', response: 'not_needed', actions: [], urgency: 'none', deadline: null,
+  const assessment: AiAssessment = { type: 'other', response: 'not_needed', task: 'none', actions: [], urgency: 'none', deadline: null,
     topics: ['Fixture topic'], risk: 'none_observed', certainty: 'clear', reason: 'No current action requested.', evidence: [] }
   const response = { id: 'fixture-response', model: 'fixture-model', status: 'completed',
     usage: { input_tokens: 1000, output_tokens: 100, total_tokens: 1100, input_tokens_details: { cached_tokens: 200, cache_write_tokens: 100 }, output_tokens_details: { reasoning_tokens: 40 } },
     output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(assessment) }] }] }
+
+  test('history admission binds confirmed settings revisions and returns existing receipts before checking current settings', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    await h.seed('alice', 'ai-history-consent', [native('history-consent')])
+    let entered = deferred<void>(), release = deferred<void>()
+    let blockScope = false, scopeReads = 0, snapshots = 0, calls = 0
+    const guarded: Inbox = { ...h.inbox,
+      mailboxes: async (...args) => { scopeReads++; const boxes = await h.inbox.mailboxes(...args); if (blockScope) { entered.resolve(); await release.promise }; return boxes },
+      mailboxSnapshot: async (...args) => { snapshots++; return h.inbox.mailboxSnapshot(...args) },
+    }
+    const fetcher = (async () => { calls++; return Response.json(response) }) as unknown as typeof fetch
+    const service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    const peer = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    cleanup.push(async () => { release.resolve(); await Promise.all([service.close(), peer.close()]); database.close() })
+    const enabled = await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    const input = { id: 'ai-confirmed-history', scope: 'inbox' as const, limit: 100, settingsRevision: enabled.settings.revision }
+    const job = await service.process('alice', input)
+    expect(job).toMatchObject({ id: input.id, settingsRevision: enabled.settings.revision })
+    await bounded((async () => { while ((await service.state('alice')).queue.pending !== 1) await Bun.sleep(10) })(), 'confirmed history inventory')
+    const changed = await service.configure('alice', { ...(await service.state('alice')).settings, mode: 'apply' })
+    const before = { scopeReads, snapshots }
+    await expect(service.process('alice', { ...input, id: 'ai-stale-confirmation' })).rejects.toMatchObject({ code: 'AI_SETTINGS_CONFLICT', status: 412 })
+    expect({ scopeReads, snapshots }).toEqual(before)
+    expect((await service.process('alice', input)).id).toBe(job.id)
+    await expect(service.process('alice', { ...input, settingsRevision: changed.settings.revision })).rejects.toMatchObject({ code: 'AI_JOB_CONFLICT', status: 409 })
+    for (const settingsRevision of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) await expect(service.process('alice', { ...input, id: 'ai-invalid-confirmation', settingsRevision })).rejects.toMatchObject({ code: 'AI_INVALID_JOB' })
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: false })
+    expect(await service.process('alice', input)).toMatchObject({ id: job.id, status: 'cancelled', settingsRevision: input.settingsRevision })
+    const resumed = await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    const beforeRace = snapshots
+    blockScope = true
+    const racing = service.process('alice', { id: 'ai-scope-confirmation-race', scope: 'all', limit: 100, settingsRevision: resumed.settings.revision })
+    await bounded(entered.promise, 'history scope admission await')
+    await peer.configure('alice', { ...(await peer.state('alice')).settings, model: 'fixture-model-next', mailboxIds: [] })
+    release.resolve()
+    await expect(racing).rejects.toMatchObject({ code: 'AI_SETTINGS_CONFLICT', status: 412 })
+    expect(snapshots).toBe(beforeRace)
+    expect(database.query("SELECT 1 FROM local_ai_jobs WHERE id='ai-scope-confirmation-race'").get()).toBeNull()
+    expect(database.query("SELECT 1 FROM local_ai_jobs WHERE id='ai-stale-confirmation'").get()).toBeNull()
+    // Mode changes do not increment the admission generation: revision must fence them too.
+    const reopened = await peer.configure('alice', { ...(await peer.state('alice')).settings, mailboxIds: null })
+    entered = deferred<void>(); release = deferred<void>()
+    const modeRace = service.process('alice', { id: 'ai-mode-confirmation-race', scope: 'all', limit: 100, settingsRevision: reopened.settings.revision })
+    await bounded(entered.promise, 'history mode admission await')
+    await peer.configure('alice', { ...(await peer.state('alice')).settings, mode: 'preview' })
+    release.resolve()
+    await expect(modeRace).rejects.toMatchObject({ code: 'AI_SETTINGS_CONFLICT', status: 412 })
+    expect(database.query("SELECT 1 FROM local_ai_jobs WHERE id='ai-mode-confirmation-race'").get()).toBeNull()
+    expect(snapshots).toBe(beforeRace)
+    expect((await service.state('alice')).queue).toMatchObject({ pending: 0, processing: 0 })
+    // Legacy requests remain usable, but a revision cannot be inferred for an old receipt.
+    database.query("UPDATE local_ai_jobs SET data=json_remove(data,'$.settingsRevision') WHERE owner=? AND id=?").run('alice', job.id)
+    await expect(service.process('alice', input)).rejects.toMatchObject({ code: 'AI_JOB_CONFLICT', status: 409 })
+    expect(await service.process('alice', { id: input.id, scope: input.scope, limit: input.limit })).toMatchObject({ id: job.id, status: 'cancelled' })
+    expect(calls).toBe(0)
+  })
+
+  test('pause and resume preserve ready scores and manual receipts while changed-offline context still rejects feedback', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const seeds = [native('toggle-manual'), native('toggle-changing')]
+    const { account, box } = await h.seed('alice', 'ai-toggle-ready', seeds)
+    const inputs: AiTriageInput[] = []
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async (_url, init) => { inputs.push(JSON.parse(JSON.parse(String(init?.body)).input[0].content)); return Response.json(response) }) as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start(); await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    await service.process('alice', { id: 'ai-toggle-seed', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 2) await Bun.sleep(10) })(), 'ready toggle receipts')
+    const summaries = (await h.page('alice')).items
+    const manualMessage = summaries.find(item => item.subject === seeds[0]!.subject)!, changing = summaries.find(item => item.subject === seeds[1]!.subject)!
+    let manual = (await service.lookup('alice', [{ sourceId: account.id, threadId: manualMessage.threadId }])).decisions[0]!
+    manual = await service.feedback('alice', { sourceId: account.id, threadId: manual.threadId, revision: manual.revision, id: 'ai-toggle-manual-choice', category: 'Important' })
+    const sha = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+    const configHash = sha({ version: configuration.version, endpoint: configuration.endpoint, models: configuration.models, output: configuration.maxOutputTokens })
+    const legacyHash = sha({ messages: inputs.find(input => input.messages[0]!.subject === seeds[0]!.subject)!.messages, model: configuration.defaultModel, schema: 'triage-1', configuration: configHash })
+    delete manual.assessment!.task
+    manual = { ...manual, inputHash: legacyHash, schemaVersion: 'triage-1', inputPolicyVersion: 'input-2', override: { ...manual.override!, inputHash: legacyHash }, score: scoreAiTriage(manual.assessment!, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 1, interestMatches: 0, learnedTopicAffinity: 0 }, { override: 'Important' }) }
+    database.query('UPDATE local_ai_decisions SET data=? WHERE owner=? AND source=? AND thread=?').run(JSON.stringify(manual), 'alice', account.id, manual.threadId)
+    const before = (await service.results('alice')).decisions
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: false })
+    expect((await service.results('alice')).decisions).toEqual(before)
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    expect((await service.results('alice')).decisions).toEqual(before)
+    expect(inputs).toHaveLength(2)
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: false })
+    box.put({ ...seeds[1]!, bodyText: 'Changed while automatic triage was switched off.' })
+    await h.sync('alice', account.id)
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    const old = before.find(item => item.threadId === changing.threadId)!
+    await expect(service.feedback('alice', { sourceId: account.id, threadId: old.threadId, revision: old.revision, id: 'ai-toggle-stale-context-vote', category: 'Important' })).rejects.toMatchObject({ code: 'AI_DECISION_CONFLICT', status: 412 })
+    const kept = await service.feedback('alice', { sourceId: account.id, threadId: manual.threadId, revision: manual.revision, id: 'ai-toggle-valid-context-vote', category: 'Important' })
+    expect(kept).toMatchObject({ state: 'ready', inputHash: legacyHash, schemaVersion: 'triage-1', override: { category: 'Important', inputHash: legacyHash } })
+    expect(inputs).toHaveLength(2)
+    await service.configure('alice', { ...(await service.state('alice')).settings, model: 'fixture-model-next' })
+    expect((await service.results('alice')).decisions.every(item => item.state === 'stale')).toBe(true)
+    expect(inputs).toHaveLength(2)
+  })
+
+  test('startup locally upgrades only task-aware old scores through bounded resumable pages without inference or body reads', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const { box } = await h.seed('alice', 'ai-local-policy-upgrade', Array.from({ length: 105 }, (_, index) => native(`policy-${index}`, { bodyText: 'Fictional policy notice. No action is required.' })))
+    let paid = 0, bodyReads = 0, threadReads = 0, inventories = 0
+    const fetcher = (async () => { paid++; return Response.json(response) }) as unknown as typeof fetch
+    let service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true, interests: ['Fixture topic'] })
+    await service.process('alice', { id: 'ai-local-policy-seed', scope: 'inbox', limit: 200 })
+    await bounded((async () => { while ((await service.state('alice')).queue.pending !== 105) await Bun.sleep(10) })(), 'synthetic saved policy receipts')
+    await service.close()
+    const rows = database.query<{ data: string; seq: number }, []>('SELECT data,seq FROM local_ai_decisions ORDER BY seq').all()
+    const grade: AiAssessment = { ...assessment, type: 'notification', task: 'none', topics: ['Fixture topic'], evidence: [{ messageRef: 'm0', field: 'type', quote: 'Fictional policy notice.' }] }
+    const oldScore: AiDecision['score'] = { category: 'Important', score: 37, version: 'preference-2', reasons: ['Explicit local interest'], contributions: [{ name: 'response', value: -8 }, { name: 'urgency', value: -5 }, { name: 'interests', value: 50 }] }
+    const originals = rows.map((row, index) => {
+      const original: AiDecision = JSON.parse(row.data)
+      const decision: AiDecision = { ...original, state: 'ready', assessment: structuredClone(grade), score: structuredClone(oldScore), inputHash: createHash('sha256').update(`fictional-policy-input:${original.threadId}`).digest('hex'), inputPolicyVersion: AI_INPUT_POLICY_VERSION, updatedAt: new Date(EPOCH - 1000).toISOString() }
+      if (index === 100) decision.override = { category: 'Important', inputHash: decision.inputHash!, at: new Date(EPOCH - 1000).toISOString() }
+      if (index === 101) { delete decision.assessment!.task; decision.schemaVersion = 'triage-1'; decision.inputPolicyVersion = 'input-2' }
+      if (index === 102) decision.score = scoreAiTriage(grade, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 1, learnedTopicAffinity: 0 })
+      if (index === 103) { decision.state = 'failed'; decision.assessment = null; decision.score = null; decision.problemCode = 'AI_EVIDENCE_INVALID' }
+      database.query('UPDATE local_ai_decisions SET data=? WHERE owner=? AND source=? AND thread=?').run(JSON.stringify(decision), 'alice', decision.sourceId, decision.threadId)
+      return decision
+    })
+    database.exec('DELETE FROM local_ai_queue; DELETE FROM local_ai_jobs; DELETE FROM local_ai_job_items')
+    const guarded: Inbox = { ...h.inbox,
+      mailboxMessage: async () => { bodyReads++; throw new Error('Policy-only upgrade must not read bodies') },
+      thread: async () => { threadReads++; throw new Error('Policy-only upgrade must not prepare context') },
+      mailboxSnapshot: async () => { inventories++; throw new Error('Policy-only upgrade must not scan mail') },
+    }
+    const sourceCalls = structuredClone(box.calls)
+    service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    const beforeReads = database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count
+    expect((await service.results('alice')).decisions[0]?.score).toMatchObject({ category: 'Important', score: 37, version: 'preference-2' })
+    expect((await service.state('alice')).jobs).toEqual([])
+    expect(database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count).toBe(beforeReads)
+    await service.start()
+    // start completes one synchronous 100-row page; close pauses at its existing yield.
+    await service.close()
+    expect(database.query<{ force: number; after: number }, []>("SELECT force,after FROM local_ai_rescore WHERE owner='alice'").get()).toEqual({ force: 2, after: rows[99]!.seq })
+    expect((await service.diagnostics('alice')).coverage?.counts.rescored).toBe(100)
+    const pending = (await service.results('alice', rows[99]!.seq)).decisions
+    for (const index of [100, 101, 102, 103]) expect(pending.find(item => item.threadId === originals[index]!.threadId)).toEqual(originals[index])
+    expect(pending.find(item => item.threadId === originals[104]!.threadId)).toMatchObject({ state: 'stale', score: null })
+    service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start()
+    await bounded((async () => { while (database.query("SELECT 1 FROM local_ai_rescore WHERE owner='alice'").get()) await Bun.sleep(10) })(), 'resumed local policy scoring')
+    await service.close()
+    const changed = database.query<{ data: string }, []>("SELECT data FROM local_ai_decisions WHERE owner='alice'").all().map(row => JSON.parse(row.data) as AiDecision)
+    for (const [index, original] of originals.entries()) {
+      const current = changed.find(item => item.threadId === original.threadId)!
+      if (index >= 100 && index <= 103) expect(current).toEqual(original)
+      else {
+        expect(current).toMatchObject({ state: 'ready', assessment: original.assessment, inputHash: original.inputHash, model: original.model, schemaVersion: original.schemaVersion, inputPolicyVersion: original.inputPolicyVersion, contextVersions: original.contextVersions, score: { category: 'Other', score: 19, version: AI_PREFERENCE_VERSION } })
+        expect(current.score!.contributions).toContainEqual({ name: 'no_obligation_gate', value: -18 })
+      }
+    }
+    expect((await service.diagnostics('alice')).coverage?.counts.rescored).toBe(101)
+    expect((await service.diagnostics('alice')).activity?.find(item => item.reason === 'rescored')?.contributions).toContainEqual({ name: 'no_obligation_gate', value: -18 })
+    // A completed upgrade is idempotent; ordinary state/result reads do not queue it again.
+    service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start(); await service.close()
+    const beforeFinalReads = database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count
+    const state = await service.state('alice'), first = await service.results('alice')
+    expect(state).toMatchObject({ jobs: [], queue: { pending: 0, processing: 0 }, usage: { attempts: 0 } })
+    expect(first.decisions.length).toBeGreaterThan(0)
+    expect(database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count).toBe(beforeFinalReads)
+    expect(database.query("SELECT 1 FROM local_ai_rescore WHERE owner='alice'").get()).toBeNull()
+    expect(database.query<{ data: string }, []>("SELECT data FROM local_ai_decisions WHERE owner='alice'").all().map(row => JSON.parse(row.data))).toEqual(changed)
+    expect((await service.diagnostics('alice')).coverage?.counts.rescored).toBe(101)
+    // An existing preference job keeps its token/high-water. The startup-only
+    // policy pass follows it to catch an old score beyond that captured boundary.
+    const tail = changed.find(item => item.threadId === originals[104]!.threadId)!, preferenceToken = randomUUID()
+    database.query('UPDATE local_ai_decisions SET data=? WHERE owner=? AND source=? AND thread=?').run(JSON.stringify({ ...tail, score: oldScore }), 'alice', tail.sourceId, tail.threadId)
+    database.query('INSERT INTO local_ai_rescore VALUES (?,?,?,?,0,0,0,NULL)').run('alice', preferenceToken, state.settings.revision, tail.revision - 1)
+    service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start(); await service.close()
+    expect(database.query<{ token: string; force: number; through: number }, []>("SELECT token,force,through FROM local_ai_rescore WHERE owner='alice'").get()).toEqual({ token: preferenceToken, force: 0, through: tail.revision - 1 })
+    service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start()
+    await bounded((async () => { while (JSON.parse(database.query<{ data: string }, [string]>('SELECT data FROM local_ai_decisions WHERE thread=?').get(tail.threadId)!.data).score.version !== AI_PREFERENCE_VERSION || database.query("SELECT 1 FROM local_ai_rescore WHERE owner='alice'").get()) await Bun.sleep(10) })(), 'policy pass after preference high-water')
+    await service.close()
+    expect((await service.diagnostics('alice')).coverage?.counts.rescored).toBe(102)
+    for (const index of [100, 101]) expect(JSON.parse(database.query<{ data: string }, [string]>('SELECT data FROM local_ai_decisions WHERE thread=?').get(originals[index]!.threadId)!.data)).toEqual(originals[index])
+    expect(paid).toBe(0); expect(bodyReads).toBe(0); expect(threadReads).toBe(0); expect(inventories).toBe(0)
+    expect(box.calls).toEqual(sourceCalls)
+  })
+
+  test('actual v1 context hashes survive uncaptured flags, explicit cache reuse and manual feedback until genuine input changes', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const seeds = Array.from({ length: 5 }, (_, index) => native(`real-v1-${index}`, { threadId: 'real-v1-thread', bodyText: `Fictional legacy context ${index}`, receivedAt: new Date(EPOCH - (5 - index) * 60000).toISOString() }))
+    const { account, box } = await h.seed('alice', 'ai-real-v1', seeds)
+    let calls = 0
+    const fetcher = (async () => { calls++; return Response.json(response) }) as unknown as typeof fetch
+    let service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    await service.process('alice', { id: 'ai-real-v1-seed', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while (!(await service.state('alice')).queue.pending) await Bun.sleep(10) })(), 'unstarted synthetic legacy projection')
+    await service.close()
+    const original: AiDecision = JSON.parse(database.query<{ data: string }, []>('SELECT data FROM local_ai_decisions').get()!.data)
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const summaries = (await h.inbox.thread('alice', original.threadId, { sort: 'newest', limit: 8 })).items
+    const messages = await Promise.all(summaries.slice(0, 4).map(summary => h.inbox.mailboxMessage('alice', mailbox.id, summary.id)))
+    const sha = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+    // The actual v1 algorithm: bounded SDK text + model + triage-1 + exact config digest.
+    // No current-schema hash is retained and merely relabeled as legacy.
+    const inputs: AiTriageInput['messages'] = messages.map((message, index) => {
+      const clean = prepareAiText(message, 3000), facts = message.facts
+      return { ref: `m${index}`, direction: 'incoming', toSelf: [...message.to, ...message.cc].some(item => item.email.toLowerCase() === account.email.toLowerCase()), receivedAt: message.receivedAt, subject: message.subject.slice(0, 500), text: clean.text, truncated: clean.truncated,
+        ...(facts ? { facts: { reply: !!facts.reply, bulk: !!facts.bulk, listUnsubscribe: !!facts.listUnsubscribe, listId: !!facts.listId, nativeCategories: (facts.nativeCategories ?? []).filter(item => /^[a-z0-9_-]{1,32}$/i.test(item)).slice(0, 10) } } : {}) }
+    })
+    const configHash = sha({ version: configuration.version, endpoint: configuration.endpoint, models: configuration.models, output: configuration.maxOutputTokens })
+    const legacyHash = sha({ messages: inputs, model: configuration.defaultModel, schema: 'triage-1', configuration: configHash })
+    expect(legacyHash).not.toBe(sha({ messages: inputs, model: configuration.defaultModel, schema: AI_TRIAGE_VERSION, configuration: configHash }))
+    const grade: AiAssessment = { ...assessment }; delete grade.task
+    const legacy: AiDecision = { ...original, state: 'ready', schemaVersion: 'triage-1', inputPolicyVersion: 'input-2', inputHash: legacyHash, messageIds: messages.map(message => message.id), contextVersions: messages.map(message => ({ messageId: message.id, bodyRevision: message.bodyRevision ?? null })), latestMessageId: messages[0]!.id, assessment: grade,
+      score: { ...scoreAiTriage(grade, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }, { override: 'Important' }), version: 'preference-1' }, override: { category: 'Important', inputHash: legacyHash, at: new Date(EPOCH).toISOString() } }
+    database.query('UPDATE local_ai_decisions SET data=?').run(JSON.stringify(legacy))
+    database.exec('DELETE FROM local_ai_queue; DELETE FROM local_ai_jobs; DELETE FROM local_ai_job_items; DELETE FROM local_ai_message_refs')
+    for (const message of messages) database.query('INSERT INTO local_ai_message_refs(owner,message,source,thread,fingerprint) VALUES (?,?,?,?,?)').run('alice', message.id, account.id, original.threadId,
+      sha({ id: message.id, bodyRevision: message.bodyRevision ?? null, from: message.from.email.toLowerCase(), to: message.to.map(item => item.email.toLowerCase()), cc: message.cc.map(item => item.email.toLowerCase()), subject: message.subject, preview: message.preview, at: message.receivedAt, facts: message.facts ?? null, folder: message.folder, folderIds: [...message.folderIds].sort() }))
+    database.query('INSERT INTO local_ai_cache(owner,hash,assessment,at,input_policy) VALUES (?,?,?,?,?)').run('alice', legacyHash, JSON.stringify(grade), EPOCH, 'input-2')
+    database.query("UPDATE local_ai_counts SET cache=1 WHERE owner='alice'").run()
+    service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start()
+    const outside = summaries[4]!
+    expect(legacy.messageIds).not.toContain(outside.id)
+    await h.mutate('alice', [outside.id], { isRead: true, isStarred: true }, 'ai-real-v1-outside-flags'); await h.inbox.runDue()
+    const head = (await h.inbox.changes('alice')).state
+    await bounded((async () => { while (database.query<{ cursor: string }, []>("SELECT cursor FROM local_ai_settings WHERE owner='alice'").get()?.cursor !== head) await Bun.sleep(10) })(), 'v1 outside-context checkpoint')
+    expect(calls).toBe(0)
+    expect((await service.lookup('alice', [legacy])).decisions[0]).toEqual(legacy)
+    // This inventory reaches the uncaptured fifth row: the durable queue must keep
+    // original provenance across restart, rather than lose it in a pending projection.
+    await service.close()
+    service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.process('alice', { id: 'ai-real-v1-explicit-reuse', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).queue.pending !== 1) await Bun.sleep(10) })(), 'durable v1 reuse queue')
+    await service.close()
+    service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start()
+    await bounded((async () => { while ((await service.state('alice')).jobs[0]?.status === 'running') await Bun.sleep(10) })(), 'v1 explicit unchanged reuse')
+    const reused = (await service.lookup('alice', [legacy])).decisions[0]!
+    expect(calls).toBe(0)
+    expect(reused).toMatchObject({ inputHash: legacyHash, schemaVersion: 'triage-1', inputPolicyVersion: 'input-2', score: legacy.score, override: legacy.override, assessment: grade })
+    const manual = await service.feedback('alice', { sourceId: account.id, threadId: legacy.threadId, revision: reused.revision, id: 'ai-real-v1-manual-after-upgrade', category: 'Other' })
+    expect(manual).toMatchObject({ inputHash: legacyHash, schemaVersion: 'triage-1', inputPolicyVersion: 'input-2', override: { category: 'Other', inputHash: legacyHash } })
+    expect(calls).toBe(0)
+    box.put({ ...seeds[4]!, bodyText: 'Genuinely changed bounded context after the legacy decision.' })
+    await h.sync('alice', account.id)
+    await bounded((async () => { while ((await service.lookup('alice', [legacy])).decisions[0]?.inputPolicyVersion !== AI_INPUT_POLICY_VERSION || (await service.lookup('alice', [legacy])).decisions[0]?.state !== 'ready') await Bun.sleep(10) })(), 'genuine legacy context replacement')
+    const changed = (await service.lookup('alice', [legacy])).decisions[0]!
+    expect(calls).toBe(1)
+    expect(changed.inputHash).not.toBe(legacyHash)
+    expect(changed).toMatchObject({ schemaVersion: AI_TRIAGE_VERSION, inputPolicyVersion: AI_INPUT_POLICY_VERSION, override: null })
+  })
+
+  test('actual v1 cache-only results reuse without a receipt while explicit uncertain-campaign refresh and changed input still infer', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const seed = native('v1-cache-only', { bodyText: 'Fictional campaign without a personal task.', receivedAt: new Date(EPOCH - 60000).toISOString() })
+    const { account, box } = await h.seed('alice', 'ai-v1-cache-only', [seed])
+    let calls = 0
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async () => { calls++; return Response.json(response) }) as unknown as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!, summary = (await h.page('alice')).items[0]!
+    const message = await h.inbox.mailboxMessage('alice', mailbox.id, summary.id), clean = prepareAiText(message, 3000), facts = message.facts
+    const sha = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+    const input: AiTriageInput['messages'][number] = { ref: 'm0', direction: 'incoming', toSelf: [...message.to, ...message.cc].some(item => item.email.toLowerCase() === account.email.toLowerCase()), receivedAt: message.receivedAt, subject: message.subject.slice(0, 500), text: clean.text, truncated: clean.truncated,
+      ...(facts ? { facts: { reply: !!facts.reply, bulk: !!facts.bulk, listUnsubscribe: !!facts.listUnsubscribe, listId: !!facts.listId, nativeCategories: (facts.nativeCategories ?? []).filter(item => /^[a-z0-9_-]{1,32}$/i.test(item)).slice(0, 10) } } : {}) }
+    const configHash = sha({ version: configuration.version, endpoint: configuration.endpoint, models: configuration.models, output: configuration.maxOutputTokens })
+    const legacyHash = sha({ messages: [input], model: configuration.defaultModel, schema: 'triage-1', configuration: configHash })
+    const currentHash = sha({ messages: [input], model: configuration.defaultModel, schema: AI_TRIAGE_VERSION, configuration: configHash })
+    expect(legacyHash).not.toBe(currentHash)
+    const clear: AiAssessment = { ...assessment }; delete clear.task
+    database.query('INSERT INTO local_ai_cache(owner,hash,assessment,at,input_policy) VALUES (?,?,?,?,?)').run('alice', legacyHash, JSON.stringify(clear), EPOCH, 'input-2')
+    expect(database.query<{ count: number }, []>('SELECT COUNT(*) count FROM local_ai_decisions').get()?.count).toBe(0)
+    await service.start()
+    const reuse = await service.process('alice', { id: 'ai-v1-cache-only-reuse', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === reuse.id)?.status === 'running') await Bun.sleep(10) })(), 'actual v1 cache-only reuse')
+    expect(calls).toBe(0)
+    expect((await service.lookup('alice', [{ sourceId: account.id, threadId: summary.threadId }])).decisions[0]).toMatchObject({ state: 'ready', inputHash: legacyHash, schemaVersion: 'triage-1', inputPolicyVersion: 'input-2', assessment: clear, override: null })
+    expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: 0, reused: 1 })
+    // Remove the actual v1-hash receipt just produced, leaving only its cache.
+    database.query('DELETE FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?').run('alice', account.id, summary.threadId)
+    const cleared = await service.process('alice', { id: 'ai-v1-cache-only-cleared-reuse', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === cleared.id)?.status === 'running') await Bun.sleep(10) })(), 'removed actual v1 receipt cache reuse')
+    expect(calls).toBe(0)
+    expect((await service.lookup('alice', [{ sourceId: account.id, threadId: summary.threadId }])).decisions[0]).toMatchObject({ inputHash: legacyHash, schemaVersion: 'triage-1', inputPolicyVersion: 'input-2', override: null })
+    expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: 0, reused: 2 })
+    const uncertain: AiAssessment = { ...clear, type: 'promotion', certainty: 'insufficient', evidence: [{ messageRef: 'm0', field: 'type', quote: 'Fictional campaign' }] }
+    database.query('UPDATE local_ai_cache SET assessment=?,input_policy=? WHERE owner=? AND hash=?').run(JSON.stringify(uncertain), 'input-1', 'alice', legacyHash)
+    database.query('DELETE FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?').run('alice', account.id, summary.threadId)
+    const refresh = await service.process('alice', { id: 'ai-v1-cache-only-refresh', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === refresh.id)?.status === 'running') await Bun.sleep(10) })(), 'actual v1 uncertain cache refresh')
+    expect(calls).toBe(1)
+    const refreshed = (await service.lookup('alice', [{ sourceId: account.id, threadId: summary.threadId }])).decisions[0]!
+    expect(refreshed).toMatchObject({ state: 'ready', inputHash: currentHash, schemaVersion: AI_TRIAGE_VERSION, inputPolicyVersion: AI_INPUT_POLICY_VERSION, override: null })
+    box.put({ ...seed, bodyText: 'Genuinely different input after both cache versions were retained.' })
+    await h.sync('alice', account.id)
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 2) await Bun.sleep(10) })(), 'cache-only genuine input change')
+    const changed = (await service.lookup('alice', [{ sourceId: account.id, threadId: summary.threadId }])).decisions[0]!
+    expect(calls).toBe(2)
+    expect(changed.inputHash).not.toBe(legacyHash)
+    expect(changed.inputHash).not.toBe(currentHash)
+    expect(changed).toMatchObject({ state: 'ready', inputPolicyVersion: AI_INPUT_POLICY_VERSION, override: null })
+  })
+
+  test('retention recovery admits a recent SDK-confirmed sent copy with old incoming context without grading unrelated history', async () => {
+    const h = await fixture({ eventRetention: 20 }), database = new Database(':memory:')
+    const { account } = await h.seed('alice', 'ai-recover-sent', [native('recover-sent-incoming', { threadId: 'recover-sent-thread', receivedAt: new Date(EPOCH - 60000).toISOString() }), native('recover-sent-unrelated', { receivedAt: new Date(EPOCH - 120000).toISOString() })])
+    const incoming = (await h.page('alice')).items.find(item => item.subject === 'Subject recover-sent-incoming')!, inputs: AiTriageInput[] = []
+    const fetcher = (async (_url, init) => { inputs.push(JSON.parse(JSON.parse(String(init?.body)).input[0].content)); return Response.json(response) }) as typeof fetch
+    let service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    const before = (await h.inbox.changes('alice')).state
+    h.clock.value += 1000
+    await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+    const draft = await h.draft('alice', account.id, { mode: 'reply', sourceMessageId: incoming.id, bodyText: 'Confirmed fictional completion sent through the actual SDK worker.' })
+    const operation = await h.submit('alice', draft, 'ai-recover-confirmed-send')
+    await h.inbox.runDue()
+    expect((await h.inbox.operation('alice', operation.id)).status).toBe('succeeded')
+    const sentEvent = (await h.inbox.changes('alice', { since: before, limit: 100 })).events.find(item => item.type === 'mail.changed' && item.change === 'created' && item.reason === 'mutation')!
+    expect(sentEvent).toBeDefined()
+    expect(await h.inbox.message('alice', sentEvent.entityId)).toMatchObject({ folder: 'sent', threadId: incoming.threadId, receivedAt: new Date(h.clock.value).toISOString() })
+    for (let index = 0; index < 30; index++) await h.inbox.createDraft('alice', { accountId: account.id, subject: `Expire sent event ${index}` })
+    await h.inbox.runDue()
+    expect((await h.inbox.changes('alice', { since: before })).resetRequired).toBe(true)
+    await service.start()
+    await bounded((async () => { while (database.query("SELECT 1 FROM local_ai_recovery WHERE owner='alice'").get() || (await service.state('alice')).usage.completed !== 1) await Bun.sleep(10) })(), 'recent sent-copy retention recovery')
+    const decisions = (await service.results('alice')).decisions
+    expect(decisions).toHaveLength(1)
+    expect(decisions[0]).toMatchObject({ threadId: incoming.threadId, state: 'ready' })
+    expect(new Set(decisions[0]!.messageIds)).toEqual(new Set([incoming.id, sentEvent.entityId]))
+    expect(inputs).toHaveLength(1)
+    expect(inputs[0]!.messages.map(item => item.direction)).toEqual(['outgoing', 'incoming'])
+    expect((await service.diagnostics('alice')).coverage?.counts.queued).toBe(1)
+    await service.close()
+    service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start()
+    await h.mutate('alice', [incoming.id], { isRead: true, isStarred: true }, 'ai-recovered-sent-flags'); await h.inbox.runDue()
+    const head = (await h.inbox.changes('alice')).state
+    await bounded((async () => { while (database.query<{ cursor: string }, []>("SELECT cursor FROM local_ai_settings WHERE owner='alice'").get()?.cursor !== head) await Bun.sleep(10) })(), 'recovered sent restart and flag checkpoint')
+    expect(inputs).toHaveLength(1)
+    expect((await service.state('alice')).usage).toMatchObject({ attempts: 1, completed: 1 })
+  })
+
+  test('prospective admission distinguishes recent initial and backfill creations from historical imports and later mutation echoes', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const { account, box } = await h.seed('alice', 'ai-prospective', [native('already-cached', { receivedAt: new Date(EPOCH - 60000).toISOString() })])
+    let calls = 0
+    const fetcher = (async () => { calls++; return Response.json(response) }) as unknown as typeof fetch
+    let service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    const before = (await h.inbox.changes('alice')).state
+    const initial = native('recent-initial', { receivedAt: new Date(EPOCH + 100).toISOString() })
+    const backfill = native('recent-backfill', { receivedAt: new Date(EPOCH + 200).toISOString() })
+    const history = native('historical-backfill', { receivedAt: new Date(EPOCH - 10000).toISOString() })
+    h.clock.value += 1000
+    box.nextSync(receipt([initial, native('historical-initial', { receivedAt: new Date(EPOCH - 20000).toISOString() })], 'prospective-initial', { fullSync: true }))
+    await h.sync('alice', account.id)
+    box.nextSync(receipt([backfill, history], 'prospective-backfill'))
+    await h.sync('alice', account.id, { lane: 'backfill' })
+    box.nextSync(receipt([{ ...backfill, isRead: true }], 'prospective-echo'))
+    await h.sync('alice', account.id)
+    const events = (await h.inbox.changes('alice', { since: before, limit: 100 })).events.filter(item => item.type === 'mail.changed')
+    expect(events.map(item => [item.change, item.reason])).toEqual([['created', 'initial'], ['created', 'initial'], ['created', 'backfill'], ['created', 'backfill'], ['updated', 'mutation']])
+    await service.start()
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 2) await Bun.sleep(10) })(), 'prospective imported arrivals')
+    expect((await service.results('alice')).decisions).toHaveLength(2)
+    expect(calls).toBe(2)
+    expect((await service.diagnostics('alice')).coverage).toMatchObject({ admissionSince: new Date(EPOCH).toISOString(), counts: { historical_no_prior: 2, queued: 2, ready: 2 } })
+    const activityBefore = (await service.diagnostics('alice')).activity
+    box.nextSync(receipt([{ ...history, isRead: true, isStarred: true }], 'historical-flags'))
+    await h.sync('alice', account.id)
+    const head = (await h.inbox.changes('alice')).state
+    await bounded((async () => { while (database.query<{ cursor: string }, []>("SELECT cursor FROM local_ai_settings WHERE owner='alice'").get()?.cursor !== head) await Bun.sleep(10) })(), 'historical mutation checkpoint')
+    expect((await service.diagnostics('alice')).activity).toEqual(activityBefore)
+    expect(calls).toBe(2)
+    await service.close()
+    // Recreate the pre-upgrade settings shape; its moving baseline is NOT old consent.
+    database.exec('ALTER TABLE local_ai_settings DROP COLUMN admission_since')
+    h.clock.value += 4000
+    service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    expect((await service.diagnostics('alice')).coverage?.admissionSince).toBe(new Date(EPOCH + 5000).toISOString())
+    await service.start(); await service.close()
+    h.clock.value += 1000
+    service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.configure('alice', { ...(await service.state('alice')).settings, mode: 'apply' })
+    expect((await service.diagnostics('alice')).coverage?.admissionSince).toBe(new Date(EPOCH + 5000).toISOString())
+    await service.configure('alice', { ...(await service.state('alice')).settings, model: 'fixture-model-next' })
+    expect((await service.diagnostics('alice')).coverage?.admissionSince).toBe(new Date(EPOCH + 6000).toISOString())
+    h.clock.value += 1000
+    await service.configure('alice', { ...(await service.state('alice')).settings, mailboxIds: [] })
+    expect((await service.diagnostics('alice')).coverage?.admissionSince).toBe(new Date(EPOCH + 7000).toISOString())
+    h.clock.value += 1000
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: false })
+    expect((await service.diagnostics('alice')).coverage?.admissionSince).toBe(new Date(EPOCH + 8000).toISOString())
+    h.clock.value += 1000
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    expect((await service.diagnostics('alice')).coverage?.admissionSince).toBe(new Date(EPOCH + 9000).toISOString())
+    expect(calls).toBe(2)
+  })
+
+  test('confirmed newly sent context assesses an unclassified incoming conversation but drafts queued sends and historical flags do not', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const { account, box } = await h.seed('alice', 'ai-sent-context', [native('sent-context-incoming', { threadId: 'sent-context-thread', receivedAt: new Date(EPOCH - 60000).toISOString() })])
+    const incoming = (await h.page('alice')).items[0]!, inputs: AiTriageInput[] = []
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async (_url, init) => { inputs.push(JSON.parse(JSON.parse(String(init?.body)).input[0].content)); return Response.json(response) }) as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start(); await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    await h.mutate('alice', [incoming.id], { isRead: true, isStarred: true }, 'ai-no-prior-flags'); await h.inbox.runDue()
+    const draft = await h.draft('alice', account.id, { mode: 'reply', sourceMessageId: incoming.id, bodyText: 'I completed the requested fictional work.' })
+    const operation = await h.submit('alice', draft, 'ai-new-sent-context')
+    const queuedHead = (await h.inbox.changes('alice')).state
+    await bounded((async () => { while (database.query<{ cursor: string }, []>("SELECT cursor FROM local_ai_settings WHERE owner='alice'").get()?.cursor !== queuedHead) await Bun.sleep(10) })(), 'draft and queued send checkpoint')
+    expect(inputs).toEqual([])
+    expect(box.calls.send).toEqual([])
+    h.clock.value += 20000
+    await h.inbox.runDue()
+    expect((await h.inbox.operation('alice', operation.id)).status).toBe('succeeded')
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 1) await Bun.sleep(10) })(), 'confirmed sent context decision')
+    expect(inputs).toHaveLength(1)
+    expect(inputs[0]!.messages.map(item => item.direction)).toEqual(['outgoing', 'incoming'])
+    expect((await service.results('alice')).decisions[0]?.messageIds).toContain(incoming.id)
+    expect((await service.diagnostics('alice')).activity?.find(item => item.reason === 'queued')?.eventReason).toBe('mutation')
+    h.clock.value += 1000
+    box.put(native('sent-context-next', { threadId: 'sent-context-thread', receivedAt: new Date(h.clock.value).toISOString(), bodyText: 'A new fictional request after the completed work.' }))
+    await h.sync('alice', account.id)
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 2) await Bun.sleep(10) })(), 'new reply after sent context')
+    expect(inputs).toHaveLength(2)
+    expect(inputs[1]!.messages[0]!.text).toBe('A new fictional request after the completed work.')
+  })
+
+  test('incoming eligibility unions selected SDK memberships when the first mailbox is Done', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    h.discoveries.set('ai-membership-union', { sources: ['alpha.example.test', 'beta.example.test'].map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const { account, box } = await h.connect('alice', 'ai-membership-union', [], SCOPED)
+    await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    await h.sync('alice', account.id)
+    const boxes = await h.inbox.mailboxes('alice')
+    let calls = 0
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async () => { calls++; return Response.json(response) }) as unknown as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true, mailboxIds: boxes.map(box => box.id) })
+    h.clock.value += 1000
+    box.put(native('union-arrival', { sourceDomains: ['alpha.example.test', 'beta.example.test'], receivedAt: new Date(h.clock.value).toISOString() }))
+    await h.sync('alice', account.id)
+    const message = (await h.inbox.mailboxMessages('alice', { mailboxIds: boxes.map(box => box.id) })).items[0]!
+    await h.inbox.setMailboxState('alice', boxes[0]!.id, message.id, { done: true }, 1)
+    expect((await h.inbox.mailboxMessage('alice', boxes[0]!.id, message.id)).memberships).toMatchObject([{ done: true }])
+    expect((await h.inbox.mailboxMessage('alice', boxes[1]!.id, message.id)).memberships).toMatchObject([{ done: false }])
+    await service.start()
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 1) await Bun.sleep(10) })(), 'union membership admission')
+    const decision = (await service.results('alice')).decisions[0]!
+    expect(new Set(decision.mailboxIds)).toEqual(new Set(boxes.map(box => box.id)))
+    expect(decision.messageIds).toEqual([message.id])
+    expect(calls).toBe(1)
+    expect(box.calls.getThread).toEqual([])
+    expect(box.calls.mutate).toEqual([])
+  })
+
+  test('retention recovery uses the stable prospective boundary rather than later unrelated event timestamps', async () => {
+    const h = await fixture({ eventRetention: 20 }), database = new Database(':memory:')
+    const { account, box } = await h.seed('alice', 'ai-stable-recovery', [native('old-recovery-history', { receivedAt: new Date(EPOCH - 10000).toISOString() })])
+    let calls = 0
+    const fetcher = (async () => { calls++; return Response.json(response) }) as unknown as typeof fetch
+    let service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start(); await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    h.clock.value += 5000
+    await h.inbox.createDraft('alice', { accountId: account.id, subject: 'Unrelated local event' })
+    const before = (await h.inbox.changes('alice')).state
+    await bounded((async () => { while (database.query<{ cursor: string }, []>("SELECT cursor FROM local_ai_settings WHERE owner='alice'").get()?.cursor !== before) await Bun.sleep(10) })(), 'moving baseline checkpoint')
+    expect(database.query<{ baseline: number }, []>("SELECT baseline FROM local_ai_settings WHERE owner='alice'").get()?.baseline).toBe(EPOCH + 5000)
+    await service.close()
+    h.clock.value += 5000
+    box.put(native('delayed-recovery-arrival', { receivedAt: new Date(EPOCH + 1000).toISOString() }))
+    await h.sync('alice', account.id)
+    for (let index = 0; index < 30; index++) await h.inbox.createDraft('alice', { accountId: account.id, subject: `Retention event ${index}` })
+    await h.inbox.runDue()
+    expect((await h.inbox.changes('alice', { since: before })).resetRequired).toBe(true)
+    service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start()
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 1 || database.query("SELECT 1 FROM local_ai_recovery WHERE owner='alice'").get()) await Bun.sleep(10) })(), 'stable boundary recovery')
+    expect((await service.results('alice')).decisions).toHaveLength(1)
+    expect((await service.diagnostics('alice')).coverage).toMatchObject({ admissionSince: new Date(EPOCH).toISOString(), counts: { recovery_historical: 1, queued: 1, ready: 1 } })
+    expect(calls).toBe(1)
+  })
+
+  test('private activity keeps structured decision grades without text, bounds owner and global history, and diagnostic reads do no work', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const { account } = await h.seed('alice', 'ai-private-activity', [native('private-activity', { bodyText: 'Please review the private fictional report.' })])
+    let calls = 0
+    const grade: AiAssessment = { ...assessment, type: 'notification', task: 'required', actions: ['review'], urgency: 'routine', reason: 'PRIVATE-DECISION-REASON', topics: ['PRIVATE-TOPIC'],
+      evidence: [{ messageRef: 'm0', field: 'task', quote: 'Please review the private fictional report.' }, { messageRef: 'm0', field: 'action', quote: 'Please review' }, { messageRef: 'm0', field: 'type', quote: 'private fictional report' }] }
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async () => { calls++; return Response.json({ ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(grade) }] }] }) }) as unknown as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start(); await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    await service.process('alice', { id: 'ai-private-activity-history', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 1) await Bun.sleep(10) })(), 'private structured grade')
+    let decision = (await service.results('alice')).decisions[0]!
+    expect(decision.assessment).toEqual(grade)
+    // Even code-shaped unknown metadata must not leak through the journal allowlist.
+    database.query("UPDATE local_ai_decisions SET data=json_set(data,'$.problemCode','AI_PRIVATE_UNKNOWN_CODE') WHERE owner=? AND source=? AND thread=?").run('alice', account.id, decision.threadId)
+    const vote = { sourceId: account.id, threadId: decision.threadId, revision: decision.revision, id: 'ai-private-journal-vote', category: 'Other' as const, note: 'PRIVATE-FEEDBACK-NOTE' }
+    decision = await service.feedback('alice', vote)
+    expect(await service.feedback('alice', vote)).toEqual(decision)
+    await service.configure('alice', { ...(await service.state('alice')).settings, personalization: false })
+    // Remove only the synthetic projection to exercise the existing explicit-job cache path.
+    database.query('DELETE FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?').run('alice', account.id, decision.threadId)
+    await service.process('alice', { id: 'ai-private-cache-reuse', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).usage.reused !== 1) await Bun.sleep(10) })(), 'explicit job reuses cached assessment')
+    const diagnostic = await service.diagnostics('alice')
+    expect(diagnostic.coverage?.counts).toMatchObject({ queued: 2, processing: 1, ready: 1, feedback: 1, rescored: 1, cache_reused: 1 })
+    const finished = diagnostic.activity!.find(item => item.reason === 'ready')!
+    expect(finished).toMatchObject({ state: 'ready', schemaVersion: AI_TRIAGE_VERSION, inputPolicyVersion: AI_INPUT_POLICY_VERSION, scorePolicyVersion: AI_PREFERENCE_VERSION, manual: false, category: 'Important', assessment: { task: 'required', response: 'not_needed', evidenceCount: 3, evidence: [{ messageRef: 'm0', field: 'task' }, { messageRef: 'm0', field: 'action' }, { messageRef: 'm0', field: 'type' }] } })
+    expect(finished.contributions?.some(item => item.name === 'requested_actions')).toBe(true)
+    expect(diagnostic.activity!.find(item => item.reason === 'feedback')).toMatchObject({ manual: true, category: 'Other' })
+    expect(diagnostic.activity!.find(item => item.reason === 'feedback')?.problemCode).toBeUndefined()
+    for (const secret of ['AI_PRIVATE_UNKNOWN_CODE', 'PRIVATE-DECISION-REASON', 'PRIVATE-TOPIC', 'PRIVATE-FEEDBACK-NOTE', 'Please review', 'sender@example.test', 'Subject private-activity', configuration.apiKey, '/private-responses']) expect(JSON.stringify(diagnostic)).not.toContain(secret)
+    // Exercise retention using only this synthetic host journal, not 12k paid calls.
+    const insert = database.query('INSERT INTO local_ai_activity(owner,data) VALUES (?,?)')
+    database.transaction(() => { for (let index = 0; index < 2100; index++) insert.run('alice', JSON.stringify({ sourceId: account.id, threadId: decision.threadId, at: new Date(EPOCH).toISOString(), reason: 'historical_no_prior' })) })()
+    decision = (await service.lookup('alice', [decision])).decisions[0]!
+    decision = await service.feedback('alice', { sourceId: account.id, threadId: decision.threadId, revision: decision.revision, id: 'ai-private-retain-owner', category: 'Important' })
+    expect(database.query<{ count: number }, []>("SELECT COUNT(*) count FROM local_ai_activity WHERE owner='alice'").get()?.count).toBe(2000)
+    database.transaction(() => { for (let index = 0; index < 10001; index++) insert.run(`synthetic-owner-${Math.floor(index / 2000)}`, JSON.stringify({ sourceId: 'synthetic-source', threadId: 'synthetic-thread', at: new Date(EPOCH).toISOString(), reason: 'historical_no_prior' })) })()
+    await service.feedback('alice', { sourceId: account.id, threadId: decision.threadId, revision: decision.revision, id: 'ai-private-retain-global', category: 'Other' })
+    expect(database.query<{ count: number }, []>('SELECT COUNT(*) count FROM local_ai_activity').get()?.count).toBe(10000)
+    expect((await service.diagnostics('synthetic-owner-4')).activity).toHaveLength(50)
+    expect((await service.diagnostics('bob')).activity).toEqual([])
+    expect((await service.diagnostics('alice')).coverage?.counts.feedback).toBe(3)
+    await service.close()
+    const spies = ['mailboxes', 'mailboxMessage', 'mailboxMessageSummary', 'changes', 'thread', 'mailboxSnapshot'].map(name => spyOn(h.inbox, name as 'mailboxes').mockImplementation(async () => { throw new Error('Diagnostics must not touch the SDK') }))
+    try {
+      const before = database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count
+      expect((await service.diagnostics('alice')).activity!.length).toBeLessThanOrEqual(50)
+      expect(database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count).toBe(before)
+      expect(spies.every(spy => spy.mock.calls.length === 0)).toBe(true)
+      expect(calls).toBe(1)
+    } finally { for (const spy of spies) spy.mockRestore() }
+  })
+
+  test('a failed change drain exposes only a safe durable problem and retries the same uncommitted prefix', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const { account, box } = await h.seed('alice', 'ai-drain-problem', [])
+    let failDrain = false, calls = 0
+    const guarded: Inbox = { ...h.inbox, changes: async (...args) => { if (failDrain) throw new Error('PRIVATE-DRAIN-ERROR sender@example.test'); return h.inbox.changes(...args) } }
+    const service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async () => { calls++; return Response.json(response) }) as unknown as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    const before = database.query<{ cursor: string }, []>("SELECT cursor FROM local_ai_settings WHERE owner='alice'").get()!.cursor
+    h.clock.value += 1000
+    for (const id of ['drain-retry-arrival', 'drain-retry-second']) box.put(native(id, { receivedAt: new Date(h.clock.value).toISOString() }))
+    await h.sync('alice', account.id)
+    failDrain = true; await service.start()
+    await bounded((async () => { while ((await service.state('alice')).problemCode !== 'AI_DRAIN_FAILED') await Bun.sleep(10) })(), 'safe drain failure')
+    expect(database.query<{ cursor: string }, []>("SELECT cursor FROM local_ai_settings WHERE owner='alice'").get()!.cursor).toBe(before)
+    const failed = await service.diagnostics('alice')
+    expect(failed.coverage).toMatchObject({ problemCode: 'AI_DRAIN_FAILED', counts: { drain_error: 1 } })
+    expect(failed.activity).toEqual([])
+    expect(JSON.stringify(failed)).not.toContain('PRIVATE-DRAIN-ERROR')
+    expect(calls).toBe(0)
+    // Fail the second queue insert after the first activity/count was written.
+    // The entire signed prefix, including its journal, must roll back together.
+    database.exec("CREATE TRIGGER fail_second_queue BEFORE INSERT ON local_ai_queue WHEN (SELECT COUNT(*) FROM local_ai_queue)>0 BEGIN SELECT RAISE(ABORT,'Synthetic queue transaction failure'); END")
+    failDrain = false
+    await bounded((async () => { while (((await service.diagnostics('alice')).coverage?.counts.drain_error ?? 0) < 2) await Bun.sleep(10) })(), 'atomic prefix rollback')
+    expect(database.query<{ cursor: string }, []>("SELECT cursor FROM local_ai_settings WHERE owner='alice'").get()!.cursor).toBe(before)
+    expect((await service.diagnostics('alice')).activity).toEqual([])
+    expect((await service.diagnostics('alice')).coverage?.counts.queued).toBeUndefined()
+    expect(calls).toBe(0)
+    database.exec('DROP TRIGGER fail_second_queue')
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 2) await Bun.sleep(10) })(), 'unchanged prefix retry')
+    expect((await service.diagnostics('alice')).coverage).toMatchObject({ problemCode: null, counts: { queued: 2, ready: 2 } })
+    expect((await service.diagnostics('alice')).coverage?.lastDrainAt).not.toBeNull()
+    expect(calls).toBe(2)
+  })
 
   test('disabled defaults and owner-bound settings diagnostics jobs and read IDs are private before bounded preview processing', async () => {
     const h = await fixture(), database = new Database(':memory:')
@@ -9261,6 +10325,9 @@ describe('AI triage service', () => {
     for (const row of database.query<{ data: string }, []>('SELECT data FROM local_ai_decisions').all()) {
       const decision: AiDecision = JSON.parse(row.data)
       delete decision.inputPolicyVersion
+      delete decision.assessment!.task
+      decision.schemaVersion = 'triage-1'
+      decision.score!.version = 'preference-2'
       if (decision.assessment!.reason === 'refresh-clear') {
         decision.assessment!.certainty = 'insufficient'
         decision.score = scoreAiTriage(decision.assessment!, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 })
@@ -9371,6 +10438,7 @@ describe('AI triage service', () => {
     await service.process('alice', { id: 'ai-invalid-history', scope: 'inbox', limit: 100 })
     await bounded((async () => { while ((await service.state('alice')).jobs[0]?.status === 'running') await Bun.sleep(10) })(), 'invalid result receipt')
     expect((await service.results('alice')).decisions[0]).toMatchObject({ state: 'failed', assessment: null, problemCode: 'AI_ASSESSMENT_INVALID' })
+    expect((await service.diagnostics('alice')).activity?.find(item => item.reason === 'failed')).toMatchObject({ state: 'failed', problemCode: 'AI_ASSESSMENT_INVALID' })
     expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: 1, completed: 0, failed: 1, inputTokens: 1000, outputTokens: 100, unknownUsage: 0 })
     expect((await service.diagnostics('alice')).usage.estimatedMinimumUsd).toBeCloseTo(0.0026, 10)
     unavailable = true

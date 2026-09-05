@@ -1,9 +1,10 @@
 /** Application-owned triage. These are not provider flags or permission grants. */
-export const AI_TRIAGE_VERSION = "triage-1";
-export const AI_INPUT_POLICY_VERSION = "input-2";
-export const AI_PREFERENCE_VERSION = "preference-1";
+export const AI_TRIAGE_VERSION = "triage-2";
+export const AI_INPUT_POLICY_VERSION = "input-3";
+export const AI_PREFERENCE_VERSION = "preference-3";
 export const aiKinds = ["conversation", "request", "notification", "invoice", "receipt", "newsletter", "promotion", "cold_outreach", "invitation", "other", "unknown"] as const;
 export const aiResponses = ["needed", "optional", "not_needed", "waiting", "unknown"] as const;
+export const aiTasks = ["required", "optional", "none", "unknown"] as const;
 export const aiActions = ["reply", "review", "approve", "confirm", "attend", "investigate", "payment_requested", "other"] as const;
 export const aiUrgencies = ["immediate", "deadline", "routine", "none", "unknown"] as const;
 export const aiRisks = ["none_observed", "unsolicited", "spam_suspected", "phishing_suspected", "unknown"] as const;
@@ -11,6 +12,8 @@ export type AiCategory = "Important" | "Other";
 export type AiAssessment = {
   type: typeof aiKinds[number];
   response: typeof aiResponses[number];
+  /** Outstanding work beyond an email reply; absent only on retained legacy assessments. */
+  task?: typeof aiTasks[number];
   actions: Array<typeof aiActions[number]>;
   urgency: typeof aiUrgencies[number];
   /** Only an explicitly supported absolute deadline; otherwise null. */
@@ -20,7 +23,7 @@ export type AiAssessment = {
   certainty: "clear" | "ambiguous" | "insufficient";
   reason: string;
   /** Private decision evidence, never general diagnostic-log fields. */
-  evidence: Array<{ messageRef: string; quote: string; field: "response" | "action" | "urgency" | "risk" | "type" }>;
+  evidence: Array<{ messageRef: string; quote: string; field: "response" | "task" | "action" | "urgency" | "risk" | "type" }>;
 };
 export type AiTriageInput = {
   observedAt: string;
@@ -128,6 +131,8 @@ export type AiHistoryJob = {
   status: "running" | "paused" | "completed" | "cancelled" | "failed";
   scope: "inbox" | "all";
   limit: number;
+  /** Captured configuration consent; absent only on retained older jobs. */
+  settingsRevision?: number;
   scanned: number;
   queued: number;
   completed: number;
@@ -166,6 +171,50 @@ export type AiDiagnosticAttempt = AiThreadKey & {
   usage: AiTokenUsage | null;
   estimate: AiCostEstimate | null;
 };
+export const aiActivityReasons = ["queued", "processing", "ready", "failed", "stale", "removed", "cache_reused", "feedback", "rescored", "historical_no_prior", "inactive_membership", "outgoing_no_prior", "unavailable", "recovery_historical", "drain_error"] as const;
+export type AiActivityReason = typeof aiActivityReasons[number];
+/** Bounded private trace. No free-form assessment text or evidence quotes. */
+export type AiDiagnosticActivity = AiThreadKey & {
+  id: number;
+  at: string;
+  reason: AiActivityReason;
+  eventReason?: "arrival" | "initial" | "backfill" | "mutation";
+  /** Only fixed host/inference codes, never arbitrary error text. */
+  problemCode?: string;
+  state?: AiDecision["state"];
+  revision?: number;
+  model?: string;
+  settingsRevision?: number;
+  schemaVersion?: string;
+  inputPolicyVersion?: string;
+  scorePolicyVersion?: string;
+  inputHash?: string;
+  manual?: boolean;
+  category?: AiCategory;
+  score?: number;
+  assessment?: Pick<AiAssessment, "type" | "response" | "actions" | "urgency" | "risk" | "certainty"> & {
+    task?: "required" | "optional" | "none" | "unknown";
+    hasDeadline: boolean;
+    evidence: Array<{ messageRef: string; field: "response" | "action" | "urgency" | "risk" | "type" | "task" }>;
+    evidenceCount: number;
+  };
+  contributions?: Array<{ name: string; value: number }>;
+};
+export type AiDiagnosticCoverage = {
+  /** Prospective boundary, not the timestamp of a past inferred consent. */
+  admissionSince: string | null;
+  lastDrainAt: string | null;
+  problemCode: string | null;
+  /** Durable event counts, not unique-message coverage. */
+  counts: Partial<Record<AiActivityReason, number>>;
+};
+export type AiDiagnostics = {
+  usage: AiUsageSummary;
+  attempts: AiDiagnosticAttempt[];
+  /** Optional for older injected clients; the current host always returns these. */
+  activity?: AiDiagnosticActivity[];
+  coverage?: AiDiagnosticCoverage;
+};
 export type AiTriageState = {
   configured: boolean;
   provider: { name: string; endpointHost: string; models: AiModel[] } | null;
@@ -176,6 +225,18 @@ export type AiTriageState = {
   jobs: AiHistoryJob[];
   cursor: number;
 };
+export function aiSortingStatus(state: AiTriageState | null, unavailable = false): { tone: "normal" | "warning"; label: string; detail?: string } {
+  if (unavailable) return { tone: "warning", label: "Sorting status unavailable", detail: "Current sorting could not be checked. Existing mail stays available." };
+  if (!state) return { tone: "normal", label: "Checking automatic sorting…" };
+  if (!state.configured) return { tone: "warning", label: "Automatic sorting unavailable", detail: "The mail host needs its AI connection configured. Normal inbox rules are in use." };
+  if (!state.settings.enabled) return { tone: "normal", label: "Automatic sorting off" };
+  if (state.settings.mailboxIds?.length === 0) return { tone: "warning", label: "No mailboxes selected", detail: "Choose a mailbox in Advanced options to start sorting." };
+  if (state.problemCode) return { tone: "warning", label: "Automatic sorting needs attention", detail: state.problemCode === "AI_MODEL_UNAVAILABLE" ? "The configured model is unavailable. Choose an available model in Advanced options." : "Some mail may not have a current assessment. Existing mail stays available; check sorting details for the recorded problem." };
+  if (state.queue.failed > 0) return { tone: "warning", label: "Some mail could not be sorted", detail: "Those conversations use normal inbox rules until a new assessment is available." };
+  if (state.settings.mode !== "apply") return { tone: "normal", label: "Preview only", detail: "Assessments are not changing Important or Other." };
+  return { tone: "normal", label: state.queue.processing || state.queue.pending ? "Sorting new activity…" : "Automatic sorting on" };
+}
+
 export type AiDecisionPage = { decisions: AiDecision[]; removed: AiThreadKey[]; cursor: number; hasMore: boolean; resetRequired: boolean };
 export type AiFeedbackInput = AiThreadKey & { id: string; revision: number; category: AiCategory | null; note?: string };
 export type AiReadingInput = AiThreadKey & { visitId: string; sequence: number; messageId: string; activeMs: number };
@@ -184,7 +245,7 @@ export type AiReadingInput = AiThreadKey & { visitId: string; sequence: number; 
 export type AiTriageActions = {
   state(): Promise<AiTriageState>;
   configure(input: AiSettings): Promise<AiTriageState>;
-  process(input: { id: string; scope: "inbox" | "all"; limit: number }): Promise<AiHistoryJob>;
+  process(input: { id: string; scope: "inbox" | "all"; limit: number; settingsRevision?: number }): Promise<AiHistoryJob>;
   control(id: string, action: "pause" | "resume" | "cancel"): Promise<AiHistoryJob>;
   lookup(keys: AiThreadKey[]): Promise<AiDecisionPage>;
   changes(after: number): Promise<AiDecisionPage>;
@@ -192,5 +253,5 @@ export type AiTriageActions = {
   feedback(input: AiFeedbackInput): Promise<AiDecision>;
   reading(input: AiReadingInput): Promise<void>;
   clearReading(): Promise<void>;
-  diagnostics(): Promise<{ usage: AiUsageSummary; attempts: AiDiagnosticAttempt[] }>;
+  diagnostics(): Promise<AiDiagnostics>;
 };

@@ -1,5 +1,6 @@
 import type { Draft, Mail, MailboxOption, Message } from "./data.ts";
 import type { AiDecision } from "../../shared/ai-triage.ts";
+import type { CategoryOverride } from "../../shared/attention-overrides.ts";
 
 export const UNIFIED_ACCOUNT = "unified";
 export const unifiedThreadId = (source: string, thread: string) => `${UNIFIED_ACCOUNT}:${source}:${thread}`;
@@ -17,6 +18,26 @@ export function currentAiDecision(mail: Mail, decision: AiDecision | undefined, 
     return version !== undefined && context.bodyRevision !== null && version !== context.bodyRevision;
   });
   return stale && decision.state === "ready" ? { ...decision, state: "stale", score: null, override: null } : decision;
+}
+
+/** An explicit category never follows an uncaptured reply, body or receiving scope. */
+export function currentCategoryOverride(mail: Mail, override: CategoryOverride | null | undefined): CategoryOverride | undefined {
+  if (!override || mail.operationId) return;
+  const context = override.context;
+  if (mail.sourceId !== context.sourceId || mail.sdkThreadId !== context.threadId || mail.sourceGeneration !== context.sourceGeneration) return;
+  const boxes = new Set(mail.mailboxIds ?? (mail.mailboxId ? [mail.mailboxId] : [mail.account]));
+  if (!boxes.size || [...boxes].some(id => !context.mailboxIds.includes(id))) return;
+  const expected = new Map(context.messages.filter(message => message.memberships.some(state => boxes.has(state.mailboxId))).map(message => [message.messageId, message]));
+  const received = mail.messages.filter(message => !message.pending);
+  if (!received.length || received.length !== expected.size) return;
+  if (boxes.size === context.mailboxIds.length && received.at(-1)?.id !== context.latestMessageId) return;
+  for (const message of received) {
+    const captured = expected.get(message.id);
+    if (!captured || (captured.bodyRevision === null ? message.revision !== captured.revision : message.bodyRevision !== captured.bodyRevision)) return;
+    const memberships = new Set(captured.memberships.filter(state => boxes.has(state.mailboxId)).map(state => state.mailboxId));
+    if (!message.memberships?.length || message.memberships.length !== memberships.size || message.memberships.some(state => !memberships.has(state.mailboxId))) return;
+  }
+  return override;
 }
 
 /** Combine owned receiving views, never identities from unrelated source accounts. */
@@ -90,6 +111,7 @@ export function unifiedMail(
       merged.triage = currentAiDecision(merged, base.triage, base.triage.model);
       if (merged.triage?.state !== "ready") merged.attentionCategory = undefined;
     }
+    if (base.attentionOverride) merged.attentionOverride = currentCategoryOverride(merged, base.attentionOverride.override) ? base.attentionOverride : undefined;
     result.push(merged);
   }
   return result.sort((a, b) => (b.receivedAt ?? 0) - (a.receivedAt ?? 0) || a.id.localeCompare(b.id));

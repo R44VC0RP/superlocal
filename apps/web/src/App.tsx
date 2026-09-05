@@ -13,6 +13,7 @@ import {
 } from "react";
 import { flushSync } from "react-dom";
 import { ApiError } from "inbox-sdk/client";
+import { aiSortingStatus } from "../../shared/ai-triage";
 import {
   defaultPreferences,
   displayDate,
@@ -28,6 +29,7 @@ import { Icon, IconButton, Key, Modal } from "./components";
 import Composer from "./Composer";
 import ThreadView from "./ThreadView";
 import Settings from "./Settings";
+import { GuidedZero, useGuidedZero } from "./GuidedZero";
 import CalendarView from "./CalendarView";
 import Snippets from "./Snippets";
 import { useMailMotion } from "./mail-motion";
@@ -380,6 +382,23 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     (currentMail
       ? drafts.find((d) => d.threadId === currentMail.id || !!d.sourceMessageId && d.sourceId === currentMail.sourceId && currentMail.messages.some(message => message.id === d.sourceMessageId))
       : undefined);
+  const zero = useGuidedZero({
+    inbox, store, account: route.account, mailboxIds: contextMailboxIds, accountMail, currentMail,
+    visible: route.view === "zero" && !settings,
+    onOpen: (mail) => {
+      if (!leaveSettings()) return;
+      setSearch(false); setQuery(""); setMailFilter(null); setSelected([]);
+      navigate({ folder: "Inbox", view: "zero", thread: mail?.id, draft: undefined });
+      if (mail && preferences.markRead && mail.unread && store.supports("read", mail.mailboxId ?? mail.account))
+        void store.action([mail], "read").catch(actionError);
+    },
+    onPause: () => navigate({ view: undefined, thread: undefined, draft: undefined }),
+  });
+  function startZero() {
+    if (!leaveSettings()) return;
+    setOverlay(null); setOverlayIds(null); setCommandDraftId(null);
+    zero.start();
+  }
   const rowCount = isDrafts ? accountDrafts.length : visibleMail.length;
   const virtualized =
     !isDrafts && (!search || searchSubmitted) && entries.length > 100;
@@ -912,7 +931,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     } else if (currentDraft && store.getSnapshot().drafts.some(draft => draft.id === currentDraft.id)) {
       void store.flushDraft(currentDraft.id).catch(actionError);
     }
-    navigate({ thread: undefined, draft: undefined, view: undefined });
+    if (route.view === "zero") zero.pause();
+    else navigate({ thread: undefined, draft: undefined, view: undefined });
     setSenderSelection(null);
   }
   function toggleComposeFocus() {
@@ -1016,13 +1036,18 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     }
   }
   async function applyAction(action: string, ids = targetIds) {
+    if (zero.active && (zero.busy || zero.retry)) return;
     if (action === "more") {
       openOverlay("command", ids);
       return;
     }
     if (action === "remind" || action === "label") {
+      if (action === "remind" && zero.active && !zero.captureLater()) return;
       openOverlay(action, ids);
       return;
+    }
+    if (zero.active && ids.length === 1 && ids[0] === currentMail?.id && (action === "done" || action === "not-important")) {
+      zero.decide(action); setOverlay(null); return;
     }
     if (!ids.length) return;
     const timing = measureAction(action, ids.length);
@@ -1089,6 +1114,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     const previousHighlight = highlight;
     const at = reminderTime(when);
     if (!at || !Number.isFinite(at)) { setNotice({ text: "Choose a future reminder date." }); return; }
+    if (zero.active) { setOverlay(null); await zero.remind(at); return; }
     const finishMotion = motion.prepare("remove", before.map(message => message.id));
     let reverse: () => Promise<void>;
     try { reverse = await store.action(before, "remind", new Date(at).toISOString()); }
@@ -1207,6 +1233,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setNotice({ text: deleting ? "Label deleted" : "Label renamed" });
   }
   function navigateThread(delta: number) {
+    if (zero.active) { zero.browse(delta); return; }
     const index = visibleMail.findIndex((m) => m.id === currentMail?.id);
     const next = visibleMail[index + delta];
     if (next) {
@@ -1351,6 +1378,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       label: `Filter: ${name}`, detail: "Use saved AI assessments in the current view", key: "", icon: "Search",
       run: () => { setOverlay(null); setMailFilter(value => value === name ? null : name); setHighlight(0); },
     })) : []),
+    { label: "Get me to zero", detail: "Work through unhandled Important conversations", key: "", icon: "Check", run: startZero },
     { label: "AI triage", detail: "Assessment settings, historical processing and costs", key: "", icon: "Gear", run: () => openSettings("AI triage") },
     {
       label: "Settings",
@@ -1466,7 +1494,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         target?.closest(".compose-view") ||
         (route.draft && !currentDraft?.popOut)
           ? "composer"
-          : route.view
+          : route.view && !(zero.active && zero.session?.phase === "review" && currentMail)
             ? "auxiliary"
             : currentMail
               ? "reader"
@@ -1647,6 +1675,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         applyAction(intent.action);
         break;
       case "undo":
+        if (zero.active && zero.undo) { void zero.undo(); break; }
         if (notice?.undo) {
           notice.undo();
           setNotice(null);
@@ -1702,6 +1731,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       }}
     />
   );
+
+  const sortingStatus = aiSortingStatus(inbox.ai, !!inbox.aiError);
+  const sortingWarning = (inbox.ai ? inbox.ai.settings.enabled : !!inbox.aiError) && sortingStatus.tone === "warning";
 
   return (
     <div
@@ -1767,11 +1799,20 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         aiActions={store.ai}
         aiMailboxes={inbox.accounts}
         store={store}
+        onStartZero={startZero}
+        zeroReady={inbox.loaded && contextMailboxIds.length > 0 && !zero.busy}
+        zeroResumable={zero.scoped && !!zero.session?.remainingIds.length}
         onboardingReturn={onboardingReturn}
         onOnboardingDone={() => setOnboardingReturn(null)}
       />}
       <main className="mail-workspace" data-folder={route.folder} hidden={settings} inert={settings} aria-hidden={settings || undefined}>
-        {route.view === "calendar" ? (
+        {route.view === "zero" && <GuidedZero state={zero} currentMail={currentMail}
+          onHandle={() => {
+            zero.handle();
+            if (currentMail?.triage?.assessment?.response === "needed") void composeReply("reply");
+          }}
+          onLater={() => { if (zero.captureLater() && currentMail) openOverlay("remind", [currentMail.id]); }} />}
+        {route.view === "zero" && (!zero.active || zero.session?.phase !== "review" || !currentMail) ? null : route.view === "calendar" ? (
           <CalendarView
             initialView={calendarInitialView}
             onBack={goBack}
@@ -1808,6 +1849,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             aiEnabled={!!inbox.ai?.configured && inbox.ai.settings.enabled}
             aiMode={inbox.ai?.settings.mode}
             aiReadingEnabled={!!inbox.ai?.settings.personalization && !!inbox.ai.settings.readingSignals && !settings && !overlay && !issueReporter}
+            onCategory={category => store.classify([currentMail], category)}
             onAiFeedback={store.ai.feedback}
             onAiReading={store.ai.reading}
             focusOperationId={sendFeedback?.threadId === currentMail.id ? sendFeedback.id : undefined}
@@ -1820,7 +1862,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             onBack={goBack}
             onNavigate={navigateThread}
             onAction={applyAction}
-            supportsAction={action => !!currentMail.operationId ? action === "trash" : store.supports(action, currentMail.mailboxId ?? currentMail.account)}
+            supportsAction={action => zero.active && (zero.busy || !!zero.retry) ? false : !!currentMail.operationId ? action === "trash" : store.supports(action, currentMail.mailboxId ?? currentMail.account)}
             onCompose={composeReply}
             replyRequest={replyRequest}
             onDraftChange={updateDraft}
@@ -1953,6 +1995,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
               )}
               {!selected.length && (
                 <div className="header-actions">
+                  {!search && route.folder === "Inbox" && <button type="button" className="zero-entry" disabled={!inbox.loaded || !contextMailboxIds.length || zero.busy} onClick={startZero}>
+                    {zero.scoped && zero.session?.remainingIds.length ? "Resume cleanup" : "Get me to zero"}
+                  </button>}
                   <IconButton name="Refresh" title="Refresh inbox" className="inbox-refresh"
                     aria-busy={inbox.refreshing} disabled={!activeAccount || inbox.refreshing}
                     onClick={() => { void store.sync(route.account).catch(actionError); }} />
@@ -1994,6 +2039,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                 </div>
               )}
             </header>
+            {!search && route.folder === "Inbox" && sortingWarning && <div className="ai-sorting-warning" role="status">
+              <div><p>{sortingStatus.label}</p><p className="settings-note">{sortingStatus.detail}</p></div>
+              <button type="button" className="text-button" onClick={() => openSettings("AI triage")}>Sorting details</button>
+            </div>}
             <div
               key={listViewKey}
               className="mail-list animated-mail-list"
