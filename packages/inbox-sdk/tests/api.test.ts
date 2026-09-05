@@ -10606,6 +10606,70 @@ describe('AI triage service', () => {
     }
   })
 
+  test('saved AI lookup authorizes real assessed decisions through cached metadata without reader bodies or writes', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    h.discoveries.set('ai-lookup-scoped', { sources: ['alpha.example.test', 'beta.example.test'].map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const { account, box } = await h.connect('alice', 'ai-lookup-scoped', [native('lookup-alpha', { sourceDomains: ['alpha.example.test'] }), native('lookup-beta', { sourceDomains: ['beta.example.test'] })], SCOPED)
+    const alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    const beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    await h.sync('alice', account.id)
+    const foreign = await h.seed('bob', 'ai-lookup-foreign')
+    const foreignMessage = (await h.page('bob')).items[0]!
+    let forbidBodies = false, bodyReads = 0, metadataReads = 0, inferenceCalls = 0, summaryFailure: number | null = null
+    const guarded: Inbox = { ...h.inbox,
+      message: async (...args) => { if (forbidBodies) { bodyReads++; throw new Error('Saved lookup must not read a body') }; return h.inbox.message(...args) },
+      mailboxMessage: async (...args) => { if (forbidBodies) { bodyReads++; throw new Error('Saved lookup must not read a mailbox body') }; return h.inbox.mailboxMessage(...args) },
+      mailboxMessageSummary: async (...args) => { metadataReads++; const summary = await h.inbox.mailboxMessageSummary(...args); if (summaryFailure) throw new InboxError('NOT_FOUND', 'Synthetic metadata authorization fence', summaryFailure); return summary },
+    }
+    const options = { database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async () => { inferenceCalls++; return Response.json(response) }) as unknown as typeof fetch }
+    let service = createAiTriageService(options)
+    cleanup.push(async () => { database.exec('PRAGMA query_only=OFF'); await service.close(); database.close() })
+    await service.start(); await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true, mailboxIds: [alpha.id] })
+    await service.process('alice', { id: 'ai-lookup-assessment', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 1) await Bun.sleep(10) })(), 'real lookup assessment')
+    const expected = (await service.results('alice')).decisions[0]!
+    expect(expected).toMatchObject({ state: 'ready', assessment, sourceId: account.id, mailboxIds: [alpha.id] })
+    await service.close()
+    service = createAiTriageService(options) // No background worker while testing saved reads.
+    forbidBodies = true
+    const key = { sourceId: account.id, threadId: expected.threadId }, calls = structuredClone(box.calls), sdkState = (await h.inbox.changes('alice')).state
+    const writes = database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count
+    database.exec('PRAGMA query_only=ON')
+    const beforeMetadata = metadataReads
+    const saved = await service.lookup('alice', Array.from({ length: 100 }, () => key)).catch(error => { expect(bodyReads).toBe(0); throw error })
+    expect(saved.decisions).toEqual([expected])
+    expect(metadataReads - beforeMetadata).toBe(1)
+    expect(await service.lookup('alice', [])).toMatchObject({ decisions: [], removed: [], hasMore: false, resetRequired: false })
+    expect((await service.lookup('bob', [key])).decisions).toEqual([])
+    expect((await service.lookup('alice', [{ sourceId: foreign.account.id, threadId: foreignMessage.threadId }, { sourceId: account.id, threadId: 'missing' }])).decisions).toEqual([])
+    await expect(service.lookup('alice', Array.from({ length: 101 }, () => key))).rejects.toMatchObject({ code: 'AI_LOOKUP_LIMIT' })
+    await expect(service.lookup('alice', [{ sourceId: account.id, threadId: '' }])).rejects.toMatchObject({ code: 'AI_INVALID_KEY' })
+    for (const status of [403, 404, 409]) { summaryFailure = status; expect((await service.lookup('alice', [key])).decisions).toEqual([]) }
+    summaryFailure = null
+    expect(database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count).toBe(writes)
+    expect((await h.inbox.changes('alice')).state).toBe(sdkState)
+    expect(box.calls).toEqual(calls); expect(bodyReads).toBe(0); expect(inferenceCalls).toBe(1)
+    database.exec('PRAGMA query_only=OFF')
+    // Pausing automatic triage preserves a ready receipt; reading must not re-enable it.
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: false })
+    const paused = (await service.state('alice')).settings
+    expect((await service.lookup('alice', [key])).decisions).toEqual([expected])
+    expect((await service.state('alice')).settings).toEqual(paused)
+    await service.configure('alice', { ...paused, mailboxIds: [beta.id] })
+    expect((await service.lookup('alice', [key])).decisions).toEqual([])
+    await service.configure('alice', { ...(await service.state('alice')).settings, mailboxIds: [alpha.id], model: 'fixture-model-next' })
+    expect((await service.lookup('alice', [key])).decisions[0]).toMatchObject({ sourceId: account.id, threadId: key.threadId, state: 'stale', score: null, holdUntil: null, problemCode: 'AI_SETTINGS_CHANGED' })
+    await h.inbox.updateMailbox('alice', alpha.id, { status: 'paused' }, alpha.revision)
+    expect((await service.lookup('alice', [key])).decisions).toEqual([])
+    await h.inbox.updateMailbox('alice', alpha.id, { status: 'active' }, alpha.revision + 1)
+    await h.inbox.disconnect('alice', account.id)
+    expect((await service.lookup('alice', [key])).decisions).toEqual([])
+    await h.inbox.updateMailbox('alice', alpha.id, { status: 'detached' }, alpha.revision + 2)
+    expect((await service.lookup('alice', [key])).decisions).toEqual([])
+    expect(bodyReads).toBe(0); expect(inferenceCalls).toBe(1)
+  })
+
   test('saved AI result and change pages bypass reader presentation while preserving pagination, scope removals and event deduplication', async () => {
     const h = await fixture(), database = new Database(':memory:')
     h.discoveries.set('ai-page-scoped', { sources: ['alpha.example.test', 'beta.example.test'].map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
@@ -10688,6 +10752,9 @@ describe('AI triage service', () => {
       expect([...latest.decisions, ...tail.decisions].map(value => value.threadId).sort()).toEqual([...current.keys()].sort())
       expect(current.has(done.threadId)).toBe(true)
       expect(current.has(snoozed.threadId)).toBe(true)
+      const lookup = await service.lookup('alice', [...selected.slice(0, 9), ...initial.filter(value => !value.mailboxIds.includes(alpha.id))].map(value => ({ sourceId: value.sourceId, threadId: value.threadId })))
+      expect(lookup.decisions.map(value => value.threadId).sort()).toEqual([done.threadId, snoozed.threadId].sort())
+      expect(lookup.decisions.every(value => value.state === 'stale')).toBe(true)
       expect(await h.inbox.mailboxMessageSummary('alice', alpha.id, done.latestMessageId)).toEqual(canonical)
       expect(box.calls).toEqual(before)
       expect(database.query<{ count: number }, []>('SELECT COUNT(*) count FROM local_ai_feedback').get()!.count).toBe(0)
