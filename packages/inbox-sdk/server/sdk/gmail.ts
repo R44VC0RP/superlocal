@@ -676,9 +676,9 @@ export class GmailProvider implements InboxProvider {
         Boolean(domain && domain.split('.').every(label =>
           /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/i.test(label)))
     }
-    // The host stores the authenticated profile address in credentials, never a send-as default.
+    // OAuth grants can be token-only; Google's authenticated response supplies the primary identity.
     const primary = this.credentials.email
-    if (!validAddress(primary)) throw new ProviderError('gmail', 'VALIDATION', 'An authenticated primary email address is required')
+    if (primary !== undefined && !validAddress(primary)) throw new ProviderError('gmail', 'VALIDATION', 'Invalid expected primary email address')
     const result = await this.request<unknown>(
       '/users/me/settings/sendAs?fields=sendAs(sendAsEmail,isPrimary,isDefault,verificationStatus)',
       { method: 'GET' }, 64 * 1024,
@@ -702,7 +702,7 @@ export class GmailProvider implements InboxProvider {
       const isPrimary = entry.isPrimary === true
       const isDefault = entry.isDefault === true
       const key = entry.sendAsEmail.toLowerCase()
-      if (isPrimary !== (key === primary.toLowerCase())) throw invalid()
+      if (primary !== undefined && isPrimary !== (key === primary.toLowerCase())) throw invalid()
       const previous = seen.get(key)
       if (previous) {
         if (previous.isPrimary !== isPrimary || previous.isDefault !== isDefault ||
@@ -713,7 +713,7 @@ export class GmailProvider implements InboxProvider {
       if (isPrimary) primaryCount++
       if (isDefault && ++defaultCount > 1) throw invalid()
       if (isPrimary || entry.verificationStatus === 'accepted') identities.push({
-        email: isPrimary ? primary : entry.sendAsEmail, isPrimary, isDefault,
+        email: isPrimary ? primary ?? entry.sendAsEmail : entry.sendAsEmail, isPrimary, isDefault,
       })
     }
     if (primaryCount !== 1) throw invalid()

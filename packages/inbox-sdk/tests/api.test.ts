@@ -3856,6 +3856,65 @@ describe('blob privacy and draft editing', () => {
 })
 
 describe('source-scoped sending identities', () => {
+  test('token-only Gmail grants discover and send through the real adapter while preserving the native primary fence', async () => {
+    const primary = 'primary@example.test', alias = 'accepted@example.test', pending = 'pending@example.test'
+    const calls: string[] = [], sent: string[] = []
+    let responsePrimary = primary
+    const h = await fixture({ providers: [builtInProviders.find(provider => provider.id === 'gmail')!],
+      fetch: (async (input, init) => {
+        const request = new Request(input, init), url = new URL(request.url)
+        expect(url.origin).toBe('https://gmail.googleapis.com')
+        expect(request.headers.get('authorization')).toBe(`Bearer ${SECRET}`)
+        calls.push(`${request.method} ${url.pathname}`)
+        if (request.method === 'GET' && url.pathname === '/gmail/v1/users/me/profile') return Response.json({ emailAddress: primary })
+        if (request.method === 'GET' && url.pathname === '/gmail/v1/users/me/labels/INBOX') return Response.json({ messagesUnread: 0 })
+        if (request.method === 'GET' && url.pathname === '/gmail/v1/users/me/settings/sendAs') {
+          expect(url.searchParams.get('fields')).toBe('sendAs(sendAsEmail,isPrimary,isDefault,verificationStatus)')
+          return Response.json({ sendAs: [
+            { sendAsEmail: responsePrimary, isPrimary: true, isDefault: true, verificationStatus: 'accepted' },
+            { sendAsEmail: alias, isPrimary: false, isDefault: false, verificationStatus: 'accepted' },
+            { sendAsEmail: pending, isPrimary: false, isDefault: false, verificationStatus: 'pending' },
+          ] })
+        }
+        if (request.method === 'POST' && url.pathname === '/gmail/v1/users/me/messages/send') {
+          const body = await request.json() as { raw: string }
+          sent.push(Buffer.from(body.raw, 'base64url').toString('utf8'))
+          return Response.json({ id: 'fictional-gmail-sent', threadId: 'fictional-gmail-thread' })
+        }
+        throw new Error('Unexpected Gmail request; live network is forbidden')
+      }) as typeof fetch,
+    })
+    const client = createInboxClient({ baseUrl: 'https://sdk.example.test', headers: { authorization: 'Bearer alice' }, cacheScope: 'alice',
+      fetch: (async (input, init) => h.api.fetch(new Request(input, init))) as typeof fetch })
+    // Matches the OAuth grant shape: profile email is not copied into credentials.
+    const account = await client.connect({ providerId: 'gmail', credentials: { accessToken: SECRET } })
+    expect(account).toMatchObject({ providerId: 'gmail', email: primary, status: 'connected' })
+    const response = await h.request('alice', `/accounts/${account.id}/sending-identities`)
+    expect(response.status).toBe(200)
+    expect(response.headers.get('cache-control')).toBe('no-store')
+    const identities = await response.json() as SendingIdentities
+    expect(identities).toEqual({ sourceId: account.id, checkedAt: new Date(EPOCH).toISOString(), identities: [
+      { email: primary, isPrimary: true, isDefault: true }, { email: alias, isPrimary: false, isDefault: false },
+    ] })
+    expect(await client.sendingIdentities(account.id)).toEqual(identities)
+    await client.setPolicy({ undoSendSeconds: 0 })
+    const draft = await client.createDraft({ accountId: account.id, from: alias, to: [participant('recipient@example.test')], subject: 'Fictional token-only send' })
+    const operation = await client.submit(draft.id, { revision: draft.revision, idempotencyKey: 'token-only-alias' })
+    await h.inbox.runDue()
+    expect(await client.operation(operation.id)).toMatchObject({ accountId: account.id, status: 'succeeded' })
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.split(/\r?\n/).find(line => line.startsWith('From:'))).toBe(`From: ${alias}`)
+    const unverified = await client.createDraft({ accountId: account.id, from: pending, to: [participant('recipient@example.test')] })
+    await expect(client.submit(unverified.id, { revision: unverified.revision, idempotencyKey: 'token-only-pending' })).rejects.toMatchObject({ code: 'FORBIDDEN_SENDER', status: 403 })
+    responsePrimary = 'different-account@example.test'
+    await expect(client.sendingIdentities(account.id, { refresh: true })).rejects.toMatchObject({ code: 'INVALID_PROVIDER', status: 502 })
+    expect((await client.account(account.id)).email).toBe(primary)
+    expect(sent).toHaveLength(1)
+    expect(calls.filter(call => call.endsWith('/profile'))).toHaveLength(1)
+    expect(calls.filter(call => call.endsWith('/labels/INBOX'))).toHaveLength(1)
+    expect(calls.filter(call => call.endsWith('/settings/sendAs'))).toHaveLength(5)
+  })
+
   test('sending identities use an owner/source cache, explicit refresh, bounded metadata and no-store HTTP/client', async () => {
     const box = referenceMailbox('senders-cache', 'primary@example.test', [])
     const primary = { email: box.email, isPrimary: true, isDefault: true }

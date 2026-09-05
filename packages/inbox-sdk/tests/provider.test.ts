@@ -3504,6 +3504,42 @@ test('Gmail rotating download handles retain stable MIME attachment identity and
 })
 
 describe('Gmail sending identities', () => {
+  test('token-only OAuth derives the primary from authenticated sendAs, never the first or default alias', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    const primary = { sendAsEmail: PRIMARY, isPrimary: true, isDefault: false }
+    const alias = { sendAsEmail: 'default-alias@example.test', isDefault: true, verificationStatus: 'accepted' }
+    let offered: unknown[] = [alias, primary, { sendAsEmail: 'pending@example.test', verificationStatus: 'pending' }]
+    const calls: string[] = []
+    const credentials = { accountId: 'gmail-token-only-identities', accessToken: 'offline-token',
+      fetch: (async (input: string | URL | Request) => {
+        const url = new URL(input instanceof Request ? input.url : String(input)); calls.push(url.pathname)
+        if (url.pathname.endsWith('/profile')) return Response.json({ emailAddress: PRIMARY })
+        if (url.pathname.endsWith('/labels/INBOX')) return Response.json({ messagesUnread: 0 })
+        if (url.pathname.endsWith('/settings/sendAs')) return Response.json({ sendAs: offered })
+        throw new Error('Unexpected token-only fixture request')
+      }) as typeof fetch }
+    const provider = await definition.create(credentials)
+    try {
+      expect((await provider.getAccount()).email).toBe(PRIMARY)
+      const before = calls.length
+      expect(await provider.getSendingIdentities!()).toEqual([
+        { email: alias.sendAsEmail, isPrimary: false, isDefault: true },
+        { email: PRIMARY, isPrimary: true, isDefault: false },
+      ])
+      expect(calls.slice(before)).toEqual(['/gmail/v1/users/me/settings/sendAs'])
+      expect(Object.hasOwn(credentials, 'email')).toBe(false)
+      for (const invalid of [
+        [alias],
+        [primary, { ...primary, sendAsEmail: 'other-primary@example.test' }],
+        [primary, { ...primary, isPrimary: false }],
+        [{ ...primary, isPrimary: 'true' }],
+      ]) {
+        offered = invalid
+        await failure(() => provider.getSendingIdentities!(), 'UPSTREAM', false)
+      }
+    } finally { await provider.disconnect() }
+  })
+
   test('requests only identity fields and returns the canonical primary plus accepted custom addresses', async () => {
     const definition = builtInProviders.find(provider => provider.id === 'gmail')!
     const calls: URL[] = []
@@ -3593,7 +3629,7 @@ describe('Gmail sending identities', () => {
       email = 'READER.NAME@GMAIL.COM'
       expect(await provider.getSendingIdentities!()).toEqual([{ email: credentials.email, isPrimary: true, isDefault: true }])
       const before = calls
-      for (const primary of [undefined, '', 'Display <reader.name@gmail.com>', 'reader.name@gmail.com\n']) {
+      for (const primary of ['', 'Display <reader.name@gmail.com>', 'reader.name@gmail.com\n']) {
         const invalid = await definition.create({ ...credentials, email: primary })
         try { await failure(() => invalid.getSendingIdentities!(), 'VALIDATION', false) }
         finally { await invalid.disconnect() }
