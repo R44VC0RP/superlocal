@@ -310,12 +310,14 @@ export default function ThreadView({
     scrollToMessage.current = "";
   }, [expanded]);
 
-  function messageLinks(root: ParentNode): HTMLAnchorElement[] {
+  function messageLinks(root: ParentNode, includeDisclosures = false): HTMLElement[] {
     const elements = root.querySelectorAll<HTMLAnchorElement | HTMLIFrameElement>(
       '.thread-body a[href]:not([aria-disabled="true"]), .message-html-frame, .thread-attachments a[href]:not([aria-disabled="true"])',
     );
+    const inFrame = 'a[href]:not([aria-disabled="true"])'
+      + (includeDisclosures ? ', details[data-inbox-disclosure] > summary' : '');
     return Array.from(elements).flatMap(element => element.tagName === "IFRAME"
-      ? Array.from((element as HTMLIFrameElement).contentDocument?.querySelectorAll<HTMLAnchorElement>('a[href]:not([aria-disabled="true"])') ?? [])
+      ? Array.from((element as HTMLIFrameElement).contentDocument?.querySelectorAll<HTMLElement>(inFrame) ?? [])
       : [element as HTMLAnchorElement]).filter(link => link.getClientRects().length > 0);
   }
 
@@ -443,7 +445,7 @@ export default function ThreadView({
           behavior: "auto",
         });
       } else if (key === "tab" && focusedMessage) {
-        const links = messageLinks(focusedMessage);
+        const links = messageLinks(focusedMessage, true);
         const index = links.indexOf(target as HTMLAnchorElement);
         const next =
           index >= 0 ? links[index + (event.shiftKey ? -1 : 1)] : undefined;
@@ -468,7 +470,7 @@ export default function ThreadView({
     shortcut(event, article);
     if (event.defaultPrevented || event.key === "Tab") return;
     const target = event.target as HTMLElement | null;
-    if (["Enter", " "].includes(event.key) && target?.closest?.("a, button")) return;
+    if (["Enter", " "].includes(event.key) && target?.closest?.("a, button, summary")) return;
     const forwarded = new KeyboardEvent("keydown", {
       key: event.key, code: event.code, altKey: event.altKey, ctrlKey: event.ctrlKey,
       metaKey: event.metaKey, shiftKey: event.shiftKey, repeat: event.repeat,

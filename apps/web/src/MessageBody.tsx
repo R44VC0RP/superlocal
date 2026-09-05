@@ -151,6 +151,41 @@ function emailDocument(html: string, styles: string, fontSize: string) {
   // The SDK allowlists this CSS; raw-text escaping also keeps it inside its style element.
   author.textContent = styles.replace(/<\/style/gi, "<\\/style");
   doc.head.replaceChildren(charset, policy, referrer, viewport, defaults, author);
+  // Only the SDK can emit these markers. Move, never discard, the qualified
+  // attribution/quote siblings; uncertain and inline replies remain untouched.
+  const history = doc.querySelectorAll('[data-inbox-quoted-history="true"]');
+  for (const first of history) {
+    if (first.closest("details[data-inbox-disclosure]")) continue;
+    const disclosure = doc.createElement("details");
+    disclosure.dataset.inboxDisclosure = id;
+    const summary = doc.createElement("summary");
+    const show = doc.createElement("span"), hide = doc.createElement("span");
+    show.textContent = "Show quoted text";
+    hide.textContent = "Hide quoted text";
+    summary.append(show, hide);
+    disclosure.append(summary);
+    first.before(disclosure);
+    let node: ChildNode | null = first;
+    while (node && (node.nodeType === Node.COMMENT_NODE
+      || node.nodeType === Node.TEXT_NODE && !node.textContent?.trim()
+      || node instanceof Element && node.getAttribute("data-inbox-quoted-history") === "true")) {
+      const next: ChildNode | null = node.nextSibling;
+      disclosure.append(node);
+      node = next;
+    }
+  }
+  if (history.length) {
+    const controls = doc.createElement("style");
+    const selector = `details[data-inbox-disclosure="${id}"]`;
+    controls.textContent = `
+      ${selector} { margin: 8px 0; }
+      ${selector} > summary { box-sizing: border-box; width: fit-content; min-height: 44px; padding: 10px 0; color: inherit; font: 13px/1.6 "Helvetica Neue", sans-serif; cursor: pointer; }
+      ${selector} > summary:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+      ${selector}:not([open]) > summary > span:last-child,
+      ${selector}[open] > summary > span:first-child { display: none; }
+    `;
+    doc.head.append(controls);
+  }
   for (const image of doc.querySelectorAll('img[data-inbox-tracking="true"]')) image.remove();
   for (const image of doc.querySelectorAll<HTMLImageElement>('img[src^="cid:" i]')) {
     unavailableImage(image, "inline image unavailable");
@@ -245,6 +280,7 @@ export default function MessageBody({ html, text = "", format, styles = "", font
     doc.addEventListener("pointerdown", onFocus, true);
     doc.addEventListener("focusin", onFocus, true);
     doc.addEventListener("load", schedule, true);
+    doc.addEventListener("toggle", schedule, true);
     doc.addEventListener("error", onError, true);
     for (const image of Array.from(doc.images)) {
       if (image.hasAttribute("src") && image.complete && !image.naturalWidth) unavailableImage(image, "image unavailable");
@@ -261,6 +297,7 @@ export default function MessageBody({ html, text = "", format, styles = "", font
       doc.removeEventListener("pointerdown", onFocus, true);
       doc.removeEventListener("focusin", onFocus, true);
       doc.removeEventListener("load", schedule, true);
+      doc.removeEventListener("toggle", schedule, true);
       doc.removeEventListener("error", onError, true);
     };
   }
