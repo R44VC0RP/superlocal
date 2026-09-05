@@ -4,7 +4,7 @@ import type {
   Account, BlobInfo, ChangeEvent, Changes, Draft as SdkDraft, DraftInput, Folder, Label,
   Mailbox, MailboxMembership, MailboxMessageSummary, MailboxStateTarget, Message as SdkMessage, MutationInput, Operation, Participant, Policy,
 } from "inbox-sdk/types";
-import type { Attachment, Draft, Mail, MailboxOption, Message } from "./data";
+import type { Attachment, Draft, LoadSendingIdentities, Mail, MailboxOption, Message } from "./data";
 import { escapeHTML, plainText } from "./mail-text";
 import { getApplicationStorage } from "./storage";
 import { createScopedFetch } from "./application-auth";
@@ -212,6 +212,7 @@ export class InboxStore {
   private rawDrafts = new Map<string, SdkDraft>();
   private edits = new Map<string, Edit>();
   private popouts = new Map<string, boolean>();
+  private sendErrors = new Map<string, NonNullable<Draft["sendError"]>>();
   private saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private saves = new Map<string, Promise<SdkDraft>>();
   private uploads = new WeakMap<Attachment, Map<string, Promise<BlobInfo>>>();
@@ -487,6 +488,25 @@ export class InboxStore {
     if (!box || !source) throw new Error("Select a connected mailbox first.");
     return { box, source };
   }
+  sendingIdentities: LoadSendingIdentities = async (mailboxId, input = {}) => {
+    const { source } = this.account(mailboxId);
+    const generation = this.generation, signal = this.controller.signal;
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      this.applicationScope.signal.throwIfAborted();
+      const current = this.sourceAccounts.find(account => account.id === source.id);
+      if (generation !== this.generation || current?.generation !== source.generation || current?.status !== source.status
+        || !this.boxes.some(box => box.id === mailboxId && box.sourceId === source.id)) {
+        throw new DOMException("The sending mailbox changed. Retry to load its senders.", "AbortError");
+      }
+    };
+    // Cache hits must obey the same owner and generation fences as network reads.
+    assertCurrent();
+    const result = await this.client.sendingIdentities(source.id, input, { signal }).catch(error => { assertCurrent(); throw error; });
+    assertCurrent();
+    if (result.sourceId !== source.id) throw new Error("The sending mailbox changed. Retry to load its senders.");
+    return result;
+  };
   unifiedMailboxIds(): string[] {
     const available = this.boxes.map(box => box.id);
     const preferences = this.state.viewPreferences;
@@ -918,7 +938,7 @@ export class InboxStore {
       this.publish({ drafts: [...drafts.values()].map(raw => {
         const edit = this.edits.get(raw.id);
         return { ...(edit?.draft ?? this.uiDraft(raw)), popOut: this.popouts.get(raw.id) ?? edit?.draft.popOut ?? false,
-          saving: this.saves.has(raw.id) || !!edit && !edit.error && completeRecipients(edit.draft), dirty: !!edit, saveError: edit?.error };
+          saving: this.saves.has(raw.id) || !!edit && !edit.error && completeRecipients(edit.draft), dirty: !!edit, saveError: edit?.error, sendError: this.sendErrors.get(raw.id) };
       }) });
     }
     for (const row of this.messageRows.values()) if (affectedSources.has(row.sourceId)) threads.add(nativeKey(row.sourceId, row.threadId));
@@ -1146,7 +1166,7 @@ export class InboxStore {
     const timing = measurePerformance({ kind: "rebuild", full: !onlyThreads });
     const accounts: MailboxOption[] = this.boxes.map(box => {
       const source = this.sourceAccounts.find(account => account.id === box.sourceId)!;
-      return { id: box.id, sourceId: source.id, name: box.name || source.name, email: box.defaultSender || source.email, selectorKind: box.selector.kind,
+      return { id: box.id, sourceId: source.id, sourceGeneration: source.generation, name: box.name || source.name, email: box.defaultSender || source.email, selectorKind: box.selector.kind,
         canSend: this.state.host?.allowProviderWrites === true && source.status === "connected" && box.status === "active" && source.capabilities.send && !!box.defaultSender };
     });
     const mail: Mail[] = [], labelNames: Record<string, string[]> = {};
@@ -1210,7 +1230,7 @@ export class InboxStore {
             attachments: detail?.attachments.map(info => this.file(info)), };
         });
         mail.push({ id: viewThreadId(box.id, thread), account: box.id, sourceId: source.id, mailboxId: box.id, sdkThreadId: thread, accountEmail: source.email,
-          from: latest.from.name || latest.from.email, email: latest.from.email, to: addresses(latest.to), subject: rows[0].subject,
+          from: latest.from.name || latest.from.email, email: latest.from.email, to: addresses(latest.to), toAddresses: latest.to.map(person => person.email), subject: rows[0].subject,
           snippet: latest.preview, ...displayTime(latest.receivedAt), receivedAt: Date.parse(latest.receivedAt), split: "Important",
           folder: hidden ?? (locations.includes("Inbox") ? "Inbox" : done ? "Done" : reminders.length ? "Reminders" : locations[0] ?? "Auto Archived"), locations, unread: rows.some(row => !row.isRead), starred: rows.some(row => row.isStarred), labels: names, messages,
           ...(reminders.length ? { reminder: reminders[0], reminderAt: Date.parse(reminders[0]) } : {}),
@@ -1235,7 +1255,7 @@ export class InboxStore {
       if (operation.status === "uncertain") continue;
       if (onlyThreads && !sendingChanged) continue;
       mail.push({ id: `operation:${operation.id}`, operationId: operation.id, sourceId: operation.accountId, mailboxId: ref.mailboxId, account: ref.mailboxId,
-        accountEmail: draft.from, from: draft.from, email: draft.from, to: addresses(draft.to), subject: draft.subject, snippet: draft.bodyText,
+        accountEmail: draft.from, from: draft.from, email: draft.from, to: addresses(draft.to), toAddresses: draft.to.map(person => person.email), subject: draft.subject, snippet: draft.bodyText,
         ...displayTime(date), receivedAt: Date.parse(date), split: "Important", folder: "Scheduled", locations: ["Scheduled"], unread: false, starred: false, labels: [], scheduled: date,
         messages: [{ ...pendingMessage, scheduledAt: date }],
       });
@@ -1286,10 +1306,11 @@ export class InboxStore {
       return;
     }
     mail.sort((a, b) => (b.receivedAt ?? 0) - (a.receivedAt ?? 0) || a.id.localeCompare(b.id));
+    for (const id of this.sendErrors.keys()) if (!this.rawDrafts.has(id)) this.sendErrors.delete(id);
     const drafts = [...this.rawDrafts.values()].map(raw => {
       const edit = this.edits.get(raw.id);
       return { ...(edit?.draft ?? this.uiDraft(raw)), popOut: this.popouts.get(raw.id) ?? edit?.draft.popOut ?? false,
-        saving: this.saves.has(raw.id) || !!edit && !edit.error && completeRecipients(edit.draft), dirty: !!edit, saveError: edit?.error };
+        saving: this.saves.has(raw.id) || !!edit && !edit.error && completeRecipients(edit.draft), dirty: !!edit, saveError: edit?.error, sendError: this.sendErrors.get(raw.id) };
     });
     this.publish({ accounts, mail, senderHistory: [...senderHistory.values()], drafts, labels: labelNames, unsaved: this.edits.size > 0 || this.saves.size > 0, operations: Object.fromEntries(this.operations) });
     timing({ conversations: mail.length });
@@ -1355,6 +1376,7 @@ export class InboxStore {
     const old = this.state.drafts.find(value => value.id === draft.id), raw = this.rawDrafts.get(draft.id);
     if (!raw) return;
     this.popouts.set(draft.id, draft.popOut ?? false);
+    if (old && (old.from !== draft.from || old.account !== draft.account)) this.sendErrors.delete(draft.id);
     if (old && contentKey(old) === contentKey(draft)) { this.rebuild(); return; }
     const previous = this.edits.get(draft.id), complete = completeRecipients(draft);
     const error = previous?.error && !(previous.errorKind === "recipients" && complete) ? { error: previous.error, errorKind: previous.errorKind } : {};
@@ -1429,7 +1451,8 @@ export class InboxStore {
     if (input.sourceMessageId && !input.mail?.messages.some(message => message.id === input.sourceMessageId)) throw new Error("The selected message no longer belongs to this conversation.");
     const parent = input.sourceMessageId ?? input.mail?.messages.filter(message => !message.pending).at(-1)?.id;
     if (input.mail?.messages.find(message => message.id === parent)?.pending) throw new Error("Wait for the queued message to finish sending before replying to it.");
-    const raw = await this.client.createDraft({ accountId: source.id, mailboxId: box.id, from: box.defaultSender!,
+    const implicitReply = !!parent && (input.mode === "reply" || input.mode === "replyAll");
+    const raw = await this.client.createDraft({ accountId: source.id, mailboxId: box.id, ...(!implicitReply ? { from: box.defaultSender! } : {}),
       mode: input.mode === "new" || !input.mode ? "compose" : input.mode, ...(parent ? { sourceMessageId: parent } : {}),
       ...(input.subject !== undefined ? { subject: input.subject } : {}), ...(input.body !== undefined ? { bodyHtml: draftHtml(input.body), bodyText: plainText(input.body) } : {}),
       ...(input.to !== undefined ? { to: recipients(input.to) } : {}),
@@ -1459,7 +1482,7 @@ export class InboxStore {
   };
   reloadDraft = async (id: string) => {
     const issue = this.state.issues.find(issue => issue.key === `draft:${id}`);
-    const raw = await this.client.draft(id, this.requestOptions()); this.draftEpoch++; this.edits.delete(id); this.rawDrafts.set(id, raw); this.saveRecovery(); this.rebuild();
+    const raw = await this.client.draft(id, this.requestOptions()); this.draftEpoch++; this.edits.delete(id); this.sendErrors.delete(id); this.rawDrafts.set(id, raw); this.saveRecovery(); this.rebuild();
     this.retireDraftIssue(id, issue);
   };
 
@@ -1473,8 +1496,19 @@ export class InboxStore {
     let intent = this.submissions.get(draft.id);
     if (!intent) { intent = { idempotencyKey: crypto.randomUUID(), revision: raw.revision, ...(sendAt ? { sendAt } : {}) }; this.submissions.set(draft.id, intent); }
     let operation: Operation;
+    const generation = this.generation;
+    this.sendErrors.delete(draft.id);
     try { operation = await this.client.submit(draft.id, intent, this.requestOptions()); }
-    catch (error) { if (error instanceof ApiError && error.status >= 400 && error.status < 500) this.submissions.delete(draft.id); throw error; }
+    catch (error) {
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500) this.submissions.delete(draft.id);
+      const current = this.state.drafts.find(value => value.id === draft.id);
+      if (generation === this.generation && !this.controller.signal.aborted && !this.applicationScope.signal.aborted
+        && current?.account === draft.account && current.from === draft.from) {
+        this.sendErrors.set(draft.id, { message: failureMessage(error), code: failureCode(error) });
+        this.rebuild();
+      }
+      throw error;
+    }
     const ref = { id: operation.id, draftId: raw.id, accountId: raw.accountId, mailboxId: raw.mailboxId || draft.account };
     this.references = [...this.references.filter(item => item.id !== ref.id), ref].slice(-200);
     if (!this.storage.writeSaved(outboxKey, this.references)) this.raise({ scope: "storage", code: "OUTBOX", title: "Browser storage is full", detail: "The send is queued, but this browser could not save its operation reference.", retry: false });

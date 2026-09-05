@@ -163,11 +163,18 @@ export interface AttachmentData {
   contentType: string
 }
 
+export interface SendingIdentity {
+  email: string
+  isPrimary: boolean
+  isDefault: boolean
+}
+
 export interface InboxProvider {
   readonly type: InboxProviderType
   readonly accountId: string
   readonly capabilities: Readonly<ProviderCapabilities>
   getAccount(): Promise<MailAccount>
+  getSendingIdentities?(): Promise<readonly SendingIdentity[]>
   listFolders(): Promise<ProviderFolder[]>
   createFolder(name: string): Promise<ProviderFolder>
   listMessages(options?: ListOptions): Promise<ProviderListResult<MailMessage>>
@@ -467,6 +474,7 @@ export async function providerRequest(
   url: string,
   init: RequestInit = {},
   timeoutMs = 30_000,
+  maxBytes?: number,
 ): Promise<Response> {
   let response: Response
   try {
@@ -485,7 +493,7 @@ export async function providerRequest(
 
   if (response.ok) return response
 
-  const text = new TextDecoder().decode(await providerBytes(provider, response))
+  const text = new TextDecoder().decode(await providerBytes(provider, response, maxBytes))
   let details: unknown = text
   if (text) {
     try {
@@ -532,7 +540,7 @@ export async function providerJson<T>(
   timeoutMs?: number,
   maxBytes?: number,
 ): Promise<T> {
-  const response = await providerRequest(provider, fetcher, url, init, timeoutMs)
+  const response = await providerRequest(provider, fetcher, url, init, timeoutMs, maxBytes)
   if (response.status === 204 || maxBytes === undefined && response.headers.get('content-length') === '0') return undefined as T
   const body = new TextDecoder().decode(await providerBytes(provider, response, maxBytes))
   if (!body.trim()) return undefined as T

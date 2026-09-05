@@ -402,6 +402,8 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     connect: (input: Parameters<Inbox['connect']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'connect'>>('/accounts', 'POST', input, requestOptions),
     reconnect: (id: string, credentials: Record<string, unknown>, requestOptions: InboxRequestOptions = {}) => write<Result<'reconnect'>>(`/accounts/${resourceId(id)}/reconnect`, 'POST', credentials, requestOptions),
     disconnect: (id: string, requestOptions: InboxRequestOptions = {}) => write<void>(`/accounts/${resourceId(id)}`, 'DELETE', undefined, requestOptions),
+    sendingIdentities: (sourceId: string, input: { refresh?: boolean } = {}, requestOptions: InboxRequestOptions = {}) =>
+      request<Result<'sendingIdentities'>>(`/accounts/${resourceId(sourceId)}/sending-identities${queryString(input)}`, { ...requestOptions, cache: 'no-store' }),
     accounts: (requestOptions: InboxRequestOptions = {}) => request<Result<'accounts'>>('/accounts', requestOptions),
     account: (id: string, requestOptions: InboxRequestOptions = {}) => request<Result<'account'>>(`/accounts/${resourceId(id)}`, requestOptions),
     sync: (id: string, input: SyncRequest = {}, requestOptions: InboxRequestOptions = {}) => write<Result<'sync'>>(`/accounts/${resourceId(id)}/sync`, 'POST', input, requestOptions),

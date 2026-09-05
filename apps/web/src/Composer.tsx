@@ -15,6 +15,7 @@ import {
   type Preferences,
   type SendOptions,
   type MailboxOption,
+  type LoadSendingIdentities,
 } from "./data";
 import "./message.css";
 import { escapeHTML, plainText } from "./mail-text";
@@ -29,6 +30,7 @@ type ComposerProps = {
   draft: Draft;
   preferences: Preferences;
   accounts: MailboxOption[];
+  loadSendingIdentities: LoadSendingIdentities;
   contacts?: Array<{ name: string; email: string }>;
   onChange: (draft: Draft) => void;
   onSend: (draft: Draft, when?: string, options?: SendOptions) => Promise<boolean>;
@@ -255,6 +257,7 @@ export default function Composer({
   draft,
   preferences,
   accounts,
+  loadSendingIdentities,
   contacts = [],
   onChange,
   onSend,
@@ -320,6 +323,39 @@ export default function Composer({
   const signatures = preferences.signaturesByAccount as
     Record<string, string> | undefined;
   const signature = signatures?.[draft.account] ?? preferences.signature;
+  const mailbox = accounts.find(account => account.id === draft.account);
+  const sourceBinding = `${mailbox?.sourceId ?? ""}\0${mailbox?.sourceGeneration ?? ""}`;
+  const identityOwner = `${draft.id}\0${draft.account}\0${sourceBinding}`;
+  const identityOwnerRef = useRef(identityOwner);
+  identityOwnerRef.current = identityOwner;
+  const identityRequest = useRef(0);
+  const previousSource = useRef(sourceBinding);
+  const identityStatusId = useId();
+  const [identityLoad, setIdentityLoad] = useState<{
+    owner: string;
+    loading: boolean;
+    value?: Awaited<ReturnType<LoadSendingIdentities>>;
+    error?: string;
+  }>({ owner: identityOwner, loading: true });
+  const identityState = identityLoad.owner === identityOwner ? identityLoad : undefined;
+  const identitiesLoading = !identityState || identityState.loading;
+  const identities = identityState?.value?.identities ?? [];
+  const from = draft.from ?? "";
+  const listedFrom = identities.find(identity => identity.email.toLowerCase() === from.toLowerCase());
+  const missingFrom = !!identityState?.value && !listedFrom;
+  const loadIdentities = useCallback(async (refresh = false) => {
+    const request = ++identityRequest.current;
+    setIdentityLoad({ owner: identityOwner, loading: true });
+    try {
+      const value = await loadSendingIdentities(draft.account, { refresh });
+      if (mounted.current && identityOwnerRef.current === identityOwner && identityRequest.current === request)
+        setIdentityLoad({ owner: identityOwner, loading: false, value });
+    } catch (cause) {
+      if (mounted.current && identityOwnerRef.current === identityOwner && identityRequest.current === request)
+        setIdentityLoad({ owner: identityOwner, loading: false, error: cause instanceof Error && !(cause instanceof TypeError)
+          ? cause.message : "Could not load sending addresses." });
+    }
+  }, [identityOwner, draft.account, loadSendingIdentities]);
 
   useEffect(() => {
     mounted.current = true;
@@ -327,6 +363,13 @@ export default function Composer({
       mounted.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    const refresh = previousSource.current !== sourceBinding;
+    previousSource.current = sourceBinding;
+    void loadIdentities(refresh);
+    return () => { identityRequest.current++; };
+  }, [loadIdentities, sourceBinding]);
 
   function update(patch: Partial<Draft>) {
     if (patch.body !== undefined) setPreviewReply(null);
@@ -517,7 +560,10 @@ export default function Composer({
     setSending(true);
     try {
       if (await onSend(next, when ? new Date(when).toISOString() : undefined, options)) setMenu(null);
-    } catch (error) { setError(error instanceof Error ? error.message : "The send could not be queued. Your draft has been kept."); }
+    } catch (error) {
+      if (mounted.current && current.current.id === next.id && current.current.account === next.account && current.current.from === next.from)
+        setError(error instanceof Error ? error.message : "The send could not be queued. Your draft has been kept.");
+    }
     finally { submitting.current = false; if (mounted.current) setSending(false); }
   }
 
@@ -660,7 +706,7 @@ export default function Composer({
                 : matches("b", "KeyB")
                   ? "Bcc"
                   : matches("f", "KeyF")
-                    ? "From account"
+                    ? "From"
                     : matches("s", "KeyS")
                       ? "Subject"
                       : null;
@@ -939,9 +985,9 @@ export default function Composer({
                     onExpand={() => setExpanded(true)}
                   />
                   <label className="compose-recipient-row compose-from">
-                    <span>From</span>
+                    <span>Mailbox</span>
                     <select
-                      aria-label="From account"
+                      aria-label="Mailbox"
                       value={draft.account}
                       onChange={(event) =>
                         update({ account: event.target.value })
@@ -959,6 +1005,25 @@ export default function Composer({
               )}
             </div>
           )}
+          <label className="compose-recipient-row compose-from">
+            <span>From</span>
+            <select
+              aria-label="From"
+              aria-describedby={identityStatusId}
+              aria-busy={identitiesLoading}
+              value={listedFrom?.email ?? from}
+              disabled={identitiesLoading || sending}
+              onChange={(event) => update({ from: event.target.value })}
+            >
+              {!listedFrom && <option value={from} disabled>{from || "Choose a sending address"}{missingFrom && from ? " (Unavailable)" : ""}</option>}
+              {identities.map(identity => <option key={identity.email} value={identity.email}>{identity.email}</option>)}
+            </select>
+            <Icon name="ChevronDown" size={12} />
+          </label>
+          <div id={identityStatusId} className={`compose-sender-status ${identityState?.error || missingFrom ? "is-error" : ""}`} aria-live="polite">
+            {identitiesLoading ? "Loading sending addresses…" : identityState?.error || (missingFrom ? "This address is not in the available senders." : "")}
+            {!identitiesLoading && (identityState?.error || missingFrom || draft.sendError) && <button type="button" onClick={() => void loadIdentities(true)}>Retry sending addresses</button>}
+          </div>
           {(!inline || expanded) && (
             <input
               className="compose-subject"
@@ -1145,9 +1210,9 @@ export default function Composer({
               </button>
             </div>
           )}
-          {(error || draft.saveError) && (
+          {(error || draft.saveError || draft.sendError) && (
             <div className="compose-error" role="alert">
-              {error || draft.saveError}
+              {error || draft.saveError || draft.sendError?.message}
               {draft.saveError && onReload && <button type="button" onClick={onReload}>Reload saved draft</button>}
             </div>
           )}

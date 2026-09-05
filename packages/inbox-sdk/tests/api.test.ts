@@ -37,7 +37,7 @@ import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
   Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, MailboxSyncStatus, Message,
   MessageSummary, Operation, Page, Policy, ProviderDefinition, Query,
-  ThreadSummary, MediaNetwork,
+  ThreadSummary, MediaNetwork, SendingIdentity, SendingIdentities,
 } from '../src/contracts'
 import {
   ProviderAuthenticationError, ProviderCursorExpiredError, ProviderError,
@@ -3852,6 +3852,389 @@ describe('blob privacy and draft editing', () => {
     expect(await response.text()).toBe('')
     await invalid(await h.request('alice', path), 404)
     expect(await h.inbox.drafts('alice')).toEqual([])
+  })
+})
+
+describe('source-scoped sending identities', () => {
+  test('sending identities use an owner/source cache, explicit refresh, bounded metadata and no-store HTTP/client', async () => {
+    const box = referenceMailbox('senders-cache', 'primary@example.test', [])
+    const primary = { email: box.email, isPrimary: true, isDefault: true }
+    const alias = { email: 'alias@example.test', isPrimary: false, isDefault: false }
+    let identities: SendingIdentity[] = [primary, alias], calls = 0
+    let wait: (() => Promise<SendingIdentity[]>) | undefined
+    const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities),
+      async getSendingIdentities() { calls++; return wait ? wait() : structuredClone(identities) },
+    }) }] })
+    const a = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+    const b = await h.inbox.connect('bob', { providerId: DYNAMIC, credentials: {} })
+    const a2 = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+    const path = `/accounts/${a.id}/sending-identities`
+    const response = await h.request('alice', path)
+    expect(response.status).toBe(200); expect(response.headers.get('cache-control')).toBe('no-store')
+    expect(response.headers.get('etag')).toBeNull()
+    const first = await response.json() as SendingIdentities
+    expect(first).toEqual({ sourceId: a.id, identities, checkedAt: new Date(EPOCH).toISOString() })
+    first.identities.length = 0
+    expect((await h.inbox.sendingIdentities('alice', a.id)).identities).toHaveLength(2)
+    expect(calls).toBe(1)
+    await invalid(await h.request('bob', path), 404)
+    await invalid(await h.request(null, path), 401)
+    await invalid(await h.request('alice', `${path}?refresh=perhaps`), 400)
+    expect(calls).toBe(1)
+    await h.inbox.sendingIdentities('bob', b.id); await h.inbox.sendingIdentities('alice', a2.id)
+    expect(calls).toBe(3)
+    const barrier = h.gate([primary])
+    wait = barrier.wait
+    const refreshed = h.pending(h.inbox.sendingIdentities('alice', a.id, { refresh: true }))
+    await bounded(barrier.entered, 'sending identity refresh')
+    const simultaneous = h.pending(h.inbox.sendingIdentities('alice', a.id, { refresh: true }))
+    barrier.release(); wait = undefined
+    expect((await refreshed).identities).toEqual([primary]); expect(await simultaneous).toEqual(await refreshed)
+    expect(calls).toBe(4)
+    h.clock.value += 60_001
+    const clientRequests: RequestInit[] = []
+    const client = createInboxClient({ baseUrl: 'https://sdk.example.test', headers: { authorization: 'Bearer alice' }, cacheScope: 'alice',
+      fetch: (async (input, init) => { clientRequests.push(init!); return h.api.fetch(new Request(input, init)) }) as typeof fetch })
+    await client.sendingIdentities(a.id); await client.sendingIdentities(a.id)
+    expect(calls).toBe(5)
+    expect(clientRequests.every(init => init.cache === 'no-store' && !new Headers(init.headers).has('if-none-match'))).toBe(true)
+    identities = [{ ...alias, email: 'unsafe\r\n@example.test' }]
+    await expect(client.sendingIdentities(a.id, { refresh: true })).rejects.toMatchObject({ code: 'INVALID_PROVIDER' })
+    identities = Array.from({ length: 101 }, (_, i) => ({ ...alias, email: `alias-${i}@example.test` }))
+    await expect(client.sendingIdentities(a.id, { refresh: true })).rejects.toMatchObject({ code: 'INVALID_PROVIDER' })
+    identities = [primary]
+    await h.restart()
+    expect((await client.sendingIdentities(a.id)).identities).toEqual([primary])
+    expect(calls).toBe(8)
+    expect(box.calls.sync).toEqual([]); expect(box.calls.listMessages).toBe(0)
+    expect(box.calls.getMessage).toEqual([]); expect(box.calls.listFolders).toBe(0); expect(box.calls.send).toEqual([])
+  })
+
+  test('sending identities evict beyond 128 sources without scanning mail and cancellation survives an overlapping display refresh', async () => {
+    const primary = { email: 'primary@example.test', isPrimary: true, isDefault: true }
+    const box = referenceMailbox('senders-bounds', primary.email, [])
+    let calls = 0, wait: (() => Promise<SendingIdentity[]>) | undefined
+    const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() { calls++; return wait ? wait() : [primary] },
+    }) }] })
+    const accounts: Account[] = []
+    for (let index = 0; index < 129; index++) {
+      const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} }); accounts.push(account)
+      await h.inbox.sendingIdentities('alice', account.id)
+    }
+    expect(calls).toBe(129)
+    await h.inbox.sendingIdentities('alice', accounts.at(-1)!.id); expect(calls).toBe(129)
+    const first = accounts[0]!
+    await h.inbox.sendingIdentities('alice', first.id); expect(calls).toBe(130)
+    const draft = await h.draft('alice', first.id, { to: [participant('recipient@example.test')] })
+    const operation = await h.submit('alice', draft, 'cancel-during-display-refresh')
+    const barrier = h.gate([primary]); wait = barrier.wait
+    const refresh = h.pending(h.inbox.sendingIdentities('alice', first.id, { refresh: true }))
+    await bounded(barrier.entered, 'display refresh during cancellation')
+    await h.inbox.cancel('alice', operation.id); barrier.release(); await refresh
+    h.clock.value += 120_000; await h.inbox.runDue()
+    expect((await h.inbox.operation('alice', operation.id)).status).toBe('cancelled')
+    expect((await h.inbox.draft('alice', draft.id)).status).toBe('active')
+    expect(box.calls.send).toEqual([]); expect(box.calls.sync).toEqual([])
+    expect(box.calls.listMessages).toBe(0); expect(box.calls.getMessage).toEqual([])
+  })
+
+  test('sending identities select only unambiguous authorized reply addresses, preserve explicit From and exclude current self aliases', async () => {
+    const primary = { email: 'primary@example.test', isPrimary: true, isDefault: false }
+    const alias = { email: 'alias@example.test', isPrimary: false, isDefault: true }
+    const second = { email: 'second@example.test', isPrimary: false, isDefault: false }
+    const box = referenceMailbox('senders-reply', primary.email, [
+      native('alias', { to: [participant('ALIAS@example.test')], cc: [participant('colleague@example.test')], replyTo: [participant('desk@example.test')] }),
+      native('ambiguous', { to: [participant(alias.email), participant(second.email)] }),
+      native('own-sent', { from: participant(second.email), to: [participant('recipient@example.test')], folder: 'sent' }),
+      native('owned-incoming', { from: participant(second.email), to: [participant(alias.email)], folder: 'inbox' }),
+      native('invented', { to: [participant('alias+invented@example.test')] }),
+    ])
+    const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() { return [primary, alias, second] },
+    }) }] })
+    const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+    await h.inbox.sync('alice', account.id)
+    const rows = (await h.page()).items
+    const source = rows.find(row => row.subject === 'Subject alias')!
+    const reply = await h.inbox.createDraft('alice', { accountId: account.id, mailboxId: account.id, mode: 'replyAll', sourceMessageId: source.id })
+    expect(reply.from).toBe(alias.email); expect(reply.to).toEqual([participant('desk@example.test')]); expect(reply.cc).toEqual([participant('colleague@example.test')])
+    for (const [subject, from] of [['ambiguous', primary.email], ['own-sent', second.email], ['owned-incoming', alias.email], ['invented', primary.email]]) {
+      const draft = await h.inbox.createDraft('alice', { accountId: account.id, mode: 'reply', sourceMessageId: rows.find(row => row.subject === `Subject ${subject}`)!.id })
+      expect(draft.from).toBe(from)
+    }
+    expect((await h.inbox.createDraft('alice', { accountId: account.id })).from).toBe(primary.email)
+    const explicit = await h.inbox.createDraft('alice', { accountId: account.id, mode: 'reply', sourceMessageId: source.id, from: second.email })
+    const edited = await h.inbox.updateDraft('alice', explicit.id, { bodyText: 'Keep my chosen sender' }, explicit.revision)
+    await h.restart()
+    expect(await h.inbox.draft('alice', explicit.id)).toMatchObject({ from: second.email, bodyText: edited.bodyText })
+    expect(box.calls.getMessage).toEqual([]); expect(box.calls.send).toEqual([])
+    await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+    const operation = await h.submit('alice', edited, 'explicit-alias-after-restart')
+    await h.inbox.runDue()
+    expect((await h.inbox.operation('alice', operation.id)).status).toBe('succeeded')
+    expect(box.calls.send[0]!.from).toBe(second.email)
+    expect(box.calls.send[0]!.to).toEqual([participant('desk@example.test')])
+  })
+
+  test('sending identities reject unknown, pending and removed senders without stale native aliases or changing the draft', async () => {
+    const primary = { email: 'primary@example.test', isPrimary: true, isDefault: true }
+    const alias = { email: 'alias@example.test', isPrimary: false, isDefault: false }
+    const box = referenceMailbox('senders-revoke', primary.email, [], [alias.email, 'pending@example.test'])
+    let identities = [primary, alias], calls = 0, outage = false
+    const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() {
+        calls++; if (outage) throw new ProviderError(DYNAMIC, 'AUTHORIZATION', 'Fictional settings unavailable')
+        return structuredClone(identities)
+      },
+    }) }] })
+    const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+    await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+    for (const from of ['unknown@example.test', 'pending@example.test']) {
+      const draft = await h.draft('alice', account.id, { from, to: [participant('recipient@example.test')] })
+      await expect(h.inbox.submit('alice', draft.id, { revision: draft.revision, idempotencyKey: from })).rejects.toMatchObject({ code: 'FORBIDDEN_SENDER' })
+      expect(await h.inbox.draft('alice', draft.id)).toMatchObject({ from, status: 'active' })
+    }
+    const draft = await h.draft('alice', account.id, { from: alias.email, to: [participant('recipient@example.test')] })
+    const operation = await h.inbox.submit('alice', draft.id, { revision: draft.revision, idempotencyKey: 'accepted-then-removed' })
+    const submittedCalls = calls
+    outage = true
+    expect(await h.inbox.submit('alice', draft.id, { revision: draft.revision, idempotencyKey: 'accepted-then-removed' })).toEqual(operation)
+    expect(calls).toBe(submittedCalls)
+    outage = false; identities = [primary]
+    await h.inbox.runDue()
+    expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'failed', problem: { code: 'FORBIDDEN_SENDER' } })
+    expect(await h.inbox.draft('alice', draft.id)).toMatchObject({ from: alias.email, status: 'active' })
+    outage = true
+    await expect(h.inbox.submit('alice', draft.id, { revision: draft.revision, idempotencyKey: 'settings-outage' })).rejects.toMatchObject({ code: 'AUTHORIZATION' })
+    expect((await h.inbox.account('alice', account.id)).status).toBe('connected')
+    expect(await h.inbox.draft('alice', draft.id)).toMatchObject({ from: alias.email, status: 'active' })
+    expect(box.calls.send).toEqual([])
+    const legacy = await fixture()
+    const connected = await legacy.connect('alice', 'legacy-senders', [], FULL, [alias.email])
+    expect(await legacy.inbox.sendingIdentities('alice', connected.account.id)).toMatchObject({ checkedAt: null, identities: [
+      { email: connected.account.email, isPrimary: true, isDefault: true }, alias,
+    ] })
+    const oldDraft = await legacy.draft('alice', connected.account.id, { from: alias.email, to: [participant('recipient@example.test')] })
+    await legacy.inbox.setPolicy('alice', { undoSendSeconds: 0 }); await legacy.submit('alice', oldDraft, 'legacy-alias'); await legacy.inbox.runDue()
+    expect(connected.box.calls.send[0]!.from).toBe(alias.email)
+    const manyAliases = Array.from({ length: 100 }, (_, index) => `legacy-alias-${index}@example.test`)
+    const large = await legacy.connect('alice', 'legacy-many-senders', [], FULL, manyAliases)
+    const response = await legacy.request('alice', `/accounts/${large.account.id}/sending-identities`)
+    expect(response.status).toBe(413)
+    expect(await response.json()).toMatchObject({ code: 'SENDING_IDENTITIES_TOO_LARGE' })
+    await expect(legacy.inbox.sendingIdentities('alice', large.account.id)).rejects.toMatchObject({ code: 'SENDING_IDENTITIES_TOO_LARGE', status: 413 })
+    const lastAlias = manyAliases.at(-1)!
+    const largeDraft = await legacy.draft('alice', large.account.id, { from: lastAlias, to: [participant('recipient@example.test')] })
+    const largeOperation = await legacy.submit('alice', largeDraft, 'legacy-last-alias')
+    await legacy.inbox.runDue()
+    expect((await legacy.inbox.operation('alice', largeOperation.id)).status).toBe('succeeded')
+    expect(large.box.calls.send[0]!.from).toBe(lastAlias)
+  })
+
+  test('sending identities fail closed on queued lookup outages and retry only before any provider send', async () => {
+    for (const code of ['NETWORK', 'RATE_LIMITED', 'AUTHORIZATION'] as const) {
+      const primary = { email: 'primary@example.test', isPrimary: true, isDefault: true }
+      const alias = { email: 'alias@example.test', isPrimary: false, isDefault: false }
+      const box = referenceMailbox(`senders-outage-${code}`, primary.email, [])
+      let outage = false, removed = false
+      const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() {
+          if (outage) throw new ProviderError(DYNAMIC, code, 'Fictional outage', { retryable: code !== 'AUTHORIZATION', retryAfter: 1 })
+          return removed ? [primary] : [primary, alias]
+        },
+      }) }] })
+      const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+      const draft = await h.draft('alice', account.id, { from: alias.email, to: [participant('recipient@example.test')] })
+      await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+      const operation = await h.submit('alice', draft, `outage-${code}`)
+      outage = true; await h.inbox.runDue()
+      expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: code === 'AUTHORIZATION' ? 'failed' : 'pending', problem: { code } })
+      expect((await h.inbox.account('alice', account.id)).status).toBe('connected')
+      if (code !== 'AUTHORIZATION') {
+        outage = false; removed = true; h.clock.value += 300_000; await h.inbox.runDue()
+        expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'failed', problem: { code: 'FORBIDDEN_SENDER' } })
+      }
+      expect(await h.inbox.draft('alice', draft.id)).toMatchObject({ status: 'active', from: alias.email })
+      expect(box.calls.send).toEqual([])
+    }
+  })
+
+  test('sending identities recheck draft revisions after lookup and retain idempotent acceptance across lost acknowledgements', async () => {
+    const primary = { email: 'primary@example.test', isPrimary: true, isDefault: true }
+    const box = referenceMailbox('senders-revision', primary.email, [])
+    let wait: (() => Promise<SendingIdentity[]>) | undefined, calls = 0
+    const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() { calls++; return wait ? wait() : [primary] },
+    }) }] })
+    const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+    const draft = await h.draft('alice', account.id, { to: [participant('recipient@example.test')] })
+    const barrier = h.gate([primary]); wait = barrier.wait
+    const submit = h.pending(h.inbox.submit('alice', draft.id, { revision: draft.revision, idempotencyKey: 'racing-editor' }))
+    await bounded(barrier.entered, 'submit sender check')
+    const edited = await h.inbox.updateDraft('alice', draft.id, { subject: 'Newer edit' }, draft.revision)
+    barrier.release(); wait = undefined
+    await expect(submit).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' })
+    expect(await h.inbox.draft('alice', draft.id)).toMatchObject({ status: 'active', subject: 'Newer edit' })
+    const operation = await h.inbox.submit('alice', edited.id, { revision: edited.revision, idempotencyKey: 'lost-ack' })
+    const acceptedCalls = calls
+    await h.restart()
+    expect(await h.inbox.submit('alice', edited.id, { revision: edited.revision, idempotencyKey: 'lost-ack' })).toEqual(operation)
+    expect(calls).toBe(acceptedCalls); expect(box.calls.send).toEqual([])
+  })
+
+  test('sending identities fence ordinary credential-version rotation even without source generation changes', async () => {
+    const primary = { email: 'primary@example.test', isPrimary: true, isDefault: true }
+    const oldAlias = { email: 'old@example.test', isPrimary: false, isDefault: false }
+    const box = referenceMailbox('senders-version', primary.email, [])
+    let rotate = false, wait: (() => Promise<SendingIdentity[]>) | undefined
+    const h = await fixture({ resolveCredentials: context => Promise.resolve(rotate ? { accessToken: 'new-fictional' } : { ...context.credentials }),
+      providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() {
+          return credentials.accessToken === 'old-fictional' && wait ? wait() : [primary]
+        },
+      }) }] })
+    const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: { accessToken: 'old-fictional' } })
+    const barrier = h.gate([primary, oldAlias]); wait = barrier.wait
+    const old = h.pending(h.inbox.sendingIdentities('alice', account.id))
+    await bounded(barrier.entered, 'old credential sender lookup')
+    rotate = true
+    expect((await h.inbox.sendingIdentities('alice', account.id, { refresh: true })).identities).toEqual([primary])
+    barrier.release()
+    await expect(old).rejects.toMatchObject({ code: 'CREDENTIALS_CHANGED' })
+    expect((await h.inbox.account('alice', account.id)).generation).toBe(account.generation)
+    expect((await h.inbox.sendingIdentities('alice', account.id)).identities).toEqual([primary])
+    expect(box.calls.send).toEqual([])
+  })
+
+  test('sending identities are checked after attachment hydration and before dispatch, not against the earlier submit snapshot', async () => {
+    const primary = { email: 'primary@example.test', isPrimary: true, isDefault: true }
+    const alias = { email: 'alias@example.test', isPrimary: false, isDefault: false }
+    const attachment: Attachment = { id: 'native-file', filename: 'fictional.txt', contentType: 'text/plain', size: 3, url: '' }
+    const box = referenceMailbox('senders-attachment', primary.email, [native('with-file', { attachments: [attachment] })])
+    let removed = false, checks = 0, wait: (() => Promise<AttachmentData>) | undefined
+    const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities),
+      async getSendingIdentities() { checks++; return removed ? [primary] : [primary, alias] },
+      async getAttachment() { return wait!() },
+    }) }] })
+    const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+    await h.inbox.sync('alice', account.id)
+    const message = await h.inbox.message('alice', (await h.page()).items[0]!.id)
+    const draft = await h.draft('alice', account.id, { from: alias.email, to: [participant('recipient@example.test')], attachmentIds: message.attachments.map(blob => blob.id) })
+    await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+    const operation = await h.submit('alice', draft, 'attachment-before-sender')
+    const barrier = h.gate({ attachment, filename: attachment.filename, contentType: attachment.contentType, content: new Uint8Array([1, 2, 3]) })
+    wait = barrier.wait
+    const due = h.pending(h.inbox.runDue())
+    await bounded(barrier.entered, 'attachment before sending identity check')
+    expect(checks).toBe(1)
+    removed = true; barrier.release(); await due
+    expect(checks).toBe(2); expect(box.calls.send).toEqual([])
+    expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'failed', problem: { code: 'FORBIDDEN_SENDER' } })
+  })
+
+  test('sending identities fence credential rotation during queued validation and retry without dispatching the removed alias', async () => {
+    const primary = { email: 'primary@example.test', isPrimary: true, isDefault: true }
+    const alias = { email: 'alias@example.test', isPrimary: false, isDefault: false }
+    const box = referenceMailbox('senders-queued-version', primary.email, [])
+    let token = 'first-fictional', wait: (() => Promise<SendingIdentity[]>) | undefined
+    const h = await fixture({ resolveCredentials: async () => ({ accessToken: token }),
+      providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() {
+          return credentials.accessToken === 'first-fictional' ? wait ? wait() : [primary, alias] : [primary]
+        },
+      }) }] })
+    const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: { accessToken: token } })
+    const draft = await h.draft('alice', account.id, { from: alias.email, to: [participant('recipient@example.test')] })
+    await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+    const operation = await h.submit('alice', draft, 'queued-version')
+    const barrier = h.gate([primary, alias]); wait = barrier.wait
+    const due = h.pending(h.inbox.runDue())
+    await bounded(barrier.entered, 'queued old credential sender lookup')
+    token = 'replacement-fictional'
+    expect((await h.inbox.sendingIdentities('alice', account.id, { refresh: true })).identities).toEqual([primary])
+    barrier.release(); await due
+    expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'pending', problem: { code: 'CREDENTIALS_CHANGED' } })
+    expect(box.calls.send).toEqual([])
+    h.clock.value += 300_000; await h.inbox.runDue()
+    expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'failed', problem: { code: 'FORBIDDEN_SENDER' } })
+    expect(box.calls.send).toEqual([])
+  })
+
+  test('sending identities refresh again after authentication rejection and do not misclassify a removed alias as an uncertain send', async () => {
+    const primary = { email: 'primary@example.test', isPrimary: true, isDefault: true }
+    const alias = { email: 'alias@example.test', isPrimary: false, isDefault: false }
+    const box = referenceMailbox('senders-auth-retry', primary.email, [])
+    let calls = 0, refreshed = 0
+    const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC,
+      async refresh() { refreshed++; return { accessToken: 'replacement-fictional' } },
+      create: credentials => ({ ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() {
+        calls++; return credentials.accessToken === 'replacement-fictional' ? [primary] : [primary, alias]
+      } }),
+    }] })
+    const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: { accessToken: 'first-fictional' } })
+    const draft = await h.draft('alice', account.id, { from: alias.email, to: [participant('recipient@example.test')] })
+    await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+    const operation = await h.submit('alice', draft, 'retry-auth')
+    box.nextSend(new ProviderAuthenticationError(DYNAMIC))
+    await h.inbox.runDue()
+    expect(calls).toBe(3); expect(refreshed).toBe(1); expect(box.calls.send).toHaveLength(1)
+    expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'failed', problem: { code: 'FORBIDDEN_SENDER' } })
+    expect(await h.inbox.draft('alice', draft.id)).toMatchObject({ status: 'active', from: alias.email })
+  })
+
+  test('sending identities never dispatch a late timed-out lookup after a same-credential provider instance is recreated', async () => {
+    const primary = { email: 'primary@example.test', isPrimary: true, isDefault: true }
+    const alias = { email: 'alias@example.test', isPrimary: false, isDefault: false }
+    const box = referenceMailbox('senders-timeout', primary.email, [])
+    let wait: (() => Promise<SendingIdentity[]>) | undefined, removed = false
+    const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() { return wait ? wait() : removed ? [primary] : [primary, alias] },
+    }) }] })
+    const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+    const draft = await h.draft('alice', account.id, { from: alias.email, to: [participant('recipient@example.test')] })
+    await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+    const operation = await h.submit('alice', draft, 'timed-out-lookup')
+    const barrier = h.gate([primary, alias]); wait = barrier.wait
+    const timeout = AbortSignal.timeout.bind(AbortSignal), interrupted = new AbortController()
+    const spy = spyOn(AbortSignal, 'timeout').mockImplementation(ms => ms === 30_000 ? interrupted.signal : timeout(ms))
+    try {
+      const due = h.pending(h.inbox.runDue())
+      await bounded(barrier.entered, 'timed-out sender lookup')
+      interrupted.abort(); await due
+      expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'pending', problem: { code: 'NETWORK' } })
+    } finally { spy.mockRestore() }
+    wait = undefined; removed = true
+    expect((await h.inbox.sendingIdentities('alice', account.id, { refresh: true })).identities).toEqual([primary])
+    barrier.release(); await Bun.sleep(0)
+    expect(box.calls.send).toEqual([])
+    expect((await h.inbox.sendingIdentities('alice', account.id)).identities).toEqual([primary])
+  })
+
+  test('sending identities check the current mailbox and lease after an in-flight dispatch lookup', async () => {
+    for (const action of ['detach', 'reconnect', 'disconnect'] as const) {
+      const primary = { email: 'primary@example.test', isPrimary: true, isDefault: true }
+      const box = referenceMailbox(`senders-${action}`, primary.email, [])
+      let wait: (() => Promise<SendingIdentity[]>) | undefined
+      const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() { return wait ? wait() : [primary] },
+      }) }] })
+      const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+      const draft = await h.draft('alice', account.id, { mailboxId: account.id, to: [participant('recipient@example.test')] })
+      await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+      const operation = await h.submit('alice', draft, `dispatch-${action}`)
+      const barrier = h.gate([primary]); wait = barrier.wait
+      const due = h.pending(h.inbox.runDue())
+      await bounded(barrier.entered, 'queued sender lookup')
+      if (action === 'detach') await h.inbox.updateMailbox('alice', account.id, { status: 'detached' }, (await h.inbox.mailbox('alice', account.id)).revision)
+      else if (action === 'reconnect') await h.inbox.reconnect('alice', account.id, {})
+      else await h.inbox.disconnect('alice', account.id)
+      barrier.release(); await due
+      expect(box.calls.send).toEqual([])
+      expect(['cancelled', 'uncertain']).toContain((await h.inbox.operation('alice', operation.id)).status)
+    }
   })
 })
 

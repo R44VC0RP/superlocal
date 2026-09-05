@@ -14,7 +14,7 @@ import { CredentialError, InboxError, MAILBOX_SYNC_PROBLEM_CODES, type MailboxSy
   type MessageSummary, type MutationInput, type Operation, type Participant, type Policy,
   type Problem, type Query, type SyncCheckpoint, type SyncRequest, type ThreadSummary, type Connection, type ConnectionIdentity,
   type Mailbox, type MailboxCandidate, type MailboxInput, type MailboxMembership, type MailboxMessageSummary,
-  type MailboxQuery, type MailboxSelector, type MailboxStateReceipt, type MailboxChangesPage } from './contracts'
+  type MailboxQuery, type MailboxSelector, type MailboxStateReceipt, type MailboxChangesPage, type SendingIdentity, type SendingIdentities } from './contracts'
 
 type AccountRow = { id: string; owner: string; generation: number; status: Account['status']; data: string; native: string; credentials: string; connection_id: string; connection_generation: number; credential_version: number }
 type ConnectionRow = { id: string; owner: string; generation: number; status: Connection['status']; credential_version: number; data: string; credentials: string }
@@ -152,6 +152,9 @@ export function createInbox(options: InboxOptions): Inbox {
   const disconnecting = new Set<Promise<void>>()
   const refreshes = new Map<string, Promise<ConnectionRow>>()
   const credentialUpdates = new Set<Promise<CredentialState>>()
+  const identityCache = new Map<string, { value: SendingIdentities | null; expires: number; sequence: number }>()
+  const identityFlights = new Map<string, Promise<SendingIdentities>>()
+  let identitySequence = 0
   const syncing = new Map<string, Promise<{ synchronized: number; hasMore: boolean; state: string }>>()
   type SyncActivity = { owner: string; sourceId: string; binding: string; folder: string; lane: 'latest' | 'backfill'; visible: boolean }
   const syncActivity = new Map<string, SyncActivity>()
@@ -179,6 +182,7 @@ export function createInbox(options: InboxOptions): Inbox {
       listeners.clear()
       inventories.clear(); inventoryBytes = 0
       syncActivity.clear(); syncCompletions.clear()
+      identityCache.clear(); identityFlights.clear()
       if (ownsDatabase) db.close()
     }),
   ))
@@ -282,6 +286,7 @@ export function createInbox(options: InboxOptions): Inbox {
   function retireSource(owner: string, id: string, abort = true, version = Number.MAX_SAFE_INTEGER): void {
     if (abort) forgetSyncStatus(owner, id)
     const prefix = `${owner}\0${id}\0`
+    for (const key of identityCache.keys()) if (key.startsWith(prefix)) identityCache.delete(key)
     for (const key of new Set([...controllers.keys(), ...instances.keys()])) {
       if (key.startsWith(prefix) && (abort || (instanceVersions.get(key) ?? 0) <= version)) retireInstance(key, abort)
     }
@@ -760,6 +765,76 @@ export function createInbox(options: InboxOptions): Inbox {
     return provider
   }
 
+  function assertIdentityBinding(row: AccountRow, key: string, controller = controllers.get(key)): void {
+    if (closed || stopping || !controller || controller.signal.aborted || controllers.get(key) !== controller || retiring.has(key) ||
+      !current(row) || generationKey(accountRow(row.owner, row.id)) !== key) {
+      throw new InboxError('CREDENTIALS_CHANGED', 'Connection changed while checking sending identities.', 409, true)
+    }
+  }
+
+  async function providerSendingIdentities(row: AccountRow, provider: InboxProvider, refresh = false, exclusive = false): Promise<SendingIdentities> {
+    // providerFor resolves/rotates credentials before this callback. Never capture this key earlier.
+    const key = generationKey(row), controller = controllers.get(key)
+    assertIdentityBinding(row, key, controller)
+    const native = JSON.parse(row.native) as MailAccount
+    if (!provider.getSendingIdentities) {
+      const seen = new Set<string>()
+      return { sourceId: row.id, checkedAt: null, identities: [native.email, ...native.aliases ?? []]
+        .filter(email => typeof email === 'string' && email.includes('@') && !seen.has(email.toLowerCase()) && !!seen.add(email.toLowerCase()))
+        .map(email => ({ email, isPrimary: email.toLowerCase() === native.email.toLowerCase(), isDefault: email.toLowerCase() === native.email.toLowerCase() })) }
+    }
+    for (const [entry, cached] of identityCache) if (cached.expires <= now()) identityCache.delete(entry)
+    const cached = identityCache.get(key)
+    if (!refresh && cached?.value) return structuredClone(cached.value)
+    const pending = exclusive ? undefined : identityFlights.get(key)
+    if (pending) {
+      const value = await pending
+      assertIdentityBinding(row, key, controller)
+      return structuredClone(value)
+    }
+    if (!exclusive && identityFlights.size >= 128) throw new InboxError('RATE_LIMITED', 'Sending identity discovery is busy.', 429, true)
+    const sequence = ++identitySequence
+    const lookup = (async () => {
+      try {
+        const offered = await provider.getSendingIdentities!()
+        assertIdentityBinding(row, key, controller)
+        if (!Array.isArray(offered) || offered.length > 100) throw new InboxError('INVALID_PROVIDER', 'Invalid sending identity response.', 502)
+        const seen = new Set<string>()
+        const identities = offered.map(identity => {
+          if (!identity || typeof identity.email !== 'string' || identity.email.length > 1024 ||
+            !/^[^\s<>@]+@[^\s<>@]+$/.test(identity.email) || /[\x00-\x1f\x7f]/.test(identity.email) ||
+            typeof identity.isPrimary !== 'boolean' || typeof identity.isDefault !== 'boolean' ||
+            seen.has(identity.email.toLowerCase()) || identity.isPrimary && identity.email.toLowerCase() !== native.email.toLowerCase()) {
+            throw new InboxError('INVALID_PROVIDER', 'Invalid sending identity response.', 502)
+          }
+          seen.add(identity.email.toLowerCase())
+          return { email: identity.email, isPrimary: identity.isPrimary, isDefault: identity.isDefault }
+        })
+        if (identities.filter(identity => identity.isPrimary).length > 1 || identities.filter(identity => identity.isDefault).length > 1) {
+          throw new InboxError('INVALID_PROVIDER', 'Conflicting sending identities.', 502)
+        }
+        const value: SendingIdentities = { sourceId: row.id, identities, checkedAt: new Date(now()).toISOString() }
+        // An older overlapping read may not replace a newer completed snapshot.
+        if ((identityCache.get(key)?.sequence ?? 0) <= sequence) {
+          identityCache.delete(key)
+          identityCache.set(key, { value, expires: now() + 60_000, sequence })
+          while (identityCache.size > 128) identityCache.delete(identityCache.keys().next().value!)
+        }
+        return value
+      } catch (error) {
+        if ((identityCache.get(key)?.sequence ?? 0) <= sequence) {
+          identityCache.delete(key)
+          identityCache.set(key, { value: null, expires: now() + 60_000, sequence })
+          while (identityCache.size > 128) identityCache.delete(identityCache.keys().next().value!)
+        }
+        throw error
+      }
+    })()
+    if (!exclusive) identityFlights.set(key, lookup)
+    try { return structuredClone(await lookup) }
+    finally { if (identityFlights.get(key) === lookup) identityFlights.delete(key) }
+  }
+
   function refreshCapabilities(row: AccountRow, provider: InboxProvider): void {
     if (!current(row)) return
     const account = JSON.parse(accountRow(row.owner, row.id).data) as Account
@@ -1155,10 +1230,10 @@ export function createInbox(options: InboxOptions): Inbox {
     return JSON.parse(row.data)
   }
 
-  function validateDraft(owner: string, input: DraftInput, submitting = false): Required<Omit<DraftInput, 'sourceMessageId' | 'mailboxId'>> & { sourceMessageId?: string; mailboxId?: string } {
+  function validateDraft(owner: string, input: DraftInput, submitting = false, identities?: readonly SendingIdentity[]): Required<Omit<DraftInput, 'sourceMessageId' | 'mailboxId'>> & { sourceMessageId?: string; mailboxId?: string } {
     const row = accountRow(owner, input.accountId)
     const native = JSON.parse(row.native)
-    const own = [native.email, ...(native.aliases ?? [])].filter((v: unknown) => typeof v === 'string') as string[]
+    const own = identities ? identities.map(identity => identity.email) : [native.email, ...(native.aliases ?? [])].filter((v: unknown) => typeof v === 'string') as string[]
     const box = input.mailboxId ? JSON.parse(mailboxRow(owner, input.mailboxId, true).data) as Mailbox : null
     if (box && box.sourceId !== row.id) throw new InboxError('NOT_FOUND', 'Mailbox belongs to a different source.', 404)
     const from = input.from ?? box?.defaultSender ?? native.email
@@ -1266,7 +1341,7 @@ export function createInbox(options: InboxOptions): Inbox {
         if (options.allowProviderWrites === false) throw new InboxError('PROVIDER_WRITES_DISABLED', 'Provider writes are disabled for this deployment.', 403)
         const payload = JSON.parse(row.payload) as SendPayload
         const draft = payload.draft
-        validateDraft(row.owner, draft, true)
+        validateDraft(row.owner, draft)
         const attachments = await Promise.all(payload.blobs.map(async blob => ({ filename: blob.filename,
           content: (await inbox.download(row.owner, blob.id)).content, contentType: blob.contentType, contentId: blob.contentId, inline: blob.inline })))
         if (!ownsLease(row) || !current(account)) return
@@ -1274,7 +1349,23 @@ export function createInbox(options: InboxOptions): Inbox {
           subject: draft.subject, text: draft.bodyText, html: draft.bodyHtml, attachments,
           ...(['reply', 'replyAll'].includes(draft.mode) ? { threadId: payload.nativeThread, sourceMessageId: payload.nativeSource, inReplyTo: payload.inReplyTo,
             references: payload.references, replyAll: false } : {}), headers: { 'X-Inbox-Submission-ID': op.id } }
-        const receipt = await io(account, provider => { dispatched = true; return provider.send(input) })
+        const receipt = await io(account, async provider => {
+          const key = generationKey(account), controller = controllers.get(key)
+          const identities = await providerSendingIdentities(account, provider, true, true)
+          if (!ownsLease(row)) return null
+          assertIdentityBinding(account, key, controller)
+          validateDraft(row.owner, draft, true, identities.identities)
+          if (!provider.capabilities.send || (['reply', 'replyAll'].includes(draft.mode) && !provider.capabilities.reply)) throw new InboxError('UNSUPPORTED_OPERATION', 'This account cannot send this message.', 409)
+          dispatched = true
+          try { return await provider.send(input) }
+          catch (error) {
+            // io may retry only a definitely rejected authentication attempt. A later
+            // identity/credential failure must not inherit an uncertain-dispatch flag.
+            if (error instanceof ProviderError && error.code === 'AUTHENTICATION') dispatched = false
+            throw error
+          }
+        })
+        if (receipt === null) return
         transaction(() => {
           if (!ownsLease(row)) return
           if (!current(account)) {
@@ -1813,6 +1904,14 @@ export function createInbox(options: InboxOptions): Inbox {
       return db.query<AccountRow, [string]>('SELECT * FROM sdk_accounts WHERE owner=? ORDER BY rowid').all(owner).map(row => JSON.parse(row.data))
     }),
     account: (owner, id) => run(() => JSON.parse(accountRow(owner, id).data)),
+    sendingIdentities: (owner, sourceId, input = {}) => run(async () => {
+      if (!input || Object.keys(input).some(key => key !== 'refresh') || input.refresh !== undefined && typeof input.refresh !== 'boolean') throw new InboxError('VALIDATION', 'Invalid sending identity options.')
+      const row = accountRow(owner, sourceId, true)
+      const result = await io(row, provider => providerSendingIdentities(row, provider, input.refresh))
+      assertIdentityBinding(row, generationKey(row))
+      if (result.identities.length > 100) throw new InboxError('SENDING_IDENTITIES_TOO_LARGE', 'Sending identity discovery supports at most 100 identities.', 413)
+      return result
+    }),
 
     connections: owner => run(() => {
       ownerId(owner)
@@ -2258,14 +2357,32 @@ export function createInbox(options: InboxOptions): Inbox {
       return db.query<DataRow, [string, string | null, string | null]>("SELECT * FROM sdk_drafts WHERE owner=? AND (? IS NULL OR account=?) AND json_extract(data,'$.status')='active' ORDER BY rowid").all(owner, id ?? null, id ?? null).map(row => JSON.parse(row.data))
     }),
     draft: (owner, id) => run(() => draftRow(owner, id)),
-    createDraft: (owner, input) => run(() => {
+    createDraft: (owner, input) => run(async () => {
       const account = accountRow(owner, input.accountId)
+      validateDraft(owner, input)
+      const replying = input.mode === 'reply' || input.mode === 'replyAll'
+      const sending = replying ? await io(account, provider => providerSendingIdentities(account, provider)) : undefined
+      if (sending) assertIdentityBinding(account, generationKey(account))
       let prepared = { ...input }
       if (input.sourceMessageId) {
         const source = messageRow(owner, input.sourceMessageId)
         if (source.account !== account.id) throw new InboxError('NOT_FOUND', 'Source message not found.', 404)
         const base = summary(source); const body = JSON.parse(source.body)
-        const native = JSON.parse(account.native); const own = new Set([native.email, ...native.aliases ?? []].map((v: string) => v.toLowerCase()))
+        const native = JSON.parse(account.native)
+        const identities: string[] = sending?.identities.map(identity => identity.email) ?? [native.email, ...native.aliases ?? []]
+        const own = new Set(identities.map(email => email.toLowerCase()))
+        if (replying && input.from === undefined) {
+          const box = input.mailboxId ? JSON.parse(mailboxRow(owner, input.mailboxId, true).data) as Mailbox : null
+          const eligible = (email: string | null | undefined) => {
+            if (!email || !own.has(email.toLowerCase())) return undefined
+            if (box) { try { assertMailboxSender(box, email) } catch { return undefined } }
+            return identities.find(value => value.toLowerCase() === email.toLowerCase())
+          }
+          const matches = [...new Set([...base.to, ...base.cc].flatMap(recipient => eligible(recipient.email) ?? []))]
+          const from = (base.folder === 'sent' ? eligible(base.from.email) : undefined) ?? (matches.length === 1 ? matches[0] : undefined) ?? eligible(box?.defaultSender) ?? eligible(native.email)
+          if (!from) throw new InboxError('FORBIDDEN_SENDER', 'No authorized sender is available for this reply.', 403)
+          prepared.from = from
+        }
         const seen = new Set<string>()
         const unique = (values: Participant[]) => values.filter(p => { const email = p.email.toLowerCase(); if (own.has(email) || seen.has(email)) return false; seen.add(email); return true })
         if (input.mode === 'reply' || input.mode === 'replyAll') {
@@ -2295,17 +2412,21 @@ export function createInbox(options: InboxOptions): Inbox {
       db.query('DELETE FROM sdk_drafts WHERE owner=? AND id=?').run(owner, id); event(owner, 'draft.updated', draft.accountId, id, 'deleted')
     })),
 
-    submit: (owner, id, input) => run(() => {
+    submit: (owner, id, input) => run(async () => {
       if (options.allowProviderWrites === false) throw new InboxError('PROVIDER_WRITES_DISABLED', 'Provider writes are disabled for this deployment.', 403)
       const intent = { type: 'send', id, revision: input.revision, sendAt: input.sendAt ?? null }
       const previous = replay(owner, input.idempotencyKey, intent); if (previous) return previous
       const draft = draftRow(owner, id); const account = accountRow(owner, draft.accountId, true)
       if (draft.revision !== input.revision) throw new InboxError('PRECONDITION_FAILED', 'The draft was modified.', 412)
       if (draft.status !== 'active') throw new InboxError('CONFLICT', 'This draft was already submitted.', 409)
-      validateDraft(owner, draft, true)
+      validateDraft(owner, draft)
       if (!draft.to.length && !draft.cc.length && !draft.bcc.length) throw new InboxError('VALIDATION', 'At least one recipient is required.')
-      const capabilities = (JSON.parse(account.data) as Account).capabilities
-      if (!capabilities.send || (['reply', 'replyAll'].includes(draft.mode) && !capabilities.reply)) throw new InboxError('UNSUPPORTED_OPERATION', 'This account cannot send this message.', 409)
+      const sending = await io(account, async provider => {
+        const identities = await providerSendingIdentities(account, provider, true, true)
+        assertIdentityBinding(account, generationKey(account))
+        if (!provider.capabilities.send || (['reply', 'replyAll'].includes(draft.mode) && !provider.capabilities.reply)) throw new InboxError('UNSUPPORTED_OPERATION', 'This account cannot send this message.', 409)
+        return identities
+      })
       let at = now() + getPolicy(owner).undoSendSeconds * 1000
       if (input.sendAt !== undefined) {
         const parsed = Date.parse(input.sendAt)
@@ -2324,7 +2445,12 @@ export function createInbox(options: InboxOptions): Inbox {
       return transaction(() => {
         const repeated = replay(owner, input.idempotencyKey, intent); if (repeated) return repeated
         const latest = draftRow(owner, id)
-        if (latest.revision !== input.revision || latest.status !== 'active') throw new InboxError('PRECONDITION_FAILED', 'The draft was modified.', 412)
+        if (latest.revision !== input.revision) throw new InboxError('PRECONDITION_FAILED', 'The draft was modified.', 412)
+        if (latest.status !== 'active') throw new InboxError('CONFLICT', 'This draft was already submitted.', 409)
+        assertIdentityBinding(account, generationKey(account))
+        validateDraft(owner, latest, true, sending.identities)
+        const capabilities = (JSON.parse(accountRow(owner, account.id).data) as Account).capabilities
+        if (!capabilities.send || (['reply', 'replyAll'].includes(latest.mode) && !capabilities.reply)) throw new InboxError('UNSUPPORTED_OPERATION', 'This account cannot send this message.', 409)
         const op = accept(owner, account, 'send', input.idempotencyKey, intent, payload, at)
         latest.status = 'submitted'
         db.query('UPDATE sdk_drafts SET data=? WHERE owner=? AND id=?').run(JSON.stringify(latest), owner, id); event(owner, 'draft.updated', account.id, id)

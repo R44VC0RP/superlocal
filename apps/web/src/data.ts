@@ -1,6 +1,8 @@
-import type { MailboxMembership } from "inbox-sdk/types";
+import type { MailboxMembership, SendingIdentities } from "inbox-sdk/types";
 import type { AttentionDecision } from "../../shared/mail-attention";
 import type { AiDecision, AiCategory } from "../../shared/ai-triage";
+
+export type LoadSendingIdentities = (mailboxId: string, input?: { refresh?: boolean }) => Promise<SendingIdentities>;
 
 export { readSaved as loadSaved } from "./storage.ts";
 
@@ -48,6 +50,8 @@ export type Mail = {
   from: string;
   email: string;
   to: string;
+  /** Actual To header addresses, never receiving-mailbox ownership or Cc/Bcc. */
+  toAddresses?: string[];
   subject: string;
   snippet: string;
   date: string;
@@ -96,11 +100,13 @@ export type Draft = {
   saving?: boolean;
   dirty?: boolean;
   saveError?: string;
+  sendError?: { message: string; code: string };
   from?: string;
 };
 export type MailboxOption = {
   id: string;
   sourceId: string;
+  sourceGeneration?: number;
   name: string;
   email: string;
   canSend: boolean;

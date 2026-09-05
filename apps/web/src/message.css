@@ -345,13 +345,13 @@
   font-weight: 700;
 }
 .compose-from > span {
-  width: 50px;
+  width: 64px;
   flex-shrink: 0;
   color: inherit;
 }
 .compose-from select {
   min-width: 0;
-  max-width: calc(100% - 68px);
+  max-width: calc(100% - 84px);
   border: 0;
   outline: none;
   padding: 2px 4px;
@@ -367,6 +367,35 @@
 .compose-from > .icon {
   margin-left: 7px;
   color: var(--subtle);
+}
+.compose-sender-status {
+  padding-left: 64px;
+  color: var(--muted);
+  font-size: var(--ui-small);
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+.compose-sender-status:empty {
+  display: none;
+}
+.compose-sender-status.is-error {
+  color: #efa2a2;
+}
+.compose-sender-status button {
+  margin-left: 8px;
+  min-height: 40px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.compose-from select:focus-visible,
+.compose-sender-status button:focus-visible {
+  outline: 2px solid var(--muted);
+  outline-offset: 2px;
 }
 .compose-subject {
   display: block;
