@@ -10,7 +10,11 @@ Review base: `ca3c9a924c24d597a9e5ee912fc57bb449435bc2`, verified healthy in pro
 
 Both captures were inspected. Current optimized application source, 172-message fictional fixture, 1440×1000 / DPR1 / 100%, Carbon (Dark), Comfortable, Super Sans Normal. Existing fixture contains one explicitly synthetic saved notification assessment (no reply needed; confirmation action) scored Other at −8. It is a controlled saved-state reproduction, not a claim of real model inference. Local provider configuration is a loopback discard endpoint; no cloud credentials, paid inference or real mail is present.
 
-The initial read-only browser attempt to inspect the fictional reader invalidated a placeholder fixture fingerprint and produced three loopback-only failures. Those are a fixture limitation, not an application classification finding. The initial Settings captures above predate that experiment; a pristine paired fixture is retained. Reader baseline stabilization is pending before editing that surface.
+![Current fictional conversation assessment](before-reader.png)
+
+![Current fictional Other placement](before-other.png)
+
+The initial reader experiment invalidated a placeholder fixture fingerprint and produced three loopback-only failures. Those are a fixture limitation, not an application classification finding. The private failed fixture is retained. Before editing the reader, the fixture was repaired using the actual public SDK semantic fingerprint and captured body revision; the matching baseline/candidate each retain 172 messages, one ready synthetic decision, the same unread state, zero queued work and zero attempts. The repaired reader and Other screenshots above were inspected. Replay opens the selected fictional thread first to resolve current cached body context, then opens the assessment and returns to the list.
 
 ## Intended behavior
 
