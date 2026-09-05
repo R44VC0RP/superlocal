@@ -14,7 +14,6 @@ type Field = NonNullable<HostProvider["fields"]>[number];
 const mailboxKey = (sourceId: string, selector: MailboxSelector) => JSON.stringify([sourceId, selector.kind, selector.kind === "all" ? null : selector.value]);
 const problem = (cause: unknown, fallback: string) => cause instanceof Error ? cause.message : fallback;
 const scopeLabel = (selector: MailboxSelector) => selector.kind === "all" ? "All mail" : selector.value;
-const RETURN_DELAY = 1800;
 
 /**
  * Coverage without duplicates: every eligible "all mail" scope, every eligible domain, and every eligible
@@ -35,13 +34,14 @@ const method = (provider: HostProvider) =>
 const statusLabel = (source: Account) =>
   source.status === "reconnect_required" ? "Sign-in required" : source.status === "disconnected" ? "Disconnected" : "Connected";
 
-export default function ProviderConnections({ host, store, resume, onStepChange, onDone }: {
+export default function ProviderConnections({ host, store, resume, onStepChange, onDone, onBeforeRedirect }: {
   host: HostConfiguration | null;
   store: InboxStore;
   /** Present after an OAuth redirect: finish onboarding for this provider/connection immediately. */
   resume: { providerId: string; connectionId: string | null } | null;
   onStepChange: (state: { title: string; back: (() => void) | null; busy: boolean }) => void;
-  onDone: () => void;
+  onDone?: () => void;
+  onBeforeRedirect?: () => boolean;
 }) {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot);
   const configuration = snapshot.host ?? host;
@@ -78,12 +78,6 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
       : { title: provider?.name ?? "Connecting", back: step.phase === "failed" ? toPick : null, busy });
   }, [step, provider, busy, onStepChange]);
 
-  // Show "Connected" briefly, then land back in the refreshed inbox.
-  useEffect(() => {
-    if (step.kind !== "progress" || step.phase !== "connected") return;
-    const timer = setTimeout(onDone, RETURN_DELAY);
-    return () => clearTimeout(timer);
-  }, [step, onDone]);
 
   const report = (patch: Partial<Progress>) => {
     if (!mounted.current) return;
@@ -181,6 +175,7 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
         if (result.authorizeUrl) {
           const url = new URL(result.authorizeUrl, location.origin);
           if (url.origin !== location.origin) throw new Error("The host returned an unexpected authorization address.");
+          if (onBeforeRedirect?.() === false) throw new Error("Sign-in was canceled. Unsaved settings are still open.");
           location.assign(url.href);
           return;
         }
@@ -332,7 +327,7 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
       </p>}
       {step.added.length > 1 && step.phase !== "failed" && <ul className="provider-added">{step.added.map(name => <li key={name}>{name}</li>)}</ul>}
       {step.phase === "failed" && <p className="provider-connection-error" role="alert">{step.error}</p>}
-      {step.phase === "connected" && <button type="button" className="settings-button" onClick={onDone}>Open inbox</button>}
+      {step.phase === "connected" && <button type="button" className="settings-button" onClick={() => { setStep({ kind: "pick" }); onDone?.(); }}>Done</button>}
       {step.phase === "failed" && <div className="mailbox-bulk-actions">
         {failedAfterConnect
           ? <button type="button" className="settings-text-button" onClick={() => setUp(provider, step.connectionIds)}>Retry setup</button>

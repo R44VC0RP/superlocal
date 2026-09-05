@@ -1127,10 +1127,10 @@ kbd {
 .empty-mailbox > .icon {
   color: var(--accent);
 }
-.app:has(.empty-mailbox.inbox-zero) {
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero) {
   isolation: isolate;
 }
-.app:has(.empty-mailbox.inbox-zero)::before {
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero)::before {
   content: "";
   position: fixed;
   inset: 0;
@@ -1161,18 +1161,18 @@ kbd {
     transform: scale(1);
   }
 }
-.app:has(.empty-mailbox.inbox-zero) > .mail-workspace,
-.app:has(.empty-mailbox.inbox-zero) > .app-rail {
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero) > .mail-workspace,
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero) > .app-rail {
   --text: #fff;
   --muted: #ffffffb3;
   --subtle: #ffffff99;
   --icon: #ffffff99;
 }
-.app:has(.empty-mailbox.inbox-zero) > .app-rail {
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero) > .app-rail {
   background: transparent;
   border-color: #ffffff22;
 }
-.app:has(.empty-mailbox.inbox-zero) > .right-sidebar {
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero) > .right-sidebar {
   display: flex;
   position: absolute;
   right: 0;
@@ -1182,10 +1182,10 @@ kbd {
   background: transparent;
   border: 0;
 }
-.app:has(.empty-mailbox.inbox-zero) > .right-sidebar .sidebar-content {
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero) > .right-sidebar .sidebar-content {
   display: none;
 }
-.app:has(.empty-mailbox.inbox-zero):not(.settings-open):not(
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero):not(
     .mobile-sidebar-open
   )
   > .right-sidebar
@@ -1194,7 +1194,7 @@ kbd {
   --icon: #ffffffaa;
   --subtle: #ffffffaa;
 }
-.app:has(.empty-mailbox.inbox-zero):is(.settings-open, .mobile-sidebar-open)
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero).mobile-sidebar-open
   > .right-sidebar {
   display: flex;
   position: absolute;
@@ -1205,12 +1205,12 @@ kbd {
   height: auto;
   background: var(--sidebar);
 }
-.app:has(.empty-mailbox.inbox-zero):is(.settings-open, .mobile-sidebar-open)
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero).mobile-sidebar-open
   > .right-sidebar
   .sidebar-content {
   display: block;
 }
-.app:has(.empty-mailbox.inbox-zero):is(.settings-open, .mobile-sidebar-open)
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero).mobile-sidebar-open
   > .right-sidebar
   .sidebar-footer {
   background: var(--sidebar);
@@ -1667,13 +1667,16 @@ kbd {
 .auxiliary-view > .right-sidebar {
   display: none;
 }
-.auxiliary-view.settings-open > .right-sidebar {
+.app.settings-open > .mail-workspace,
+.app.settings-open > .right-sidebar {
+  display: none;
+}
+.settings-open .rail-mobile-actions {
   display: flex;
-  position: absolute;
-  right: 0;
-  top: 0;
-  bottom: 0;
-  z-index: 45;
+  flex-direction: column;
+}
+.settings-open .rail-mobile-actions > :last-child {
+  display: none;
 }
 .search-sidebar {
   height: 100%;
@@ -1850,7 +1853,7 @@ kbd {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .app:has(.empty-mailbox.inbox-zero)::before {
+  .app:not(.settings-open):has(.empty-mailbox.inbox-zero)::before {
     animation: none;
   }
   .folder-panel {

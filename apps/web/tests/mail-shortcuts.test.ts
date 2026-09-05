@@ -137,18 +137,21 @@ test("Control account numbers work in inputs and the account dialog, but not oth
   assert.deepEqual(resolve("0", { editing: true, modal: true, accountDialog: true }, { ctrlKey: true }), { type: "unified" });
   assert.equal(resolve("0", { modal: true }, { ctrlKey: true }), null);
   assert.equal(resolve("0", {}, { metaKey: true }), null);
-  assert.deepEqual(resolve("2", { settings: true }, { ctrlKey: true }), {
-    type: "account",
-    index: 1,
-  });
+  for (let index = 0; index <= 9; index++) {
+    assert.equal(resolve(String(index), { settings: true }, { ctrlKey: true }), null);
+    assert.equal(resolve(String(index), { settings: true, editing: true, modal: true, accountDialog: true }, { ctrlKey: true }), null);
+  }
   assert.deepEqual(resolve("1", {}, { ctrlKey: true, shiftKey: true }), {
     type: "account",
     index: 0,
   });
 });
 
-test("command and floating draft focus shortcuts precede editing guards", () => {
+test("command and floating draft focus shortcuts precede editing guards, but settings owns mail focus", () => {
   for (const modifier of [{ metaKey: true }, { ctrlKey: true }]) {
+    assert.deepEqual(resolve("k", { settings: true, editing: true }, modifier), { type: "command" });
+    assert.equal(resolve("d", { settings: true, floatingDraft: true }, modifier), null);
+    assert.equal(resolve("d", { settings: true, floatingDraft: true, editing: true }, modifier), null);
     assert.deepEqual(resolve("k", { editing: true }, modifier), {
       type: "command",
     });

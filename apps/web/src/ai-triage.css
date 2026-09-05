@@ -4,6 +4,46 @@
   gap: 16px;
   min-width: 0;
 }
+.ai-status,
+.ai-explanation {
+  display: grid;
+  gap: 8px;
+}
+.ai-status {
+  font-variant-numeric: tabular-nums;
+}
+.ai-status strong {
+  font-weight: 500;
+}
+.ai-explanation {
+  line-height: 1.55;
+  max-width: 78ch;
+}
+.ai-refresh {
+  justify-self: start;
+}
+.ai-job-progress {
+  display: block;
+  width: min(100%, 280px);
+  height: 4px;
+  appearance: none;
+  border: 0;
+  background: var(--border);
+  color: var(--muted);
+}
+.ai-job-progress::-webkit-progress-bar {
+  background: var(--border);
+}
+.ai-job-progress::-webkit-progress-value {
+  background: var(--muted);
+}
+.ai-job-progress::-moz-progress-bar {
+  background: var(--muted);
+}
+.settings-main .ai-table-scroll {
+  max-height: none;
+  overflow: visible;
+}
 .ai-settings-form fieldset {
   display: grid;
   gap: 12px;

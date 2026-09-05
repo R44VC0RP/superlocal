@@ -156,6 +156,7 @@ export default function Snippets({
     return `${value.toLocaleDateString("en-US", { month: "long" })} ${day}${suffix}, ${value.getFullYear()}`;
   }
   const shortcut = useEffectEvent((event: KeyboardEvent) => {
+    if (document.querySelector(".app.settings-open")) return;
     if (
       event.target instanceof HTMLElement &&
       event.target.closest('input,textarea,select,[contenteditable="true"]')
