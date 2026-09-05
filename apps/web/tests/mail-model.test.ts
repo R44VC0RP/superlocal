@@ -5,7 +5,7 @@ import { accounts, seedMail, defaultPreferences, type Draft, type Mail } from ".
 import { matchesSearch, splitRuleError } from "../src/mail-search.ts";
 import { selectMailView } from "../src/mail-view.ts";
 import { classifyAttention, conversationAttention } from "../../shared/mail-attention.ts";
-import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
+import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, aiSortingStatus, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
 import {
@@ -1132,6 +1132,29 @@ test("SDK-backed startup catches signed changes before first display without rep
     for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
   }
 });
+test("automatic sorting status never describes blocked or failed processing as healthy", () => {
+  const state: AiTriageState = { configured: true, provider: null, problemCode: null,
+    settings: { revision: 1, enabled: true, mode: "apply", model: "fixture-model", mailboxIds: null, personalization: true, readingSignals: false, interests: [] },
+    queue: { pending: 0, processing: 0, failed: 0 }, jobs: [], cursor: 0,
+    usage: { attempts: 0, completed: 0, failed: 0, reused: 0, unknownUsage: 0, unpriced: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0,
+      cacheWriteInputTokens: 0, reasoningOutputTokens: 0, estimatedMinimumUsd: 0, estimatedMaximumUsd: 0 } };
+  assert.deepEqual(aiSortingStatus(state), { tone: "normal", label: "Automatic sorting on" });
+  for (const problemCode of ["AI_DRAIN_FAILED", "AI_RECOVERY_LIMIT", "AI_MODEL_UNAVAILABLE", "AI_RESCORE_FAILED"]) {
+    const result = aiSortingStatus({ ...state, problemCode });
+    assert.equal(result.tone, "warning");
+    assert.equal(result.label, "Automatic sorting needs attention");
+    assert.ok(result.detail);
+  }
+  assert.equal(aiSortingStatus({ ...state, queue: { pending: 0, processing: 0, failed: 1 } }).label, "Some mail could not be sorted");
+  assert.equal(aiSortingStatus({ ...state, settings: { ...state.settings, mailboxIds: [] } }).tone, "warning");
+  assert.equal(aiSortingStatus(state, true).label, "Sorting status unavailable");
+  assert.equal(aiSortingStatus(null, true).tone, "warning");
+  assert.equal(aiSortingStatus({ ...state, configured: false }).tone, "warning");
+  assert.equal(aiSortingStatus({ ...state, settings: { ...state.settings, enabled: false } }).label, "Automatic sorting off");
+  assert.equal(aiSortingStatus({ ...state, settings: { ...state.settings, mode: "preview" } }).label, "Preview only");
+  assert.equal(aiSortingStatus({ ...state, queue: { pending: 1, processing: 0, failed: 0 } }).label, "Sorting new activity…");
+});
+
 test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bounded arrival holds and aborted generations", async () => {
   if (!process.versions.bun) {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {

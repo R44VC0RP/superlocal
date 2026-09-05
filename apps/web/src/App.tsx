@@ -13,6 +13,7 @@ import {
 } from "react";
 import { flushSync } from "react-dom";
 import { ApiError } from "inbox-sdk/client";
+import { aiSortingStatus } from "../../shared/ai-triage";
 import {
   defaultPreferences,
   displayDate,
@@ -1703,6 +1704,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     />
   );
 
+  const sortingStatus = aiSortingStatus(inbox.ai, !!inbox.aiError);
+  const sortingWarning = (inbox.ai ? inbox.ai.settings.enabled : !!inbox.aiError) && sortingStatus.tone === "warning";
+
   return (
     <div
       className={`app ${navigation ? "navigation-open" : ""} ${settings ? "settings-open" : ""} ${mobileSidebar ? "mobile-sidebar-open" : ""} ${route.view === "calendar" || route.view === "snippets" ? "auxiliary-view" : ""}`}
@@ -1994,6 +1998,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                 </div>
               )}
             </header>
+            {!search && route.folder === "Inbox" && sortingWarning && <div className="ai-sorting-warning" role="status">
+              <div><p>{sortingStatus.label}</p><p className="settings-note">{sortingStatus.detail}</p></div>
+              <button type="button" className="text-button" onClick={() => openSettings("AI triage")}>Sorting details</button>
+            </div>}
             <div
               key={listViewKey}
               className="mail-list animated-mail-list"

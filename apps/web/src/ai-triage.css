@@ -19,6 +19,41 @@
   line-height: 1.55;
   max-width: 78ch;
 }
+.ai-disclosure-body {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding-top: 12px;
+}
+.ai-triage-settings > .settings-checkbox-row {
+  min-height: 44px;
+}
+.ai-settings-disclosure > summary {
+  cursor: pointer;
+  min-height: 44px;
+  align-content: center;
+}
+.ai-settings-disclosure > summary:focus-visible {
+  outline: 2px solid var(--muted);
+  outline-offset: 3px;
+}
+.ai-sorting-warning {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  font: var(--ui-small) / 1.5 var(--font);
+}
+.ai-sorting-warning p {
+  margin: 0;
+}
+.ai-sorting-warning button {
+  min-height: 44px;
+}
 .ai-refresh {
   justify-self: start;
 }

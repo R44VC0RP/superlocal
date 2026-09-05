@@ -8898,6 +8898,75 @@ describe('AI triage inference and local scoring', () => {
     expect(scoreAiTriage(replyOnly, { ...neutral, explicitAffinity: -1, learnedTopicAffinity: -1 }).category).toBe('Important')
   })
 
+  test('clear task-aware mail without obligations stays Other despite type optional replies reported urgency or affinity', () => {
+    const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
+    const rich: AiScoreSignals = { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 }
+    const base: AiAssessment = { ...request, type: 'notification', response: 'not_needed', task: 'none', actions: [], urgency: 'routine', deadline: null }
+    const fixtures: Array<{ assessment: AiAssessment; signals: AiScoreSignals; quote: string; previousScore: number }> = [
+      { assessment: { ...base, type: 'request' }, signals: neutral, quote: 'Your request is complete. Nothing remains for you to do.', previousScore: 24 },
+      { assessment: { ...base, type: 'conversation', response: 'optional' }, signals: neutral, quote: 'Reply if you would like a summary; no response is needed.', previousScore: 23 },
+      { assessment: { ...base, urgency: 'immediate' }, signals: neutral, quote: 'Your urgent access issue is resolved. Nothing remains for you to do.', previousScore: 37 },
+      { assessment: base, signals: { ...neutral, correspondenceDays: 14 }, quote: 'A routine update; no action is needed.', previousScore: 20 },
+      { assessment: base, signals: { ...neutral, explicitAffinity: 1 }, quote: 'A routine update; no action is needed.', previousScore: 72 },
+      { assessment: base, signals: { ...neutral, interestMatches: 1 }, quote: 'A routine update; no action is needed.', previousScore: 42 },
+      { assessment: { ...base, type: 'newsletter', task: 'optional' }, signals: rich, quote: 'Browse this weekly digest if interested.', previousScore: 199 },
+      { assessment: { ...base, type: 'conversation', response: 'waiting' }, signals: rich, quote: 'Morgan will send the update. Nothing else is needed from you.', previousScore: 227 },
+    ]
+    for (const fixture of fixtures) {
+      const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional update', text: fixture.quote }] }
+      const evidence: AiAssessment['evidence'] = [{ messageRef: 'message-1', quote: 'Fictional update', field: 'type' }]
+      if (fixture.assessment.urgency === 'immediate') evidence.push({ messageRef: 'message-1', quote: fixture.quote, field: 'urgency' })
+      const assessment = validateAiAssessment({ ...fixture.assessment, evidence }, source)
+      const result = scoreAiTriage(assessment, fixture.signals)
+      expect(result).toMatchObject({ category: 'Other', score: 19, version: 'preference-3' })
+      expect(result.contributions).toContainEqual({ name: 'no_obligation_gate', value: 19 - fixture.previousScore })
+      expect(result.contributions.reduce((sum, item) => sum + item.value, 0)).toBe(result.score)
+      expect(result.contributions.some(item => item.name === 'actionability_gate')).toBe(false)
+      expect(scoreAiTriage(assessment, fixture.signals, { override: 'Important' })).toMatchObject({ category: 'Important', score: 19 })
+    }
+    const quote = 'Your submission with deadline 2026-09-15 is complete. No further action is needed.'
+    const completedDeadline = validateAiAssessment({ ...base, urgency: 'deadline', deadline: '2026-09-15', evidence: [
+      { messageRef: 'message-1', quote, field: 'type' }, { messageRef: 'message-1', quote, field: 'urgency' },
+    ] }, { ...input, messages: [{ ...input.messages[0]!, text: quote }] })
+    expect(scoreAiTriage(completedDeadline, neutral)).toMatchObject({ category: 'Other', score: 19 })
+    expect(scoreAiTriage({ ...base, evidence: [] }, { ...neutral, readingSeconds: 1_000_000 })).toMatchObject({ category: 'Other', score: -4 })
+  })
+
+  test('task-aware obligations remain Important across genres while risk uncertainty and manual overrides keep precedence', () => {
+    const disliked: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: -1, interestMatches: 0, learnedTopicAffinity: -1 }
+    for (const type of ['notification', 'newsletter', 'promotion', 'cold_outreach'] as const) {
+      for (const task of ['none', 'required'] as const) {
+        const quote = task === 'required' ? 'You must review the agreement to complete your requested delivery.' : 'Please reply to confirm the address for your requested delivery.'
+        const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional delivery follow-up', text: quote }] }
+        const assessment = validateAiAssessment({ ...request, type, task, response: task === 'required' ? 'not_needed' : 'needed',
+          actions: task === 'required' ? ['review'] : ['reply'], urgency: 'routine', deadline: null, evidence: [
+            { messageRef: 'message-1', quote: 'Fictional delivery follow-up', field: 'type' },
+            { messageRef: 'message-1', quote, field: task === 'required' ? 'task' : 'response' },
+            { messageRef: 'message-1', quote, field: 'action' },
+          ] }, source)
+        expect(scoreAiTriage(assessment, disliked)).toMatchObject({ category: 'Important', score: 20, version: 'preference-3' })
+        expect(scoreAiTriage(assessment, disliked, { override: 'Other' })).toMatchObject({ category: 'Other', score: 20 })
+      }
+    }
+    const noTask: AiAssessment = { ...request, type: 'notification', response: 'not_needed', task: 'none', actions: [], urgency: 'routine', deadline: null }
+    for (const change of [{ certainty: 'ambiguous' }, { certainty: 'insufficient' }, { type: 'unknown' }, { response: 'unknown' }, { task: 'unknown' }] as const) {
+      const score = scoreAiTriage({ ...noTask, ...change }, disliked)
+      expect(score).toMatchObject({ category: 'Important', score: 20 })
+      expect(score.contributions.some(item => item.name === 'no_obligation_gate')).toBe(false)
+    }
+    const rich: AiScoreSignals = { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 }
+    for (const risk of ['spam_suspected', 'phishing_suspected'] as const) {
+      expect(scoreAiTriage({ ...noTask, risk }, rich)).toMatchObject({ category: 'Other', score: -100 })
+      expect(scoreAiTriage({ ...noTask, risk }, rich, { override: 'Important' })).toMatchObject({ category: 'Important', score: -100 })
+    }
+    const quote = 'You must investigate this unauthorized account change immediately.'
+    const security = validateAiAssessment({ ...noTask, task: 'required', actions: ['investigate'], urgency: 'immediate', evidence: [
+      { messageRef: 'message-1', quote, field: 'type' }, { messageRef: 'message-1', quote, field: 'task' },
+      { messageRef: 'message-1', quote, field: 'action' }, { messageRef: 'message-1', quote, field: 'urgency' },
+    ] }, { ...input, messages: [{ ...input.messages[0]!, text: quote }] })
+    expect(scoreAiTriage(security, disliked)).toMatchObject({ category: 'Important', score: 20 })
+  })
+
   test('retained legacy task absence keeps its numeric scoring and evidence unchanged instead of becoming new unknown or required work', () => {
     const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
     const fixtures: Array<{ type: AiAssessment['type']; response: AiAssessment['response']; expected: number }> = [
@@ -8913,10 +8982,14 @@ describe('AI triage inference and local scoring', () => {
       legacy.evidence = legacy.evidence.filter(item => item.field !== 'task')
       const original = structuredClone(legacy)
       const score = scoreAiTriage(legacy, neutral)
-      expect(score).toMatchObject({ score: fixture.expected, category: fixture.expected >= 20 ? 'Important' : 'Other' })
+      expect(score).toMatchObject({ score: fixture.expected, category: fixture.expected >= 20 ? 'Important' : 'Other', version: 'preference-2' })
       expect(legacy).toEqual(original)
       expect(legacy).not.toHaveProperty('task')
     }
+    const legacy: AiAssessment = { ...request, type: 'promotion', response: 'not_needed', actions: [], urgency: 'routine', deadline: null }
+    delete legacy.task
+    expect(scoreAiTriage(legacy, { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 })).toMatchObject({ category: 'Important', score: 174, version: 'preference-2' })
+    expect(scoreAiTriage({ ...legacy, type: 'notification', urgency: 'immediate' }, neutral)).toMatchObject({ category: 'Important', score: 37, version: 'preference-2' })
   })
 
   test('deterministic scoring preserves needs-reply and uncertainty, distinguishes promotion from spam, and caps weak reading affinity', () => {
@@ -8924,15 +8997,15 @@ describe('AI triage inference and local scoring', () => {
     const rich: AiScoreSignals = { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 }
     expect(scoreAiTriage(request, neutral).category).toBe('Important')
     const disliked: AiScoreSignals = { ...neutral, explicitAffinity: -1, learnedTopicAffinity: -1 }
-    const invoice: AiAssessment = { ...request, type: 'invoice', response: 'needed', urgency: 'routine', deadline: null, actions: ['reply'] }
+    const invoice: AiAssessment = { ...request, type: 'invoice', response: 'needed', task: 'none', urgency: 'routine', deadline: null, actions: ['reply'] }
     expect(scoreAiTriage(invoice, disliked).category).toBe('Important')
     expect(scoreAiTriage(invoice, disliked, { override: 'Other' }).category).toBe('Other')
     expect(scoreAiTriage({ ...invoice, risk: 'phishing_suspected' }, disliked).category).toBe('Other')
-    expect(scoreAiTriage({ ...request, response: 'not_needed', task: 'none', actions: [], urgency: 'immediate' }, neutral).category).toBe('Important')
+    expect(scoreAiTriage({ ...request, response: 'not_needed', task: 'none', actions: [], urgency: 'immediate' }, neutral)).toMatchObject({ category: 'Other', score: 19 })
     expect(scoreAiTriage(unknown, neutral).category).toBe('Important')
     const promotion: AiAssessment = { ...unknown, type: 'promotion', response: 'not_needed', task: 'none', urgency: 'none', risk: 'unsolicited', certainty: 'clear' }
     expect(scoreAiTriage(promotion, neutral).category).toBe('Other')
-    expect(scoreAiTriage(promotion, rich).category).toBe('Important')
+    expect(scoreAiTriage(promotion, rich)).toMatchObject({ category: 'Other', score: 19 })
     for (const risk of ['spam_suspected', 'phishing_suspected'] as const) {
       const assessment = { ...request, risk }, original = structuredClone(assessment)
       expect(scoreAiTriage(assessment, rich)).toMatchObject({ category: 'Other', score: -100 })
@@ -8974,6 +9047,191 @@ describe('AI triage service', () => {
   const response = { id: 'fixture-response', model: 'fixture-model', status: 'completed',
     usage: { input_tokens: 1000, output_tokens: 100, total_tokens: 1100, input_tokens_details: { cached_tokens: 200, cache_write_tokens: 100 }, output_tokens_details: { reasoning_tokens: 40 } },
     output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(assessment) }] }] }
+
+  test('history admission binds confirmed settings revisions and returns existing receipts before checking current settings', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    await h.seed('alice', 'ai-history-consent', [native('history-consent')])
+    let entered = deferred<void>(), release = deferred<void>()
+    let blockScope = false, scopeReads = 0, snapshots = 0, calls = 0
+    const guarded: Inbox = { ...h.inbox,
+      mailboxes: async (...args) => { scopeReads++; const boxes = await h.inbox.mailboxes(...args); if (blockScope) { entered.resolve(); await release.promise }; return boxes },
+      mailboxSnapshot: async (...args) => { snapshots++; return h.inbox.mailboxSnapshot(...args) },
+    }
+    const fetcher = (async () => { calls++; return Response.json(response) }) as unknown as typeof fetch
+    const service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    const peer = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    cleanup.push(async () => { release.resolve(); await Promise.all([service.close(), peer.close()]); database.close() })
+    const enabled = await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    const input = { id: 'ai-confirmed-history', scope: 'inbox' as const, limit: 100, settingsRevision: enabled.settings.revision }
+    const job = await service.process('alice', input)
+    expect(job).toMatchObject({ id: input.id, settingsRevision: enabled.settings.revision })
+    await bounded((async () => { while ((await service.state('alice')).queue.pending !== 1) await Bun.sleep(10) })(), 'confirmed history inventory')
+    const changed = await service.configure('alice', { ...(await service.state('alice')).settings, mode: 'apply' })
+    const before = { scopeReads, snapshots }
+    await expect(service.process('alice', { ...input, id: 'ai-stale-confirmation' })).rejects.toMatchObject({ code: 'AI_SETTINGS_CONFLICT', status: 412 })
+    expect({ scopeReads, snapshots }).toEqual(before)
+    expect((await service.process('alice', input)).id).toBe(job.id)
+    await expect(service.process('alice', { ...input, settingsRevision: changed.settings.revision })).rejects.toMatchObject({ code: 'AI_JOB_CONFLICT', status: 409 })
+    for (const settingsRevision of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) await expect(service.process('alice', { ...input, id: 'ai-invalid-confirmation', settingsRevision })).rejects.toMatchObject({ code: 'AI_INVALID_JOB' })
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: false })
+    expect(await service.process('alice', input)).toMatchObject({ id: job.id, status: 'cancelled', settingsRevision: input.settingsRevision })
+    const resumed = await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    const beforeRace = snapshots
+    blockScope = true
+    const racing = service.process('alice', { id: 'ai-scope-confirmation-race', scope: 'all', limit: 100, settingsRevision: resumed.settings.revision })
+    await bounded(entered.promise, 'history scope admission await')
+    await peer.configure('alice', { ...(await peer.state('alice')).settings, model: 'fixture-model-next', mailboxIds: [] })
+    release.resolve()
+    await expect(racing).rejects.toMatchObject({ code: 'AI_SETTINGS_CONFLICT', status: 412 })
+    expect(snapshots).toBe(beforeRace)
+    expect(database.query("SELECT 1 FROM local_ai_jobs WHERE id='ai-scope-confirmation-race'").get()).toBeNull()
+    expect(database.query("SELECT 1 FROM local_ai_jobs WHERE id='ai-stale-confirmation'").get()).toBeNull()
+    // Mode changes do not increment the admission generation: revision must fence them too.
+    const reopened = await peer.configure('alice', { ...(await peer.state('alice')).settings, mailboxIds: null })
+    entered = deferred<void>(); release = deferred<void>()
+    const modeRace = service.process('alice', { id: 'ai-mode-confirmation-race', scope: 'all', limit: 100, settingsRevision: reopened.settings.revision })
+    await bounded(entered.promise, 'history mode admission await')
+    await peer.configure('alice', { ...(await peer.state('alice')).settings, mode: 'preview' })
+    release.resolve()
+    await expect(modeRace).rejects.toMatchObject({ code: 'AI_SETTINGS_CONFLICT', status: 412 })
+    expect(database.query("SELECT 1 FROM local_ai_jobs WHERE id='ai-mode-confirmation-race'").get()).toBeNull()
+    expect(snapshots).toBe(beforeRace)
+    expect((await service.state('alice')).queue).toMatchObject({ pending: 0, processing: 0 })
+    // Legacy requests remain usable, but a revision cannot be inferred for an old receipt.
+    database.query("UPDATE local_ai_jobs SET data=json_remove(data,'$.settingsRevision') WHERE owner=? AND id=?").run('alice', job.id)
+    await expect(service.process('alice', input)).rejects.toMatchObject({ code: 'AI_JOB_CONFLICT', status: 409 })
+    expect(await service.process('alice', { id: input.id, scope: input.scope, limit: input.limit })).toMatchObject({ id: job.id, status: 'cancelled' })
+    expect(calls).toBe(0)
+  })
+
+  test('pause and resume preserve ready scores and manual receipts while changed-offline context still rejects feedback', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const seeds = [native('toggle-manual'), native('toggle-changing')]
+    const { account, box } = await h.seed('alice', 'ai-toggle-ready', seeds)
+    const inputs: AiTriageInput[] = []
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async (_url, init) => { inputs.push(JSON.parse(JSON.parse(String(init?.body)).input[0].content)); return Response.json(response) }) as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start(); await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    await service.process('alice', { id: 'ai-toggle-seed', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 2) await Bun.sleep(10) })(), 'ready toggle receipts')
+    const summaries = (await h.page('alice')).items
+    const manualMessage = summaries.find(item => item.subject === seeds[0]!.subject)!, changing = summaries.find(item => item.subject === seeds[1]!.subject)!
+    let manual = (await service.lookup('alice', [{ sourceId: account.id, threadId: manualMessage.threadId }])).decisions[0]!
+    manual = await service.feedback('alice', { sourceId: account.id, threadId: manual.threadId, revision: manual.revision, id: 'ai-toggle-manual-choice', category: 'Important' })
+    const sha = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+    const configHash = sha({ version: configuration.version, endpoint: configuration.endpoint, models: configuration.models, output: configuration.maxOutputTokens })
+    const legacyHash = sha({ messages: inputs.find(input => input.messages[0]!.subject === seeds[0]!.subject)!.messages, model: configuration.defaultModel, schema: 'triage-1', configuration: configHash })
+    delete manual.assessment!.task
+    manual = { ...manual, inputHash: legacyHash, schemaVersion: 'triage-1', inputPolicyVersion: 'input-2', override: { ...manual.override!, inputHash: legacyHash }, score: scoreAiTriage(manual.assessment!, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 1, interestMatches: 0, learnedTopicAffinity: 0 }, { override: 'Important' }) }
+    database.query('UPDATE local_ai_decisions SET data=? WHERE owner=? AND source=? AND thread=?').run(JSON.stringify(manual), 'alice', account.id, manual.threadId)
+    const before = (await service.results('alice')).decisions
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: false })
+    expect((await service.results('alice')).decisions).toEqual(before)
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    expect((await service.results('alice')).decisions).toEqual(before)
+    expect(inputs).toHaveLength(2)
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: false })
+    box.put({ ...seeds[1]!, bodyText: 'Changed while automatic triage was switched off.' })
+    await h.sync('alice', account.id)
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    const old = before.find(item => item.threadId === changing.threadId)!
+    await expect(service.feedback('alice', { sourceId: account.id, threadId: old.threadId, revision: old.revision, id: 'ai-toggle-stale-context-vote', category: 'Important' })).rejects.toMatchObject({ code: 'AI_DECISION_CONFLICT', status: 412 })
+    const kept = await service.feedback('alice', { sourceId: account.id, threadId: manual.threadId, revision: manual.revision, id: 'ai-toggle-valid-context-vote', category: 'Important' })
+    expect(kept).toMatchObject({ state: 'ready', inputHash: legacyHash, schemaVersion: 'triage-1', override: { category: 'Important', inputHash: legacyHash } })
+    expect(inputs).toHaveLength(2)
+    await service.configure('alice', { ...(await service.state('alice')).settings, model: 'fixture-model-next' })
+    expect((await service.results('alice')).decisions.every(item => item.state === 'stale')).toBe(true)
+    expect(inputs).toHaveLength(2)
+  })
+
+  test('startup locally upgrades only task-aware old scores through bounded resumable pages without inference or body reads', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const { box } = await h.seed('alice', 'ai-local-policy-upgrade', Array.from({ length: 105 }, (_, index) => native(`policy-${index}`, { bodyText: 'Fictional policy notice. No action is required.' })))
+    let paid = 0, bodyReads = 0, threadReads = 0, inventories = 0
+    const fetcher = (async () => { paid++; return Response.json(response) }) as unknown as typeof fetch
+    let service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true, interests: ['Fixture topic'] })
+    await service.process('alice', { id: 'ai-local-policy-seed', scope: 'inbox', limit: 200 })
+    await bounded((async () => { while ((await service.state('alice')).queue.pending !== 105) await Bun.sleep(10) })(), 'synthetic saved policy receipts')
+    await service.close()
+    const rows = database.query<{ data: string; seq: number }, []>('SELECT data,seq FROM local_ai_decisions ORDER BY seq').all()
+    const grade: AiAssessment = { ...assessment, type: 'notification', task: 'none', topics: ['Fixture topic'], evidence: [{ messageRef: 'm0', field: 'type', quote: 'Fictional policy notice.' }] }
+    const oldScore: AiDecision['score'] = { category: 'Important', score: 37, version: 'preference-2', reasons: ['Explicit local interest'], contributions: [{ name: 'response', value: -8 }, { name: 'urgency', value: -5 }, { name: 'interests', value: 50 }] }
+    const originals = rows.map((row, index) => {
+      const original: AiDecision = JSON.parse(row.data)
+      const decision: AiDecision = { ...original, state: 'ready', assessment: structuredClone(grade), score: structuredClone(oldScore), inputHash: createHash('sha256').update(`fictional-policy-input:${original.threadId}`).digest('hex'), inputPolicyVersion: AI_INPUT_POLICY_VERSION, updatedAt: new Date(EPOCH - 1000).toISOString() }
+      if (index === 100) decision.override = { category: 'Important', inputHash: decision.inputHash!, at: new Date(EPOCH - 1000).toISOString() }
+      if (index === 101) { delete decision.assessment!.task; decision.schemaVersion = 'triage-1'; decision.inputPolicyVersion = 'input-2' }
+      if (index === 102) decision.score = scoreAiTriage(grade, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 1, learnedTopicAffinity: 0 })
+      if (index === 103) { decision.state = 'failed'; decision.assessment = null; decision.score = null; decision.problemCode = 'AI_EVIDENCE_INVALID' }
+      database.query('UPDATE local_ai_decisions SET data=? WHERE owner=? AND source=? AND thread=?').run(JSON.stringify(decision), 'alice', decision.sourceId, decision.threadId)
+      return decision
+    })
+    database.exec('DELETE FROM local_ai_queue; DELETE FROM local_ai_jobs; DELETE FROM local_ai_job_items')
+    const guarded: Inbox = { ...h.inbox,
+      mailboxMessage: async () => { bodyReads++; throw new Error('Policy-only upgrade must not read bodies') },
+      thread: async () => { threadReads++; throw new Error('Policy-only upgrade must not prepare context') },
+      mailboxSnapshot: async () => { inventories++; throw new Error('Policy-only upgrade must not scan mail') },
+    }
+    const sourceCalls = structuredClone(box.calls)
+    service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    const beforeReads = database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count
+    expect((await service.results('alice')).decisions[0]?.score).toMatchObject({ category: 'Important', score: 37, version: 'preference-2' })
+    expect((await service.state('alice')).jobs).toEqual([])
+    expect(database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count).toBe(beforeReads)
+    await service.start()
+    // start completes one synchronous 100-row page; close pauses at its existing yield.
+    await service.close()
+    expect(database.query<{ force: number; after: number }, []>("SELECT force,after FROM local_ai_rescore WHERE owner='alice'").get()).toEqual({ force: 2, after: rows[99]!.seq })
+    expect((await service.diagnostics('alice')).coverage?.counts.rescored).toBe(100)
+    const pending = (await service.results('alice', rows[99]!.seq)).decisions
+    for (const index of [100, 101, 102, 103]) expect(pending.find(item => item.threadId === originals[index]!.threadId)).toEqual(originals[index])
+    expect(pending.find(item => item.threadId === originals[104]!.threadId)).toMatchObject({ state: 'stale', score: null })
+    service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start()
+    await bounded((async () => { while (database.query("SELECT 1 FROM local_ai_rescore WHERE owner='alice'").get()) await Bun.sleep(10) })(), 'resumed local policy scoring')
+    await service.close()
+    const changed = database.query<{ data: string }, []>("SELECT data FROM local_ai_decisions WHERE owner='alice'").all().map(row => JSON.parse(row.data) as AiDecision)
+    for (const [index, original] of originals.entries()) {
+      const current = changed.find(item => item.threadId === original.threadId)!
+      if (index >= 100 && index <= 103) expect(current).toEqual(original)
+      else {
+        expect(current).toMatchObject({ state: 'ready', assessment: original.assessment, inputHash: original.inputHash, model: original.model, schemaVersion: original.schemaVersion, inputPolicyVersion: original.inputPolicyVersion, contextVersions: original.contextVersions, score: { category: 'Other', score: 19, version: AI_PREFERENCE_VERSION } })
+        expect(current.score!.contributions).toContainEqual({ name: 'no_obligation_gate', value: -18 })
+      }
+    }
+    expect((await service.diagnostics('alice')).coverage?.counts.rescored).toBe(101)
+    expect((await service.diagnostics('alice')).activity?.find(item => item.reason === 'rescored')?.contributions).toContainEqual({ name: 'no_obligation_gate', value: -18 })
+    // A completed upgrade is idempotent; ordinary state/result reads do not queue it again.
+    service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start(); await service.close()
+    const beforeFinalReads = database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count
+    const state = await service.state('alice'), first = await service.results('alice')
+    expect(state).toMatchObject({ jobs: [], queue: { pending: 0, processing: 0 }, usage: { attempts: 0 } })
+    expect(first.decisions.length).toBeGreaterThan(0)
+    expect(database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count).toBe(beforeFinalReads)
+    expect(database.query("SELECT 1 FROM local_ai_rescore WHERE owner='alice'").get()).toBeNull()
+    expect(database.query<{ data: string }, []>("SELECT data FROM local_ai_decisions WHERE owner='alice'").all().map(row => JSON.parse(row.data))).toEqual(changed)
+    expect((await service.diagnostics('alice')).coverage?.counts.rescored).toBe(101)
+    // An existing preference job keeps its token/high-water. The startup-only
+    // policy pass follows it to catch an old score beyond that captured boundary.
+    const tail = changed.find(item => item.threadId === originals[104]!.threadId)!, preferenceToken = randomUUID()
+    database.query('UPDATE local_ai_decisions SET data=? WHERE owner=? AND source=? AND thread=?').run(JSON.stringify({ ...tail, score: oldScore }), 'alice', tail.sourceId, tail.threadId)
+    database.query('INSERT INTO local_ai_rescore VALUES (?,?,?,?,0,0,0,NULL)').run('alice', preferenceToken, state.settings.revision, tail.revision - 1)
+    service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start(); await service.close()
+    expect(database.query<{ token: string; force: number; through: number }, []>("SELECT token,force,through FROM local_ai_rescore WHERE owner='alice'").get()).toEqual({ token: preferenceToken, force: 0, through: tail.revision - 1 })
+    service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start()
+    await bounded((async () => { while (JSON.parse(database.query<{ data: string }, [string]>('SELECT data FROM local_ai_decisions WHERE thread=?').get(tail.threadId)!.data).score.version !== AI_PREFERENCE_VERSION || database.query("SELECT 1 FROM local_ai_rescore WHERE owner='alice'").get()) await Bun.sleep(10) })(), 'policy pass after preference high-water')
+    await service.close()
+    expect((await service.diagnostics('alice')).coverage?.counts.rescored).toBe(102)
+    for (const index of [100, 101]) expect(JSON.parse(database.query<{ data: string }, [string]>('SELECT data FROM local_ai_decisions WHERE thread=?').get(originals[index]!.threadId)!.data)).toEqual(originals[index])
+    expect(paid).toBe(0); expect(bodyReads).toBe(0); expect(threadReads).toBe(0); expect(inventories).toBe(0)
+    expect(box.calls).toEqual(sourceCalls)
+  })
 
   test('actual v1 context hashes survive uncaptured flags, explicit cache reuse and manual feedback until genuine input changes', async () => {
     const h = await fixture(), database = new Database(':memory:')
@@ -9792,6 +10050,7 @@ describe('AI triage service', () => {
       delete decision.inputPolicyVersion
       delete decision.assessment!.task
       decision.schemaVersion = 'triage-1'
+      decision.score!.version = 'preference-2'
       if (decision.assessment!.reason === 'refresh-clear') {
         decision.assessment!.certainty = 'insufficient'
         decision.score = scoreAiTriage(decision.assessment!, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 })

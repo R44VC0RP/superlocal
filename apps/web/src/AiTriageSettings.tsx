@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { AiDecision, AiSettings, AiTriageActions, AiTriageState, AiUsageSummary } from "../../shared/ai-triage";
+import { aiSortingStatus, type AiDecision, type AiSettings, type AiTriageActions, type AiTriageState, type AiUsageSummary } from "../../shared/ai-triage";
 import { aiLabel, aiTaskLabel } from "./ConversationTriage";
 import "./ai-triage.css";
 
@@ -56,6 +56,7 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
   const stateRef = useRef<AiTriageState | null>(null);
   const lifetime = useRef<object | null>(null);
   const [loadError, setLoadError] = useState(false);
+  const [saveUncertain, setSaveUncertain] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -64,6 +65,7 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
   const [reload, setReload] = useState(0);
   const [scope, setScope] = useState<"inbox" | "all">("inbox");
   const [limit, setLimit] = useState(100);
+  const [historyRequest, setHistoryRequest] = useState<{ actions: AiTriageActions; input: Parameters<AiTriageActions["process"]>[0]; confirmation: string } | null>(null);
   const [results, setResults] = useState<AiDecision[] | null>(null);
   const [resultCursor, setResultCursor] = useState<number>();
   const [hasMore, setHasMore] = useState(false);
@@ -96,7 +98,7 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
     busyRef.current = false;
     setState(null); setDraft(null); setDirty(false); setBusy(false);
     setResults(null); setResultCursor(undefined); setHasMore(false); setDiagnostics(null);
-    setLoadError(false); setError(""); setNotice("");
+    setLoadError(false); setSaveUncertain(false); setError(""); setNotice("");
     if (actions) void actions.state().then(next => {
       if (lifetime.current === token) accept(next, true);
     }).catch(() => { if (lifetime.current === token) setLoadError(true); });
@@ -139,6 +141,31 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
     setReload(value => value + 1);
   }
 
+  function setAutomaticSorting(enabled: boolean) {
+    const saved = stateRef.current?.settings;
+    if (!saved || dirtyRef.current || loadError || saveUncertain || enabled && !stateRef.current?.configured) return;
+    void run(async (api, alive) => {
+      try {
+        const next = await api.configure({ ...saved, enabled, mode: enabled ? "apply" : saved.mode });
+        if (alive()) { accept(next, true); setNotice("Automatic sorting setting saved."); }
+      } catch (cause) {
+        if (alive()) setSaveUncertain(true);
+        throw cause;
+      }
+    }, "Could not confirm the saved setting. Reload saved settings before trying again; your change may have been saved.");
+  }
+
+  function refreshStatus() {
+    void run(async (api, alive) => {
+      try {
+        const next = await api.state(); if (alive()) { accept(next); setLoadError(false); }
+      } catch (cause) {
+        if (alive()) setLoadError(true);
+        throw cause;
+      }
+    }, "Could not refresh AI status. Your unsaved settings have been kept.");
+  }
+
   async function loadResults(more = false) {
     await run(async (api, alive) => {
       const page = await api.results(more ? resultCursor : undefined);
@@ -163,56 +190,57 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
   const savedModel = state.provider?.models.find(model => model.id === state.settings.model);
   const stale = dirty && state.settings.revision !== draft.revision;
   const saved = state.settings;
-  const paused = state.jobs.some(job => job.status === "paused");
-  const running = state.jobs.some(job => job.status === "running");
-  const status = loadError ? "Progress unavailable"
-    : !state.configured ? "Not configured"
-    : !saved.enabled ? "Off"
-    : saved.mailboxIds?.length === 0 ? "No mailboxes selected"
-    : state.queue.processing > 0 ? "Processing mail"
-    : paused && !running ? "Historical processing paused"
-    : state.queue.pending > 0 || running ? "Waiting to process mail"
-    : "Idle — watching for new mail";
+  const pendingHistory = historyRequest?.actions === actions ? historyRequest : null;
+  const automatic = saved.enabled && saved.mode === "apply";
+  const toggleDisabled = busy || dirty || loadError || saveUncertain || !state.configured && !automatic;
+  const status = aiSortingStatus(state, loadError || saveUncertain);
   return <div className="ai-triage-settings" aria-busy={busy}>
-    <div className="ai-status" role="status" aria-live="polite" aria-atomic="true">
-      <strong>{status}</strong>
-      <span className="settings-note">{!state.configured ? "AI is unavailable; your normal inbox rules are in use." : !saved.enabled ? "AI sorting is off; your normal inbox rules are in use." : saved.mode === "apply" ? "Applying saved assessments to Important and Other." : "Preview only — AI suggestions do not change your inbox."}</span>
-      <span className="settings-note">{loadError ? "Last reported queue: " : "Queue: "}{number(state.queue.processing)} processing · {number(state.queue.pending)} waiting · {number(state.queue.failed)} failed</span>
-    </div>
-    {state.queue.failed > 0 && <p className="settings-error">{number(state.queue.failed)} conversations could not be assessed. They use normal inbox rules, not a successful AI classification. Details are under Recent attempts below.</p>}
-    {!state.configured && <p className="settings-note">Set up a provider, model and credentials in this host’s private configuration to use AI. Credentials never go in this page.</p>}
-    {loadError && <p className="settings-error" role="alert">Could not refresh AI status. The last reported counts may be out of date.</p>}
-    <button type="button" className="settings-text-button ai-refresh" disabled={busy} onClick={() => void run(async (api, alive) => {
-      try {
-        const next = await api.state(); if (alive()) { accept(next); setLoadError(false); }
-      } catch (cause) {
-        if (alive()) setLoadError(true);
-        throw cause;
-      }
-    }, "Could not refresh AI status. Your unsaved settings have been kept.")}>Refresh status</button>
+    <label className="settings-checkbox-row"><span>Automatic sorting</span><input type="checkbox" checked={automatic} disabled={toggleDisabled} onChange={event => setAutomaticSorting(event.target.checked)} /></label>
     <div className="ai-explanation">
-      <p><strong>Important</strong> is for mail that needs your attention: personal requests, replies, real deadlines and important account issues. <strong>Other</strong> is for routine marketing, product updates and other non-actionable mail, unless your preferences make it important.</p>
-      <p className="settings-note">AI reads selected text and recent conversation context. Superlocal combines that assessment with your explicit preferences and confirmed correspondence. Genuinely unclear mail stays Important for review; suspicious mail stays reviewable in Other. Manual category choices win.</p>
-      <p className="settings-note">AI does not send replies, delete mail or move it to your provider’s Spam folder. Done (W) handles a message; it does not teach AI that you dislike the sender. Mail without a current assessment uses normal inbox rules.</p>
+      <p><strong>Important</strong> needs a reply or action. <strong>Other</strong> has no outstanding work.</p>
+      <p className="settings-note">Uncertain mail stays Important for review; unassessed mail uses normal inbox rules. Your manual choices always win.</p>
+      <p className="settings-note">Turning this on sends selected email text and recent conversation context to {state.provider?.endpointHost || "the privately configured provider"} to sort new mail. Provider charges may apply. Personal behavior and preferences stay on the server.</p>
     </div>
-    <form className="ai-settings-form" onSubmit={event => {
+    <div className="ai-status" role="status" aria-live="polite" aria-atomic="true">
+      <strong className={status.tone === "warning" ? "settings-error" : undefined}>{status.label}</strong>
+      {status.detail && <span className="settings-note">{status.detail}</span>}
+    </div>
+    {saved.enabled && saved.mode === "preview" && <button type="button" className="settings-button ai-refresh" disabled={toggleDisabled} onClick={() => setAutomaticSorting(true)}>Enable automatic sorting</button>}
+    {dirty && <p className="settings-note" role="status">Save or discard advanced changes first to change automatic sorting.</p>}
+    {stale && <p className="settings-error" role="alert">Settings changed elsewhere. Reload before saving.</p>}
+    {error && <p className="settings-error" role="alert">{error}</p>}
+    {saveUncertain && !error && <p className="settings-error" role="alert">Saved settings could not be confirmed. Reload saved settings before making another change.</p>}
+    {pendingHistory && !busy && <p className="settings-error" role="alert">The older-mail request is unconfirmed. Retry the same request in Sort older mail; its approved scope, limit and settings are kept.</p>}
+    {notice && <p className="settings-note" role="status">{notice}</p>}
+    {saveUncertain ? <button type="button" className="settings-text-button ai-refresh" disabled={busy} onClick={reset}>Reload saved settings</button>
+      : loadError && <button type="button" className="settings-text-button ai-refresh" disabled={busy} onClick={refreshStatus}>Refresh status</button>}
+    <details className="ai-settings-disclosure">
+      <summary tabIndex={0}>Advanced options</summary>
+      <div className="ai-disclosure-body">
+      {!state.configured && <p className="settings-note">Set up a provider, model and credentials in this host’s private configuration to use AI. Credentials never go in this page.</p>}
+      <form className="ai-settings-form" onSubmit={event => {
       event.preventDefault();
-      if (invalidInterests || stale) return;
+      if (!dirty || invalidInterests || stale || saveUncertain) return;
       void run(async (api, alive) => {
-        const next = await api.configure({ ...draft, interests: terms });
-        if (alive()) { accept(next, true); setNotice("AI triage settings saved."); }
+        try {
+          const next = await api.configure({ ...draft, interests: terms });
+          if (alive()) { accept(next, true); setNotice("AI triage settings saved."); }
+        } catch (cause) {
+          if (alive()) setSaveUncertain(true);
+          throw cause;
+        }
       }, "Could not save settings. Reload saved settings before retrying; another change may have been saved.");
     }}>
       <fieldset disabled={busy}>
-        <label className="settings-checkbox-row"><span>Enable AI triage</span><input type="checkbox" checked={draft.enabled} disabled={!state.configured && !draft.enabled} onChange={event => change({ enabled: event.target.checked })} /></label>
-        <p className="settings-note">When enabled, selected email text and bounded thread context are sent to {state.provider?.endpointHost || "the privately configured provider"}. Personal behavior and preferences stay on the server.</p>
+        <label className="settings-checkbox-row"><span>Enable AI assessments</span><input type="checkbox" checked={draft.enabled} disabled={!state.configured && !draft.enabled} onChange={event => change({ enabled: event.target.checked })} /></label>
+        <p className="settings-note">Enabled assessments send selected email text and recent context to {state.provider?.endpointHost || "the privately configured provider"}, including in Preview mode. Provider charges may apply.</p>
         <label className="settings-control-row"><span>Mode</span><select value={draft.mode} onChange={event => change({ mode: event.target.value as AiSettings["mode"] })}><option value="preview">Preview only</option><option value="apply">Apply to Important / Other</option></select></label>
         <p className="settings-note">Preview proposes categories without applying them. Save Apply mode to use saved assessments; this does not start a historical rescan.</p>
         <label className="settings-control-row"><span>Model</span><select value={draft.model} disabled={!state.provider?.models.length} onChange={event => change({ model: event.target.value })}>
           {!selectedModel && <option value={draft.model}>{draft.model || "Not configured"}</option>}
           {state.provider?.models.map(model => <option key={model.id} value={model.id}>{model.label}</option>)}
         </select></label>
-        <p className="settings-note">Changing the model does not automatically pay to reprocess older mail. Process historical mail below when you want new assessments.</p>
+        <p className="settings-note">Changing the model does not reprocess older mail. Use Sort older mail when you want new assessments.</p>
         <label className="settings-control-row"><span>Mailboxes</span><select value={draft.mailboxIds === null ? "all" : "selected"} onChange={event => change({ mailboxIds: event.target.value === "all" ? null : [] })}><option value="all">All active mailboxes</option><option value="selected">Selected mailboxes</option></select></label>
         {draft.mailboxIds !== null && <div className="ai-mailbox-options">
           {mailboxes.map(mailbox => <label className="settings-checkbox-row" key={mailbox.id}><span>{mailbox.name}{mailbox.email && <span className="settings-checkbox-note">{mailbox.email}</span>}</span><input type="checkbox" checked={draft.mailboxIds!.includes(mailbox.id)} onChange={event => change({ mailboxIds: event.target.checked ? [...draft.mailboxIds!, mailbox.id] : draft.mailboxIds!.filter(id => id !== mailbox.id) })} /></label>)}
@@ -223,24 +251,57 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
         <p className={invalidInterests ? "settings-error" : "settings-note"}>Up to 20 comma-separated terms, 60 characters each. Used locally, not sent to the model.</p>
         <label className="settings-checkbox-row"><span>Use estimated reading activity<span className="settings-checkbox-note">Opt-in active reading time for local personalization; no text, typing, or screenshots are collected.</span></span><input type="checkbox" checked={draft.readingSignals} onChange={event => change({ readingSignals: event.target.checked })} /></label>
       </fieldset>
-      {stale && <p className="settings-error" role="alert">Settings changed elsewhere. Reload before saving.</p>}
-      {dirty && <p className="settings-note" role="status">Unsaved AI changes. Status and processing still use your saved settings.</p>}
-      <div className="ai-actions"><button type="submit" className="settings-button" disabled={busy || !dirty || invalidInterests || stale || draft.enabled && !state.configured}>Save AI settings</button><button type="button" className="settings-text-button" disabled={busy} onClick={reset}>{dirty ? "Discard AI changes" : "Reload saved settings"}</button></div>
+      {dirty && <p className="settings-note">Unsaved AI changes. Status and processing still use your saved settings.</p>}
+      <div className="ai-actions"><button type="submit" className="settings-button" disabled={busy || !dirty || invalidInterests || stale || saveUncertain || draft.enabled && !state.configured}>Save AI settings</button><button type="button" className="settings-text-button" disabled={busy} onClick={reset}>{dirty ? "Discard AI changes" : "Reload saved settings"}</button></div>
     </form>
-    {error && <p className="settings-error" role="alert">{error}</p>}
-    {notice && <p className="settings-note" role="status">{notice}</p>}
-    <section className="ai-section">
-      <h3>Historical mail</h3>
-      <div className="ai-actions">
-        <select aria-label="Historical mail scope" value={scope} disabled={busy} onChange={event => setScope(event.target.value as "inbox" | "all")}><option value="inbox">Inbox</option><option value="all">All mail</option></select>
-        <select aria-label="Maximum conversations" value={limit} disabled={busy} onChange={event => setLimit(Number(event.target.value))}>{[100, 500, 1000, 10000].map(value => <option key={value} value={value}>Up to {number(value)}</option>)}</select>
-        <button type="button" className="settings-button" disabled={busy || !state.configured || !state.settings.enabled || state.settings.mailboxIds?.length === 0} onClick={() => void run(async (api, alive) => {
-          await api.process({ id: crypto.randomUUID(), scope, limit });
-          if (!alive()) return;
-          const next = await api.state(); if (alive()) accept(next);
-        }, "Could not start processing. Refresh progress before retrying.")}>Process historical mail</button>
+    <button type="button" className="settings-text-button ai-clear-reading" disabled={busy} onClick={() => {
+      if (!window.confirm("Clear estimated reading history for this account? Emails, manual categories, interests, and other settings are kept.")) return;
+      void run(async (api, alive) => { await api.clearReading(); if (alive()) setNotice("Estimated reading history cleared."); }, "Could not clear estimated reading history. Try again.");
+    }}>Clear estimated reading history</button>
       </div>
-      <p className="settings-note">Uses saved settings and only already-synced mail, within the scope and limit above. This can incur provider charges. Current assessments are reused; missing or failed assessments and older uncertain marketing assessments are processed. Cancelling stops work, never deletes emails.</p>
+    </details>
+    <details className="ai-settings-disclosure">
+      <summary tabIndex={0}>Sort older mail</summary>
+      <div className="ai-disclosure-body">
+      <section className="ai-section">
+      <p className="settings-note">Uses saved settings and only already-synced mail in your selected mailboxes, within the scope and limit below. Starting a run may incur provider charges; opening this section or turning on automatic sorting does not start one.</p>
+      <div className="ai-actions">
+        <select aria-label="Historical mail scope" value={pendingHistory?.input.scope ?? scope} disabled={busy || !!pendingHistory} onChange={event => setScope(event.target.value as "inbox" | "all")}><option value="inbox">Inbox</option><option value="all">All mail</option></select>
+        <select aria-label="Maximum conversations" value={pendingHistory?.input.limit ?? limit} disabled={busy || !!pendingHistory} onChange={event => setLimit(Number(event.target.value))}>{[100, 500, 1000, 10000].map(value => <option key={value} value={value}>Up to {number(value)}</option>)}</select>
+        <button type="button" className="settings-button" disabled={busy || saveUncertain || !pendingHistory && (loadError || !state.configured || !saved.enabled || saved.mailboxIds?.length === 0)} onClick={() => {
+          const request = pendingHistory ?? {
+            actions,
+            input: { id: crypto.randomUUID(), scope, limit, settingsRevision: saved.revision },
+            confirmation: `Sort up to ${number(limit)} already-synced conversations from ${scope === "inbox" ? "the inbox" : "all mail"} in ${saved.mailboxIds === null ? "all active mailboxes" : "your saved selected mailboxes"}, using ${savedModel?.label || saved.model || "the saved model"}? This may incur provider charges.${saved.mode === "preview" ? " Preview results will not change your inbox." : " Results will sort mail into Important and Other."}`,
+          };
+          if (!window.confirm(request.confirmation)) return;
+          void run(async (api, alive) => {
+            setHistoryRequest(request);
+            let job;
+            try {
+              job = await api.process(request.input);
+            } catch (cause) {
+              if (alive() && cause && typeof cause === "object" && "code" in cause && cause.code === "AI_SETTINGS_CONFLICT") {
+                setHistoryRequest(null); setLoadError(true);
+                setError("Saved settings changed. Refresh status before confirming a new older-mail run.");
+                return;
+              }
+              throw cause;
+            }
+            if (!alive()) return;
+            setHistoryRequest(null);
+            const current = stateRef.current;
+            if (current) accept({ ...current, jobs: [job, ...current.jobs.filter(item => item.id !== job.id)].slice(0, 20) });
+            setNotice("Older-mail request confirmed.");
+            try {
+              const next = await api.state(); if (alive()) { accept(next); setLoadError(false); }
+            } catch {
+              if (alive()) { setLoadError(true); setError("The older-mail request was accepted, but progress could not be refreshed. Refresh status before starting another run."); }
+            }
+          }, "Could not confirm older-mail processing. Retry the same request in Sort older mail.");
+        }}>{pendingHistory ? "Retry same request" : "Sort older mail"}</button>
+      </div>
+      <p className="settings-note">Current assessments are reused; missing or failed assessments and older uncertain marketing assessments are processed. Cancelling stops work, never deletes emails.</p>
       {state.jobs.length === 0 ? <p className="settings-note">No historical jobs started. Turning AI on does not mean all older mail has been processed.</p> : state.jobs.map(job => <div className="ai-job" key={job.id}>
         <div>{job.scope === "inbox" ? "Inbox" : "All mail"} · {job.status === "completed" && job.failed > 0 ? "Finished with failures" : aiLabel(job.status)} · up to {number(job.limit)}</div>
         <p className="settings-note">{number(job.completed)} assessed · {number(job.failed)} failed · {number(job.queued)} queued from {number(job.scanned)} scanned</p>
@@ -253,6 +314,15 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
         }, "Could not change this job. Refresh progress and try again.")}>{aiLabel(action)}</button>)}</div>
       </div>)}
     </section>
+      </div>
+    </details>
+    <details className="ai-settings-disclosure">
+      <summary tabIndex={0}>Diagnostics</summary>
+      <div className="ai-disclosure-body">
+      <p className="settings-note">{loadError ? "Last reported queue: " : "Queue: "}{number(state.queue.processing)} processing · {number(state.queue.pending)} waiting · {number(state.queue.failed)} failed</p>
+      {state.problemCode && <p className="settings-error">{state.problemCode}</p>}
+      {state.queue.failed > 0 && <p className="settings-error">{number(state.queue.failed)} conversations could not be assessed. They use normal inbox rules, not a successful AI classification. Details are under Inference attempts below.</p>}
+      <button type="button" className="settings-text-button ai-refresh" disabled={busy} onClick={refreshStatus}>Refresh status</button>
     <section className="ai-section">
       <h3>{state.settings.mode === "preview" ? "Preview results" : "Assessment results"}</h3>
       <p className="settings-note">{state.settings.mode === "preview" ? "Proposed categories are not applied. " : "Saved assessments. "}Loads only on request, up to 100 results.</p>
@@ -321,10 +391,8 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
       {diagnostics?.attempts.length === 0 && <p className="settings-note">No diagnostic attempts recorded.</p>}
       {!!diagnostics?.attempts.length && <div className="ai-table-scroll"><table className="ai-table"><thead><tr><th>Attempt</th><th>Duration / queue</th></tr></thead><tbody>{diagnostics.attempts.slice(0, 50).map(attempt => <tr key={attempt.id}><td>{aiLabel(attempt.outcome)}{attempt.code && <span className="ai-secondary" title={attempt.code}>{problemLabels[attempt.code] || aiLabel(attempt.code)}</span>}<span className="ai-secondary">{attempt.model}</span>{attempt.requestId && <span className="ai-secondary">Request: {attempt.requestId}</span>}</td><td>{attempt.durationMs === null ? "Pending" : `${number(attempt.durationMs)} ms`} / {number(attempt.queueMs)} ms</td></tr>)}</tbody></table></div>}
     </section>
-    <button type="button" className="settings-text-button ai-clear-reading" disabled={busy} onClick={() => {
-      if (!window.confirm("Clear estimated reading history for this account? Emails, manual categories, interests, and other settings are kept.")) return;
-      void run(async (api, alive) => { await api.clearReading(); if (alive()) setNotice("Estimated reading history cleared."); }, "Could not clear estimated reading history. Try again.");
-    }}>Clear estimated reading history</button>
+      </div>
+    </details>
   </div>;
 }
 

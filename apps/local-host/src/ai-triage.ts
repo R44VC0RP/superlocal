@@ -1,7 +1,7 @@
 import type { Database } from 'bun:sqlite'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { InboxError, type Inbox, type Mailbox, type Message, type MessageSummary } from 'inbox-sdk'
-import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, aiKinds, aiResponses, aiActions, aiUrgencies, aiRisks, aiActivityReasons, type AiActivityReason, type AiAssessment, type AiDecision, type AiDecisionPage, type AiDiagnosticActivity, type AiDiagnosticAttempt, type AiDiagnostics, type AiFeedbackInput, type AiHistoryJob, type AiInferenceResult, type AiReadingInput, type AiSettings, type AiThreadKey, type AiTriageInput, type AiTriageState, type AiUsageSummary } from '../../shared/ai-triage'
+import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, AI_PREFERENCE_VERSION, aiKinds, aiResponses, aiActions, aiUrgencies, aiRisks, aiActivityReasons, type AiActivityReason, type AiAssessment, type AiDecision, type AiDecisionPage, type AiDiagnosticActivity, type AiDiagnosticAttempt, type AiDiagnostics, type AiFeedbackInput, type AiHistoryJob, type AiInferenceResult, type AiReadingInput, type AiSettings, type AiThreadKey, type AiTriageInput, type AiTriageState, type AiUsageSummary } from '../../shared/ai-triage'
 import { inferAiTriage, prepareAiText, publicAiProvider, type AiInferenceConfig } from './ai-inference'
 import { countAiTopicMatches, normalizeAiTopics, scoreAiTriage } from './ai-preferences'
 
@@ -48,7 +48,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     CREATE TABLE IF NOT EXISTS local_ai_settings (owner TEXT PRIMARY KEY, data TEXT NOT NULL, generation INTEGER NOT NULL, cursor TEXT, baseline INTEGER NOT NULL, admission_since INTEGER NOT NULL) STRICT;
     CREATE TABLE IF NOT EXISTS local_ai_activity (seq INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, data TEXT NOT NULL) STRICT;
     CREATE INDEX IF NOT EXISTS local_ai_activity_owner ON local_ai_activity(owner,seq);
-    CREATE TABLE IF NOT EXISTS local_ai_coverage (owner TEXT PRIMARY KEY, counts TEXT NOT NULL DEFAULT '{}', last_drain INTEGER, problem TEXT) STRICT;
+    CREATE TABLE IF NOT EXISTS local_ai_coverage (owner TEXT PRIMARY KEY, counts TEXT NOT NULL DEFAULT '{}', last_drain INTEGER, problem TEXT, retained INTEGER NOT NULL DEFAULT 0 CHECK(retained>=0)) STRICT;
     CREATE TABLE IF NOT EXISTS local_ai_usage (owner TEXT PRIMARY KEY, data TEXT NOT NULL) STRICT;
     CREATE TABLE IF NOT EXISTS local_ai_decisions (owner TEXT NOT NULL, source TEXT NOT NULL, thread TEXT NOT NULL, data TEXT NOT NULL, fingerprint TEXT NOT NULL, sender TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(owner,source,thread)) STRICT;
     CREATE INDEX IF NOT EXISTS local_ai_decisions_seq ON local_ai_decisions(owner,seq);
@@ -99,6 +99,17 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     CREATE TRIGGER IF NOT EXISTS local_ai_recovery_seen_removed AFTER DELETE ON local_ai_recovery_seen BEGIN UPDATE local_ai_recovery_global SET seen=seen-1 WHERE id=1; END;
   `)
   // Only host-owned schema is inspected. Existing durable queues survive this additive upgrade.
+  db.transaction(() => {
+    if (!db.query<{ name: string }, []>('PRAGMA table_info(local_ai_coverage)').all().some(column => column.name === 'retained')) db.exec('ALTER TABLE local_ai_coverage ADD COLUMN retained INTEGER NOT NULL DEFAULT 0 CHECK(retained>=0)')
+    if (!db.query("SELECT 1 FROM local_ai_migrations WHERE name='activity-retained-counts-1'").get()) {
+      db.exec('INSERT INTO local_ai_coverage(owner,retained) SELECT owner,COUNT(*) FROM local_ai_activity GROUP BY owner ON CONFLICT(owner) DO UPDATE SET retained=excluded.retained')
+      db.exec("INSERT INTO local_ai_migrations VALUES ('activity-retained-counts-1')")
+    }
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS local_ai_activity_added AFTER INSERT ON local_ai_activity BEGIN INSERT INTO local_ai_coverage(owner,retained) VALUES (NEW.owner,1) ON CONFLICT(owner) DO UPDATE SET retained=retained+1; END;
+      CREATE TRIGGER IF NOT EXISTS local_ai_activity_removed AFTER DELETE ON local_ai_activity BEGIN UPDATE local_ai_coverage SET retained=retained-1 WHERE owner=OLD.owner; END;
+    `)
+  })()
   // Old moving watermarks cannot prove past consent. New admission starts prospectively.
   if (!db.query<{ name: string }, []>('PRAGMA table_info(local_ai_settings)').all().some(column => column.name === 'admission_since')) db.transaction(() => {
     db.exec('ALTER TABLE local_ai_settings ADD COLUMN admission_since INTEGER NOT NULL DEFAULT 0')
@@ -127,6 +138,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
   const inventories = new Set<string>()
   const recovering = new Set<string>()
   const rescoring = new Set<string>()
+  const policyAfterRescore = new Set<string>()
   const recoveryPages = new Map<string, { cursor?: string; page?: Awaited<ReturnType<Inbox['mailboxSnapshot']>>; index: number }>()
   const work = new Set<Promise<unknown>>()
   const configVersion = digest(configuration ? { version: configuration.version, endpoint: configuration.endpoint, models: configuration.models, output: configuration.maxOutputTokens } : null)
@@ -141,19 +153,28 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     void task.finally(() => { if (locks.get(owner) === task) locks.delete(owner) }).catch(() => {})
     return task
   }
-  const settingsRow = (owner: string) => db.query<SettingsRow, [string]>('SELECT * FROM local_ai_settings WHERE owner=?').get(owner)
+  const settingsStatement = db.prepare<SettingsRow, [string]>('SELECT * FROM local_ai_settings WHERE owner=?')
+  const settingsRow = (owner: string) => settingsStatement.get(owner)
   const defaultSettings = (): AiSettings => ({ revision: 0, enabled: false, mode: 'preview', model: configuration?.defaultModel ?? '', mailboxIds: null, personalization: true, readingSignals: false, interests: [] })
   const settings = (owner: string): AiSettings => { const row = settingsRow(owner); return row ? JSON.parse(row.data) : defaultSettings() }
-  const decisionRow = (owner: string, source: string, thread: string) => db.query<DecisionRow, [string, string, string]>('SELECT data,fingerprint,sender,seq FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?').get(owner, source, thread)
+  const decisionStatement = db.prepare<DecisionRow, [string, string, string]>('SELECT data,fingerprint,sender,seq FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?')
+  const decisionRow = (owner: string, source: string, thread: string) => decisionStatement.get(owner, source, thread)
   const usage = (owner: string): AiUsageSummary => { const row = db.query<{ data: string }, [string]>('SELECT data FROM local_ai_usage WHERE owner=?').get(owner); return row ? JSON.parse(row.data) : emptyUsage() }
   function updateUsage(owner: string, mutate: (value: AiUsageSummary) => void) { const value = usage(owner); mutate(value); db.query('INSERT INTO local_ai_usage VALUES (?,?) ON CONFLICT(owner) DO UPDATE SET data=excluded.data').run(owner, JSON.stringify(value)) }
   function cursor(owner: string) { return db.query<{ head: number; floor: number }, [string]>('SELECT head,floor FROM local_ai_cursor WHERE owner=?').get(owner) ?? { head: 0, floor: 0 } }
   const activityProblems = new Set(['AI_INSUFFICIENT_CONTEXT', 'AI_RETRY_LIMIT', 'AI_CONTEXT_FAILED', 'AI_REQUEST_FAILED', 'AI_CONTEXT_CHANGED', 'AI_SETTINGS_CHANGED', 'AI_JOB_CANCELLED', 'AI_ASSESSMENT_FAILED', 'AI_INPUT_INVALID', 'AI_INPUT_LIMIT', 'AI_MODEL_NOT_ALLOWED', 'AI_RATE_LIMITED', 'AI_AUTH_FAILED', 'AI_PROVIDER_UNAVAILABLE', 'AI_HTTP_FAILED', 'AI_RESPONSE_LIMIT', 'AI_RESPONSE_INVALID', 'AI_RESPONSE_INCOMPLETE', 'AI_RESPONSE_FAILED', 'AI_RESPONSE_REFUSED', 'AI_ASSESSMENT_INVALID', 'AI_EVIDENCE_INVALID', 'AI_EVIDENCE_REQUIRED', 'AI_TIMEOUT', 'AI_ABORTED', 'AI_TRANSPORT_FAILED'])
-  const contributionNames = new Set(['message_type', 'response', 'urgency', 'requested_actions', 'correspondence_days', 'active_reading', 'explicit_feedback', 'interests', 'topic_affinity', 'risk_gate', 'uncertainty_gate', 'actionability_gate'])
+  const contributionNames = new Set(['message_type', 'response', 'urgency', 'requested_actions', 'correspondence_days', 'active_reading', 'explicit_feedback', 'interests', 'topic_affinity', 'risk_gate', 'uncertainty_gate', 'actionability_gate', 'no_obligation_gate'])
   const member = <T extends string>(values: readonly T[], value: unknown): value is T => typeof value === 'string' && values.includes(value as T)
+  // Keep fixed journal statements outside Bun's small shared query LRU. The
+  // wider enqueue pipeline must not force SQL recompilation for every event.
+  const journalStatements = {
+    insert: db.prepare('INSERT INTO local_ai_activity(owner,data) VALUES (?,?)'),
+    count: db.prepare("INSERT INTO local_ai_coverage(owner,counts) VALUES (?,json_object(?,?)) ON CONFLICT(owner) DO UPDATE SET counts=json_set(counts,?,COALESCE(json_extract(counts,?),0)+?)"),
+    pruneOwner: db.prepare('DELETE FROM local_ai_activity WHERE seq IN (SELECT seq FROM local_ai_activity WHERE owner=? ORDER BY seq LIMIT MAX(0,(SELECT retained FROM local_ai_coverage WHERE owner=?)-2000))'),
+    pruneGlobal: db.prepare('DELETE FROM local_ai_activity WHERE seq IN (SELECT seq FROM local_ai_activity ORDER BY seq LIMIT MAX(0,(SELECT COALESCE(SUM(retained),0) FROM local_ai_coverage)-10000))'),
+  }
   function countActivity(owner: string, reason: AiActivityReason, amount = 1) {
-    db.query('INSERT OR IGNORE INTO local_ai_coverage(owner) VALUES (?)').run(owner)
-    db.query("UPDATE local_ai_coverage SET counts=json_set(counts,?,COALESCE(json_extract(counts,?),0)+?) WHERE owner=?").run(`$.${reason}`, `$.${reason}`, amount, owner)
+    journalStatements.count.run(owner, reason, amount, `$.${reason}`, `$.${reason}`, amount)
   }
   function activity(owner: string, source: string, thread: string, reason: AiActivityReason, value?: AiDecision, eventReason?: EventReason) {
     // Only this explicit projection is durable. Never spread an assessment/provider object.
@@ -179,10 +200,13 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         item.contributions = scored.contributions.filter(part => contributionNames.has(part.name) && Number.isFinite(part.value)).slice(0, contributionNames.size).map(part => ({ name: part.name, value: part.value }))
       }
     }
-    db.query('INSERT INTO local_ai_activity(owner,data) VALUES (?,?)').run(owner, JSON.stringify(item))
+    journalStatements.insert.run(owner, JSON.stringify(item))
     countActivity(owner, reason)
-    db.query('DELETE FROM local_ai_activity WHERE owner=? AND seq<=(SELECT seq FROM local_ai_activity WHERE owner=? ORDER BY seq DESC LIMIT 1 OFFSET 2000)').run(owner, owner)
-    db.query('DELETE FROM local_ai_activity WHERE seq<=(SELECT seq FROM local_ai_activity ORDER BY seq DESC LIMIT 1 OFFSET 10000)').run()
+    // Trigger-maintained retained counts roll back with the journal. Delete only
+    // the oldest excess rows; do not walk 2k/10k retained entries on every publish.
+    // Summing the small owner ledger never scans message or journal payloads.
+    journalStatements.pruneOwner.run(owner, owner)
+    journalStatements.pruneGlobal.run()
   }
   function drained(owner: string, problem: string | null = null) {
     db.query('INSERT OR IGNORE INTO local_ai_coverage(owner) VALUES (?)').run(owner)
@@ -231,8 +255,10 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     db.query('DELETE FROM local_ai_queue WHERE owner=? AND source=? AND thread=?').run(owner, source, thread)
     settleItems(owner, source, thread, false)
   }
-  const jobRow = (owner: string, id: string) => db.query<JobRow, [string, string]>('SELECT * FROM local_ai_jobs WHERE owner=? AND id=?').get(owner, id)
-  function saveJob(row: JobRow, job: AiHistoryJob) { db.query('UPDATE local_ai_jobs SET data=?,enumerated=?,bytes=?,examined=? WHERE owner=? AND id=?').run(JSON.stringify(job), row.enumerated, row.bytes, row.examined, row.owner, row.id) }
+  const jobStatement = db.prepare<JobRow, [string, string]>('SELECT * FROM local_ai_jobs WHERE owner=? AND id=?')
+  const saveJobStatement = db.prepare('UPDATE local_ai_jobs SET data=?,enumerated=?,bytes=?,examined=? WHERE owner=? AND id=?')
+  const jobRow = (owner: string, id: string) => jobStatement.get(owner, id)
+  function saveJob(row: JobRow, job: AiHistoryJob) { saveJobStatement.run(JSON.stringify(job), row.enumerated, row.bytes, row.examined, row.owner, row.id) }
   function refreshJob(owner: string, id: string) {
     const row = jobRow(owner, id); if (!row) return
     const job: AiHistoryJob = JSON.parse(row.data)
@@ -718,7 +744,8 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       // message/version scope. Only the matching retained receipt carries that choice.
       if (decision.override?.inputHash !== context.hash || context.hash === context.legacyHash && !retained) decision.override = null
     } else decision.override = null
-    decision.score = retained?.score && retained.settingsRevision === value.revision && retained.override?.category === decision.override?.category
+    decision.score = retained?.score && retained.settingsRevision === value.revision && retained.override?.category === decision.override?.category &&
+      (retained.assessment?.task === undefined || !!retained.override || retained.score.version === AI_PREFERENCE_VERSION)
       ? structuredClone(retained.score) : assessment ? score(queue.owner, assessment, context?.sender ?? row.sender, value, decision.override) : null
     if (assessment && context && !problem) {
       const fresh = !db.query('SELECT 1 FROM local_ai_cache WHERE owner=? AND hash=?').get(queue.owner, context.hash)
@@ -810,9 +837,25 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
   }
   const rescoreRow = (owner: string) => db.query<RescoreRow, [string]>('SELECT * FROM local_ai_rescore WHERE owner=?').get(owner)
   const fenceRevision = (owner: string) => db.query<{ revision: number }, [string]>('SELECT revision FROM local_ai_settings_fence WHERE owner=?').get(owner)?.revision ?? 0
-  function queueRescore(owner: string, value: AiSettings, stale = false, force = false) {
+  const needsPolicyScore = (decision: AiDecision) => decision.state === 'ready' && !decision.override &&
+    member(['required', 'optional', 'none', 'unknown'] as const, decision.assessment?.task) &&
+    !!decision.score && typeof decision.score.version === 'string' && decision.score.version !== AI_PREFERENCE_VERSION
+  function queueRescore(owner: string, value: AiSettings, stale = false, force: boolean | 2 = false) {
     if (stale) db.query('INSERT INTO local_ai_settings_fence VALUES (?,?) ON CONFLICT(owner) DO UPDATE SET revision=excluded.revision').run(owner, value.revision)
-    db.query('INSERT INTO local_ai_rescore VALUES (?,?,?,?,0,?,?,NULL) ON CONFLICT(owner) DO UPDATE SET token=excluded.token,revision=excluded.revision,through=excluded.through,after=0,stale=excluded.stale,force=excluded.force,problem=NULL').run(owner, randomUUID(), value.revision, cursor(owner).head, Number(stale), Number(force))
+    db.query('INSERT INTO local_ai_rescore VALUES (?,?,?,?,0,?,?,NULL) ON CONFLICT(owner) DO UPDATE SET token=excluded.token,revision=excluded.revision,through=excluded.through,after=0,stale=excluded.stale,force=excluded.force,problem=NULL WHERE excluded.force<>2').run(owner, randomUUID(), value.revision, cursor(owner).head, Number(stale), Number(force))
+  }
+  function queuePolicyRescore(owner: string) {
+    const existing = rescoreRow(owner)
+    // Preference work keeps its token and captured high-water. Recheck once it
+    // finishes, including old scores published beyond that earlier high-water.
+    if (existing) { if (existing.force !== 2) policyAfterRescore.add(owner); return }
+    const value = settings(owner)
+    if (!value.enabled) return
+    const affected = db.query(`SELECT 1 FROM local_ai_decisions WHERE owner=? AND json_extract(data,'$.state')='ready'
+      AND json_extract(data,'$.assessment.task') IN ('required','optional','none','unknown')
+      AND json_extract(data,'$.score.version')<>? AND json_extract(data,'$.override') IS NULL
+      AND json_extract(data,'$.model')=? AND json_extract(data,'$.settingsRevision')>=? LIMIT 1`).get(owner, AI_PREFERENCE_VERSION, value.model, fenceRevision(owner))
+    if (affected) queueRescore(owner, value, false, 2)
   }
   function rescorePage(owner: string, token: string): boolean {
     return transaction(() => {
@@ -830,7 +873,8 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         if (!row || row.seq !== item.seq || row.seq > job.through) continue
         const decision: AiDecision = JSON.parse(row.data)
         const stale = decision.model !== value.model || decision.settingsRevision < fence || !!job.stale && decision.settingsRevision < job.revision
-        if (!job.force && decision.settingsRevision >= job.revision && !stale) continue
+        if (job.force === 2 && (stale || !needsPolicyScore(decision))) continue
+        if (!job.force && decision.settingsRevision >= job.revision && !stale && !needsPolicyScore(decision)) continue
         decision.settingsRevision = value.revision; decision.updatedAt = stamp(now()); decision.holdUntil = null
         if (stale) { decision.state = 'stale'; decision.problemCode = 'AI_SETTINGS_CHANGED' }
         else if (decision.assessment) { votes ??= affinityVotes(owner); decision.score = score(owner, decision.assessment, row.sender, value, decision.override, votes) }
@@ -856,12 +900,14 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       rescoring.delete(owner)
       const next = rescoreRow(owner)
       if (!closed && next && next.token !== job.token) startRescore(owner)
+      else if (!closed && !next && policyAfterRescore.delete(owner)) { queuePolicyRescore(owner); startRescore(owner) }
     }))
   }
   function projected(owner: string, decision: AiDecision): AiDecision {
     const value = settings(owner), job = rescoreRow(owner)
-    const pending = !!job && decision.revision <= job.through && (job.force !== 0 || decision.settingsRevision < value.revision)
-    if (decision.model !== value.model || decision.settingsRevision < fenceRevision(owner) || pending) {
+    const pending = !!job && decision.revision <= job.through && (job.force === 2 ? needsPolicyScore(decision) : job.force !== 0 || decision.settingsRevision < value.revision)
+    const interrupted = ['pending', 'processing'].includes(decision.state) && !db.query('SELECT 1 FROM local_ai_queue WHERE owner=? AND source=? AND thread=?').get(owner, decision.sourceId, decision.threadId)
+    if (decision.model !== value.model || decision.settingsRevision < fenceRevision(owner) || pending || interrupted) {
       return { ...decision, settingsRevision: value.revision, state: 'stale', holdUntil: null, score: null, problemCode: 'AI_SETTINGS_CHANGED' }
     }
     return decision
@@ -928,6 +974,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       db.query("UPDATE local_ai_decisions SET data=json_set(data,'$.holdUntil',NULL) WHERE json_extract(data,'$.holdUntil') IS NOT NULL").run()
       const owners = db.query<{ owner: string }, []>("SELECT owner FROM local_ai_settings WHERE json_extract(data,'$.enabled')=1 LIMIT 256").all()
       for (const { owner } of owners) {
+        queuePolicyRescore(owner)
         watch(owner); schedule(owner)
         for (const row of db.query<JobRow, [string]>("SELECT * FROM local_ai_jobs WHERE owner=? AND enumerated=0 AND json_extract(data,'$.status')='running' LIMIT 20").all(owner)) startInventory(owner, row.id)
       }
@@ -943,6 +990,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       for (const running of active.values()) running.controller.abort()
       await Promise.allSettled([...active.values()].map(item => item.task))
       await Promise.allSettled([...work, ...locks.values()])
+      for (const statement of Object.values(journalStatements)) statement.finalize()
     },
     async state(owner: string): Promise<AiTriageState> {
       const counts = db.query<{ status: string; count: number }, [string]>('SELECT status,COUNT(*) count FROM local_ai_queue WHERE owner=? GROUP BY status').all(owner)
@@ -960,7 +1008,9 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       const boxes = await inbox.mailboxes(owner)
       if (input.mailboxIds?.some(id => !boxes.some(box => box.id === id && box.status === 'active'))) fail('AI_SCOPE_NOT_FOUND', 404)
       const value: AiSettings = { ...input, revision: previous.revision + 1, mailboxIds: input.mailboxIds === null ? null : [...new Set(input.mailboxIds)].sort(), interests: normalizeAiTopics(input.interests) }
-      const fenced = previous.enabled !== value.enabled || previous.model !== value.model || JSON.stringify(previous.mailboxIds) !== JSON.stringify(value.mailboxIds)
+      const invalidated = previous.model !== value.model || JSON.stringify(previous.mailboxIds) !== JSON.stringify(value.mailboxIds)
+      const fenced = previous.enabled !== value.enabled || invalidated
+      const pauseOnly = previous.enabled !== value.enabled && !invalidated && previous.personalization === value.personalization && previous.readingSignals === value.readingSignals && JSON.stringify(previous.interests) === JSON.stringify(value.interests)
       const head = fenced || !priorRow ? (await inbox.changes(owner, { limit: 1 })).state : priorRow.cursor
       transaction(() => {
         if (settings(owner).revision !== previous.revision) fail('AI_SETTINGS_CONFLICT', 412)
@@ -973,28 +1023,47 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
           const jobs = db.query<JobRow, [string]>('SELECT * FROM local_ai_jobs WHERE owner=? LIMIT 20').all(owner)
           for (const row of jobs) { const job: AiHistoryJob = JSON.parse(row.data); if (['running', 'paused'].includes(job.status)) { job.status = 'cancelled'; job.problemCode = 'AI_SETTINGS_CHANGED'; saveJob(row, job) } }
         }
-        queueRescore(owner, value, fenced)
+        // Pausing does not reinterpret a ready receipt. Preserve any already
+        // pending local preference/policy pass, including its token and high-water.
+        if (pauseOnly) db.query('UPDATE local_ai_rescore SET revision=? WHERE owner=?').run(value.revision, owner)
+        else queueRescore(owner, value, invalidated)
       })
+      if (pauseOnly && value.enabled) queuePolicyRescore(owner)
       startRescore(owner)
       if (value.enabled) { watch(owner); schedule(owner) } else { subscriptions.get(owner)?.(); subscriptions.delete(owner) }
       return service.state(owner)
     }) },
-    process(owner: string, input: { id: string; scope: 'inbox' | 'all'; limit: number }): Promise<AiHistoryJob> { return serial(owner, async () => {
-      if (!object(input) || Object.keys(input).some(key => !['id', 'scope', 'limit'].includes(key)) || !commandOK(input.id) || !['inbox', 'all'].includes(input.scope) || !Number.isInteger(input.limit) || input.limit < 100 || input.limit > 10000) fail('AI_INVALID_JOB')
-      const previous = jobRow(owner, input.id)
-      if (previous) { const job: AiHistoryJob = JSON.parse(previous.data); if (job.scope !== input.scope || job.limit !== input.limit) fail('AI_JOB_CONFLICT', 409); return job }
-      const row = settingsRow(owner), value = settings(owner)
+    process(owner: string, input: { id: string; scope: 'inbox' | 'all'; limit: number; settingsRevision?: number }): Promise<AiHistoryJob> { return serial(owner, async () => {
+      if (!object(input) || Object.keys(input).some(key => !['id', 'scope', 'limit', 'settingsRevision'].includes(key)) || !commandOK(input.id) || !['inbox', 'all'].includes(input.scope) || !Number.isInteger(input.limit) || input.limit < 100 || input.limit > 10000 || input.settingsRevision !== undefined && (!Number.isSafeInteger(input.settingsRevision) || input.settingsRevision < 0)) fail('AI_INVALID_JOB')
+      const receipt = (): AiHistoryJob | null => {
+        const previous = jobRow(owner, input.id); if (!previous) return null
+        const job: AiHistoryJob = JSON.parse(previous.data)
+        if (job.scope !== input.scope || job.limit !== input.limit || input.settingsRevision !== undefined && job.settingsRevision !== input.settingsRevision) fail('AI_JOB_CONFLICT', 409)
+        return job
+      }
+      // A matching durable command stays idempotent even after settings change.
+      const previous = receipt(); if (previous) return previous
+      const row = settingsRow(owner), value: AiSettings = row ? JSON.parse(row.data) : defaultSettings()
+      if (input.settingsRevision !== undefined && input.settingsRevision !== value.revision) fail('AI_SETTINGS_CONFLICT', 412)
       if (!configuration) fail('AI_NOT_CONFIGURED', 503)
       if (!row || !value.enabled) fail('AI_DISABLED', 409)
       const selected = await scope(owner, value)
-      if (!selected.boxes.length) fail('AI_EMPTY_SCOPE', 409)
-      const activeJobs = db.query<{ count: number }, [string]>("SELECT COUNT(*) count FROM local_ai_jobs WHERE owner=? AND json_extract(data,'$.status') IN ('running','paused')").get(owner)!.count
-      if (activeJobs >= 3) fail('AI_JOB_LIMIT', 429)
-      const job: AiHistoryJob = { id: input.id, status: 'running', scope: input.scope, limit: input.limit, scanned: 0, queued: 0, completed: 0, failed: 0, createdAt: stamp(now()), problemCode: null }
-      db.query('INSERT INTO local_ai_jobs(owner,id,data,generation,boxes,input_policy) VALUES (?,?,?,?,?,?)').run(owner, job.id, JSON.stringify(job), row.generation, JSON.stringify(selected.boxes.map(box => box.id)), AI_INPUT_POLICY_VERSION)
-      const old = db.query<{ id: string }, [string]>("SELECT id FROM local_ai_jobs WHERE owner=? AND json_extract(data,'$.status') NOT IN ('running','paused') ORDER BY rowid DESC LIMIT 100 OFFSET 17").all(owner)
-      for (const item of old) { db.query('DELETE FROM local_ai_job_items WHERE owner=? AND job=?').run(owner, item.id); db.query('DELETE FROM local_ai_jobs WHERE owner=? AND id=?').run(owner, item.id) }
-      startInventory(owner, job.id)
+      let created = false
+      const job = transaction(() => {
+        const previous = receipt(); if (previous) return previous
+        const current = settingsRow(owner)
+        if (!current || current.generation !== row.generation || JSON.parse(current.data).revision !== value.revision) fail('AI_SETTINGS_CONFLICT', 412)
+        if (!selected.boxes.length) fail('AI_EMPTY_SCOPE', 409)
+        const activeJobs = db.query<{ count: number }, [string]>("SELECT COUNT(*) count FROM local_ai_jobs WHERE owner=? AND json_extract(data,'$.status') IN ('running','paused')").get(owner)!.count
+        if (activeJobs >= 3) fail('AI_JOB_LIMIT', 429)
+        const job: AiHistoryJob = { id: input.id, status: 'running', scope: input.scope, limit: input.limit, settingsRevision: value.revision, scanned: 0, queued: 0, completed: 0, failed: 0, createdAt: stamp(now()), problemCode: null }
+        db.query('INSERT INTO local_ai_jobs(owner,id,data,generation,boxes,input_policy) VALUES (?,?,?,?,?,?)').run(owner, job.id, JSON.stringify(job), row.generation, JSON.stringify(selected.boxes.map(box => box.id)), AI_INPUT_POLICY_VERSION)
+        const old = db.query<{ id: string }, [string]>("SELECT id FROM local_ai_jobs WHERE owner=? AND json_extract(data,'$.status') NOT IN ('running','paused') ORDER BY rowid DESC LIMIT 100 OFFSET 17").all(owner)
+        for (const item of old) { db.query('DELETE FROM local_ai_job_items WHERE owner=? AND job=?').run(owner, item.id); db.query('DELETE FROM local_ai_jobs WHERE owner=? AND id=?').run(owner, item.id) }
+        created = true
+        return job
+      })
+      if (created) startInventory(owner, job.id)
       return job
     }) },
     control(owner: string, id: string, action: 'pause' | 'resume' | 'cancel'): Promise<AiHistoryJob> { return serial(owner, async () => {

@@ -78,9 +78,16 @@ export function scoreAiTriage(
     if (score < 20) add('uncertainty_gate', 20 - score, 'Uncertain assessment stays Important for review')
     else reasons.push('Uncertain assessment stays Important for review')
     score = Math.max(20, score)
-  } else if (assessment.task === 'required' || !['promotion', 'newsletter', 'cold_outreach'].includes(assessment.type) &&
-    (assessment.response === 'needed' || assessment.urgency === 'immediate' || assessment.urgency === 'deadline' ||
-      assessment.task === undefined && personalAction && assessment.actions.some(action => action !== 'other'))) {
+  } else if ((assessment.task === 'none' || assessment.task === 'optional') &&
+    ['not_needed', 'optional', 'waiting'].includes(assessment.response)) {
+    // Relevance and reported urgency cannot create work the clear assessment rules out.
+    if (score >= 20) add('no_obligation_gate', 19 - score, 'No outstanding user obligation; relevance alone remains Other')
+    score = Math.min(19, score)
+  } else if (assessment.task !== undefined
+    ? assessment.task === 'required' || assessment.response === 'needed'
+    : !['promotion', 'newsletter', 'cold_outreach'].includes(assessment.type) &&
+      (assessment.response === 'needed' || assessment.urgency === 'immediate' || assessment.urgency === 'deadline' ||
+        personalAction && assessment.actions.some(action => action !== 'other'))) {
     // Disinterest learned from an earlier message cannot bury a genuine new task.
     // Only a manual choice for this captured conversation can override this floor.
     if (score < 20) add('actionability_gate', 20 - score, 'Requested action remains Important independently of personal interest')
@@ -91,5 +98,5 @@ export function scoreAiTriage(
   if (options.override === 'Important' || options.override === 'Other') reasons.push(`Manual category override: ${options.override}`)
   if (!reasons.length) reasons.push('No strong importance signal')
   // Never mutate the assessment: a manual override or an interest cannot clear risk.
-  return { category, score, reasons, contributions, version: AI_PREFERENCE_VERSION }
+  return { category, score, reasons, contributions, version: assessment.task === undefined ? 'preference-2' : AI_PREFERENCE_VERSION }
 }
