@@ -1,5 +1,15 @@
 # Continuous AI triage and decision diagnostics
 
+## Hands-off refinement in progress
+
+Following user review, this PR is being refined from `3056414`: Important must represent work to handle, not mere topic/sender affinity, and technical controls must not be the normal experience. The before captures below were taken and inspected from that current optimized revision before these edits, with the same 173-message fictional fixture, saved decision, viewport and appearance. The prior qualification below is retained historical evidence, not approval of the ongoing refinement.
+
+![Before: operator-heavy settings](hands-off-before-settings.png)
+
+![Before: technical explanation](hands-off-before-explanation.png)
+
+![Before: current inbox](hands-off-before-inbox.png)
+
 Review base: `ca3c9a924c24d597a9e5ee912fc57bb449435bc2`, verified healthy in production. Qualified application source: `ef1eacdbafc614f992c4a24d4c9ea4d32a9dba5f`. Baseline evidence was committed in `a031cf8` and the draft PR opened before implementation. Original private Mac work and unpublished classifier history remain excluded. This change is not deployed.
 
 ## Before and after
