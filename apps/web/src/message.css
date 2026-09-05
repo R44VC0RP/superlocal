@@ -345,13 +345,13 @@
   font-weight: 700;
 }
 .compose-from > span {
-  width: 50px;
+  width: 64px;
   flex-shrink: 0;
   color: inherit;
 }
 .compose-from select {
   min-width: 0;
-  max-width: calc(100% - 68px);
+  max-width: calc(100% - 84px);
   border: 0;
   outline: none;
   padding: 2px 4px;
@@ -369,7 +369,7 @@
   color: var(--subtle);
 }
 .compose-sender-status {
-  padding-left: 50px;
+  padding-left: 64px;
   color: var(--muted);
   font-size: var(--ui-small);
   line-height: 20px;

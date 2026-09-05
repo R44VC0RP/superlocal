@@ -6,6 +6,9 @@
 }
 .row-recipients { flex: 0 1 160px; max-width: 160px; min-width: 0; margin-inline-start: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
 .mail-row.has-recipients .row-metadata { min-width: 84px; }
+@media (min-width: 701px) and (max-width: 1024px) {
+  .row-recipients { flex-basis: 100px; max-width: 100px; }
+}
 @media (min-width: 701px) {
   /* Highlight swaps metadata (8 + 84) for actions (84 - 6 right margin); 14px keeps the swap width-neutral. */
   .mail-row.has-recipients .row-actions { margin-left: 14px; }
