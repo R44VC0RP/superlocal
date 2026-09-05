@@ -420,7 +420,7 @@ export function createInboxWindowService(deps: Dependencies) {
     const splitMatches = new Map<string, boolean>()
     for (const name of new Set([...scope.preferences.splits, query.split])) {
       const category = attentionSplit(scope.preferences as never, name), rule = (scope.preferences.splitRules as Record<string, string> | undefined)?.[name]
-      splitMatches.set(name, category ? attention === 'Unknown' || attention === category : typeof rule === 'string' && !!rule.trim() && await expression(scope, row, rule, false))
+      splitMatches.set(name, category ? attention === category || category === 'Important' && attention === 'Unknown' : typeof rule === 'string' && !!rule.trim() && await expression(scope, row, rule, false))
     }
     if (!(holding && !query.search && query.folder === 'Inbox')) {
       counts.inbox = Number(inbox && attention === 'Important')

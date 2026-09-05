@@ -2127,6 +2127,29 @@ function sse(response: Response) {
 }
 
 describe('bounded host inbox window', () => {
+  test('cold giant conversations with unknown attention stay in Important review, never Other', async () => {
+    const h = await fixture(), database = new Database(':memory:'), raw = h.gate<void>(undefined)
+    await h.seed('alice', 'unknown-window', Array.from({ length: 620 }, (_, index) => native(`unknown-${index}`, {
+      threadId: 'one-giant', receivedAt: new Date(EPOCH - index * 1000).toISOString(), bodyText: BODY_SECRET,
+    })))
+    const guarded: Inbox = { ...h.inbox, mailboxMessagePage: async (...args) => { await raw.wait(); return h.inbox.mailboxMessagePage(...args) } }
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY })
+    const service = createInboxWindowService({ database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: false,
+      inboxPreferences: createInboxViewPreferencesStore(database, guarded, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'),
+      attentionOverrides: createAttentionOverridesStore(database, guarded, 'alice') })
+    cleanup.push(async () => { raw.release(); await service.close(); await ai.close(); database.close() })
+    const query = { account: 'unified', folder: 'Inbox', split: 'Important', search: false, query: '', filter: null }
+    const important = await bounded(service.dispatch('/host/inbox/query', query), 'unknown giant review page') as WindowDTO.InboxWindowPage
+    expect(important.rows).toHaveLength(1)
+    expect(important.rows[0]!.mail.split).toBe('Unknown')
+    expect(important.rows[0]!.counts.messages).toBe(620)
+    expect(important.state.indexing).toBe(true)
+    const other = await bounded(service.dispatch('/host/inbox/query', { ...query, split: 'Other' }), 'unknown giant Other exclusion') as WindowDTO.InboxWindowPage
+    expect(other.rows).toHaveLength(0)
+    expect(other.exhausted).toBe(false)
+    expect(other.totals.conversations).toBeNull()
+  })
+
   test('first pages stay bounded while overlapping mailboxes, global Boolean search and counts cover off-window history', async () => {
     const h = await fixture({ eventRetention: 5000 })
     const domains = ['window-a.example.test', 'window-b.example.test']
