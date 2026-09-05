@@ -14,4 +14,15 @@ Captured and inspected before implementation. The current released UI is shown w
 
 Derive the primary address from Google's authenticated send-as response. Preserve optional explicit-address mismatch checks, response validation/bounds, and the SDK's native-source identity validation. No credentials, OAuth scopes, receiving mailboxes, cache fences or UI source changes.
 
-Implementation, matching after evidence, token-only OAuth regressions and live post-deployment checks are pending. The user authorized applying and shipping this narrow correction; the previous release's performance exception does not assert that the 246ms outlier is fixed.
+## After and verification
+
+![Fictional composer after successful sender discovery](after.png)
+
+[Inspected recovery recording](recovery.mp4): Retry clears the error without changing From, recipients or draft writing. The after response uses identities produced by the corrected Gmail adapter with token-only fictional credentials and a mocked authenticated Google response. Source-ID wrapping at the local UI interception boundary is fixture plumbing, not a new application API. The independent SDK test below exercises the real adapter, HTTP adapter and client without that UI interception.
+
+- 12 focused provider tests / 147 assertions pass, including token-only grants, primary-vs-default selection, malformed/conflicting responses, explicit expected-address checks and existing size bounds.
+- 13 source-scoped SDK identity tests / 192 assertions pass. The added real Gmail adapter → SDK HTTP/client test uses token-only credentials, accepts an authorized alias through submission and queued MIME generation, rejects pending aliases, and rejects a primary that differs from the stored profile. Profile/INBOX reads occur only at connection, not discovery.
+- SDK typecheck and build pass. Independent read-only review found no high/medium issue. No UI source, query, reconciliation or rendering implementation changed; the unchanged broad suites and scale benchmarks were not repeated.
+- Before merging, the corrected adapter was exercised with the two existing live Gmail grants using at most two read-only requests. It returned five identities (four custom) and one primary-only identity; both primary addresses matched their SDK native profiles. No credential/configuration write, reconnect, live send or extra profile request was made. Post-deployment SDK endpoint verification will be recorded on the PR.
+
+Before/after images and decoded recording were inspected. A first exact-text wait missed the error because Retry shares its container; the existing rendered state was inspected, not replayed as an application action. The user authorized applying and shipping this narrow correction. The previous release's performance exception remains disclosed and does not assert that the 246ms outlier is fixed.
