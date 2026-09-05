@@ -197,7 +197,21 @@ function Calendar({
   const [calendarError, setCalendarError] = useState("");
   const [now, setNow] = useState(() => new Date().toISOString());
   const scroller = useRef<HTMLDivElement>(null);
-  const closeEditor = useCallback(() => setEditor(null), []);
+  const actionsTrigger = useRef<HTMLButtonElement>(null);
+  const dismissEditor = useCallback(() => {
+    const trigger = actionsTrigger.current;
+    setEditor(null);
+    // Wait for the editor's autofocus target to detach and backdrop input to settle.
+    requestAnimationFrame(() => {
+      if (
+        trigger?.isConnected &&
+        trigger.getClientRects().length &&
+        document.activeElement === document.body &&
+        !document.querySelector('[role="dialog"], [aria-modal="true"]')
+      )
+        trigger.focus({ preventScroll: true });
+    });
+  }, []);
   const closeSidebarDialog = useCallback(() => {
     setSidebarDialog(null);
     setSidebarTitle("");
@@ -441,6 +455,7 @@ function Calendar({
           </div>
           <h1>
             <button
+              ref={actionsTrigger}
               aria-label={`${heading}, calendar view and actions`}
               aria-expanded={actionsOpen}
               onClick={() => setActionsOpen(!actionsOpen)}
@@ -1032,7 +1047,7 @@ function Calendar({
           timezone={timezone}
           account={account}
           sources={sources}
-          onClose={closeEditor}
+          onClose={dismissEditor}
           onSave={(event) => {
             saveEvents(
               event.id
@@ -1046,11 +1061,11 @@ function Calendar({
                 ? event.start
                 : wallTime(event.start, timezone).slice(0, 10),
             );
-            closeEditor();
+            setEditor(null);
           }}
           onDelete={() => {
             saveEvents(events.filter((event) => event.id !== editor.id));
-            closeEditor();
+            setEditor(null);
           }}
         />
       )}
