@@ -15,10 +15,10 @@ Combined draft [PR15](https://github.com/R44VC0RP/superlocal/pull/15) fixes the 
 | Scenario | Before | After |
 | --- | --- | --- |
 | Reply footer and collapsed history | ![Before](before-reader.png) | ![After](after-reader.png) |
-| History disclosure | [Baseline recording](before-reader.mp4) | [Native expand/reclose recording](after-reader.mp4) |
+| History disclosure | ![Baseline recording](before-reader.gif) | ![Native expand/reclose recording](after-reader.gif) |
 | Full older reply remains available | Always visible above | ![Expanded history](after-expanded.png) |
 
-Screenshots and decoded recording frames were inspected. The after recording is an unchanged-speed six-second excerpt showing the native disclosure expand and reclose, not a latency benchmark. Supplementary fictional edge states: [unsaved recipient](after-unsaved-recipient.png), [save conflict](after-save-error.png), [expanded mobile quote](after-mobile-expanded.png), [popped-out reply](after-popout.png).
+Screenshots and decoded recording frames were inspected. Embedded GIFs render directly in GitHub; the original [before MP4](before-reader.mp4) and [after MP4](after-reader.mp4) remain downloadable. The after recording is an unchanged-speed six-second excerpt showing the native disclosure expand and reclose, not a latency benchmark. Supplementary fictional edge states: [unsaved recipient](after-unsaved-recipient.png), [save conflict](after-save-error.png), [expanded mobile quote](after-mobile-expanded.png), [popped-out reply](after-popout.png).
 
 ## Changes
 
