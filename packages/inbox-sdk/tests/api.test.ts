@@ -34,7 +34,7 @@ import { MockMailStore } from '../../../apps/mock-api/src/store'
 import { seedMockMail } from '../../../apps/mock-api/src/seed'
 import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
-  Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, Message,
+  Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, MailboxSyncStatus, Message,
   MessageSummary, Operation, Page, Policy, ProviderDefinition, Query,
   ThreadSummary, MediaNetwork,
 } from '../src/contracts'
@@ -6266,6 +6266,286 @@ test('close drains an in-flight foreground refresh and preserves rotated credent
   expect(box.calls.createFolder).toEqual([])
 })
 
+describe('mailbox sync status', () => {
+  test('polls held primary lanes read-only, preserves client caches and reports only committed batch records', async () => {
+    const h = await fixture()
+    const { account, box } = await h.connect('alice', 'status-held')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const database = new Database(h.database)
+    await h.restart(database)
+    const input = { mailboxIds: [mailbox.id] }
+    const before = await h.inbox.mailboxSyncStatus('alice', input)
+    expect(before).toEqual([{ sourceId: account.id, scopeKey: expect.any(String), state: 'idle', activeLanes: [], retryAt: null, problemCode: null, lastBatch: null, lastSyncAt: null }])
+    let wakes = 0
+    const unsubscribe = h.inbox.subscribe('alice', () => { wakes++ })
+    const baseline = await h.inbox.changes('alice')
+    const latest = h.gate(receipt([native('same'), native('same')], 'latest-held', { hasMore: true }))
+    const backfill = h.gate(receipt([native('older')], 'backfill-held'))
+    box.nextSync(latest.wait)
+    const syncingLatest = h.pending(h.inbox.syncMailbox('alice', mailbox.id))
+    await bounded(latest.entered, 'held latest page')
+    box.nextSync(backfill.wait)
+    const syncingBackfill = h.pending(h.inbox.syncMailbox('alice', mailbox.id, { lane: 'backfill' }))
+    await bounded(backfill.entered, 'held backfill page')
+    // A fresh instance sharing the same durable state cannot claim this process's active work.
+    expect(await h.worker().mailboxSyncStatus('alice', input)).toEqual(before)
+    const requests: Array<{ path: string; headers: Headers; method: string; body: unknown; status: number }> = []
+    const client = createInboxClient({ baseUrl: 'https://inbox.example.test', cacheScope: 'alice', headers: { authorization: 'Bearer alice' },
+      fetch: (async (url, init) => {
+        const request = new Request(url, init)
+        const response = await h.api.fetch(request)
+        requests.push({ path: new URL(request.url).pathname, headers: request.headers, method: request.method,
+          body: typeof init?.body === 'string' ? JSON.parse(init.body) : null, status: response.status })
+        return response
+      }) as typeof fetch })
+    await client.account(account.id)
+    const calls = structuredClone(box.calls)
+    const queries: string[] = []
+    const query = database.query.bind(database)
+    const guard = spyOn(database, 'query').mockImplementation(((sql: string) => {
+      queries.push(sql)
+      if (!/^\s*SELECT\b/i.test(sql) || /sdk_(messages|memberships|blobs|events|states|checkpoints)\b/.test(sql)) throw new Error('Status read accessed mail data or wrote state')
+      return query(sql)
+    }) as typeof database.query)
+    try {
+      expect(await client.mailboxSyncStatus(input)).toEqual([{ ...before[0], state: 'syncing', activeLanes: ['latest', 'backfill'] }])
+      const response = await h.request('alice', '/mailbox-sync/status', { method: 'POST', headers: { 'content-type': 'application/json', 'if-none-match': '*' }, body: JSON.stringify(input) })
+      expect(response.status).toBe(200)
+      expect(response.headers.get('cache-control')).toBe('no-store')
+      expect(response.headers.get('etag')).toBeNull()
+      expect(await response.json()).toEqual([{ ...before[0], state: 'syncing', activeLanes: ['latest', 'backfill'] }])
+      expect(queries.length).toBeGreaterThan(0)
+      expect(box.calls).toEqual(calls)
+      expect(wakes).toBe(0)
+    } finally { guard.mockRestore(); unsubscribe() }
+    expect((await h.inbox.changes('alice', { since: baseline.state })).events).toEqual([])
+    await client.account(account.id)
+    expect(requests.at(-1)).toMatchObject({ status: 304 })
+    expect(requests.at(-1)!.headers.has('if-none-match')).toBe(true)
+    const posted = requests.find(request => request.path === '/v1/mailbox-sync/status')!
+    expect(posted).toMatchObject({ method: 'POST', body: input })
+    expect(posted.headers.has('if-none-match')).toBe(false)
+    latest.release()
+    await bounded(syncingLatest, 'latest commit')
+    expect(await client.mailboxSyncStatus(input)).toEqual([{ ...before[0], state: 'syncing', activeLanes: ['backfill'],
+      lastBatch: { lane: 'latest', processed: 2, completedAt: new Date(EPOCH).toISOString(), hasMore: true }, lastSyncAt: new Date(EPOCH).toISOString() }])
+    expect((await h.page()).total).toBe(1) // Two committed records, one canonical message; never unique-new progress.
+    h.clock.value += 1000
+    backfill.release()
+    await bounded(syncingBackfill, 'backfill commit')
+    expect((await client.mailboxSyncStatus(input))[0]).toMatchObject({ state: 'idle', activeLanes: [], lastBatch: { lane: 'backfill', processed: 1, hasMore: false } })
+    const folder = h.gate(receipt([], 'sent-held'))
+    box.nextSync(folder.wait)
+    const syncingFolder = h.pending(h.inbox.sync('alice', account.id, { folder: 'sent' }))
+    await bounded(folder.entered, 'held non-primary folder')
+    expect((await client.mailboxSyncStatus(input))[0]).toMatchObject({ state: 'idle', activeLanes: [], lastBatch: { lane: 'backfill', processed: 1 } })
+    h.clock.value += 1000
+    folder.release()
+    await syncingFolder
+    const completedAt = new Date(h.clock.value).toISOString()
+    expect((await client.mailboxSyncStatus(input))[0]).toMatchObject({ lastSyncAt: completedAt, lastBatch: { lane: 'backfill', processed: 1 } })
+    const callsAfterFolder = box.calls.sync.length
+    h.clock.value = EPOCH + 61_000 // Primary batch would be due; the later source sync still suppresses polling.
+    await h.inbox.poll()
+    expect(box.calls.sync).toHaveLength(callsAfterFolder)
+    await h.restart()
+    const restarted = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+    expect(restarted).toMatchObject({ state: 'idle', activeLanes: [], lastBatch: null, lastSyncAt: completedAt, scopeKey: before[0]!.scopeKey })
+  })
+
+  test('normalizes provider, validation and rolled-back persistence failures and always clears activity', async () => {
+    const h = await fixture()
+    const { account, box } = await h.connect('alice', 'status-failed')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const database = new Database(h.database)
+    await h.restart(database)
+    const input = { mailboxIds: [mailbox.id] }
+    box.nextSync(new ProviderError(FULL, 'UPSTREAM', SECRET, { cause: new Error(BODY_SECRET), details: { secret: SECRET } }))
+    await expect(h.inbox.syncMailbox('alice', mailbox.id)).rejects.toMatchObject({ code: 'UPSTREAM' })
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], problemCode: 'UPSTREAM', lastBatch: null })
+    box.nextSync(receipt([], 'invalid', { hasMore: true, cursor: null }))
+    await expect(h.inbox.syncMailbox('alice', mailbox.id)).rejects.toMatchObject({ code: 'INVALID_PROVIDER' })
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], problemCode: 'INVALID_PROVIDER', lastBatch: null })
+    database.exec("CREATE TEMP TRIGGER fail_status_persistence BEFORE INSERT ON sdk_messages BEGIN SELECT RAISE(ABORT, 'private persistence failure'); END")
+    box.nextSync(receipt([native('rollback')], 'rollback'))
+    await expect(h.inbox.syncMailbox('alice', mailbox.id)).rejects.toMatchObject({ code: 'INTERNAL' })
+    expect((await h.page()).total).toBe(0)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], problemCode: 'INTERNAL', lastBatch: null, lastSyncAt: null })
+    database.exec('DROP TRIGGER fail_status_persistence')
+    database.query("UPDATE sdk_accounts SET data=json_set(data,'$.sync.problem',?) WHERE id=?").run(SECRET, account.id)
+    const response = await h.json<MailboxSyncStatus[]>('alice', '/mailbox-sync/status', input, 'POST')
+    expect(response[0]!.problemCode).toBe('INTERNAL')
+    expect(JSON.stringify(response)).not.toContain(SECRET)
+    expect(JSON.stringify(response)).not.toContain(BODY_SECRET)
+    box.nextSync(receipt([native('success')], 'success'))
+    await h.inbox.syncMailbox('alice', mailbox.id)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', activeLanes: [], problemCode: null, lastBatch: { processed: 1 } })
+    box.nextSync(receipt([], 'success', { hasMore: true }))
+    await expect(h.inbox.syncMailbox('alice', mailbox.id)).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], problemCode: 'INVALID_CURSOR', lastBatch: { processed: 1 } })
+    box.nextSync(receipt([], 'after-nonadvancing'))
+    await h.inbox.syncMailbox('alice', mailbox.id)
+    expect(cursorValue(box.calls.sync.at(-1)!.cursor)).toBe('success')
+  })
+
+  test('binds overlapping source views to their union, excludes detached scopes and fences stale scope attempts', async () => {
+    const h = await fixture()
+    h.discoveries.set('status-union', { sources: [
+      { kind: 'domain', value: 'alpha.example.test', canReceive: true, canSend: true, canFilter: true },
+      { kind: 'domain', value: 'beta.example.test', canReceive: true, canSend: true, canFilter: true },
+      { kind: 'address', value: 'help@alpha.example.test', canReceive: true, canSend: true, canFilter: true },
+    ], identities: [{ email: 'help@alpha.example.test' }, { email: 'help@beta.example.test' }] })
+    const { account, box } = await h.connect('alice', 'status-union', [], SCOPED)
+    const alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    const beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    const address = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Help', selector: { kind: 'address', value: 'help@alpha.example.test' } })
+    const input = { mailboxIds: [alpha.id, beta.id, address.id, alpha.id] }
+    const before = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+    const old = h.gate(receipt([native('stale', { sourceDomains: ['alpha.example.test'] })], 'stale'))
+    box.nextSync(old.wait)
+    const stale = h.pending(h.inbox.syncMailbox('alice', alpha.id))
+    await bounded(old.entered, 'old selected union')
+    expect(box.calls.sync.at(-1)!.options.mailboxScopes).toHaveLength(3)
+    expect(await h.inbox.mailboxSyncStatus('alice', { mailboxIds: [beta.id] })).toEqual([{ ...before, state: 'syncing', activeLanes: ['latest'] }])
+    expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([{ ...before, state: 'syncing', activeLanes: ['latest'] }])
+    const paused = await h.inbox.updateMailbox('alice', alpha.id, { status: 'paused' }, alpha.revision)
+    const replacement = h.gate(receipt([native('current', { sourceDomains: ['beta.example.test'] })], 'current'))
+    box.nextSync(replacement.wait)
+    const newer = h.pending(h.inbox.syncMailbox('alice', beta.id))
+    await bounded(replacement.entered, 'replacement selected union')
+    const active = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+    expect(active.scopeKey).not.toBe(before.scopeKey)
+    old.release()
+    await expect(stale).rejects.toMatchObject({ code: 'SCOPE_CHANGED' })
+    expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([active])
+    replacement.release()
+    await newer
+    expect((await h.page()).total).toBe(1)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', lastBatch: { processed: 1 } })
+    const detached = await h.inbox.updateMailbox('alice', address.id, { status: 'detached' }, address.revision)
+    expect(await h.inbox.mailboxSyncStatus('alice', { mailboxIds: [detached.id] })).toEqual([])
+    expect((await h.inbox.mailbox('alice', paused.id)).status).toBe('paused')
+    await h.inbox.updateMailbox('alice', beta.id, { status: 'paused' }, beta.revision)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'paused', activeLanes: [], lastBatch: null, retryAt: null })
+    await expect(h.inbox.mailboxSyncStatus('bob', input)).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(h.inbox.mailboxSyncStatus('', input)).rejects.toMatchObject({ code: 'UNAUTHORIZED' })
+    const calls = structuredClone(box.calls)
+    expect(await h.inbox.mailboxSyncStatus('alice', { mailboxIds: Array(1000).fill(alpha.id) })).toHaveLength(1)
+    for (const mailboxIds of [[], Array(1001).fill(alpha.id), ['missing']]) {
+      await invalid(await h.request('alice', '/mailbox-sync/status', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mailboxIds }) }), mailboxIds[0] === 'missing' ? 404 : 400)
+    }
+    await invalid(await h.request('bob', '/mailbox-sync/status', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }), 404)
+    await invalid(await h.request('alice', '/mailbox-sync/status', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...input, owner: 'bob' }) }), 400)
+    expect(box.calls).toEqual(calls)
+  })
+
+  test.each([true, false])('metadata edits preserve in-flight sync and deduplication (mailboxScoped=%s)', async mailboxScoped => {
+    const h = await fixture()
+    h.discoveries.set('status-metadata', { sources: [
+      { kind: 'domain', value: 'alpha.example.test', canReceive: true, canSend: true, canFilter: true },
+      { kind: 'domain', value: 'beta.example.test', canReceive: true, canSend: true, canFilter: true },
+      { kind: 'address', value: 'help@alpha.example.test', canReceive: true, canSend: true, canFilter: true },
+    ], identities: [{ email: 'help@alpha.example.test' }, { email: 'help@beta.example.test' }] })
+    const { account, box } = await h.connect('alice', 'status-metadata', [], SCOPED)
+    let alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    let beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    let address = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Help', selector: { kind: 'address', value: 'help@alpha.example.test' } })
+    beta = await h.inbox.updateMailbox('alice', beta.id, { status: 'paused' }, beta.revision)
+    address = await h.inbox.updateMailbox('alice', address.id, { status: 'detached' }, address.revision)
+    const input = { mailboxIds: [alpha.id, beta.id] }
+    const barrier = h.gate(receipt([native('metadata-kept', { sourceDomains: ['alpha.example.test'] })], 'metadata-kept'))
+    box.nextSync(barrier.wait)
+    const first = h.pending(mailboxScoped ? h.inbox.syncMailbox('alice', alpha.id) : h.inbox.sync('alice', account.id))
+    await bounded(barrier.entered, 'sync before mailbox metadata edits')
+    const before = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+    alpha = await h.inbox.updateMailbox('alice', alpha.id, { name: 'Renamed alpha', defaultSender: null }, alpha.revision)
+    beta = await h.inbox.updateMailbox('alice', beta.id, { name: 'Renamed paused beta', defaultSender: null }, beta.revision)
+    address = await h.inbox.updateMailbox('alice', address.id, { name: 'Renamed detached help', defaultSender: null }, address.revision)
+    expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([before])
+    // Returning to the original selectors preserves the SDK's original pause/resume behavior.
+    alpha = await h.inbox.updateMailbox('alice', alpha.id, { status: 'paused' }, alpha.revision)
+    alpha = await h.inbox.updateMailbox('alice', alpha.id, { status: 'active' }, alpha.revision)
+    expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([before])
+    if (!mailboxScoped) {
+      // A legacy all-source operation has never been fenced by the selected mailbox union.
+      beta = await h.inbox.updateMailbox('alice', beta.id, { status: 'active' }, beta.revision)
+    }
+    const duplicate = h.pending(mailboxScoped ? h.inbox.syncMailbox('alice', alpha.id) : h.inbox.sync('alice', account.id))
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(box.calls.sync).toHaveLength(1)
+    expect(box.calls.sync[0]!.options.mailboxScopes).toEqual(mailboxScoped ? [{ kind: 'domain', value: 'alpha.example.test' }] : undefined)
+    barrier.release()
+    const results = await bounded(Promise.all([first, duplicate]), 'unchanged in-flight sync and duplicate')
+    expect(results[0]).toEqual(results[1])
+    expect(results[0]!.synchronized).toBe(1)
+    expect((await h.page()).total).toBe(1)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', activeLanes: [], problemCode: null })
+    if (mailboxScoped) {
+      const committed = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+      await h.inbox.updateMailbox('alice', beta.id, { name: 'Still paused beta' }, beta.revision)
+      expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([committed])
+    }
+  })
+
+  test.each([false, true])('provider rate limits retain their failure and backoff after mailbox edits (changedScope=%s)', async changedScope => {
+    const h = await fixture()
+    h.discoveries.set('status-failure-scope', { sources: [
+      { kind: 'domain', value: 'alpha.example.test', canReceive: true, canSend: true, canFilter: true },
+      { kind: 'domain', value: 'beta.example.test', canReceive: true, canSend: true, canFilter: true },
+    ], identities: [] })
+    const { account, box } = await h.connect('alice', 'status-failure-scope', [], SCOPED)
+    let alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    const beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    const barrier = h.gate<void>(undefined)
+    box.nextSync(async () => { await barrier.wait(); throw new ProviderRateLimitError(SCOPED, SECRET, { retryAfter: 120 }) })
+    const pending = h.pending(h.inbox.syncMailbox('alice', alpha.id))
+    await bounded(barrier.entered, 'provider failure before mailbox edit')
+    alpha = await h.inbox.updateMailbox('alice', alpha.id, { name: 'Renamed alpha' }, alpha.revision)
+    if (changedScope) await h.inbox.updateMailbox('alice', beta.id, { status: 'paused' }, beta.revision)
+    barrier.release()
+    await expect(pending).rejects.toMatchObject({ code: 'RATE_LIMITED', status: 429, retryable: true })
+    const input = { mailboxIds: [alpha.id] }
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'waiting', problemCode: 'RATE_LIMITED', retryAt: new Date(EPOCH + 120_000).toISOString(), activeLanes: [], lastBatch: null })
+    await expect(h.inbox.syncMailbox('alice', alpha.id)).rejects.toMatchObject({ code: 'RATE_LIMITED' })
+    expect(box.calls.sync).toHaveLength(1)
+    await h.restart()
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'waiting', problemCode: 'RATE_LIMITED', retryAt: new Date(EPOCH + 120_000).toISOString() })
+    expect((await h.inbox.account('alice', account.id)).sync.problem).toBe('RATE_LIMITED')
+  })
+
+  test('disconnect and reconnect cannot resurrect old activity or clear a replacement attempt', async () => {
+    const h = await fixture()
+    const { account, box } = await h.connect('alice', 'status-disconnect')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const input = { mailboxIds: [mailbox.id] }
+    const old = h.gate(receipt([native('old')], 'old'))
+    box.nextSync(old.wait)
+    const stale = h.pending(h.inbox.syncMailbox('alice', mailbox.id))
+    await bounded(old.entered, 'sync before disconnect')
+    const binding = (await h.inbox.mailboxSyncStatus('alice', input))[0]!.scopeKey
+    const paused = await h.inbox.updateMailbox('alice', mailbox.id, { status: 'paused' }, mailbox.revision)
+    await h.inbox.disconnect('alice', account.id)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], lastBatch: null, problemCode: 'RECONNECT_REQUIRED' })
+    await h.inbox.reconnect('alice', account.id, { mailbox: box.key, accessToken: SECRET })
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'paused', problemCode: null })
+    await h.inbox.updateMailbox('alice', mailbox.id, { status: 'active' }, paused.revision)
+    const next = h.gate(receipt([native('new')], 'new'))
+    box.nextSync(next.wait)
+    const current = h.pending(h.inbox.syncMailbox('alice', mailbox.id))
+    await bounded(next.entered, 'sync after reconnect')
+    const replacement = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+    expect(replacement).toMatchObject({ state: 'syncing', activeLanes: ['latest'], lastBatch: null })
+    expect(replacement.scopeKey).not.toBe(binding)
+    old.release()
+    await expect(stale).rejects.toMatchObject({ code: 'RECONNECT_REQUIRED' })
+    expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([replacement])
+    next.release()
+    await current
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', activeLanes: [], lastBatch: { processed: 1 } })
+    expect((await h.page()).total).toBe(1)
+  })
+})
+
 test('refresh-hook rate limits persist Retry-After cooldown and sync problems across restart', async () => {
   const box = referenceMailbox('refresh-cooldown', 'refresh-cooldown@example.test', [])
   const refreshTokens: unknown[] = []
@@ -6288,10 +6568,12 @@ test('refresh-hook rate limits persist Retry-After cooldown and sync problems ac
     },
   }] })
   const source = await h.inbox.connect('alice', { providerId: 'gmail', credentials: initial })
+  const input = { mailboxIds: (await h.inbox.mailboxes('alice')).map(mailbox => mailbox.id) }
   h.clock.value = EPOCH + 60_000
   const retryAt = h.clock.value + retryAfter * 1000
   await expect(h.inbox.sync('alice', source.id)).rejects.toMatchObject({ code: 'RATE_LIMITED', status: 429, retryable: true })
   expect(refreshTokens).toEqual([initial.refreshToken])
+  expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'waiting', activeLanes: [], retryAt: new Date(retryAt).toISOString(), problemCode: 'RATE_LIMITED', lastBatch: null })
   expect(await h.inbox.account('alice', source.id)).toMatchObject({
     status: 'connected', sync: { lastSyncAt: null, problem: 'RATE_LIMITED' },
   })
@@ -6304,13 +6586,17 @@ test('refresh-hook rate limits persist Retry-After cooldown and sync problems ac
     id: source.id, connectionId: source.connectionId, status: 'connected',
     sync: { lastSyncAt: null, problem: 'RATE_LIMITED' },
   })
+  expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'waiting', activeLanes: [], retryAt: new Date(retryAt).toISOString(), problemCode: 'RATE_LIMITED', lastBatch: null })
   h.clock.value = retryAt - 1
   await h.inbox.poll()
   await expect(h.inbox.sync('alice', source.id)).rejects.toMatchObject({ code: 'RATE_LIMITED', status: 429, retryable: true })
   expect(refreshTokens).toEqual([initial.refreshToken])
   expect(box.calls.sync).toEqual([])
   h.clock.value = retryAt
+  expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], retryAt: null, problemCode: 'RATE_LIMITED', lastBatch: null })
+  expect(refreshTokens).toEqual([initial.refreshToken]) // A due cooldown is not evidence of a scheduled or running job.
   await h.inbox.poll()
+  expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', activeLanes: [], retryAt: null, problemCode: null, lastBatch: { processed: 0 } })
   expect(refreshTokens).toEqual([initial.refreshToken, initial.refreshToken])
   expect(box.calls.create.at(-1)).toMatchObject({ ...rotated, accountId: source.id, userId: 'alice' })
   expect(box.calls.sync).toHaveLength(1)

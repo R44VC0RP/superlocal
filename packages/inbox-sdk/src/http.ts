@@ -1,7 +1,7 @@
 import { Hono, type Context } from 'hono'
 import busboy from 'busboy'
 import { z } from 'zod'
-import { InboxError, type ChangeEvent, type ChangePage, type Inbox } from './contracts'
+import { InboxError, MAILBOX_SYNC_PROBLEM_CODES, type ChangeEvent, type ChangePage, type Inbox } from './contracts'
 
 export interface InboxApiOptions {
   inbox: Inbox
@@ -167,6 +167,12 @@ const schemas = {
   MailboxMessageSummary: mailboxMessageSummary,
   MailboxMessage: message.extend({ sourceId: id, memberships: z.array(membership) }),
   MailboxMessagePage: z.object({ items: z.array(mailboxMessageSummary), nextCursor: opaque.nullable(), state: opaque, total: revision }),
+  MailboxSyncStatusInput: mailboxReadInput.pick({ mailboxIds: true }),
+  MailboxSyncStatus: z.strictObject({ sourceId: id, scopeKey: opaque,
+    state: z.enum(['syncing', 'waiting', 'error', 'paused', 'idle']), activeLanes: z.array(z.enum(['latest', 'backfill'])).max(2),
+    retryAt: date.nullable(), problemCode: z.enum(MAILBOX_SYNC_PROBLEM_CODES).nullable(),
+    lastBatch: z.strictObject({ lane: z.enum(['latest', 'backfill']), processed: revision, completedAt: date, hasMore: z.boolean() }).nullable(),
+    lastSyncAt: date.nullable() }),
   MailboxSnapshotInput: mailboxReadInput.extend({ cursor: opaque.optional() }),
   MailboxSnapshotPage: z.object({ items: z.array(mailboxMessageSummary).max(500), nextCursor: opaque.nullable(), state: opaque, total: revision, scopeState: opaque, expiresAt: date }),
   MailboxChangesInput: mailboxReadInput.extend({ since: opaque, scopeState: opaque }),
@@ -490,6 +496,13 @@ export function createInboxApi(options: InboxApiOptions) {
     const input = query(c, mailboxQuery)
     await Promise.all(input.mailboxIds.map((mailboxId) => inbox.mailbox(owner, mailboxId)))
     return json(c, validate(schemas.MailboxMessagePage, await inbox.mailboxMessages(owner, input)))
+  })
+  route('post', '/v1/mailbox-sync/status', { summary: 'Read primary inbox sync status grouped by source', input: 'MailboxSyncStatusInput', output: 'MailboxSyncStatus[]', noStore: true,
+    description: 'Read-only polling, independent of mail-change events. Active lanes and the last committed record batch are ephemeral, source-selection-bound and never cumulative. retryAt is a not-before time, not a scheduled execution promise.' }, async c => {
+    const result = validate(z.array(schemas.MailboxSyncStatus).max(1000), await inbox.mailboxSyncStatus(c.get('owner'), body(c, schemas.MailboxSyncStatusInput)))
+    c.header('Cache-Control', 'no-store')
+    c.header('Referrer-Policy', 'no-referrer')
+    return c.newResponse(JSON.stringify(result), 200, { 'Content-Type': 'application/json; charset=utf-8' })
   })
   route('post', '/v1/mailbox-snapshot', { summary: 'Page a stable mailbox ID inventory with live body-free rows', input: 'MailboxSnapshotInput', output: 'MailboxSnapshotPage',
     description: 'Read-only POST; no Idempotency-Key. Select 1–1000 owned attached mailboxes, up to 500 rows/page. IDs/order and state baseline are fixed for five minutes; row and membership values are current when each page is read. Finish the inventory then apply mailbox-changes from that baseline, merging canonical and membership revisions independently. A 100,000-ID and bounded shared-memory budget applies; expired/evicted/restarted inventories return SNAPSHOT_EXPIRED (410). Scope revocation returns no rows. No query filters; legacy filtered queries remain unchanged.' }, async c => json(c, validate(schemas.MailboxSnapshotPage, await inbox.mailboxSnapshot(c.get('owner'), body(c, schemas.MailboxSnapshotInput)))))

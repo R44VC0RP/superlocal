@@ -106,7 +106,7 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     const target = url(path)
     const method = (init.method ?? 'GET').toUpperCase()
     binary ||= method === 'GET' && /\/v1\/blobs\//.test(target)
-    const readPost = method === 'POST' && ['/v1/mailbox-snapshot', '/v1/mailbox-changes'].some(path => target.endsWith(path))
+    const readPost = method === 'POST' && ['/v1/mailbox-snapshot', '/v1/mailbox-changes', '/v1/mailbox-sync/status'].some(path => target.endsWith(path))
     const mutation = !readPost && !['GET', 'HEAD', 'OPTIONS'].includes(method)
     if (mutation) clearCache()
     const version = credentialsVersion
@@ -382,6 +382,7 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     },
     mailboxMessageSummary: (mailboxId: string, messageId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'mailboxMessageSummary'>>(`/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}/summary`, requestOptions),
     mailboxMessage: (mailboxId: string, messageId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'mailboxMessage'>>(`/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}`, requestOptions),
+    mailboxSyncStatus: (input: Parameters<Inbox['mailboxSyncStatus']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxSyncStatus'>>('/mailbox-sync/status', 'POST', input, requestOptions),
     mailboxSnapshot: (input: Parameters<Inbox['mailboxSnapshot']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxSnapshot'>>('/mailbox-snapshot', 'POST', input, requestOptions),
     mailboxChanges: (input: Parameters<Inbox['mailboxChanges']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxChanges'>>('/mailbox-changes', 'POST', input, requestOptions),
     setMailboxStates: (input: Parameters<Inbox['setMailboxStates']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'setMailboxStates'>>('/mailbox-actions', 'POST', input, requestOptions),

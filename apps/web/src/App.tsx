@@ -37,6 +37,7 @@ import "./inbox.css";
 import FolderNavigation from "./FolderNavigation";
 import MailRows from "./MailRows";
 import RecentOpens from "./RecentOpens";
+import { MailSyncStatus } from "./MailSyncStatus";
 import { selectMailView, mailWindow } from "./mail-view";
 import { UNIFIED_ACCOUNT } from "./mail-model";
 import { plainText } from "./mail-text";
@@ -2185,6 +2186,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             </div>
           )}
         </div>
+        <MailSyncStatus client={inbox.store.client} mailboxes={inbox.mailboxes} sources={inbox.sources} enabled={inbox.loaded && !settings && !route.view} onMailboxes={() => openSettings("Mailboxes")} />
         <footer className="sidebar-footer">
           {applicationUser && onSignOut && (
             <button className="application-sign-out" type="button" title={`Sign out ${applicationUser.email}`} onClick={onSignOut}>Sign out</button>
