@@ -16,9 +16,14 @@ export async function startLocalServer(config: LocalConfig = loadLocalConfig()) 
   const host = await createLocalHost(config)
   try {
     const server = Bun.serve({ hostname: '127.0.0.1', port: config.backend.port, idleTimeout: 30, maxRequestBodySize: 27 * 1024 * 1024,
-      fetch(request, server) {
+      async fetch(request, server) {
         if (new URL(request.url).pathname === '/v1/events') server.timeout(request, 0)
-        return host.fetch(request)
+        const response = await host.fetch(request)
+        // Authenticated finite streams have their own five-minute deadline. The
+        // socket's shorter idle timer must not cut a backpressured transfer.
+        if (request.method === 'POST' && new URL(request.url).pathname === '/v1/mailbox-snapshot' && response.ok
+          && response.headers.get('Content-Type')?.startsWith('application/x-ndjson')) server.timeout(request, 0)
+        return response
       } })
     host.start()
     let stopping: Promise<void> | undefined

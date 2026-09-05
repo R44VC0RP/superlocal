@@ -1093,7 +1093,20 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     async lookup(owner: string, keys: AiThreadKey[]): Promise<AiDecisionPage> {
       if (!Array.isArray(keys) || keys.length > 100) fail('AI_LOOKUP_LIMIT')
       const decisions: AiDecision[] = [], seen = new Set<string>()
-      for (const item of keys) { validateKey(item); const id = key(owner, item.sourceId, item.threadId); if (seen.has(id)) continue; seen.add(id); try { decisions.push((await authorizedDecision(owner, item)).value) } catch (error) { if (!(error instanceof InboxError) || error.status !== 404) throw error } }
+      for (const item of keys) {
+        validateKey(item)
+        const id = key(owner, item.sourceId, item.threadId)
+        if (seen.has(id)) continue
+        seen.add(id)
+        const row = decisionRow(owner, item.sourceId, item.threadId)
+        if (!row) continue
+        const value: AiDecision = JSON.parse(row.data)
+        if (value.sourceId !== item.sourceId || value.threadId !== item.threadId) continue
+        try {
+          const selected = await scope(owner, settings(owner), item.sourceId)
+          if (await visible(owner, value, new Set(selected.boxes.map(box => box.id)))) decisions.push(projected(owner, value))
+        } catch (error) { if (!(error instanceof InboxError) || error.status !== 404) throw error }
+      }
       return { decisions, removed: [], cursor: cursor(owner).head, hasMore: false, resetRequired: false }
     },
     changes(owner: string, after: number) { return page(owner, after, false) },

@@ -1,3 +1,7 @@
+import { projectMailboxMail } from "../../shared/mail-projection";
+import { INBOX_FIRST_PAGE_LIMIT, INBOX_PAGE_LIMIT, INBOX_AUTO_PREFETCH_LIMIT, INBOX_WINDOW_LIMIT, INBOX_WINDOW_BYTE_LIMIT, INBOX_LOOKUP_LIMIT,
+  type InboxWindowPage, type InboxWindowRow, type InboxWindowState, type InboxTotals, type InboxViewQuery, type InboxSelection, type InboxActionReceiptReference, type InboxSenderInput } from "../../shared/inbox-window";
+import { createInboxWindowTransport } from "./host";
 import { ApiError, createInboxClient, type InboxClient } from "inbox-sdk/client";
 import { measurePerformance, measureRequest, measureWork } from "./browser-logs";
 import type {
@@ -19,7 +23,7 @@ import { classifyAttention, conversationAttention } from "../../shared/mail-atte
 import { normalizeSplits, type SplitPreferences } from "../../shared/splits";
 import type { AiTriageActions, AiTriageState, AiDecision, AiDecisionPage } from "../../shared/ai-triage";
 
-import { CATEGORY_BATCH_LIMIT, CATEGORY_MEMBERSHIP_LIMIT, CATEGORY_BODY_LIMIT, categoryKey, categoryErrorMessages, isCategoryContext, type AttentionCategory, type CategoryContext, type CategoryEntry, type CategoryCommand, type CategoryReceipt, type CategoryErrorCode } from "../../shared/attention-overrides";
+import { CATEGORY_BATCH_LIMIT, CATEGORY_MEMBERSHIP_LIMIT, CATEGORY_BODY_LIMIT, categoryKey, categoryErrorMessages, isCategoryContext, isCategoryCommand, type AttentionCategory, type CategoryContext, type CategoryEntry, type CategoryCommand, type CategoryReceipt, type CategoryErrorCode } from "../../shared/attention-overrides";
 
 type Edit = { draft: Draft; revision: number; version: number; error?: string; errorKind?: "recipients" };
 class DraftRecipientError extends Error {}
@@ -56,7 +60,41 @@ export type InboxIssue = {
   updatedAt: number;
   dismissed: boolean;
 };
+type RecoveryStatus = "prepared" | "uncertain" | "accepted" | "rejected" | "retracted";
+type RecoveryScope = { version: 1; owner: string | null; sources: Array<{ sourceId: string; generation: number; mailboxIds: string[] }> };
+/** Frozen command data only. No projected mail, content, addresses or drafts. */
+export type InboxCommandRecovery = RecoveryScope & (
+  | { kind: "category"; groups: Array<{ input: CategoryCommand; status: RecoveryStatus }> }
+  | { kind: "attention-feedback"; input: { id: string; targets: AttentionFeedbackTarget[] }; status: RecoveryStatus; undoStatus?: RecoveryStatus }
+  | { kind: "mailbox-state"; input: Parameters<InboxClient["setMailboxStates"]>[0]; status: RecoveryStatus;
+      before: MailboxMembership[]; accepted: MailboxMembership[]; undoStatus?: RecoveryStatus }
+);
+export type InboxRecoverySink = (plan: InboxCommandRecovery) => void;
+export type InboxUndo = (() => Promise<void>) & { receipts?: InboxActionReceiptReference[]; inverseReceipts?: InboxActionReceiptReference[]; recovery?: InboxCommandRecovery };
+class InboxRecoveryStorageError extends InboxActionError {}
+export class InboxRecoveryRejected extends InboxActionError {}
+const recoveryBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+/** Strict field validation also prevents accidentally persisting a Mail graph. */
+export function validInboxCommandRecovery(value: unknown): value is InboxCommandRecovery {
+  const object = (v: any, keys: string[]) => v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).every(key => keys.includes(key));
+  const id = (v: unknown) => typeof v === "string" && v.length > 0 && v.length <= 1024;
+  const revision = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 1;
+  const status = (v: unknown) => ["prepared", "uncertain", "accepted", "rejected", "retracted"].includes(v as string);
+  const target = (v: any) => object(v, ["mailboxId", "messageId", "revision"]) && id(v.mailboxId) && id(v.messageId) && revision(v.revision);
+  const state = (v: any) => object(v, ["mailboxId", "messageId", "revision", "done", "snoozedUntil"]) && id(v.mailboxId) && id(v.messageId) && revision(v.revision) && typeof v.done === "boolean" && (v.snoozedUntil === null || typeof v.snoozedUntil === "string" && v.snoozedUntil.length <= 100 && Number.isFinite(Date.parse(v.snoozedUntil)));
+  const p = value as InboxCommandRecovery;
+  if (!object(p, ["version", "owner", "sources", "kind", "groups", "input", "status", "before", "accepted", "undoStatus"]) || p.version !== 1 || !(p.owner === null || typeof p.owner === "string" && /^[a-f0-9]{64}$/.test(p.owner)) || !Array.isArray(p.sources) || !p.sources.length || p.sources.length > 500 || !p.sources.every(s => object(s, ["sourceId", "generation", "mailboxIds"]) && id(s.sourceId) && revision(s.generation) && Array.isArray(s.mailboxIds) && s.mailboxIds.length > 0 && s.mailboxIds.length <= 500 && s.mailboxIds.every(id)) || recoveryBytes(p) > 768 * 1024) return false;
+  if (p.kind === "category") return object(p, ["version", "owner", "sources", "kind", "groups"]) && Array.isArray(p.groups) && p.groups.length > 0 && p.groups.length <= 100 && p.groups.every(g => object(g, ["input", "status"]) && status(g.status) && isCategoryCommand(g.input) && recoveryBytes(g.input) <= CATEGORY_BODY_LIMIT && g.input.targets.every(t => p.sources.some(s => s.sourceId === t.context.sourceId && s.generation === t.context.sourceGeneration && t.context.mailboxIds.every(id => s.mailboxIds.includes(id)))));
+  if (p.kind === "attention-feedback") return object(p, ["version", "owner", "sources", "kind", "input", "status", "undoStatus"]) && object(p.input, ["id", "targets"]) && /^[a-zA-Z0-9-]{16,80}$/.test(p.input.id) && status(p.status) && (p.undoStatus === undefined || status(p.undoStatus)) && Array.isArray(p.input.targets) && p.input.targets.length > 0 && p.input.targets.length <= 500 && recoveryBytes(p.input) <= 64 * 1024 && p.input.targets.every(t => object(t, ["sourceId", "mailboxId", "messageId", "revision", "messageRevision"]) && id(t.sourceId) && id(t.mailboxId) && id(t.messageId) && revision(t.revision) && revision(t.messageRevision) && p.sources.some(s => s.sourceId === t.sourceId && s.mailboxIds.includes(t.mailboxId)));
+  if (p.kind !== "mailbox-state" || !object(p, ["version", "owner", "sources", "kind", "input", "status", "before", "accepted", "undoStatus"]) || !object(p.input, ["id", "targets", "done", "snoozedUntil"]) || !id(p.input.id) || !status(p.status) || p.undoStatus !== undefined && !status(p.undoStatus) || !Array.isArray(p.input.targets) || !p.input.targets.length || p.input.targets.length > 500 || !p.input.targets.every(t => target(t) && p.sources.some(s => s.mailboxIds.includes(t.mailboxId))) || recoveryBytes(p.input) > 64 * 1024 || p.input.done === undefined && p.input.snoozedUntil === undefined || p.input.done !== undefined && typeof p.input.done !== "boolean" || p.input.snoozedUntil !== undefined && p.input.snoozedUntil !== null && !(typeof p.input.snoozedUntil === "string" && p.input.snoozedUntil.length <= 100 && Number.isFinite(Date.parse(p.input.snoozedUntil)))) return false;
+  return [p.before, p.accepted].every(states => Array.isArray(states) && states.length <= 500 && states.every(s => state(s) && p.input.targets.some(t => t.mailboxId === s.mailboxId && t.messageId === s.messageId)));
+}
+export type InboxActiveWindow = {
+  query: InboxViewQuery; state: InboxWindowState; keys: string[]; totals: InboxTotals;
+  nextCursor: string | null; exhausted: boolean; paging: boolean; residentBytes: number; hasNewer: boolean;
+};
 export type InboxSnapshot = {
+  window: InboxActiveWindow | null;
   accounts: MailboxOption[];
   mailboxes: Mailbox[];
   sources: Account[];
@@ -84,7 +122,7 @@ export type InboxSnapshot = {
   operations: Readonly<Record<string, Operation>>;
 };
 
-const initial: InboxSnapshot = { accounts: [], mailboxes: [], sources: [], viewPreferences: null, splitPreferences: null, attentionFeedback: [], mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, loaded: false, refreshing: false, pending: 0, unsaved: false, error: null, issues: [], live: "connecting", policy: null, host: null, ai: null, aiError: null, operations: {} };
+const initial: InboxSnapshot = { window: null, accounts: [], mailboxes: [], sources: [], viewPreferences: null, splitPreferences: null, attentionFeedback: [], mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, loaded: false, refreshing: false, pending: 0, unsaved: false, error: null, issues: [], live: "connecting", policy: null, host: null, ai: null, aiError: null, operations: {} };
 const MAX_ISSUES = 4;
 /** A problem stays visible until its recovery has held this long, so ready/error flapping never re-announces. */
 const RESOLVE_HOLD_MS = 10_000;
@@ -219,6 +257,7 @@ export class InboxStore {
   private discoveredFolders = new Set<string>();
   private labels: Label[] = [];
   private rawDrafts = new Map<string, SdkDraft>();
+  private draftParents = new Map<string, { sourceMessageId: string; threadId: string }>();
   private edits = new Map<string, Edit>();
   private popouts = new Map<string, boolean>();
   private sendErrors = new Map<string, NonNullable<Draft["sendError"]>>();
@@ -255,6 +294,28 @@ export class InboxStore {
   private readonly categoryTransport = createCategoryTransport(() => AbortSignal.any([this.controller.signal, this.applicationScope.signal]), (input, init) => this.fetch(input, init));
   private readonly aiTransport = createAiTriageClient(() => AbortSignal.any([this.controller.signal, this.applicationScope.signal]), (input, init) => this.fetch(input, init));
   readonly client: InboxClient;
+  readonly windowTransport = createInboxWindowTransport(() => AbortSignal.any([this.controller.signal, this.applicationScope.signal]), (input, init) => this.fetch(input, init));
+  private windowQuery: InboxViewQuery = (() => {
+    // Capture deep-link scope before bootstrap starts, not after the first render.
+    const params = new URLSearchParams(location.hash.replace(/^#\/?/, ""));
+    return { account: params.get("account") || UNIFIED_ACCOUNT, folder: params.get("folder") || "Inbox", split: params.get("split") || "Important", search: false, query: "", filter: null };
+  })();
+  private windowEpoch = 0;
+  private windowController = new AbortController();
+  private windowRows = new Map<string, InboxWindowRow>();
+  private windowBoundaryCursors = new Map<string, string>();
+  private windowLocalRemoved = new Map<string, string>();
+  private windowRemovalFences = new Map<string, { revision: number; removed: boolean }>();
+  private windowPins = new Map<string, Set<string>>();
+  private windowPinnedBytes = new Map<string, number>();
+  private windowLoading?: Promise<void>;
+  private windowPaging?: Promise<void>;
+  private windowAutoDone = false;
+  private windowSenderEpoch = 0;
+  private windowChanges?: Promise<void>;
+  private windowMetadataEvents: ChangeEvent[] = [];
+  private windowDetails = new Map<string, { contextVersion: string; summaries: MailboxMessageSummary[]; cursor: string | null; exhausted: boolean }>();
+  private initialThread = new URLSearchParams(location.hash.replace(/^#\/?/, "")).get("thread");
 
   readonly ai: AiTriageActions = {
     ...this.aiTransport,
@@ -294,10 +355,283 @@ export class InboxStore {
     clearReading: async () => { await this.aiTransport.clearReading(); this.aiStateAt = 0; this.scheduleAi(0); },
   };
 
+  setWindowQuery = (query: InboxViewQuery): Promise<void> => {
+    if (JSON.stringify(query) === JSON.stringify(this.windowQuery)) return this.windowLoading ?? Promise.resolve();
+    this.windowQuery = { ...query };
+    this.windowEpoch++; this.windowController.abort(); this.windowController = new AbortController();
+    return this.state.host?.inboxWindow ? this.openWindow() : Promise.resolve();
+  };
+  private windowCheck(epoch: number, generation: number) {
+    this.controller.signal.throwIfAborted(); this.applicationScope.signal.throwIfAborted();
+    if (epoch !== this.windowEpoch || generation !== this.generation) throw new DOMException("Inbox view changed", "AbortError");
+  }
+  private pinnedWindowKeys() { return new Set([...this.windowPins.values()].flatMap(ids => [...ids])); }
+  pinWindow = (owner: string, ids: readonly string[], projections: readonly Mail[] = []) => {
+    if (ids.length > INBOX_LOOKUP_LIMIT) throw new Error("Too many conversations are pinned. Finish the current action first.");
+    if (ids.length) {
+      this.windowPins.set(owner, new Set(ids));
+      this.windowPinnedBytes.set(owner, new TextEncoder().encode(JSON.stringify(projections)).length * 2);
+    } else { this.windowPins.delete(owner); this.windowPinnedBytes.delete(owner); }
+    if (projections.length && this.state.window && this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) {
+      const keys = this.trimWindow(this.state.window.keys);
+      this.publish({ window: { ...this.state.window, keys, residentBytes: this.windowBytes() } }); this.rebuild();
+    }
+  };
+  private windowBytes() {
+    // Account for raw DTOs, materialized projections and UTF-16 strings, including pinned rows and body caches.
+    const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length * 2;
+    const resident = new Map(this.state.mail.filter(mail => this.windowRows.has(mail.id)).map(mail => [mail.id, mail]));
+    for (const row of this.windowRows.values()) if (!resident.has(row.key)) resident.set(row.key, row.mail);
+    return size([...this.windowRows.values()]) + size([...resident.values()]) + size([...this.windowDetails.values()]) + size([...this.details.values()]) + [...this.windowPinnedBytes.values()].reduce((sum, value) => sum + value, 0);
+  }
+  private trimWindow(keys: string[], evict: "start" | "end" = "start"): string[] {
+    const pins = this.pinnedWindowKeys();
+    const active = new Set(keys);
+    for (const id of this.windowRows.keys()) if (!active.has(id) && !pins.has(id)) { this.windowRows.delete(id); this.windowDetails.delete(id); }
+    // Body eviction is not metadata deletion and never drops command intent/fences.
+    while (this.details.size && this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT / 2) this.details.delete(this.details.keys().next().value!);
+    while (this.windowRows.size > INBOX_WINDOW_LIMIT || this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) {
+      const candidates = evict === "start" ? keys : [...keys].reverse();
+      const id = candidates.find(id => active.has(id) && this.windowRows.has(id));
+      if (!id) throw new Error("Pinned conversations exceed the safe window size. Close a reader before loading more.");
+      active.delete(id);
+      if (!pins.has(id)) { this.windowRows.delete(id); this.windowDetails.delete(id); }
+    }
+    for (const key of this.windowBoundaryCursors.keys()) if (!this.windowRows.has(key)) this.windowBoundaryCursors.delete(key);
+    this.knownThreads = new Set([...this.windowRows.values()].map(row => nativeKey(row.sourceId, row.threadId)));
+    for (const key of this.categories.keys()) if (!this.knownThreads.has(key)) this.categories.delete(key);
+    for (const key of this.aiDecisions.keys()) if (!this.knownThreads.has(key)) this.aiDecisions.delete(key);
+    return keys.filter(id => active.has(id) && this.windowRows.has(id));
+  }
+  private receiveWindowRows(rows: InboxWindowRow[], epoch = this.flagEpoch) {
+    if (rows.length > INBOX_PAGE_LIMIT) throw new Error("The host returned an oversized inbox page.");
+    for (const row of rows) {
+      const previous = this.windowRows.get(row.key);
+      const fence = this.windowRemovalFences.get(row.key);
+      if (fence?.removed && row.revision <= fence.revision) continue;
+      if (previous && previous.sourceGeneration === row.sourceGeneration && previous.revision > row.revision) continue;
+      if (previous && previous.sourceGeneration !== row.sourceGeneration) {
+        for (const summary of previous.summaries) this.details.delete(summary.id);
+        this.bodyEpoch++;
+      }
+      if (this.windowDetails.get(row.key)?.contextVersion !== row.contextVersion) this.windowDetails.delete(row.key);
+      this.windowRows.set(row.key, row);
+      for (const summary of row.summaries) {
+        const key = nativeKey(summary.sourceId, summary.id), old = this.messageRows.get(key);
+        if (!old || summary.revision >= old.revision) this.summaryFences.set(key, { epoch, revision: summary.revision });
+        for (const state of summary.memberships) {
+          const receiptKey = membershipKey(summary.sourceId, state), receipt = this.membershipReceipts.get(receiptKey);
+          if (receipt && state.revision >= receipt.state.revision) this.membershipReceipts.delete(receiptKey);
+        }
+      }
+    }
+  }
+  private applyWindowPage(page: InboxWindowPage, append: boolean, query: InboxViewQuery, flagEpoch: number) {
+    const previous = this.state.window;
+    if (append && previous && (page.state.queryId !== previous.state.queryId || page.state.scopeState !== previous.state.scopeState || page.state.queryGeneration !== previous.state.queryGeneration)) throw new Error("The inbox query changed. Reload this view.");
+    this.receiveWindowRows(page.rows, flagEpoch);
+    for (const row of page.rows) if (page.nextCursor) this.windowBoundaryCursors.set(row.key, page.nextCursor);
+    const combined = [...new Set([...(append ? previous?.keys ?? [] : []), ...page.rows.filter(row => row.revision > (this.windowRemovalFences.get(row.key)?.revision ?? -1)).map(row => row.key)])];
+    const keys = this.trimWindow(combined);
+    const stale = append && previous && previous.state.indexRevision > page.state.indexRevision;
+    const state = stale ? previous.state : page.state, totals = stale ? previous.totals : page.totals;
+    const exhausted = stale ? false : page.exhausted;
+    const usable = keys.length > 0 || exhausted && !state.indexing;
+    this.publish({ window: { query, state, keys, totals, nextCursor: page.nextCursor ?? (stale ? previous.nextCursor : null), exhausted, paging: false, residentBytes: this.windowBytes(), hasNewer: append && (previous?.hasNewer === true || combined[0] !== keys[0]) }, loading: !usable, loaded: usable, refreshing: false, error: null });
+    this.rebuild(); this.resolve("snapshot");
+  }
+  private openWindow = (): Promise<void> => {
+    const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
+    this.windowController.abort(); this.windowController = new AbortController();
+    this.windowPaging = undefined; this.windowChanges = undefined; this.windowBoundaryCursors.clear(); this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
+    const signal = AbortSignal.any([this.windowController.signal, this.controller.signal]);
+    const transport = createInboxWindowTransport(() => signal, (input, init) => this.fetch(input, init));
+    this.publish({ window: null, loading: true, loaded: false, refreshing: true });
+    const work = (async () => {
+      const flagEpoch = this.flagEpoch;
+      const page = await transport.query({ ...query, limit: INBOX_FIRST_PAGE_LIMIT });
+      this.windowCheck(epoch, generation); this.applyWindowPage(page, false, query, flagEpoch);
+      if (page.state.indexing) this.scheduleRefresh();
+      if (this.initialThread) {
+        const id = this.initialThread; this.initialThread = null;
+        this.pinWindow("reader", [id]); void this.lookupWindow([id]).catch(error => this.fail(error, "load-thread"));
+      }
+      // Publish the first usable page before continuing in the background. Never prefetch beyond 300.
+      void this.prefetchWindow(epoch, generation).catch(error => { if (!(error instanceof DOMException && error.name === "AbortError")) this.fail(error, "refresh"); });
+    })().catch(error => { if (epoch === this.windowEpoch && generation === this.generation) this.fail(error, "refresh"); throw error; })
+      .finally(() => { if (this.windowLoading === work) this.windowLoading = undefined; });
+    this.windowLoading = work; return work;
+  };
+  private async prefetchWindow(epoch: number, generation: number) {
+    while (!this.windowAutoDone && this.state.window?.nextCursor && this.state.window.keys.length < INBOX_AUTO_PREFETCH_LIMIT) {
+      this.windowCheck(epoch, generation);
+      const before = this.state.window.keys.length;
+      await this.loadMoreWindow(Math.min(INBOX_PAGE_LIMIT, INBOX_AUTO_PREFETCH_LIMIT - before));
+      if ((this.state.window?.keys.length ?? 0) <= before) break;
+    }
+    this.windowCheck(epoch, generation);
+    this.windowAutoDone ||= (this.state.window?.keys.length ?? 0) >= INBOX_AUTO_PREFETCH_LIMIT;
+  }
+  loadMoreWindow = (limit = INBOX_PAGE_LIMIT): Promise<void> => {
+    if (this.windowPaging) return this.windowPaging;
+    const current = this.state.window, epoch = this.windowEpoch, generation = this.generation;
+    if (!current?.nextCursor) return Promise.resolve();
+    this.publish({ window: { ...current, paging: true } });
+    const work = (async () => {
+      const flagEpoch = this.flagEpoch;
+      const page = await this.windowTransport.page({ queryId: current.state.queryId, cursor: current.nextCursor!, limit });
+      this.windowCheck(epoch, generation); this.applyWindowPage(page, true, current.query, flagEpoch);
+    })().finally(() => {
+      if (this.windowPaging !== work) return;
+      this.windowPaging = undefined;
+      if (epoch === this.windowEpoch && this.state.window?.paging) this.publish({ window: { ...this.state.window, paging: false } });
+    });
+    this.windowPaging = work; return work;
+  };
+  seekWindow = async (seek: "start" | "end"): Promise<void> => {
+    const current = this.state.window, epoch = this.windowEpoch, generation = this.generation;
+    if (!current) return;
+    const flagEpoch = this.flagEpoch; this.windowAutoDone = true;
+    const page = await this.windowTransport.page({ queryId: current.state.queryId, seek, limit: 100 });
+    this.windowCheck(epoch, generation); this.applyWindowPage(page, false, current.query, flagEpoch);
+    if (seek === "end") this.publish({ window: { ...this.state.window!, hasNewer: !page.exhausted, exhausted: true, nextCursor: null } });
+  };
+  loadNewerWindow = async (): Promise<void> => {
+    const current = this.state.window, epoch = this.windowEpoch, generation = this.generation;
+    if (!current?.hasNewer || current.paging) return;
+    const cursor = this.windowBoundaryCursors.get(current.keys[0]);
+    if (!cursor) return this.seekWindow("start");
+    this.publish({ window: { ...current, paging: true } });
+    try {
+      const flagEpoch = this.flagEpoch;
+      const page = await this.windowTransport.page({ queryId: current.state.queryId, cursor, direction: "newer", limit: 100 });
+      this.windowCheck(epoch, generation); this.receiveWindowRows(page.rows, flagEpoch);
+      for (const row of page.rows) if (page.nextCursor) this.windowBoundaryCursors.set(row.key, page.nextCursor);
+      const combined = [...new Set([...page.rows.map(row => row.key), ...current.keys])];
+      const keys = this.trimWindow(combined, "end");
+      this.publish({ window: { ...current, keys, state: page.state, totals: page.totals, hasNewer: !page.exhausted, paging: false,
+        nextCursor: combined.at(-1) !== keys.at(-1) ? this.windowBoundaryCursors.get(keys.at(-1)!) ?? null : current.nextCursor,
+        exhausted: combined.at(-1) === keys.at(-1) && current.exhausted } });
+      this.rebuild();
+    } finally { if (epoch === this.windowEpoch && this.state.window) this.publish({ window: { ...this.state.window, paging: false } }); }
+  };
+  lookupWindow = async (ids: readonly string[], account = this.windowQuery.account): Promise<Mail[]> => {
+    const unique = [...new Set(ids)], epoch = this.windowEpoch, generation = this.generation;
+    if (unique.length > INBOX_LOOKUP_LIMIT) throw new Error("Load at most 100 captured conversations at once.");
+    if (!this.state.host?.inboxWindow) return this.state.mail.filter(mail => unique.includes(mail.id));
+    const flagEpoch = this.flagEpoch;
+    const result = await this.windowTransport.lookup({ account, ids: unique });
+    this.windowCheck(epoch, generation);
+    const scope = this.state.window?.state.scopeState;
+    if (scope && result.state.scopeState !== scope) throw new Error("The receiving scope changed. Reload this view.");
+    if (result.entries.some(entry => entry.status === "unknown")) throw new Error("Some conversations are still being indexed. Retry when indexing finishes.");
+    this.receiveWindowRows(result.entries.flatMap(entry => entry.status === "found" ? [entry.row] : []), flagEpoch);
+    // The caller's pin controls lifetime. Lookup must not add rows to the active view.
+    this.pinWindow("lookup", unique);
+    try {
+      const keys = this.trimWindow(this.state.window?.keys ?? []);
+      if (this.state.window) this.publish({ window: { ...this.state.window, keys } });
+      this.rebuild();
+    } finally { this.pinWindow("lookup", []); }
+    return unique.flatMap(id => { const mail = this.state.mail.find(mail => mail.id === id); return mail ? [mail] : []; });
+  };
+  clearSenderWindow = () => { this.windowSenderEpoch++; this.pinWindow("sender", []); };
+  senderWindow = async (input: InboxSenderInput) => {
+    const request = ++this.windowSenderEpoch, epoch = this.windowEpoch, generation = this.generation, flagEpoch = this.flagEpoch;
+    const result = await this.windowTransport.sender(input);
+    this.windowCheck(epoch, generation);
+    if (request !== this.windowSenderEpoch) throw new DOMException("Sender changed", "AbortError");
+    this.receiveWindowRows(result.recent, flagEpoch);
+    this.pinWindow("sender", result.recent.map(row => row.key));
+    this.windowPinnedBytes.set("sender", new TextEncoder().encode(JSON.stringify(result.recent)).length * 2);
+    if (this.state.window) {
+      const keys = this.trimWindow(this.state.window.keys);
+      this.publish({ window: { ...this.state.window, keys, residentBytes: this.windowBytes() } }); this.rebuild();
+    }
+    return result;
+  };
+  createWindowSelection = () => {
+    const window = this.state.window;
+    if (!window) throw new Error("The current view is still loading.");
+    return this.windowTransport.selectionCreate({ id: crypto.randomUUID(), account: window.query.account, queryId: window.state.queryId, allMatching: true });
+  };
+  resolveWindowSelection = async (selection: InboxSelection): Promise<Mail[]> => {
+    if (selection.count !== null && selection.count > 500) throw new Error("This selection exceeds 500 conversations. Choose a smaller selection before making changes.");
+    const found: Mail[] = []; let cursor: string | undefined;
+    do {
+      const page = await this.windowTransport.selectionPage({ selectionId: selection.id, cursor, limit: INBOX_PAGE_LIMIT });
+      if (!page.selection.captureComplete || page.selection.count === null) throw new Error("The selection is still being captured. Try again shortly.");
+      if (page.selection.count > 500) throw new Error("This selection exceeds 500 conversations. No mail was changed.");
+      if (page.entries.some(entry => entry.status !== "found")) throw new Error("The captured selection changed or is still indexing. No mail was changed.");
+      for (const entry of page.entries) if (entry.status === "found") found.push({ ...entry.row.mail, window: this.rowProvenance(entry.row) });
+      if (found.reduce((sum, mail) => sum + (mail.window?.targets.length ?? 0), 0) > 500 || found.some(mail => !mail.window?.targetsComplete)) throw new Error("This selection exceeds 500 message memberships. No mail was changed.");
+      if (page.exhausted) break;
+      if (!page.nextCursor) throw new Error("The selection is still being captured. No mail was changed.");
+      cursor = page.nextCursor;
+    } while (cursor);
+    return found;
+  };
+  private rowProvenance(row: InboxWindowRow): NonNullable<Mail["window"]> {
+    const targets = row.targets.map(target => {
+      const receipt = this.membershipReceipts.get(`${row.sourceId}\0${target.messageId}\0${target.mailboxId}`)?.state;
+      return receipt && receipt.revision > target.revision ? { ...target, revision: receipt.revision } : target;
+    });
+    return { counts: row.counts, messagesComplete: row.messagesComplete, targets, targetsComplete: row.targetsComplete, actionContextComplete: row.actionContextComplete, contextVersion: row.contextVersion };
+  }
+  private readWindowChanges = (metadata = false): Promise<void> => {
+    this.metadataPending ||= metadata;
+    if (this.windowLoading) return this.windowLoading.then(() => { this.scheduleRefresh(); }, error => {
+      if (!(error instanceof DOMException && error.name === "AbortError")) throw error;
+    });
+    if (this.windowChanges) { this.updateAgain = true; return this.windowChanges; }
+    this.updateAgain = false;
+    const epoch = this.windowEpoch, generation = this.generation;
+    const work = (async () => {
+      const events = this.windowMetadataEvents.splice(0), force = metadata || this.metadataPending; this.metadataPending = false;
+      if (force || events.length) {
+        const meta = await this.updateMetadata(events, this.controller.signal, force); this.windowCheck(epoch, generation);
+        if (meta.reset) { await this.bootstrap(); return; }
+      }
+      const current = this.state.window;
+      if (!current) { await this.openWindow(); return; }
+      let cursor: string | undefined;
+      do {
+        const flagEpoch = this.flagEpoch;
+        const page = await this.windowTransport.changes({ queryId: current.state.queryId, sinceRevision: current.state.indexRevision,
+          residentKeys: current.keys, pinnedKeys: [...this.pinnedWindowKeys()], cursor, limit: INBOX_PAGE_LIMIT });
+        this.windowCheck(epoch, generation);
+        if (page.resetReason) { await this.openWindow(); return; }
+        if (page.state.scopeState !== current.state.scopeState) { await this.openWindow(); return; }
+        this.receiveWindowRows([...page.upserts, ...page.newHead], flagEpoch);
+        const removed = new Set(page.removed.map(row => row.key));
+        for (const row of page.removed) this.windowRemovalFences.set(row.key, { revision: page.throughRevision, removed: row.reason !== "not-matching" });
+        while (this.windowRemovalFences.size > INBOX_WINDOW_LIMIT) this.windowRemovalFences.delete(this.windowRemovalFences.keys().next().value!);
+        for (const item of page.removed) if (item.reason === "deleted" || item.reason === "unselected") { this.windowRows.delete(item.key); this.windowDetails.delete(item.key); }
+        const latest = this.state.window!;
+        const keys = this.trimWindow([...new Set([...page.newHead.map(row => row.key), ...latest.keys.filter(key => !removed.has(key))])]);
+        this.publish({ window: { ...latest, keys, state: page.nextCursor ? latest.state : { ...page.state, indexRevision: page.throughRevision }, totals: page.totals },
+          ...(keys.length ? { loading: false, loaded: true, error: null } : {}) });
+        this.reconcileFlags(); this.rebuild();
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor);
+      if (this.state.window?.state.indexing) {
+        clearTimeout(this.refreshTimer);
+        this.refreshTimer = setTimeout(() => void this.readWindowChanges().catch(error => this.fail(error, "refresh")), 500);
+      }
+      await this.prefetchWindow(epoch, generation);
+    })().finally(() => {
+      if (this.windowChanges !== work) return;
+      this.windowChanges = undefined;
+      if (this.updateAgain && epoch === this.windowEpoch && generation === this.generation) this.scheduleRefresh();
+    });
+    this.windowChanges = work; return work;
+  };
+
   private receiveCategories(entries: CategoryEntry[]) {
     const threads = new Set<string>();
     for (const entry of entries) {
       const key = categoryKey(entry), previous = this.categories.get(key);
+      if (this.state.host?.inboxWindow && !this.knownThreads.has(key)) continue;
       if (previous && previous.revision >= entry.revision) continue;
       if (!previous && this.categories.size >= 100_000) throw new CategoryRequestError("HOST_CATEGORY_TOO_LARGE", 413);
       this.categories.set(key, entry);
@@ -310,7 +644,7 @@ export class InboxStore {
    * not a new poller. Receipts reconcile immediately; no SDK inventory is restarted. */
   private readCategories(): Promise<void> {
     if (this.categoryReads) return this.categoryReads;
-    if (!this.state.host?.attentionOverrides || this.controller.signal.aborted) return Promise.resolve();
+    if (this.state.host?.inboxWindow || !this.state.host?.attentionOverrides || this.controller.signal.aborted) return Promise.resolve();
     const signal = this.controller.signal, generation = this.generation, epoch = this.categoryEpoch;
     const work = (async () => {
       let resets = 0;
@@ -375,6 +709,7 @@ export class InboxStore {
     for (const decision of page.decisions) {
       if (!decision || typeof decision.sourceId !== "string" || typeof decision.threadId !== "string" || !Number.isSafeInteger(decision.revision) || !Array.isArray(decision.contextVersions) || decision.contextVersions.length > 8) throw new Error("Invalid AI triage decision.");
       const key = nativeKey(decision.sourceId, decision.threadId), previous = this.aiDecisions.get(key);
+      if (this.state.host?.inboxWindow && !this.knownThreads.has(key)) continue;
       if (previous && previous.revision > decision.revision || previous && JSON.stringify(previous) === JSON.stringify(decision)) continue;
       if (!previous && this.aiDecisions.size >= 100_000) throw new Error("AI triage cache capacity reached.");
       this.aiDecisions.set(key, decision); threads.add(key);
@@ -429,6 +764,7 @@ export class InboxStore {
     const work = (async () => {
       if (!this.state.ai || Date.now() - this.aiStateAt > 15_000) await this.ai.state();
       if (signal.aborted || generation !== this.generation || !this.state.ai?.configured || !this.state.ai.settings.enabled) return;
+      if (this.state.host?.inboxWindow) return; // Row provenance comes from the bounded host index, not AI history drains.
       const epoch = this.aiEpoch;
       if (!this.aiInitialLoaded) {
         const baseline = this.state.ai.cursor;
@@ -617,6 +953,10 @@ export class InboxStore {
   }
 
   async search(boxId: string, query: string, signal: AbortSignal): Promise<Set<string>> {
+    if (this.state.host?.inboxWindow) {
+      signal.throwIfAborted(); await this.setWindowQuery({ ...this.windowQuery, account: boxId, search: true, query }); signal.throwIfAborted();
+      return new Set(this.state.window?.keys ?? []);
+    }
     const options = { signal: AbortSignal.any([signal, this.controller.signal]) };
     const scope = boxId === UNIFIED_ACCOUNT ? this.unifiedMailboxIds() : [this.account(boxId).box.id];
     if (!scope.length) return new Set();
@@ -754,7 +1094,12 @@ export class InboxStore {
                 this.resolve("live");
               }, STREAM_HEALTHY_MS);
             } else if ("state" in event) { cursor = event.state; this.scheduleRefresh(); }
-            else { cursor = event.id; this.scheduleRefresh(); }
+            else {
+              if (this.state.host?.inboxWindow && ["account.updated", "mailbox.updated", "connection.updated", "draft.updated", "operation.updated", "label.updated", "policy.updated"].includes(event.type)) {
+                if (this.windowMetadataEvents.length < 100) this.windowMetadataEvents.push(event); else this.metadataPending = true;
+              }
+              cursor = event.id; this.scheduleRefresh();
+            }
           }
         } catch (error) { failure = error; failed = true; }
         finally { clearTimeout(healthy); }
@@ -811,6 +1156,7 @@ export class InboxStore {
 
   /** One coalesced owner of the scoped summary cursor; SSE only wakes it. */
   private readUpdates = (metadata = false): Promise<void> => {
+    if (this.state.host?.inboxWindow) return this.readWindowChanges(metadata);
     this.metadataPending ||= metadata;
     if (this.updatesPromise) { this.updateAgain = true; return this.updatesPromise; }
     const signal = this.controller.signal, generation = this.generation;
@@ -1089,15 +1435,22 @@ export class InboxStore {
       // scope is separate from the SSE cursor. Catch-up uses its signed scope
       // and the earlier metadata baseline, covering both reads after the last
       // page, never a newly sampled global ready token.
-      if (mailboxIds.length && mailboxIds.length <= 1000) {
-          const items: MailboxMessageSummary[] = []; let cursor: string | undefined;
-          do {
-            const started = performance.now();
-            const page = await this.client.mailboxSnapshot({ mailboxIds, limit: 500, ...(cursor ? { cursor } : {}) }, options);
-            networkMs += performance.now() - started; pages++; messages += page.items.length;
-            baseline = { state: metadataBaseline.state, scopeState: page.scopeState, mailboxIds };
-            items.push(...page.items); cursor = page.nextCursor ?? undefined;
-          } while (cursor);
+      if (host.inboxWindow) {
+        // New hosts always use app-view windows. Errors never fall through to inventory.
+      } else if (mailboxIds.length && mailboxIds.length <= 1000) {
+          const items: MailboxMessageSummary[] = [];
+          const snapshot = this.client.mailboxSnapshotPages({ mailboxIds, limit: 500 }, options);
+          try {
+            for (;;) {
+              const started = performance.now();
+              const result = await snapshot.next();
+              networkMs += performance.now() - started;
+              if (result.done) break;
+              const page = result.value; pages++; messages += page.items.length;
+              baseline = { state: metadataBaseline.state, scopeState: page.scopeState, mailboxIds };
+              items.push(...page.items);
+            }
+          } finally { await snapshot.return?.(); }
           for (const item of items) for (const membership of item.memberships) summaries.get(membership.mailboxId)?.push(item);
       } else if (mailboxIds.length) {
         // Preserve the older >1000-view capability. This exceptional scope
@@ -1156,6 +1509,7 @@ export class InboxStore {
       }
       this.operations = operations;
       this.sourceAccounts = accounts; this.boxes = selected; this.labels = labels; this.summaries = summaries; this.sending = sending;
+      if (!host.inboxWindow) {
       this.messageRows = new Map([...summaries.values()].flat().map(row => [nativeKey(row.sourceId, row.id), row]));
       this.summaryFences = new Map([...this.messageRows].map(([key, row]) => [key, { epoch: flagEpoch, revision: row.revision }]));
       for (const write of this.flagWrites) for (const target of write.targets) if (!this.messageRows.has(nativeKey(target.sourceId, target.messageId))) {
@@ -1168,6 +1522,7 @@ export class InboxStore {
         const row = summaries.get(receipt.state.mailboxId)?.find(row => row.sourceId === receipt.sourceId && row.id === receipt.state.messageId);
         const state = row?.memberships.find(state => state.mailboxId === receipt.state.mailboxId);
         if (!state || state.revision >= receipt.state.revision) this.membershipReceipts.delete(key);
+      }
       }
       if (this.draftEpoch === draftEpoch) this.rawDrafts = new Map(drafts.map(draft => [draft.id, draft]));
       else this.scheduleRefresh();
@@ -1183,6 +1538,13 @@ export class InboxStore {
       if (this.state.policy && this.state.policy.remoteImages !== currentPolicy.remoteImages) {
         this.bodyEpoch++;
         this.details.clear();
+      }
+      if (host.inboxWindow) {
+        this.publish({ policy: currentPolicy, host, viewPreferences, splitPreferences, attentionFeedback: this.feedbackEpoch === feedbackEpoch ? attentionFeedback : this.state.attentionFeedback, mailboxes: selected, sources: accounts });
+        this.rebuildWindow();
+        await this.openWindow();
+        void this.discoverFolders();
+        return;
       }
       this.catchingUp = !!baseline;
       this.publish({ policy: currentPolicy, host, viewPreferences, splitPreferences, attentionFeedback: this.feedbackEpoch === feedbackEpoch ? attentionFeedback : this.state.attentionFeedback, mailboxes: selected, sources: accounts,
@@ -1213,6 +1575,16 @@ export class InboxStore {
     this.blobInfo.set(info.id, info);
     return { name: info.filename, size: info.size, type: info.contentType, blobId: info.id, sourceId: info.accountId, data: `/v1/blobs/${encodeURIComponent(info.id)}` };
   }
+  loadDraftParent = async (id: string, account = this.windowQuery.account) => {
+    const draft = this.rawDrafts.get(id), generation = this.generation;
+    if (!this.state.host?.inboxWindow || !draft?.sourceMessageId || !draft.mailboxId) return;
+    const summary = await this.client.mailboxMessageSummary(draft.mailboxId, draft.sourceMessageId, this.requestOptions());
+    if (generation !== this.generation || this.rawDrafts.get(id)?.sourceMessageId !== draft.sourceMessageId) return;
+    if (summary.sourceId !== draft.accountId) throw new Error("The draft parent belongs to a different source.");
+    const threadId = account === UNIFIED_ACCOUNT ? unifiedThreadId(summary.sourceId, summary.threadId) : viewThreadId(account, summary.threadId);
+    this.draftParents.set(id, { sourceMessageId: draft.sourceMessageId, threadId });
+    this.pinWindow(`draft:${id}`, [threadId]); await this.lookupWindow([threadId], account);
+  };
   private uiDraft(raw: SdkDraft): Draft {
     const box = this.boxes.find(box => box.id === raw.mailboxId) ?? this.boxes.find(box => box.sourceId === raw.accountId);
     const parent = raw.sourceMessageId && [...this.summaries.values()].flat().find(message => message.id === raw.sourceMessageId);
@@ -1221,14 +1593,100 @@ export class InboxStore {
       id: raw.id, account: box?.id ?? "", sourceId: raw.accountId, from: raw.from,
       sourceMessageId: raw.sourceMessageId, revision: raw.revision,
       mode: raw.mode === "compose" ? "new" : raw.mode,
-      threadId: parent && box ? viewThreadId(box.id, parent.threadId) : undefined,
+      threadId: parent && box ? viewThreadId(box.id, parent.threadId) : this.draftParents.get(raw.id)?.threadId,
       popOut: this.popouts.get(raw.id) ?? false, to: addresses(raw.to), cc: addresses(raw.cc), bcc: addresses(raw.bcc), subject: raw.subject,
       body: draftHtml(raw.bodyHtml || `<div>${escapeHTML(raw.bodyText).replaceAll("\n", "<br>")}</div>`),
       attachments: raw.attachmentIds.map(id => { const info = known.find(info => info.id === id); return info ? this.file(info) : { name: "Attachment", size: 0, type: "application/octet-stream", blobId: id, sourceId: raw.accountId, data: `/v1/blobs/${encodeURIComponent(id)}` }; }),
       updated: Date.parse(raw.updatedAt),
     };
   }
+  private rebuildWindow() {
+    const calendar = displayTimes(); this.calendarKey = calendar.key;
+    const rows = [...this.windowRows.values()];
+    const summaries = new Map<string, MailboxMessageSummary>();
+    for (const row of rows) for (const summary of this.windowDetails.get(row.key)?.summaries ?? row.summaries) {
+      const key = nativeKey(summary.sourceId, summary.id), previous = summaries.get(key);
+      const memberships = new Map([...(previous?.memberships ?? []), ...summary.memberships].map(state => [state.mailboxId, state]));
+      summaries.set(key, { ...(previous && previous.revision > summary.revision ? previous : summary), memberships: [...memberships.values()] });
+    }
+    this.messageRows = summaries;
+    const attachmentIds = new Set([...this.rawDrafts.values()].flatMap(draft => draft.attachmentIds));
+    for (const detail of this.details.values()) for (const attachment of detail.attachments) attachmentIds.add(attachment.id);
+    for (const edit of this.edits.values()) for (const attachment of edit.draft.attachments) if (attachment.blobId) attachmentIds.add(attachment.blobId);
+    for (const id of this.blobInfo.keys()) if (!attachmentIds.has(id)) this.blobInfo.delete(id);
+    const pendingKeys = new Set([...this.flagWrites].flatMap(write => write.targets.map(target => nativeKey(target.sourceId, target.messageId))));
+    for (const key of this.summaryFences.keys()) if (!summaries.has(key) && !pendingKeys.has(key)) this.summaryFences.delete(key);
+    this.summaries = new Map(this.boxes.map(box => [box.id, [...summaries.values()].filter(row => row.memberships.some(state => state.mailboxId === box.id))]));
+    const projected = projectMailboxMail({ sources: this.sourceAccounts, mailboxes: this.boxes, summaries: [...summaries.values()].map(row => this.projectFlags(row)),
+      labels: this.labels, folders: this.folders, includedMailboxIds: this.unifiedMailboxIds(), allowProviderWrites: this.state.host?.allowProviderWrites === true,
+      now: Date.now(), displayTime: calendar.format, decorateMessage: (message, summary) => {
+        const detail = this.cachedDetail(summary);
+        return detail ? { ...message, bcc: addresses(detail.bcc), body: detail.bodyHtml, bodyText: detail.bodyText,
+          bodyFormat: detail.bodyFormat, bodyDocument: detail.bodyDocument, loaded: true, attachments: detail.attachments.map(info => this.file(info)) } : message;
+      } });
+    const byId = new Map(projected.mail.map(mail => [mail.id, mail])), previous = new Map(this.state.mail.map(mail => [mail.id, mail]));
+    const mail = rows.map(row => {
+      const local = byId.get(row.key), detail = this.windowDetails.get(row.key), provenance = this.rowProvenance(row);
+      if (detail?.exhausted && row.counts.messages === detail.summaries.length) { provenance.messagesComplete = true; provenance.actionContextComplete = row.targetsComplete; }
+      // Whole-conversation aggregate/provenance always wins over partial projected metadata.
+      const time = Number.isFinite(row.mail.receivedAt) ? calendar.format(new Date(row.mail.receivedAt!).toISOString()) : { date: row.mail.date, group: row.mail.group };
+      let next: Mail = { ...row.mail, ...time, messages: local?.messages ?? row.mail.messages, window: provenance,
+        hasAttachments: row.mail.hasAttachments ?? (row.messagesComplete ? row.mail.messages.some(message => message.hasAttachments) : undefined), historyExhausted: detail?.exhausted ?? row.messagesComplete };
+      const overlay = row.summaries.some(summary => this.projectFlags(summary) !== summary);
+      if (overlay && local) {
+        if (provenance.messagesComplete) next = { ...next, unread: local.unread, starred: local.starred, folder: local.folder, locations: local.locations, reminder: local.reminder, reminderAt: local.reminderAt };
+        else {
+          const intents = row.summaries.flatMap(summary => [this.flagIntents.get(`${nativeKey(summary.sourceId, summary.id)}\0isRead`), this.flagIntents.get(`${nativeKey(summary.sourceId, summary.id)}\0isStarred`)]).filter(Boolean);
+          if (intents.some(intent => intent!.field === "isRead" && !intent!.value)) next.unread = true;
+          if (intents.some(intent => intent!.field === "isStarred" && intent!.value)) next.starred = true;
+          const states = provenance.targets.map(target => this.membershipReceipts.get(`${row.sourceId}\0${target.messageId}\0${target.mailboxId}`)?.state);
+          if (provenance.targetsComplete && states.length && states.every(state => state?.done)) { next.folder = "Done"; next.locations = ["Done"]; }
+        }
+      }
+      const category = this.categories.get(nativeKey(row.sourceId, row.threadId));
+      if (category && provenance.actionContextComplete && currentCategoryOverride(next, category.override)) {
+        next = { ...next, attentionOverride: category }; next.split = conversationAttention(next);
+      }
+      const old = previous.get(row.key);
+      return old && JSON.stringify(old) === JSON.stringify(next) ? old : next;
+    });
+    // Queued sends are local draft state, never credited as received indexed conversations.
+    for (const { ref, operation, draft } of this.sending.values()) {
+      if (!["pending", "processing", "uncertain"].includes(operation.status)) continue;
+      const parent = mail.find(mail => mail.sourceId === draft.accountId && mail.messages.some(message => message.id === draft.sourceMessageId));
+      const pending: Message = { id: `pending:${operation.id}`, operationId: operation.id, sendStatus: operation.status, pending: true,
+        from: draft.from, email: draft.from, to: addresses(draft.to), cc: addresses(draft.cc), date: "Queued", body: draftHtml(draft.bodyHtml || escapeHTML(draft.bodyText)), loaded: true, outgoing: true };
+      if (parent) { const i = mail.indexOf(parent); mail[i] = { ...parent, messages: [...parent.messages, pending] }; }
+      else if (this.windowQuery.folder === "Scheduled" && operation.status !== "uncertain" && (this.windowQuery.account === ref.mailboxId || this.windowQuery.account === UNIFIED_ACCOUNT && this.unifiedMailboxIds().includes(ref.mailboxId))) mail.push({ id: `operation:${operation.id}`, operationId: operation.id, account: this.windowQuery.account, mailboxId: ref.mailboxId,
+        sourceId: operation.accountId, from: draft.from, email: draft.from, to: addresses(draft.to), subject: draft.subject, snippet: draft.bodyText,
+        ...displayTimes().format(operation.sendAt || operation.createdAt), folder: "Scheduled", split: "Important", unread: false, starred: false, labels: [], messages: [pending] });
+    }
+    const drafts = [...this.rawDrafts.values()].map(raw => {
+      const edit = this.edits.get(raw.id);
+      return { ...(edit?.draft ?? this.uiDraft(raw)), popOut: this.popouts.get(raw.id) ?? edit?.draft.popOut ?? false,
+        saving: this.saves.has(raw.id) || !!edit && !edit.error && completeRecipients(edit.draft), dirty: !!edit, saveError: edit?.error, sendError: this.sendErrors.get(raw.id) };
+    });
+    const window = this.state.window;
+    let keys = window?.keys;
+    if (window && !window.query.search && window.query.folder === "Inbox") {
+      const visible = new Map(mail.map(mail => [mail.id, mail]));
+      keys = window.keys.filter(key => {
+        const item = visible.get(key), source = this.windowRows.get(key);
+        const removed = item && source && source.mail.locations?.includes("Inbox") && !item.locations?.includes("Inbox");
+        if (removed) this.windowLocalRemoved.set(key, window.state.queryId);
+        return !removed;
+      });
+      for (const [key, queryId] of this.windowLocalRemoved) if (queryId === window.state.queryId && visible.get(key)?.locations?.includes("Inbox")) {
+        keys.push(key); this.windowLocalRemoved.delete(key);
+      }
+      keys = [...new Set(keys)].sort((a, b) => (visible.get(b)?.receivedAt ?? 0) - (visible.get(a)?.receivedAt ?? 0) || a.localeCompare(b));
+    }
+    this.publish({ mail, ...(window && keys ? { window: { ...window, keys } } : {}), accounts: JSON.stringify(projected.accounts) === JSON.stringify(this.state.accounts) ? this.state.accounts : projected.accounts,
+      labels: projected.labels, senderHistory: [], drafts, unsaved: this.edits.size > 0 || this.saves.size > 0, operations: Object.fromEntries(this.operations) });
+  }
+
   private rebuild(onlyThreads?: Set<string>, summariesChanged = false, sendingChanged = false, historyChanged = summariesChanged) {
+    if (this.state.host?.inboxWindow) { this.rebuildWindow(); return; }
     if (onlyThreads && !onlyThreads.size && !sendingChanged) return;
     const calendar = displayTimes(), displayTime = calendar.format;
     if (this.calendarKey !== undefined && this.calendarKey !== calendar.key) onlyThreads = undefined;
@@ -1402,10 +1860,47 @@ export class InboxStore {
     return detail.revision >= row.revision ? detail : undefined;
   }
 
-  loadThread = (id: string): Promise<void> => {
+  loadMoreMessages = async (id: string): Promise<void> => {
+    const row = this.windowRows.get(id);
+    if (!row || row.messagesComplete || this.windowDetails.get(id)?.exhausted) return;
+    const epoch = this.windowEpoch, generation = this.generation, previous = this.windowDetails.get(id);
+    const page = await this.windowTransport.messages({ account: row.mail.account, id, cursor: previous?.cursor ?? undefined, limit: 100 });
+    this.windowCheck(epoch, generation);
+    if (page.contextVersion !== row.contextVersion) throw new Error("The conversation changed. Reload before loading more messages.");
+    const summaries = [...new Map([...(previous?.summaries ?? row.summaries), ...page.summaries].map(summary => [summary.id, summary])).values()];
+    // Long history is a moving detail window, not an accidental 100k-message graph.
+    this.windowDetails.set(id, { contextVersion: page.contextVersion, summaries: summaries.slice(-500), cursor: page.nextCursor,
+      exhausted: page.exhausted });
+    if (this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) { this.windowDetails.delete(id); throw new Error("This conversation exceeds the safe detail window size."); }
+    this.rebuild();
+  };
+  prepareActionContext = (mails: Mail[]) => this.completeActionContext(mails);
+  private completeActionContext = async (mails: Mail[]): Promise<Mail[]> => {
+    const completed: Mail[] = [];
+    for (const captured of mails) {
+      if (!captured.window || captured.window.actionContextComplete) { completed.push(captured); continue; }
+      if (!captured.window.targetsComplete || captured.window.counts.memberships === null || captured.window.counts.memberships > 500) throw new Error("This conversation exceeds 500 message memberships. No mail was changed.");
+      this.pinWindow("action-context", [captured.id]);
+      try {
+        if (!this.windowRows.has(captured.id)) await this.lookupWindow([captured.id], captured.account);
+        const current = this.windowRows.get(captured.id);
+        if (!current || current.contextVersion !== captured.window.contextVersion) throw new Error("The captured conversation changed. Review it before making changes.");
+        while (!this.windowDetails.get(captured.id)?.exhausted) {
+          await this.loadMoreMessages(captured.id);
+          if (!this.windowDetails.get(captured.id)?.cursor && !this.windowDetails.get(captured.id)?.exhausted) throw new Error("Conversation context is still incomplete. No mail was changed.");
+        }
+        const mail = this.state.mail.find(mail => mail.id === captured.id)!;
+        if (mail.window?.contextVersion !== captured.window.contextVersion || !mail.window.actionContextComplete) throw new Error("The captured conversation changed. No mail was changed.");
+        completed.push(mail);
+      } finally { this.pinWindow("action-context", []); }
+    }
+    return completed;
+  };
+
+  loadThread = (id: string, messageId?: string): Promise<void> => {
     const mail = this.state.mail.find(mail => mail.id === id);
     if (!mail || mail.operationId) return Promise.resolve();
-    const key = nativeKey(mail.sourceId!, mail.sdkThreadId!);
+    const key = nativeKey(mail.sourceId!, mail.sdkThreadId!) + (mail.window ? `\0${messageId ?? mail.messages.at(-1)?.id}` : "");
     const pending = this.loadingThreads.get(key); if (pending) return pending;
     const generation = this.generation;
     const bodyEpoch = this.bodyEpoch;
@@ -1413,7 +1908,7 @@ export class InboxStore {
     const work = (async () => {
       const changed = new Set<string>();
       let fetched = 0;
-      for (const message of mail.messages) if (!message.pending) {
+      for (const message of mail.messages) if (!message.pending && (!mail.window || message.id === (messageId ?? mail.messages.at(-1)?.id))) {
         const mailboxId = message.memberships?.[0]?.mailboxId ?? mail.mailboxId!;
         const row = this.summaries.get(mailboxId)?.find(row => row.sourceId === mail.sourceId && row.id === message.id);
         if (!row || this.cachedDetail(row)) continue;
@@ -1424,6 +1919,11 @@ export class InboxStore {
         const previous = this.details.get(message.id);
         if (previous && previous.revision >= detail.revision) continue;
         this.details.set(message.id, detail);
+        if (mail.window) {
+          const bytes = () => new TextEncoder().encode(JSON.stringify([...this.details.values()])).length * 2;
+          while (this.details.size > 1 && bytes() > 8 * 1024 * 1024) this.details.delete(this.details.keys().next().value!);
+          if (bytes() > 8 * 1024 * 1024) { this.details.delete(message.id); throw new Error("This message exceeds the safe body cache size."); }
+        }
         changed.add(nativeKey(row.sourceId, row.threadId));
       }
       if (changed.size) this.rebuild(changed);
@@ -1610,7 +2110,7 @@ export class InboxStore {
     if (!this.state.host?.allowProviderWrites && Object.keys(changes).some(key => !["addLabelIds", "removeLabelIds", "snoozedUntil"].includes(key))) {
       throw new Error("Provider changes are disabled by this read-only host.");
     }
-    const rows = await Promise.all(ids.map(id => this.client.mailboxMessage(boxId, id, this.requestOptions())));
+    const rows = await Promise.all(ids.map(id => this.state.host?.inboxWindow ? this.client.mailboxMessageSummary(boxId, id, this.requestOptions()) : this.client.mailboxMessage(boxId, id, this.requestOptions())));
     const operation = await this.client.mutate({ messageIds: ids, viaMailboxId: boxId, changes, ifRevisions: Object.fromEntries(rows.map(row => [row.id, row.revision])), idempotencyKey: crypto.randomUUID() }, this.requestOptions());
     this.scheduleRefresh(); return this.settled(operation);
   }
@@ -1632,12 +2132,15 @@ export class InboxStore {
       if (!sourceId) continue;
       const row = this.summaries.get(state.mailboxId)?.find(row => row.sourceId === sourceId && row.id === state.messageId);
       const current = row?.memberships.find(current => current.mailboxId === state.mailboxId);
-      if (!row || !current || state.revision <= current.revision) continue;
+      if ((!row || !current) && !this.state.host?.inboxWindow || current && state.revision <= current.revision) continue;
       const key = membershipKey(sourceId, state), previous = this.membershipReceipts.get(key);
       if (previous && previous.state.revision >= state.revision) continue;
-      this.membershipReceipts.set(key, { sourceId, state }); threads.add(nativeKey(sourceId, row.threadId));
+      this.membershipReceipts.set(key, { sourceId, state });
+      if (row) threads.add(nativeKey(sourceId, row.threadId));
+      else for (const item of this.windowRows.values()) if (item.sourceId === sourceId && item.targets.some(target => target.messageId === state.messageId)) threads.add(nativeKey(sourceId, item.threadId));
     }
     if (threads.size) this.rebuild(threads);
+    if (this.state.host?.inboxWindow) this.scheduleRefresh();
   }
   private async receiveFeedback(event: AttentionFeedback) {
     this.feedbackEpoch++;
@@ -1693,9 +2196,13 @@ export class InboxStore {
         // Sparse operation-only pages do NOT advance this target's fence.
         // A newer receipt can prove an already-read row reflected settlement,
         // but only through that operation's exact canonical revision edges.
-        const accepted = write.accepted !== undefined && fence && (fence.epoch >= write.accepted || fence.removed || fence.revision >= latest);
+        const accepted = write.accepted !== undefined && fence && (this.state.host?.inboxWindow
+          ? fence.removed === "deleted" || fence.revision >= latest
+          : fence.epoch >= write.accepted || fence.removed || fence.revision >= latest);
         if (accepted && !intent.retired) { this.retireFlagIntent(intent); threads.add(nativeKey(intent.target.sourceId, intent.target.threadId)); }
-        terminalReflected &&= !!fence && (fence.epoch >= write.terminal! || !!fence.removed || revisions.length > 1 && latest > Math.min(...revisions) && fence.revision >= latest);
+        terminalReflected &&= !!fence && (this.state.host?.inboxWindow
+          ? fence.removed === "deleted" || fence.revision >= latest
+          : fence.epoch >= write.terminal! || !!fence.removed || revisions.length > 1 && latest > Math.min(...revisions) && fence.revision >= latest);
       }
       if (terminalReflected) this.flagWrites.delete(write);
     }
@@ -1841,9 +2348,15 @@ export class InboxStore {
           const { source } = this.account(mailboxId);
           if (!this.supports(field === "isStarred" ? "star" : value ? "read" : "unread", mailboxId)) throw new Error(`A selected source does not support ${action}.`);
           for (const messageId of ids) {
-            const row = this.flagSummary({ sourceId: source.id, mailboxId, messageId });
-            const projected = this.projectFlags(row);
-            targets.set(nativeKey(source.id, messageId), { sourceId: source.id, mailboxId, messageId, threadId: row.threadId, revision: row.revision, before: projected[field] });
+            if (mail.window) {
+              const message = mail.messages.find(message => message.id === messageId);
+              if (!message?.revision || typeof message[field] !== "boolean") throw new Error("The captured flag context is incomplete.");
+              targets.set(nativeKey(source.id, messageId), { sourceId: source.id, mailboxId, messageId, threadId: mail.sdkThreadId!, revision: message.revision, before: message[field]! });
+            } else {
+              const row = this.flagSummary({ sourceId: source.id, mailboxId, messageId });
+              const projected = this.projectFlags(row);
+              targets.set(nativeKey(source.id, messageId), { sourceId: source.id, mailboxId, messageId, threadId: row.threadId, revision: row.revision, before: projected[field] });
+            }
           }
         }
       }
@@ -1882,7 +2395,8 @@ export class InboxStore {
         // original provider command is still processing, without blind cancel.
         const groups = new Map<boolean, FlagTarget[]>();
         for (const write of batches) for (const intent of write.intents) {
-          const row = this.flagSummary(intent.target), before = this.projectFlags(row)[field];
+          const row = this.messageRows.get(nativeKey(intent.target.sourceId, intent.target.messageId));
+          const before = row ? this.projectFlags(row)[field] : write.value; // Eviction is not deletion; Undo uses its captured receipt edges.
           const group = groups.get(intent.target.before) ?? [];
           // Only this operation's receipt authorizes Undo's baseline. A newer
           // unrelated snapshot revision must not silently permit overwriting
@@ -1930,8 +2444,170 @@ export class InboxStore {
     catch (error) { timing({ queueMs, outcome: "error" }); this.scheduleRefresh(); this.fail(error, action); throw error; }
     finally { release(); this.aiRebuildAfter = Date.now() + 50; this.publish({ pending: Math.max(0, this.state.pending - 1) }); }
   }
+  private recoveryScope(selected: Mail[]): RecoveryScope {
+    const sources = new Map<string, RecoveryScope["sources"][number]>();
+    for (const mail of selected) {
+      const source = this.sourceAccounts.find(source => source.id === mail.sourceId);
+      if (!source || source.status !== "connected" || source.generation !== mail.sourceGeneration) throw new InboxRecoveryRejected("The captured source generation changed. Review this conversation again.");
+      const entry = sources.get(source.id) ?? { sourceId: source.id, generation: source.generation, mailboxIds: [] };
+      entry.mailboxIds = [...new Set([...entry.mailboxIds, ...mail.mailboxIds ?? [mail.mailboxId ?? mail.account]])];
+      sources.set(source.id, entry);
+    }
+    return { version: 1, owner: this.applicationScope.scope, sources: [...sources.values()] };
+  }
+  private publishRecovery(plan: InboxCommandRecovery, sink?: InboxRecoverySink) {
+    if (!validInboxCommandRecovery(plan)) throw new InboxRecoveryStorageError("The captured recovery plan is invalid or exceeds its bounded budget. No further command was sent.");
+    try { sink?.(structuredClone(plan)); } catch { throw new InboxRecoveryStorageError("The frozen mail command could not be saved. No further command was sent."); }
+  }
+  private async checkRecovery(plan: InboxCommandRecovery, signal: AbortSignal, generation: number, local = false) {
+    const check = () => { signal.throwIfAborted(); this.applicationScope.signal.throwIfAborted(); if (generation !== this.generation) throw new DOMException("Request cancelled", "AbortError"); };
+    check();
+    if (!validInboxCommandRecovery(plan) || plan.owner !== this.applicationScope.scope) throw new InboxRecoveryRejected("The captured command belongs to a different application scope.");
+    for (const expected of plan.sources) {
+      const source = local ? this.sourceAccounts.find(source => source.id === expected.sourceId) : await this.client.account(expected.sourceId, { signal }); check();
+      if (!source || source.status !== "connected" || source.generation !== expected.generation) throw new InboxRecoveryRejected("The captured source generation changed. No command was replayed.");
+      for (const id of expected.mailboxIds) {
+        const box = local ? this.state.mailboxes.find(box => box.id === id) : await this.client.mailbox(id, { signal }); check();
+        if (!box || box.sourceId !== expected.sourceId || box.status === "detached") throw new InboxRecoveryRejected("The captured receiving scope changed. No command was replayed.");
+      }
+    }
+    return check;
+  }
+  private async applyFeedbackRecovery(plan: Extract<InboxCommandRecovery, { kind: "attention-feedback" }>, sink: InboxRecoverySink | undefined, signal: AbortSignal, check: () => void): Promise<InboxUndo> {
+    if (plan.status === "rejected" || plan.status === "retracted") throw new InboxRecoveryRejected("The original feedback command is no longer active. Review this conversation before choosing another action.");
+    plan.status = "uncertain"; this.publishRecovery(plan, sink); check();
+    let event: AttentionFeedback;
+    try { event = await recordAttentionFeedback(plan.input, signal); }
+    catch (error) {
+      if (error instanceof InboxViewPreferencesError && error.status < 500 && ![408, 425, 429].includes(error.status)) plan.status = "rejected";
+      this.publishRecovery(plan, sink); throw error;
+    }
+    check();
+    if (event.id !== plan.input.id) throw new Error("The feedback acknowledgement does not match the captured command.");
+    if (event.status === "failed" || event.status === "retracted") {
+      plan.status = event.status === "failed" ? "rejected" : "retracted"; this.publishRecovery(plan, sink);
+      throw new InboxRecoveryRejected(event.problem ?? "The original feedback command is no longer active.");
+    }
+    if (event.status !== "active" || !event.states || event.states.length !== plan.input.targets.length || event.states.some(state => !state.done || !plan.input.targets.some(target => target.mailboxId === state.mailboxId && target.messageId === state.messageId && state.revision > target.revision))) throw new Error("The feedback receipt is not yet confirmed. Retry the original request.");
+    plan.status = "accepted"; this.publishRecovery(plan, sink); await this.receiveFeedback(event);
+    const reverse: InboxUndo = async () => { reverse.inverseReceipts = await this.undoCommand(plan, sink); };
+    reverse.recovery = plan; reverse.receipts = [{ kind: "attention-feedback", id: event.id }];
+    return reverse;
+  }
+  /** Called only by an explicit user Retry. Construction/restoration performs no I/O. */
+  replayCommand = (saved: InboxCommandRecovery, sink?: InboxRecoverySink): Promise<InboxUndo> => this.runRecoveredCommand(saved, sink, false);
+  private runRecoveredCommand = (saved: InboxCommandRecovery, sink: InboxRecoverySink | undefined, fresh: boolean): Promise<InboxUndo> => {
+    if (!validInboxCommandRecovery(saved)) return Promise.reject(new InboxRecoveryRejected("Invalid captured command."));
+    const plan = structuredClone(saved), signal = this.controller.signal, generation = this.generation;
+    return this.act("recover-mail-command", async () => {
+      const check = await this.checkRecovery(plan, signal, generation, fresh);
+      if (plan.kind === "attention-feedback") return this.applyFeedbackRecovery(plan, sink, signal, check);
+      const reverse: InboxUndo = async () => { reverse.inverseReceipts = await this.undoCommand(plan, sink); };
+      reverse.recovery = plan;
+      if (plan.kind === "mailbox-state") {
+        if (plan.status === "rejected") throw new InboxRecoveryRejected("The original command was rejected. Review the captured conversation before choosing another action.");
+        this.publishRecovery(plan, sink);
+        let receipt;
+        try {
+          // An acknowledged/retracted result is read first, including after a
+          // lost inverse acknowledgement. Never infer ownership from equal state.
+          if (!fresh) {
+            try { receipt = await this.client.mailboxStateReceipt(plan.input.id, { signal }); }
+            catch (error) { if (!(error instanceof ApiError && error.status === 404)) throw error; }
+          }
+          if (!receipt) {
+            plan.status = "uncertain"; this.publishRecovery(plan, sink);
+            try { receipt = await this.client.setMailboxStates(plan.input, { signal }); }
+            catch (error) {
+              if (signal.aborted || definitive(error)) throw error;
+              receipt = await this.client.setMailboxStates(plan.input, { signal });
+            }
+          }
+        } catch (error) {
+          if (!(error instanceof InboxRecoveryStorageError) && definitive(error)) plan.status = "rejected";
+          this.publishRecovery(plan, sink); throw error;
+        }
+        check();
+        plan.status = receipt.retracted ? "retracted" : "accepted"; plan.accepted = receipt.states;
+        if (receipt.retracted) plan.undoStatus = "accepted";
+        this.publishRecovery(plan, sink); this.receiveMemberships(receipt.states);
+        if (receipt.retracted) throw new InboxRecoveryRejected("The original mail command was already undone. No new decision was sent.");
+        reverse.receipts = [{ kind: "mailbox-state", id: receipt.id }];
+      } else {
+        const total = plan.groups.reduce((n, g) => n + g.input.targets.length, 0);
+        try {
+          for (const group of plan.groups) {
+            if (["accepted", "retracted"].includes(group.status)) continue;
+            if (group.status === "rejected") throw new CategoryRequestError("HOST_CATEGORY_CONFLICT", 412);
+            group.status = "uncertain"; this.publishRecovery(plan, sink);
+            try {
+              const receipt = await this.categoryTransport.classify(group.input!);
+              check();
+              if (receipt.id !== group.input.id || receipt.entries.length !== group.input.targets.length) throw new CategoryRequestError("HOST_CATEGORY_ACK_PENDING", 503);
+              this.receiveCategories(receipt.entries); group.status = receipt.retracted ? "retracted" : "accepted";
+              this.publishRecovery(plan, sink);
+            } catch (error) {
+              if (error instanceof CategoryRequestError && error.status < 500 && ![408, 425, 429].includes(error.status)) group.status = "rejected";
+              this.publishRecovery(plan, sink); throw error;
+            }
+          }
+        } catch (error) {
+          const completed = plan.groups.filter(g => ["accepted", "retracted"].includes(g.status)).reduce((n, g) => n + g.input.targets.length, 0);
+          reverse.receipts = plan.groups.filter(g => g.status === "accepted").map(g => ({ kind: "category", id: g.input.id }));
+          const retry = !plan.groups.some(g => g.status === "rejected") ? () => this.replayCommand(plan, sink) : undefined;
+          throw new InboxClassificationError(error instanceof CategoryRequestError ? error.code : "HOST_CATEGORY_ACK_PENDING", completed, total - completed, retry, completed ? reverse : undefined);
+        }
+        reverse.receipts = plan.groups.filter(g => g.status === "accepted").map(g => ({ kind: "category", id: g.input.id }));
+      }
+      this.scheduleRefresh(); return reverse;
+    }, false);
+  };
+  /** The durable server receipt owns the conditional inverse, including reminders. */
+  undoCommand = (saved: InboxCommandRecovery, sink?: InboxRecoverySink): Promise<InboxActionReceiptReference[]> => {
+    if (!validInboxCommandRecovery(saved)) return Promise.reject(new InboxRecoveryRejected("Invalid captured command."));
+    const plan = structuredClone(saved), signal = this.controller.signal, generation = this.generation;
+    return this.act("recover-mail-undo", async () => {
+      const check = await this.checkRecovery(plan, signal, generation);
+      const references: InboxActionReceiptReference[] = [];
+      if (plan.kind === "attention-feedback") {
+        if (!["accepted", "retracted"].includes(plan.status) && plan.undoStatus !== "uncertain") throw new InboxRecoveryRejected("Confirm the original feedback before Undo.");
+        plan.undoStatus = "uncertain"; this.publishRecovery(plan, sink);
+        const event = await retractAttentionFeedback(plan.input.id, signal); check();
+        if (event.id !== plan.input.id || event.status !== "retracted") throw new Error("Feedback Undo is not yet confirmed. Retry the original request.");
+        plan.status = "retracted";
+        if (event.problem || !event.states || event.states.length !== plan.input.targets.length) {
+          plan.undoStatus = "rejected"; this.publishRecovery(plan, sink); await this.receiveFeedback(event);
+          throw new InboxRecoveryRejected(event.problem ?? "Feedback was retracted, but its conditional mail inverse was not accepted.");
+        }
+        plan.undoStatus = "accepted"; this.publishRecovery(plan, sink); await this.receiveFeedback(event);
+        references.push({ kind: "attention-feedback", id: plan.input.id });
+      } else if (plan.kind === "mailbox-state") {
+        if (plan.status !== "accepted" && plan.status !== "retracted" && plan.undoStatus !== "uncertain") throw new InboxRecoveryRejected("Confirm the original mail command before Undo.");
+        plan.undoStatus = "uncertain"; this.publishRecovery(plan, sink);
+        let receipt;
+        try { receipt = await this.client.undoMailboxStates(plan.input.id, { signal }); }
+        catch (error) { if (definitive(error)) plan.undoStatus = "rejected"; this.publishRecovery(plan, sink); throw error; }
+        check();
+        if (!receipt.retracted) throw new Error("The mail inverse is not yet acknowledged.");
+        plan.status = "retracted"; plan.undoStatus = "accepted";
+        this.publishRecovery(plan, sink); this.receiveMemberships(receipt.states);
+        references.push({ kind: "mailbox-state", id: plan.input.id });
+      } else for (const group of [...plan.groups].reverse()) {
+        if (group.status !== "accepted" && group.status !== "retracted") continue;
+        this.publishRecovery(plan, sink);
+        const receipt = await this.categoryTransport.undo(group.input.id);
+        check();
+        if (!receipt.retracted) throw new Error("The category inverse is not yet acknowledged.");
+        group.status = "retracted"; this.publishRecovery(plan, sink); this.receiveCategories(receipt.entries);
+        references.push({ kind: "category", id: group.input.id });
+      }
+      this.scheduleRefresh(); return references;
+    }, false);
+  };
   /** Freeze user-selected context before any queue or network await. */
-  classify = (mails: Mail[], category: AttentionCategory): Promise<() => Promise<void>> => {
+  classify = (mails: Mail[], category: AttentionCategory, sink?: InboxRecoverySink): Promise<InboxUndo> => mails.some(mail => mail.window && !mail.window.actionContextComplete)
+    ? this.completeActionContext(mails).then(complete => this.classifyComplete(complete, category, sink)) : this.classifyComplete(mails, category, sink);
+  private classifyComplete = (mails: Mail[], category: AttentionCategory, sink?: InboxRecoverySink): Promise<InboxUndo> => {
     type Group = { id: string; targets: CategoryCommand["targets"]; input?: CategoryCommand; receipt?: CategoryReceipt; uncertain?: boolean };
     const groups: Group[] = [], signal = this.controller.signal, generation = this.generation;
     const revisionKnown = new Set<string>();
@@ -1946,7 +2622,7 @@ export class InboxStore {
       const selected = new Map<string, Mail[]>(), current = new Map(this.state.mail.map(mail => [mail.id, mail]));
       for (const mail of mails) {
         const source = this.sourceAccounts.find(source => source.id === mail.sourceId);
-        if (!source || source.status !== "connected" || source.generation !== mail.sourceGeneration || !mail.sdkThreadId || mail.operationId || !current.has(mail.id)) throw new CategoryRequestError("HOST_CATEGORY_CONTEXT_CHANGED", 412);
+        if (!source || source.status !== "connected" || source.generation !== mail.sourceGeneration || !mail.sdkThreadId || mail.operationId || !mail.window && !current.has(mail.id)) throw new CategoryRequestError("HOST_CATEGORY_CONTEXT_CHANGED", 412);
         if (!mail.messages.some(message => !message.pending && !message.outgoing && message.nativeFolder === "inbox" && message.memberships?.some(state => !state.done && (!state.snoozedUntil || Date.parse(state.snoozedUntil) <= Date.now())))) throw new CategoryRequestError("HOST_CATEGORY_CONTEXT_CHANGED", 412);
         const key = nativeKey(source.id, mail.sdkThreadId), copies = selected.get(key) ?? [];
         copies.push(mail); selected.set(key, copies);
@@ -1975,7 +2651,7 @@ export class InboxStore {
         const memberships = context.messages.reduce((sum, message) => sum + message.memberships.length, 0);
         if (memberships > CATEGORY_MEMBERSHIP_LIMIT) throw new CategoryRequestError("HOST_CATEGORY_TOO_LARGE", 413);
         if (!isCategoryContext(context)) throw new CategoryRequestError("HOST_CATEGORY_INVALID", 400);
-        for (const mail of copies) if (!currentCategoryOverride(current.get(mail.id)!, { category, context })) throw new CategoryRequestError("HOST_CATEGORY_CONTEXT_CHANGED", 412);
+        for (const mail of copies) if (!currentCategoryOverride(current.get(mail.id) ?? mail, { category, context })) throw new CategoryRequestError("HOST_CATEGORY_CONTEXT_CHANGED", 412);
         const previous = this.categories.get(key);
         if (previous) revisionKnown.add(key);
         const target = { context, ifRevision: previous?.revision ?? 0 };
@@ -1999,9 +2675,11 @@ export class InboxStore {
     const flags = [...this.flagWrites].filter(write => write.targets.some(target => keys.has(nativeKey(target.sourceId, target.messageId))));
     const edges = new Map([...keys].map(key => [key, new Map(this.flagRevisions.get(key))]));
     let preparedFlags = false, retired = false, running: Promise<() => Promise<void>> | undefined;
+    let recovery: Extract<InboxCommandRecovery, { kind: "category" }> | undefined;
+    const publish = () => { if (recovery) this.publishRecovery(recovery, sink); };
     const total = groups.reduce((sum, group) => sum + group.targets.length, 0);
     const check = () => { signal.throwIfAborted(); this.applicationScope.signal.throwIfAborted(); if (generation !== this.generation) throw new DOMException("Request cancelled", "AbortError"); };
-    const undo = async () => {
+    const undo: InboxUndo = async () => {
       retired = true;
       await this.act("undo-category", async () => {
         let problem: unknown;
@@ -2017,6 +2695,10 @@ export class InboxStore {
               receipt = await this.categoryTransport.undo(group.id);
             }
             check(); this.receiveCategories(receipt.entries); group.receipt = receipt;
+            const captured = recovery?.groups.find(entry => entry.input.id === group.id);
+            if (captured) { captured.status = "retracted"; publish(); }
+            undo.inverseReceipts = [...(undo.inverseReceipts ?? []), { kind: "category", id: group.id }];
+            this.scheduleRefresh();
           } catch (error) { problem ??= error; }
         }
         if (problem) {
@@ -2059,29 +2741,49 @@ export class InboxStore {
               }
               group.input = structuredClone({ id: group.id, category, targets: group.targets });
             }
+          }
+          // Freeze every group before the first mutation, including groups that
+          // have not yet been sent when an earlier acknowledgement is lost.
+          if (sink && !recovery) recovery = { ...this.recoveryScope(mails), kind: "category", groups: groups.map(group => ({ input: structuredClone(group.input!), status: "prepared" })) };
+          publish();
+          for (const group of groups) {
+            if (group.receipt) continue;
+            const captured = recovery?.groups.find(entry => entry.input.id === group.id);
+            if (captured) { captured.status = "uncertain"; publish(); }
             let receipt: CategoryReceipt;
-            try { receipt = await this.categoryTransport.classify(group.input); }
+            try { receipt = await this.categoryTransport.classify(group.input!); }
             catch (error) {
               check();
               if (error instanceof CategoryRequestError && error.status < 500 && ![408, 425, 429].includes(error.status)) throw error;
               group.uncertain = true;
-              receipt = await this.categoryTransport.classify(group.input);
+              receipt = await this.categoryTransport.classify(group.input!);
             }
             check();
             if (receipt.entries.length !== group.targets.length || new Set(receipt.entries.map(categoryKey)).size !== group.targets.length || receipt.entries.some(entry => !group.targets.some(target => categoryKey(target.context) === categoryKey(entry)))) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
             this.receiveCategories(receipt.entries);
             if (receipt.retracted) throw new CategoryRequestError("HOST_CATEGORY_CONFLICT", 412);
             group.receipt = receipt; group.uncertain = false;
+            if (captured) { captured.status = "accepted"; publish(); }
           }
+          undo.recovery = recovery;
+          undo.receipts = groups.filter(group => group.receipt && !group.receipt.retracted).map(group => ({ kind: "category", id: group.id }));
+          this.scheduleRefresh();
           return undo;
         } catch (error) {
           check();
+          undo.receipts = groups.filter(group => group.receipt && !group.receipt.retracted).map(group => ({ kind: "category", id: group.id }));
           const completed = groups.filter(group => group.receipt && !group.receipt.retracted).reduce((sum, group) => sum + group.targets.length, 0);
           const uncertain = groups.some(group => group.uncertain && !group.receipt);
           // The host checks durable IDs before capacity: storage-full explicitly
           // rejects this new command, even if an earlier transport response was lost.
           const recoverable = !retired && !(error instanceof CategoryRequestError && error.code === "HOST_CATEGORY_STORAGE_FULL")
             && (uncertain || !(error instanceof CategoryRequestError) || error.status >= 500 || [408, 425, 429].includes(error.status));
+          if (!recoverable && recovery) {
+            const failed = recovery.groups.find(group => group.status === "uncertain");
+            if (failed) failed.status = "rejected";
+            publish();
+          }
+          undo.recovery = recovery;
           const code = recoverable ? "HOST_CATEGORY_ACK_PENDING" : error instanceof CategoryRequestError ? error.code : "HOST_CATEGORY_UNAVAILABLE";
           throw failure(code, completed, total - completed, recoverable ? resume : undefined, completed ? undo : undefined);
         }
@@ -2093,11 +2795,19 @@ export class InboxStore {
     return resume();
   };
 
-  private done(selected: Mail[], done: boolean): Promise<() => Promise<void>> {
+  private done(selected: Mail[], done: boolean | undefined, sink?: InboxRecoverySink, snoozedUntil?: string | null): Promise<InboxUndo> {
     const targets = new Map<string, MailboxStateTarget>();
     try {
       for (const mail of selected) {
         if (mail.operationId) throw new Error("Cancel the queued send before changing it.");
+        if (mail.window) {
+          if (!mail.window.targetsComplete) throw new Error("This conversation exceeds 500 message memberships. No mail was changed.");
+          for (const target of mail.window.targets) {
+            if (this.account(target.mailboxId).source.id !== mail.sourceId) throw new Error("The receiving scope changed.");
+            targets.set(`${mail.sourceId}\0${target.messageId}\0${target.mailboxId}`, { mailboxId: target.mailboxId, messageId: target.messageId, revision: target.revision });
+          }
+          continue;
+        }
         for (const message of mail.messages) {
           if (message.pending) continue;
           if (!message.memberships?.length) throw new Error("This conversation is still loading. Try again after it refreshes.");
@@ -2110,32 +2820,22 @@ export class InboxStore {
       }
       if (!targets.size || targets.size > 500) throw new Error("Select between 1 and 500 message memberships for one Done action.");
     } catch (error) { return Promise.reject(error); }
-    const input = { id: crypto.randomUUID(), targets: [...targets.values()], done }, signal = this.controller.signal;
-    return this.act(done ? "done" : "inbox", async () => {
-      let receipt;
-      try { receipt = await this.client.setMailboxStates(input, { signal }); }
-      catch (error) {
-        if (signal.aborted || definitive(error)) throw error;
-        receipt = await this.client.setMailboxStates(input, { signal });
-      }
-      signal.throwIfAborted(); this.receiveMemberships(receipt.states);
-      return () => {
-        const signal = this.controller.signal;
-        return this.act("undo-done", async () => {
-          let receipt;
-          try { receipt = await this.client.undoMailboxStates(input.id, { signal }); }
-          catch (error) {
-            if (signal.aborted || definitive(error)) throw error;
-            receipt = await this.client.undoMailboxStates(input.id, { signal });
-          }
-          signal.throwIfAborted(); this.receiveMemberships(receipt.states);
-        }, false);
-      };
-    }, false);
+    const input = { id: crypto.randomUUID(), targets: [...targets.values()], ...(done === undefined ? { snoozedUntil: snoozedUntil ?? null } : { done }) };
+    const before = new Map<string, MailboxMembership>();
+    for (const mail of selected) for (const message of mail.messages) for (const state of message.memberships ?? []) {
+      if (!input.targets.some(target => target.mailboxId === state.mailboxId && target.messageId === message.id)) continue;
+      before.set(`${state.mailboxId}\0${message.id}`, { mailboxId: state.mailboxId, messageId: message.id, revision: state.revision, done: state.done, snoozedUntil: state.snoozedUntil });
+    }
+    const plan: InboxCommandRecovery = { ...this.recoveryScope(selected), kind: "mailbox-state", input, before: [...before.values()], accepted: [], status: "prepared" };
+    // SDK setMailboxStates now owns snooze as well as Done: its idempotent
+    // receipt stores the actual original states and conditional inverse. Never
+    // fall back to non-idempotent PATCH or infer a receipt from equal state.
+    this.publishRecovery(plan, sink);
+    return this.runRecoveredCommand(plan, sink, true);
   }
   canRecordFeedback = (selected: Mail[]): boolean => !!this.state.host?.preferenceScope && selected.length > 0 && selected.every(mail => !mail.operationId && !!mail.sourceId && mail.messages.some(message => !message.pending && !message.outgoing && message.nativeFolder === "inbox"
     && message.memberships?.some(state => !state.done && (!state.snoozedUntil || Date.parse(state.snoozedUntil) <= Date.now()))));
-  private async notImportant(selected: Mail[]): Promise<() => Promise<void>> {
+  private async notImportant(selected: Mail[], sink?: InboxRecoverySink): Promise<InboxUndo> {
     if (!this.state.host?.preferenceScope) throw new Error("The local host must be updated before it can save attention feedback.");
     if (!this.canRecordFeedback(selected)) throw new Error("Select incoming inbox conversations to record not-important feedback.");
     const captured = new Map<string, AttentionFeedbackTarget>();
@@ -2151,6 +2851,7 @@ export class InboxStore {
     // submissions for these canonical messages may advance message revisions;
     // a later reply, mailbox change or unrelated writer is never rebased in.
     const targets = [...captured.values()], id = crypto.randomUUID(), signal = this.controller.signal;
+    const recoveryScope = this.recoveryScope(selected), generation = this.generation;
     const keys = new Set(targets.map(target => nativeKey(target.sourceId, target.messageId)));
     const flags = [...this.flagWrites].filter(write => write.targets.some(target => keys.has(nativeKey(target.sourceId, target.messageId))));
     const edges = new Map([...keys].map(key => [key, new Map(this.flagRevisions.get(key))]));
@@ -2173,10 +2874,10 @@ export class InboxStore {
         while (links?.has(messageRevision)) messageRevision = links.get(messageRevision)!;
         return { ...target, messageRevision };
       }) };
-      const event = await recordAttentionFeedback(input, signal);
-      if (event.status !== "active") throw new Error(event.problem ?? "This feedback action is no longer active.");
-      await this.receiveFeedback(event);
-      return () => this.undoFeedback(event.id);
+      const plan: InboxCommandRecovery = { ...recoveryScope, kind: "attention-feedback", input, status: "prepared" };
+      this.publishRecovery(plan, sink);
+      const check = await this.checkRecovery(plan, signal, generation, true);
+      return this.applyFeedbackRecovery(plan, sink, signal, check);
     }, false);
   }
   undoFeedback = (id: string): Promise<void> => this.act("undo-feedback", async () => {
@@ -2184,17 +2885,26 @@ export class InboxStore {
     await this.receiveFeedback(event);
     if (event.problem) throw new Error(event.problem);
   }, false);
-  action = (selected: Mail[], action: string, value?: string): Promise<() => Promise<void>> => ["read", "unread", "star"].includes(action) ? this.flagAction(selected, action) : action === "not-important" ? this.notImportant(selected)
-    : action === "done" || action === "inbox" && selected.every(mail => !mail.operationId && mail.messages.every(message => message.pending || ["inbox", "sent"].includes(message.nativeFolder ?? ""))) ? this.done(selected, action === "done") : this.act(action, async () => {
+  action = (selected: Mail[], action: string, value?: string, sink?: InboxRecoverySink): Promise<InboxUndo> => {
+    if (!selected.length) return Promise.reject(new Error("Select a conversation before making changes."));
+    if (selected.some(mail => mail.window && !mail.window.targetsComplete)) return Promise.reject(new Error("This conversation exceeds 500 message memberships. No mail was changed."));
+    if (selected.reduce((sum, mail) => sum + (mail.window?.targets.length ?? 0), 0) > 500) return Promise.reject(new Error("Select at most 500 message memberships. No mail was changed."));
+    if (action !== "done" && selected.some(mail => mail.window && !mail.window.actionContextComplete)) return this.completeActionContext(selected).then(mails => this.actionComplete(mails, action, value, sink));
+    return this.actionComplete(selected, action, value, sink);
+  };
+  private actionComplete = (selected: Mail[], action: string, value?: string, sink?: InboxRecoverySink): Promise<InboxUndo> => ["read", "unread", "star"].includes(action) ? this.flagAction(selected, action) : action === "not-important" ? this.notImportant(selected, sink)
+    : action === "remind" ? this.done(selected, undefined, sink, value)
+    : action === "done" || action === "inbox" && selected.every(mail => !mail.operationId && mail.messages.every(message => message.pending || ["inbox", "sent"].includes(message.nativeFolder ?? ""))) ? this.done(selected, action === "done", sink) : this.act(action, async () => {
     // Keep the clicked message/membership scope: a queued action must not absorb
     // a newly arrived reply or a later change to Unified inbox configuration.
     const undo: Array<() => Promise<unknown>> = [];
+    const receipts: InboxActionReceiptReference[] = [], inverseReceipts: InboxActionReceiptReference[] = [];
     const starred = selected.some(mail => !mail.starred), unread = selected.some(mail => !mail.unread);
     const native = action === "star" ? { isStarred: starred } : action === "unread" ? { isRead: !unread } : action === "read" ? { isRead: true }
       : action === "trash" ? { folder: "trash" } : action === "spam" ? { folder: "spam" } : undefined;
     for (const mail of selected) {
       if (mail.operationId && !["trash", "cancel"].includes(action)) throw new Error("Cancel the queued send before changing it.");
-      if (!mail.operationId && !native && !["done", "inbox", "remind"].includes(action)) throw new Error(`The SDK does not expose ${action}; no simulated mail change was made.`);
+      if (!mail.operationId && !native && !["done", "inbox"].includes(action)) throw new Error(`The SDK does not expose ${action}; no simulated mail change was made.`);
       if (native && !mail.operationId) for (const boxId of this.mailboxTargets(mail).keys()) {
         const capability = action === "star" ? "star" : action === "unread" && unread ? "markUnread" : ["unread", "read"].includes(action) ? "markRead" : action === "trash" ? "trash" : "folders";
         const { source } = this.account(boxId);
@@ -2211,7 +2921,7 @@ export class InboxStore {
           }
         } else {
           if (action === "inbox") for (const [boxId, ids] of this.mailboxTargets(mail)) {
-            const rows = await Promise.all(ids.map(id => this.client.mailboxMessage(boxId, id, this.requestOptions())));
+            const rows = await Promise.all(ids.map(id => this.state.host?.inboxWindow ? this.client.mailboxMessageSummary(boxId, id, this.requestOptions()) : this.client.mailboxMessage(boxId, id, this.requestOptions())));
             const moved = rows.filter(row => !["inbox", "sent"].includes(row.folder));
             if (moved.length) {
               const operation = await this.mutation(boxId, moved.map(row => row.id), { folder: "inbox" });
@@ -2220,11 +2930,16 @@ export class InboxStore {
           }
           // Unified local actions affect only memberships represented by this view.
           for (const [boxId, ids] of this.mailboxTargets(mail, true)) for (const id of ids) {
-            const row = await this.client.mailboxMessage(boxId, id, this.requestOptions());
-            const before = row.memberships.find(state => state.mailboxId === boxId)!;
-            const saved = await this.client.setMailboxState(boxId, id, action === "remind" ? { snoozedUntil: value ?? null } : { done: action === "done", snoozedUntil: null }, before.revision, this.requestOptions());
+            const captured = mail.messages.find(message => message.id === id)?.memberships?.find(state => state.mailboxId === boxId);
+            const before = mail.window ? captured : (await this.client.mailboxMessage(boxId, id, this.requestOptions())).memberships.find(state => state.mailboxId === boxId);
+            if (!before) throw new Error("The captured membership is incomplete. No further mail was changed.");
+            const saved = await this.client.setMailboxState(boxId, id, { done: action === "done", snoozedUntil: null }, before.revision, this.requestOptions());
             this.receiveMemberships([saved]);
-            undo.push(async () => { this.receiveMemberships([await this.client.setMailboxState(boxId, id, { done: before.done, snoozedUntil: before.snoozedUntil }, saved.revision, this.requestOptions())]); });
+            receipts.push({ kind: "mailbox-membership", target: { mailboxId: boxId, messageId: id, revision: saved.revision } });
+            undo.push(async () => {
+              const restored = await this.client.setMailboxState(boxId, id, { done: before.done, snoozedUntil: before.snoozedUntil }, saved.revision, this.requestOptions());
+              this.receiveMemberships([restored]); inverseReceipts.push({ kind: "mailbox-membership", target: { mailboxId: boxId, messageId: id, revision: restored.revision } });
+            });
           }
         }
       }
@@ -2234,10 +2949,16 @@ export class InboxStore {
       if (incomplete) throw new Error("The action did not finish, and some changes could not be restored. Refresh the inbox before retrying.");
       throw error;
     }
-    return async () => { await this.act("undo", async () => { for (const reverse of [...undo].reverse()) await reverse(); }); };
+    const reverse: InboxUndo = async () => { await this.act("undo", async () => { for (const reverse of [...undo].reverse()) await reverse(); }); reverse.inverseReceipts = inverseReceipts; };
+    reverse.receipts = receipts;
+    return reverse;
   });
 
-  setLabel = (selected: Mail[], name: string, remove: boolean) => this.act("label", async () => {
+  setLabel = async (selected: Mail[], name: string, remove: boolean): Promise<() => Promise<void>> => {
+    if (selected.some(mail => mail.window && !mail.window.targetsComplete) || selected.reduce((sum, mail) => sum + (mail.window?.targets.length ?? 0), 0) > 500) throw new Error("Choose at most 500 captured message memberships. No labels were changed.");
+    return this.setLabelComplete(await this.completeActionContext(selected), name, remove);
+  };
+  private setLabelComplete = (selected: Mail[], name: string, remove: boolean) => this.act("label", async () => {
     const operations: Operation[] = [];
     const plans: Array<{ boxId: string; ids: string[]; changes: Changes }> = [];
     for (const mail of selected) {

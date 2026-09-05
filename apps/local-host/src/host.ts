@@ -16,6 +16,7 @@ import { createPerformanceLog } from './performance-log'
 import { assertApplicationAuthRuntime, createApplicationAuth } from './application-auth'
 import { loadAiInferenceConfig, type AiInferenceConfig } from './ai-inference'
 import { createAiTriageService } from './ai-triage'
+import { createInboxWindowService } from './inbox-window'
 import type { AiSettings, AiFeedbackInput, AiReadingInput, AiThreadKey } from '../../shared/ai-triage'
 
 const safeHeaders = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', Vary: 'Origin, Cookie' }
@@ -23,19 +24,19 @@ function problem(status: number, code: string, error: string): Response {
   return Response.json({ code, error, retryable: status >= 500 }, { status, headers: safeHeaders })
 }
 
-async function jsonBody(request: Request, kind: 'connection' | 'preferences' | 'performance' | 'triage' | 'category' = 'connection'): Promise<Record<string, unknown>> {
-  const limit = (kind === 'triage' || kind === 'category') ? 64 * 1024 : kind === 'performance' ? 32 * 1024 : kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
-  const description = kind === 'category' ? 'Category' : kind === 'triage' ? 'Triage' : kind === 'performance' ? 'Performance' : kind === 'preferences' ? 'Preferences' : 'Connection'
+async function jsonBody(request: Request, kind: 'connection' | 'preferences' | 'performance' | 'triage' | 'category' | 'inbox' | 'inboxChanges' = 'connection'): Promise<Record<string, unknown>> {
+  const limit = kind === 'inboxChanges' ? 256 * 1024 : (kind === 'triage' || kind === 'category' || kind === 'inbox') ? 64 * 1024 : kind === 'performance' ? 32 * 1024 : kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
+  const description = kind === 'inbox' || kind === 'inboxChanges' ? 'Inbox' : kind === 'category' ? 'Category' : kind === 'triage' ? 'Triage' : kind === 'performance' ? 'Performance' : kind === 'preferences' ? 'Preferences' : 'Connection'
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) throw new InboxError('HOST_JSON_REQUIRED', 'Use application/json.', 415)
   const length = request.headers.get('content-length')
   if (length && (!/^\d+$/.test(length) || Number(length) > limit)) throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
-  if (request.headers.has('content-encoding') && (kind === 'performance' || (kind === 'triage' || kind === 'category') || request.headers.get('content-encoding') !== 'identity')) throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
+  if (request.headers.has('content-encoding') && (kind === 'performance' || (kind === 'triage' || kind === 'category' || kind === 'inbox' || kind === 'inboxChanges') || request.headers.get('content-encoding') !== 'identity')) throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
   if (!request.body) throw new InboxError('HOST_INVALID_INPUT', 'A JSON object is required.', 400)
   const reader = request.body.getReader()
   const chunks: Uint8Array[] = []
   let size = 0
   let expired = false
-  const timer = kind === 'performance' || (kind === 'triage' || kind === 'category') ? setTimeout(() => { expired = true; void reader.cancel().catch(() => {}) }, 2000) : undefined
+  const timer = kind === 'performance' || (kind === 'triage' || kind === 'category' || kind === 'inbox' || kind === 'inboxChanges') ? setTimeout(() => { expired = true; void reader.cancel().catch(() => {}) }, 2000) : undefined
   try {
     while (true) {
       const { value, done } = await reader.read()
@@ -43,7 +44,7 @@ async function jsonBody(request: Request, kind: 'connection' | 'preferences' | '
       if (done) break
       size += value.byteLength
       if (size > limit) {
-        if (kind === 'performance' || (kind === 'triage' || kind === 'category')) void reader.cancel().catch(() => {})
+        if (kind === 'performance' || (kind === 'triage' || kind === 'category' || kind === 'inbox' || kind === 'inboxChanges')) void reader.cancel().catch(() => {})
         else await reader.cancel()
         throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
       }
@@ -121,6 +122,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     attentionFeedback: ReturnType<typeof createAttentionFeedbackStore>
     attentionOverrides: ReturnType<typeof createAttentionOverridesStore>
     senderDomains: ReturnType<typeof createSenderDomainHost>
+    inboxWindow: ReturnType<typeof createInboxWindowService>
   }>()
   function contextFor(owner: string) {
     if (closed) throw new InboxError('HOST_CLOSED', 'The local host is shutting down.', 503)
@@ -128,13 +130,15 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     if (!context) {
       // Auth admission is capped at 256 durable identities. Never evict a live owner's queue.
       if (ownerContexts.size >= 256) throw new InboxError('HOST_OWNER_LIMIT', 'This host has reached its active-user limit.', 503)
-      context = {
+      const services = {
         inboxPreferences: createInboxViewPreferencesStore(runtime.database, liveInbox, owner),
         splitPreferences: createSplitPreferencesStore(runtime.database, owner),
         attentionFeedback: createAttentionFeedbackStore(runtime.database, liveInbox, owner),
         attentionOverrides: createAttentionOverridesStore(runtime.database, liveInbox, owner),
         senderDomains: createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' }),
       }
+      context = { ...services, inboxWindow: createInboxWindowService({ database: runtime.database, inbox: liveInbox, owner,
+        sessionKey: runtime.sessionKey, allowProviderWrites: config.allowProviderWrites, ai: aiTriage, ...services }) }
       ownerContexts.set(owner, context)
     }
     return context
@@ -246,8 +250,13 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     }
     if (!ownsMailboxAuthorization(request, identity.id)) return problem(404, 'NOT_FOUND', 'OAuth attempt not found.')
     const owner = identity.id
-    const { inboxPreferences, splitPreferences, attentionFeedback, attentionOverrides, senderDomains } = contextFor(owner)
+    const { inboxPreferences, splitPreferences, attentionFeedback, attentionOverrides, senderDomains, inboxWindow } = contextFor(owner)
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
+    if (url.pathname.startsWith('/host/inbox/')) {
+      if (url.search) return problem(400, 'HOST_INBOX_INVALID', 'Inbox input belongs in the JSON body.')
+      if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use POST for inbox queries.')
+      return Response.json(await inboxWindow.dispatch(url.pathname, await jsonBody(request, url.pathname === '/host/inbox/changes' ? 'inboxChanges' : 'inbox')), { headers: safeHeaders })
+    }
     if (url.pathname === '/host/ai-triage' || url.pathname.startsWith('/host/ai-triage/')) {
       const route = url.pathname.slice('/host/ai-triage'.length)
       const reply = (value: unknown) => Response.json(value, { headers: safeHeaders })
@@ -336,7 +345,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       const descriptors: Array<Omit<HostProvider, 'connectionIds'>> = config.mode === 'mock'
         ? [{ id: 'mock', name: 'Offline mock', connection: 'none', enabled: true, ready: true }]
         : registrations.map(registration => registration.onboarding)
-      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true, aiTriage: aiConfiguration !== null, attentionOverrides: true,
+      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true, aiTriage: aiConfiguration !== null, attentionOverrides: true, inboxWindow: true,
         preferenceScope: createHmac('sha256', runtime.sessionKey).update(`split-preferences:${owner}`).digest('hex'),
         providers: descriptors.map(provider => ({ ...provider, connectionIds: connections.filter(connection => connection.providerId === provider.id).map(connection => connection.id) })) }, { headers: safeHeaders })
     }
@@ -357,9 +366,10 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       request.method === 'PUT' && /^\/v1\/connections\/[^/]+\/credentials$/.test(path)) return problem(403, 'HOST_CONNECT_REQUIRED', 'Use the host provider connection flow, not raw SDK credential input.')
     if (extension) return extension.fetch(request)
     if (url.pathname.startsWith('/v1/')) {
-      // SDK events reauthenticate on every page and the one-second poll, against the
-      // same uncached application session lookup. Revocation also terminates open SSE.
-      const forwarded = url.pathname === '/v1/events' ? new Request(request, { signal: AbortSignal.any([request.signal, streamShutdown.signal]) }) : request
+      // SDK streams reauthenticate each page; events also recheck on idle polls.
+      // Host shutdown must abort snapshot streams as well as open SSE.
+      const streaming = url.pathname === '/v1/events' || url.pathname === '/v1/mailbox-snapshot'
+      const forwarded = streaming ? new Request(request, { signal: AbortSignal.any([request.signal, streamShutdown.signal]) }) : request
       return api.fetch(forwarded)
     }
     return problem(404, 'NOT_FOUND', 'Route not found.')
@@ -397,7 +407,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       sessions.clear()
       streamShutdown.abort()
       return closing = (async () => {
-        await Promise.all([...ownerContexts.values()].map(context => context.senderDomains.close()))
+        await Promise.all([...ownerContexts.values()].flatMap(context => [context.senderDomains.close(), context.inboxWindow.close()]))
         await Promise.allSettled([...pending])
         ownerContexts.clear()
         await aiTriage.close()

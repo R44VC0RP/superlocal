@@ -20,6 +20,7 @@ function MailRow({
   showSnippets,
 }: MailRowProps) {
   const recipients = m.toAddresses?.join(", ") ?? m.to;
+  const messageCount = m.window ? m.window.counts.messages : m.messages.length;
   return (
     <div
       key={m.id}
@@ -43,9 +44,9 @@ function MailRow({
       </button>
       <span className="unread-dot" aria-label={m.unread ? "Unread" : "Read"} />
       <span className="row-from" role="cell">
-        {sent && m.messages.length === 1 ? "Me" : m.from}
-        {m.messages.length > 1 && (
-          <span className="message-count">{m.messages.length}</span>
+        {sent && messageCount === 1 ? "Me" : m.from}
+        {(messageCount === null || messageCount > 1) && (
+          <span className="message-count">{messageCount ?? "…"}</span>
         )}
       </span>
       <span className="row-content" role="cell">
@@ -62,7 +63,7 @@ function MailRow({
       </span>
       <span className="row-metadata">
         {m.starred && <Icon name="Star" size={13} className="starred-icon" />}
-        {m.messages.some((msg) => msg.hasAttachments || msg.attachments?.length) && (
+        {(m.window ? m.hasAttachments : m.messages.some((msg) => msg.hasAttachments || msg.attachments?.length)) && (
           <Icon name="Paperclip" size={14} />
         )}
         <time className={m.reminder || m.scheduled ? "reminder-date" : ""}>

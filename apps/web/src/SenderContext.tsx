@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type { InboxSenderResult } from "../../shared/inbox-window";
 import type { Mail } from "./data";
 import { Icon } from "./components";
 import {
@@ -22,7 +23,8 @@ function DomainMark({ src }: { src: string | null }) {
   </span>;
 }
 
-export default function SenderContext({ contact, history, mailboxIds, getConversations, currentThreadId, remoteImages, showLogos, canCompose, onCompose, onOpen, onImageSettings }: {
+export default function SenderContext({ loadActivity, contact, history, mailboxIds, getConversations, currentThreadId, remoteImages, showLogos, canCompose, onCompose, onOpen, onImageSettings }: {
+  loadActivity?: (domain: string | null) => Promise<InboxSenderResult>;
   contact: SenderContact;
   history: readonly SenderHistoryMessage[];
   mailboxIds: readonly string[];
@@ -53,12 +55,23 @@ export default function SenderContext({ contact, history, mailboxIds, getConvers
   }, [hostname, lookupKey]);
   const root = info?.rootDomain ?? null;
   const grouped = wholeDomain && info?.kind === "domain" && root ? root : null;
-  const activity = useMemo(() => senderActivity(history, contact.email, mailboxIds, grouped), [history, contact.email, mailboxIds, grouped]);
-  const conversations = useMemo(() => getConversations(activity.recentThreadKeys), [getConversations, activity]);
+  const [remote, setRemote] = useState<{ key: string; result: InboxSenderResult | null } | null>(null);
+  const activityKey = `${currentThreadId}:${contact.messageId}:${grouped}`;
+  useEffect(() => {
+    if (!loadActivity) return;
+    let stopped = false;
+    void loadActivity(grouped).then(result => { if (!stopped) setRemote({ key: activityKey, result }); })
+      .catch(() => { if (!stopped) setRemote({ key: activityKey, result: null }); });
+    return () => { stopped = true; };
+  }, [loadActivity, activityKey, grouped]);
+  const local = useMemo(() => loadActivity ? null : senderActivity(history, contact.email, mailboxIds, grouped), [loadActivity, history, contact.email, mailboxIds, grouped]);
+  const activity = loadActivity ? remote?.key === activityKey ? remote.result?.activity ?? null : null : local;
+  const conversations = useMemo(() => loadActivity ? remote?.key === activityKey ? remote.result?.recent.map(row => ({ ...row.mail, window: row })) ?? [] : []
+    : getConversations(local?.recentThreadKeys ?? []), [loadActivity, remote, activityKey, getConversations, local]);
   const icon = remoteImages && showLogos && info?.imagePolicy === "allowed" ? info.iconUrl : null;
-  const peak = Math.max(1, ...activity.weeks.map(week => week.received + week.sent));
-  const levelName = activity.level === 0 ? "No history" : activity.level === 1 ? "One-way mail" : activity.level === 2 ? "In touch"
-    : activity.level === 3 ? "Regular contact" : activity.level === 4 ? "Frequent contact" : "Established contact";
+  const peak = Math.max(1, ...(activity?.weeks.map(week => week.received + week.sent) ?? []));
+  const levelName = activity?.level === 0 ? "No history" : activity?.level === 1 ? "One-way mail" : activity?.level === 2 ? "In touch"
+    : activity?.level === 3 ? "Regular contact" : activity?.level === 4 ? "Frequent contact" : "Established contact";
 
   return <section className="sender-context" aria-label="Sender context" data-sender-domain={root ?? ""}>
     <header className="sender-heading">
@@ -94,7 +107,7 @@ export default function SenderContext({ contact, history, mailboxIds, getConvers
         <button type="button" aria-pressed={!wholeDomain} onClick={() => setWholeDomain(false)}>This address</button>
         <button type="button" aria-pressed={wholeDomain} onClick={() => setWholeDomain(true)} title={`Include addresses at ${root} and its subdomains`}>Whole domain</button>
       </div>}
-      <details className="sender-level-details">
+      {!activity ? <p role="status">{remote?.key === activityKey ? "Exchange history is not available yet." : "Loading exchange history…"}</p> : <><details className="sender-level-details">
         <summary>
           <span className="sender-level-scale" aria-hidden="true">{[1, 2, 3, 4, 5].map(value => <i key={value} className={value <= activity.level ? "is-filled" : ""} />)}</span>
           <span>Level {activity.level}</span><span className="sender-level-name">{levelName}</span><Icon name="ChevronDown" size={12} />
@@ -112,7 +125,7 @@ export default function SenderContext({ contact, history, mailboxIds, getConvers
           <i className="sender-week-sent" style={{ height: `${week.sent / peak * 100}%` }} /><i className="sender-week-received" style={{ height: `${week.received / peak * 100}%` }} />
         </span>)}
       </div>
-      <div className="sender-chart-caption"><span>Last 12 weeks</span><span><i />Sent</span></div>
+      <div className="sender-chart-caption"><span>Last 12 weeks</span><span><i />Sent</span></div></>}
     </section>
 
     <section className="sender-conversations" aria-label="Recent conversations with this contact">
@@ -120,7 +133,7 @@ export default function SenderContext({ contact, history, mailboxIds, getConvers
       {conversations.length ? conversations.map(item => <button type="button" key={item.id} className="sender-conversation"
         title={item.subject || "(No subject)"} aria-current={item.id === currentThreadId ? "true" : undefined} onClick={() => onOpen(item)}>
         <span dir="auto">{item.subject || "(No subject)"}</span><time>{item.date}</time>
-      </button>) : <p>No conversations in this view.</p>}
+      </button>) : <p>{activity ? "No conversations in this view." : "Recent conversations are not available yet."}</p>}
     </section>
   </section>;
 }

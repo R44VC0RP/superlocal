@@ -63,6 +63,10 @@ export type Mail = {
   starred: boolean;
   labels: string[];
   messages: Message[];
+  /** Host-authoritative aggregate and captured-context provenance; never inferred from a preview. */
+  window?: Pick<import("../../shared/inbox-window").InboxWindowRow, "counts" | "messagesComplete" | "targets" | "targetsComplete" | "actionContextComplete" | "contextVersion">;
+  hasAttachments?: boolean;
+  historyExhausted?: boolean;
   triage?: AiDecision;
   /** A validated, opted-in local decision; never a provider folder mutation. */
   attentionCategory?: AiCategory;
@@ -85,6 +89,8 @@ export type Mail = {
   mailboxIds?: string[];
   mailboxNames?: string[];
 };
+/** Commands freeze metadata/receiving context, never retained reader body graphs. */
+export const captureActionMail = (mail: Mail): Mail => ({ ...mail, messages: mail.messages.map(message => ({ ...message, body: "", bodyText: undefined, bodyDocument: undefined, attachments: undefined, loaded: false })) });
 export type Draft = {
   id: string;
   account: string;

@@ -14,7 +14,7 @@ import { CredentialError, InboxError, MAILBOX_SYNC_PROBLEM_CODES, type MailboxSy
   type MessageSummary, type MutationInput, type Operation, type Participant, type Policy,
   type Problem, type Query, type SyncCheckpoint, type SyncRequest, type ThreadSummary, type Connection, type ConnectionIdentity,
   type Mailbox, type MailboxCandidate, type MailboxInput, type MailboxMembership, type MailboxMessageSummary,
-  type MailboxQuery, type MailboxSelector, type MailboxStateReceipt, type MailboxChangesPage, type SendingIdentity, type SendingIdentities } from './contracts'
+  type MailboxQuery, type MailboxConversationQuery, type MailboxConversation, type MailboxThreadKey, type MailboxSelector, type MailboxStateReceipt, type MailboxChangesPage, type SendingIdentity, type SendingIdentities } from './contracts'
 
 type AccountRow = { id: string; owner: string; generation: number; status: Account['status']; data: string; native: string; credentials: string; connection_id: string; connection_generation: number; credential_version: number }
 type ConnectionRow = { id: string; owner: string; generation: number; status: Connection['status']; credential_version: number; data: string; credentials: string }
@@ -585,6 +585,62 @@ export function createInbox(options: InboxOptions): Inbox {
     return limit
   }
 
+  function conversationQuery(input: MailboxConversationQuery | undefined): MailboxConversationQuery {
+    if (input === undefined) return {}
+    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['folder', 'labelId', 'search', 'unreadOnly', 'starredOnly', 'hasAttachments', 'from', 'to', 'before', 'after', 'done', 'snoozed'].includes(key))) throw new InboxError('VALIDATION', 'Invalid conversation query.')
+    const query: Record<string, string | boolean> = {}
+    for (const [key, value] of Object.entries(input)) {
+      if (value === undefined) continue
+      if (['unreadOnly', 'starredOnly', 'hasAttachments', 'done', 'snoozed'].includes(key)) {
+        if (typeof value !== 'boolean') throw new InboxError('VALIDATION', 'Query flags must be boolean.')
+        query[key] = value
+      } else {
+        const normalized = text(value, `Query ${key}`, key === 'search' ? 2000 : 512)
+        if (key === 'before' || key === 'after') {
+          if (!Number.isFinite(Date.parse(normalized))) throw new InboxError('VALIDATION', 'Invalid date filter.')
+          query[key] = new Date(normalized).toISOString()
+        } else query[key] = normalized
+      }
+    }
+    return query
+  }
+
+  function selectedMembership(alias = 'm') {
+    return `EXISTS(SELECT 1 FROM sdk_memberships v INDEXED BY sdk_membership_read WHERE v.owner=${alias}.owner AND v.source=${alias}.account AND v.message=${alias}.id AND v.mailbox IN (SELECT value FROM json_each(?)))`
+  }
+
+  function scopedReadWhere(owner: string, scope: ReturnType<typeof mailboxReadScope>, query: MailboxConversationQuery = {}, alias = 'm') {
+    const { done, snoozed, ...filters } = query
+    const base = where(owner, filters, true)
+    const clauses = [base.sql, 'm.account IN (SELECT value FROM json_each(?))', 'm.generation=(SELECT generation FROM sdk_accounts a WHERE a.id=m.account AND a.owner=m.owner)', selectedMembership()]
+    const params: Array<string | number> = [...base.params, scope.sourceJson, scope.json]
+    if (done !== undefined || snoozed !== undefined) {
+      clauses.push(`EXISTS(SELECT 1 FROM sdk_memberships v INDEXED BY sdk_membership_read WHERE v.owner=m.owner AND v.source=m.account AND v.message=m.id AND v.mailbox IN (SELECT value FROM json_each(?))${done === undefined ? '' : " AND json_extract(v.data,'$.done')=?"}${snoozed === undefined ? '' : ` AND json_extract(v.data,'$.snoozedUntil') IS ${snoozed ? 'NOT ' : ''}NULL`})`)
+      params.push(scope.json)
+      if (done !== undefined) params.push(Number(done))
+    }
+    return { sql: clauses.join(' AND ').replace(/\bm\./g, `${alias}.`), params }
+  }
+
+  function liveMailboxPage(owner: string, scope: ReturnType<typeof mailboxReadScope>, cursor: string | undefined, kind: string, context: unknown) {
+    const hash = fingerprint(context), head = sequence(owner)
+    let seq = head, position: [string, string] | null = null
+    if (cursor !== undefined) {
+      const parsed = decode(owner, text(cursor, 'Mailbox page cursor', 2048))
+      let saved: { kind?: string; hash?: string; binding?: string; position?: unknown }
+      try { saved = JSON.parse(parsed.query ?? '') } catch { throw new InboxError('INVALID_CURSOR', 'Not a mailbox page cursor.') }
+      if (!saved || saved.kind !== kind || saved.hash !== hash) throw new InboxError('INVALID_CURSOR', 'Cursor does not match this mailbox query.')
+      if (!scope.attached || parsed.epoch !== epoch || saved.binding !== scope.binding) throw new InboxError('MAILBOX_SCOPE_CHANGED', 'Restart the changed mailbox selection.', 409, true)
+      const floor = db.query<{ floor: number }, [string]>('SELECT floor FROM sdk_states WHERE owner=?').get(owner)?.floor ?? 0
+      if (parsed.seq < floor || parsed.seq > head) throw new InboxError('MAILBOX_HISTORY_EXPIRED', 'Restart paging because the reconciliation history expired.', 410, true)
+      if (!Array.isArray(saved.position) || saved.position.length !== 2 || saved.position.some(value => typeof value !== 'string' || !value || value.length > 512)) throw new InboxError('INVALID_CURSOR', 'Invalid mailbox keyset position.')
+      position = saved.position as [string, string]
+      seq = parsed.seq
+    } else if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+    return { position, state: token(owner, seq), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`),
+      next: (at: string, id: string) => token(owner, seq, JSON.stringify({ kind, hash, binding: scope.binding, position: [at, id] })) }
+  }
+
   function discardInventory(id: string): void {
     const saved = inventories.get(id)
     if (saved) { inventoryBytes -= saved.bytes; inventories.delete(id) }
@@ -616,13 +672,13 @@ export function createInbox(options: InboxOptions): Inbox {
   }
 
   /** Hydrate only a consecutive bounded ID prefix, never one membership query per message. */
-  function mailboxReadRows(owner: string, scope: ReturnType<typeof mailboxReadScope>, ids: string[], cachedOnly = false) {
-    type Meta = { id: string; account: string; revision: number; deleted: number; generation: number; source_generation: number; bytes: number }
+  function mailboxReadRows(owner: string, scope: ReturnType<typeof mailboxReadScope>, ids: string[], cachedOnly = false, membershipLimit = READ_MEMBERSHIPS) {
+    type Meta = { id: string; account: string; thread_id: string; revision: number; deleted: number; generation: number; source_generation: number; bytes: number }
     const items = new Map<string, MailboxMessageSummary>()
     const rows = new Map<string, Meta>()
     if (!ids.length) return { items, rows, consumed: 0 }
     const json = JSON.stringify(ids)
-    for (const row of db.query<Meta, [string, string]>(`SELECT m.id,m.account,m.revision,m.deleted,m.generation,a.generation source_generation,length(CAST(m.visible AS BLOB)) bytes
+    for (const row of db.query<Meta, [string, string]>(`SELECT m.id,m.account,m.thread_id,m.revision,m.deleted,m.generation,a.generation source_generation,length(CAST(m.visible AS BLOB)) bytes
       FROM sdk_messages m JOIN sdk_accounts a ON a.id=m.account AND a.owner=m.owner WHERE m.owner=? AND m.id IN (SELECT value FROM json_each(?))`).all(owner, json)) rows.set(row.id, row)
     const wanted = ids.flatMap((id, ordinal) => {
       const row = rows.get(id)
@@ -633,9 +689,9 @@ export function createInbox(options: InboxOptions): Inbox {
     const membershipRows = db.query<{ ordinal: number; message: string; data: string }, [string, string, string]>(`
       SELECT json_extract(w.value,'$.ordinal') ordinal,v.message,v.data FROM json_each(?) w
       CROSS JOIN sdk_memberships v INDEXED BY sdk_membership_read ON v.owner=? AND v.source=json_extract(w.value,'$.source') AND v.message=json_extract(w.value,'$.id')
-      WHERE v.mailbox IN (SELECT value FROM json_each(?)) ORDER BY ordinal,v.mailbox LIMIT ${READ_MEMBERSHIPS + 1}`).all(JSON.stringify(wanted), owner, scope.json)
+      WHERE v.mailbox IN (SELECT value FROM json_each(?)) ORDER BY ordinal,v.mailbox LIMIT ${membershipLimit + 1}`).all(JSON.stringify(wanted), owner, scope.json)
     // If the budget cuts through a membership group, leave that whole message for the next page.
-    const boundary = membershipRows.length > READ_MEMBERSHIPS ? membershipRows[READ_MEMBERSHIPS]!.ordinal : ids.length
+    const boundary = membershipRows.length > membershipLimit ? membershipRows[membershipLimit]!.ordinal : ids.length
     const memberships = new Map<string, { states: MailboxMembership[]; bytes: number }>()
     for (const row of membershipRows) {
       if (row.ordinal >= boundary) break
@@ -2006,6 +2062,108 @@ export function createInbox(options: InboxOptions): Inbox {
       return { items: rows.map(row => mailboxSummary(row, selection.ids)), total, state: page.state,
         nextCursor: page.offset + rows.length < total ? token(owner, sequence(owner), `${page.hash}:${page.offset + rows.length}`) : null }
     }),
+    mailboxMessagePage: (owner, input) => run(() => db.transaction(() => {
+      if (!input || Object.keys(input).some(key => !['mailboxIds', 'limit', 'cursor', 'sourceId', 'threadId'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox message page input.')
+      const scope = mailboxReadScope(owner, input.mailboxIds), limit = mailboxReadLimit(input.limit)
+      const sourceId = input.sourceId === undefined ? undefined : text(input.sourceId, 'Source ID', 512)
+      const threadId = input.threadId === undefined ? undefined : text(input.threadId, 'Thread ID', 512)
+      if (sourceId && !scope.sources.has(sourceId)) throw new InboxError('NOT_FOUND', 'Source is not in the mailbox selection.', 404)
+      const page = liveMailboxPage(owner, scope, input.cursor, 'mailbox-message-page', { ids: scope.ids, limit, sourceId, threadId })
+      const selection = scopedReadWhere(owner, scope)
+      if (sourceId) { selection.sql += ' AND m.account=?'; selection.params.push(sourceId) }
+      if (threadId) { selection.sql += ' AND m.thread_id=?'; selection.params.push(threadId) }
+      if (page.position) { selection.sql += ' AND (m.received_at,m.id)<(?,?)'; selection.params.push(...page.position) }
+      const rows = db.query<{ id: string; received_at: string }, (string | number)[]>(`SELECT m.id,m.received_at FROM sdk_messages m INDEXED BY ${threadId ? 'sdk_message_thread' : sourceId ? 'sdk_message_account' : 'sdk_message_query'} WHERE ${selection.sql} ORDER BY m.received_at DESC,m.id DESC LIMIT ?`).all(...selection.params, limit + 1)
+      const selected = rows.slice(0, limit), hydrated = mailboxReadRows(owner, scope, selected.map(row => row.id), true)
+      const consumed = selected.slice(0, hydrated.consumed), last = consumed.at(-1)
+      const result = { items: consumed.flatMap(row => hydrated.items.has(row.id) ? [hydrated.items.get(row.id)!] : []), nextCursor: last && rows.length > consumed.length ? page.next(last.received_at, last.id) : null, state: page.state, scopeState: page.scopeState }
+      if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The mailbox page exceeds its encoded budget.', 413)
+      return result
+    }).deferred()),
+    mailboxConversations: (owner, input) => run(() => db.transaction(() => {
+      if (!input || Object.keys(input).some(key => !['mailboxIds', 'limit', 'cursor', 'keys', 'query'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox conversations input.')
+      const scope = mailboxReadScope(owner, input.mailboxIds), limit = input.limit ?? 100
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new InboxError('VALIDATION', 'Conversation pages contain between 1 and 100 rows.')
+      const query = conversationQuery(input.query), readAt = new Date(now()).toISOString()
+      let keys: MailboxThreadKey[] | undefined
+      if (input.keys !== undefined) {
+        if (!Array.isArray(input.keys) || !input.keys.length || input.keys.length > 50) throw new InboxError('VALIDATION', 'Select between 1 and 50 conversation keys.')
+        keys = input.keys.map(key => {
+          if (!key || Object.keys(key).some(field => !['sourceId', 'threadId'].includes(field))) throw new InboxError('VALIDATION', 'Invalid conversation key.')
+          const sourceId = text(key.sourceId, 'Source ID', 512), threadId = text(key.threadId, 'Thread ID', 512)
+          if (!scope.sources.has(sourceId)) throw new InboxError('NOT_FOUND', 'Source is not in the mailbox selection.', 404)
+          return { sourceId, threadId }
+        }).sort((a, b) => a.sourceId.localeCompare(b.sourceId) || a.threadId.localeCompare(b.threadId))
+        keys = [...new Map(keys.map(key => [JSON.stringify(key), key])).values()]
+      }
+      const page = liveMailboxPage(owner, scope, input.cursor, 'mailbox-conversations', { ids: scope.ids, limit, keys, query })
+      const selection = scopedReadWhere(owner, scope)
+      const matching = scopedReadWhere(owner, scope, query, 'f')
+      // Walk chronological leaders, checking later selected members through the existing per-thread index.
+      // No GROUP BY inventory or unbounded JavaScript ID set precedes the first page.
+      selection.sql += ` AND NOT EXISTS(SELECT 1 FROM sdk_messages n INDEXED BY sdk_message_thread WHERE n.owner=m.owner AND n.thread_id=m.thread_id AND n.account=m.account AND n.generation=m.generation AND n.deleted=0 AND (n.received_at,n.id)>(m.received_at,m.id) AND ${selectedMembership('n')})`
+      selection.params.push(scope.json)
+      if (Object.keys(query).length) {
+        selection.sql += ` AND EXISTS(SELECT 1 FROM sdk_messages f INDEXED BY sdk_message_thread WHERE f.thread_id=m.thread_id AND f.account=m.account AND ${matching.sql})`
+        selection.params.push(...matching.params)
+      }
+      if (keys) selection.sql += " AND m.thread_id=json_extract(k.value,'$.threadId') AND m.account=json_extract(k.value,'$.sourceId')"
+      if (page.position) { selection.sql += ' AND (m.received_at,m.id)<(?,?)'; selection.params.push(...page.position) }
+      const leaders = db.query<{ id: string; account: string; thread_id: string; received_at: string }, (string | number)[]>(`SELECT m.id,m.account,m.thread_id,m.received_at FROM ${keys ? 'json_each(?) k CROSS JOIN ' : ''}sdk_messages m INDEXED BY ${keys ? 'sdk_message_thread' : 'sdk_message_query'} WHERE ${selection.sql} ORDER BY m.received_at DESC,m.id DESC LIMIT ?`).all(...keys ? [JSON.stringify(keys)] : [], ...selection.params, limit + 1)
+      const items: MailboxConversation[] = []
+      let membershipBudget = READ_MEMBERSHIPS, bytes = 4096, last: typeof leaders[number] | undefined
+      for (const leader of leaders.slice(0, limit)) {
+        if (items.length && membershipBudget < scope.ids.length) break
+        const selected = scopedReadWhere(owner, scope)
+        selected.sql += ' AND m.thread_id=? AND m.account=?'; selected.params.push(leader.thread_id, leader.account)
+        const roles = ['inbox', 'archive', 'sent', 'drafts', 'spam', 'trash'] as const
+        const nativeColumns = roles.map(role => `MAX(CASE WHEN m.folder='${role}' OR EXISTS(SELECT 1 FROM json_each(m.visible,'$.folderIds') j JOIN sdk_folders f ON f.id=j.value AND f.owner=m.owner AND f.account=m.account WHERE json_extract(f.data,'$.role')='${role}') THEN 1 ELSE 0 END) ${role}`)
+        const awakeInbox = `SUM(CASE WHEN m.folder='inbox' AND EXISTS(SELECT 1 FROM sdk_memberships v INDEXED BY sdk_membership_read WHERE v.owner=m.owner AND v.source=m.account AND v.message=m.id AND v.mailbox IN (SELECT value FROM json_each(?)) AND json_extract(v.data,'$.done')=0 AND (json_extract(v.data,'$.snoozedUntil') IS NULL OR json_extract(v.data,'$.snoozedUntil')<=?)) THEN 1 ELSE 0 END)`
+        const aggregate = db.query<{ count: number; read: number; starred: number; attachments: number; awakeInboxMessageCount: number } & Record<typeof roles[number], number>, (string | number)[]>(`SELECT COUNT(*) count,MIN(m.is_read) read,MAX(m.is_starred) starred,MAX(json_extract(m.visible,'$.hasAttachments')) attachments,${awakeInbox} awakeInboxMessageCount,${nativeColumns.join(',')} FROM sdk_messages m INDEXED BY sdk_message_thread WHERE ${selected.sql}`).get(scope.json, readAt, ...selected.params)!
+        const memberGroups = db.query<{ mailboxId: string; messageCount: number; doneCount: number; snoozedCount: number; earliestSnoozedUntil: string | null }, (string | number)[]>(`SELECT v.mailbox mailboxId,COUNT(*) messageCount,SUM(json_extract(v.data,'$.done')=1) doneCount,SUM(json_extract(v.data,'$.snoozedUntil') IS NOT NULL) snoozedCount,MIN(CASE WHEN json_extract(v.data,'$.snoozedUntil')>? THEN json_extract(v.data,'$.snoozedUntil') END) earliestSnoozedUntil FROM sdk_messages m INDEXED BY sdk_message_thread CROSS JOIN sdk_memberships v INDEXED BY sdk_membership_read ON v.owner=m.owner AND v.source=m.account AND v.message=m.id WHERE ${selected.sql} AND v.mailbox IN (SELECT value FROM json_each(?)) GROUP BY v.mailbox ORDER BY v.mailbox`).all(readAt, ...selected.params, scope.json)
+        const mailboxStates = memberGroups.map(({ earliestSnoozedUntil: _earliest, ...state }) => state)
+        const membershipCount = memberGroups.reduce((sum, state) => sum + state.messageCount, 0)
+        const doneMembershipCount = memberGroups.reduce((sum, state) => sum + state.doneCount, 0)
+        const earliestSnoozedUntil = memberGroups.reduce<string | null>((earliest, state) => state.earliestSnoozedUntil && (!earliest || state.earliestSnoozedUntil < earliest) ? state.earliestSnoozedUntil : earliest, null)
+        const first = db.query<{ id: string; subject: string }, (string | number)[]>(`SELECT m.id,m.subject FROM sdk_messages m INDEXED BY sdk_message_thread WHERE ${selected.sql} ORDER BY m.received_at ASC,m.id ASC LIMIT 1`).get(...selected.params)!
+        const previewIds = db.query<{ id: string }, (string | number)[]>(`SELECT m.id FROM sdk_messages m INDEXED BY sdk_message_thread WHERE ${selected.sql} ORDER BY m.received_at DESC,m.id DESC LIMIT 50`).all(...selected.params).map(row => row.id)
+        let messages: MailboxMessageSummary[] = []
+        try {
+          const previews = mailboxReadRows(owner, scope, previewIds, true, membershipBudget)
+          messages = previewIds.slice(0, previews.consumed).flatMap(id => previews.items.has(id) ? [previews.items.get(id)!] : [])
+        } catch (error) { if (!(error instanceof InboxError) || error.code !== 'MAILBOX_READ_TOO_LARGE') throw error }
+        let used = messages.reduce((sum, message) => sum + message.memberships.length, 0)
+        const targetLimit = Math.min(500, membershipBudget - used)
+        const targets = db.query<{ mailboxId: string; messageId: string; revision: number; messageRevision: number }, (string | number)[]>(`SELECT v.mailbox mailboxId,m.id messageId,json_extract(v.data,'$.revision') revision,m.revision messageRevision FROM sdk_messages m INDEXED BY sdk_message_thread CROSS JOIN sdk_memberships v INDEXED BY sdk_membership_read ON v.owner=m.owner AND v.source=m.account AND v.message=m.id WHERE ${selected.sql} AND v.mailbox IN (SELECT value FROM json_each(?)) ORDER BY m.received_at DESC,m.id DESC,v.mailbox LIMIT ?`).all(...selected.params, scope.json, targetLimit)
+        const row: MailboxConversation = { sourceId: leader.account, threadId: leader.thread_id, subject: first.subject, firstMessageId: first.id, messageCount: aggregate.count, membershipCount, doneMembershipCount,
+          awakeInboxMessageCount: aggregate.awakeInboxMessageCount, earliestSnoozedUntil, lastMessageAt: leader.received_at, isRead: !!aggregate.read, isStarred: !!aggregate.starred, hasAttachments: !!aggregate.attachments,
+          nativeFolders: { inbox: !!aggregate.inbox, archive: !!aggregate.archive, sent: !!aggregate.sent, drafts: !!aggregate.drafts, spam: !!aggregate.spam, trash: !!aggregate.trash }, mailboxStates, messages, messagesComplete: messages.length === aggregate.count, targets, targetsComplete: targets.length === membershipCount }
+        let size = Buffer.byteLength(JSON.stringify(row))
+        // Context may shrink, but counts/state never do. Keep giant conversations visible.
+        while (bytes + size > READ_BYTES - 65536 && (row.messages.length || row.targets.length)) {
+          const removed = row.targets.length ? row.targets.pop() : row.messages.pop()
+          if (removed && 'memberships' in removed) row.messagesComplete = false
+          else row.targetsComplete = false
+          size -= Buffer.byteLength(JSON.stringify(removed))
+        }
+        size = Buffer.byteLength(JSON.stringify(row))
+        if (bytes + size > READ_BYTES - 65536) {
+          if (items.length) break
+          throw new InboxError('MAILBOX_READ_TOO_LARGE', 'One conversation aggregate exceeds its encoded budget.', 413)
+        }
+        used = row.messages.reduce((sum, message) => sum + message.memberships.length, 0) + row.targets.length
+        membershipBudget -= used; bytes += size; items.push(row); last = leader
+      }
+      return { items, nextCursor: last && leaders.length > items.length ? page.next(last.received_at, last.id) : null, state: page.state, scopeState: page.scopeState }
+    }).deferred()),
+    mailboxCounts: (owner, input) => run(() => db.transaction(() => {
+      if (!input || Object.keys(input).some(key => !['mailboxIds', 'query'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox counts input.')
+      const scope = mailboxReadScope(owner, input.mailboxIds)
+      if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+      const selection = scopedReadWhere(owner, scope, conversationQuery(input.query))
+      const counts = db.query<{ messages: number; conversations: number }, (string | number)[]>(`SELECT COALESCE(SUM(messageCount),0) messages,COUNT(*) conversations FROM (SELECT COUNT(*) messageCount FROM sdk_messages m WHERE ${selection.sql} GROUP BY m.account,m.thread_id)`).get(...selection.params)!
+      return { ...counts, asOfState: token(owner, sequence(owner)), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`) }
+    }).deferred()),
     mailboxSyncStatus: (owner, input) => run(() => db.transaction(() => {
       if (!input || Object.keys(input).some(key => key !== 'mailboxIds')) throw new InboxError('VALIDATION', 'Invalid mailbox sync status input.')
       const scope = mailboxReadScope(owner, input.mailboxIds)
@@ -2087,7 +2245,7 @@ export function createInbox(options: InboxOptions): Inbox {
       const from = decode(owner, text(input.since, 'Change state', 4096))
       if (from.query !== null) throw new InboxError('INVALID_CURSOR', 'A query cursor cannot resume mailbox changes.')
       const head = sequence(owner)
-      const reset = (reason: 'scope' | 'history'): MailboxChangesPage => ({ events: [], upserts: [], removed: [], state: token(owner, head), hasMore: false, resetRequired: true, resetReason: reason })
+      const reset = (reason: 'scope' | 'history'): MailboxChangesPage => ({ events: [], upserts: [], removed: [], affectedThreads: [], state: token(owner, head), hasMore: false, resetRequired: true, resetReason: reason })
       if (!scope.attached || bound.epoch !== epoch || parts[2] !== scope.binding) return reset('scope')
       const floor = db.query<{ floor: number }, [string]>('SELECT floor FROM sdk_states WHERE owner=?').get(owner)?.floor ?? 0
       if (from.epoch !== epoch || from.seq < floor || from.seq > head) return reset('history')
@@ -2128,7 +2286,11 @@ export function createInbox(options: InboxOptions): Inbox {
           removed.push({ sourceId, messageId, reason: deleted ? 'deleted' : 'unselected', revision: deleted ? row?.revision ?? null : null })
         }
       }
-      const result: MailboxChangesPage = { events, upserts, removed, state: token(owner, through), hasMore: through < head, resetRequired: false }
+      const affectedThreads = [...new Map([...selected].flatMap(([messageId, sourceId]) => {
+        const row = hydrated.rows.get(messageId)
+        return row && row.account === sourceId ? [[JSON.stringify([sourceId, row.thread_id]), { sourceId, threadId: row.thread_id }] as const] : []
+      })).values()]
+      const result: MailboxChangesPage = { events, upserts, removed, affectedThreads, state: token(owner, through), hasMore: through < head, resetRequired: false }
       if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The mailbox changes exceed their encoded budget.', 413)
       return result
     }).deferred()),
@@ -2162,9 +2324,11 @@ export function createInbox(options: InboxOptions): Inbox {
     })),
     setMailboxStates: (owner, input) => run(() => transaction(() => {
       ownerId(owner)
-      if (!input || Object.keys(input).some(key => !['id', 'targets', 'done'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox action.')
+      if (!input || Object.keys(input).some(key => !['id', 'targets', 'done', 'snoozedUntil'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox action.')
       text(input.id, 'Action ID', 128)
-      if (typeof input.done !== 'boolean' || !Array.isArray(input.targets) || !input.targets.length || input.targets.length > 500) throw new InboxError('VALIDATION', 'Use 1–500 mailbox message targets.')
+      if (input.done === undefined && input.snoozedUntil === undefined || input.done !== undefined && typeof input.done !== 'boolean') throw new InboxError('VALIDATION', 'Provide Done or snooze state for the mailbox action.')
+      if (input.snoozedUntil !== undefined && input.snoozedUntil !== null && (typeof input.snoozedUntil !== 'string' || input.snoozedUntil.length > 100 || !Number.isFinite(Date.parse(input.snoozedUntil)))) throw new InboxError('VALIDATION', 'Invalid snooze instant.')
+      if (!Array.isArray(input.targets) || !input.targets.length || input.targets.length > 500) throw new InboxError('VALIDATION', 'Use 1–500 mailbox message targets.')
       for (const target of input.targets) {
         if (!target || Object.keys(target).some(key => !['mailboxId', 'messageId', 'revision', 'messageRevision'].includes(key)) || !Number.isSafeInteger(target.revision) || target.revision < 1 || target.messageRevision !== undefined && (!Number.isSafeInteger(target.messageRevision) || target.messageRevision < 1)) throw new InboxError('VALIDATION', 'Invalid mailbox message target.')
         text(target.mailboxId, 'Mailbox ID', 512); text(target.messageId, 'Message ID', 512)
@@ -2175,6 +2339,8 @@ export function createInbox(options: InboxOptions): Inbox {
         if (prior.fingerprint !== hash) throw new InboxError('IDEMPOTENCY_CONFLICT', 'This action ID already describes different targets.', 409)
         return JSON.parse(prior.data) as MailboxStateReceipt
       }
+      // Durable retries remain valid after their reminder instant has passed.
+      if (input.snoozedUntil && Date.parse(input.snoozedUntil) <= now()) throw new InboxError('VALIDATION', 'Snooze requires a future instant.')
       const keys = new Set<string>()
       const before = input.targets.map(target => {
         const key = `${target.mailboxId}\0${target.messageId}`
@@ -2185,7 +2351,8 @@ export function createInbox(options: InboxOptions): Inbox {
         if (target.messageRevision !== undefined && summary(messageRow(owner, target.messageId)).revision !== target.messageRevision) throw new InboxError('PRECONDITION_FAILED', 'Message changed.', 412)
         return state
       })
-      const states = before.map(state => ({ ...state, done: input.done, snoozedUntil: null, revision: state.revision + 1 }))
+      const states = before.map(state => ({ ...state, ...(input.done === undefined ? {} : { done: input.done }),
+        snoozedUntil: input.snoozedUntil ? new Date(input.snoozedUntil).toISOString() : null, revision: state.revision + 1 }))
       for (const state of states) {
         db.query('UPDATE sdk_memberships SET data=? WHERE owner=? AND mailbox=? AND message=?').run(JSON.stringify(state), owner, state.mailboxId, state.messageId)
         event(owner, 'membership.updated', mailboxRow(owner, state.mailboxId).source, state.messageId, 'updated', 'mutation', state.mailboxId)
@@ -2194,6 +2361,14 @@ export function createInbox(options: InboxOptions): Inbox {
       db.query('INSERT INTO sdk_mailbox_actions VALUES (?,?,?,?,?)').run(owner, input.id, hash, JSON.stringify(receipt), JSON.stringify(before))
       return receipt
     })),
+    mailboxStateReceipt: (owner, id) => run(() => {
+      ownerId(owner); text(id, 'Action ID', 128)
+      const row = db.query<{ data: string }, [string, string]>('SELECT data FROM sdk_mailbox_actions WHERE owner=? AND id=?').get(owner, id)
+      if (!row) throw new InboxError('NOT_FOUND', 'Mailbox action not found.', 404)
+      const receipt = JSON.parse(row.data) as MailboxStateReceipt
+      if (!Array.isArray(receipt.states) || receipt.states.length > 500) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The mailbox receipt exceeds its state budget.', 413)
+      return receipt
+    }),
     undoMailboxStates: (owner, id) => run(() => transaction(() => {
       ownerId(owner); text(id, 'Action ID', 128)
       const row = db.query<{ data: string; before_states: string }, [string, string]>('SELECT data,before_states FROM sdk_mailbox_actions WHERE owner=? AND id=?').get(owner, id)

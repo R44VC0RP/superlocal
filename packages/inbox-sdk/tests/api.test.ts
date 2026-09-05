@@ -22,6 +22,9 @@ import { createAttentionFeedbackStore } from '../../../apps/local-host/src/atten
 import { createAttentionOverridesStore, CATEGORY_STORAGE_LIMITS } from '../../../apps/local-host/src/attention-overrides'
 import { isCategoryCommand, isCategoryEntry, type CategoryCommand, type CategoryContext, type CategoryEntry } from '../../../apps/shared/attention-overrides'
 import { createSplitPreferencesStore } from '../../../apps/local-host/src/split-preferences'
+import { createInboxViewPreferencesStore } from '../../../apps/local-host/src/inbox-preferences'
+import { createInboxWindowService } from '../../../apps/local-host/src/inbox-window'
+import * as WindowDTO from '../../../apps/shared/inbox-window'
 import { classifyAttention } from '../../../apps/shared/mail-attention'
 import { normalizeSplits } from '../../../apps/shared/splits'
 import { mailFacts } from '../src/mail-facts'
@@ -37,7 +40,7 @@ import { MockMailStore } from '../../../apps/mock-api/src/store'
 import { seedMockMail } from '../../../apps/mock-api/src/seed'
 import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
-  Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, MailboxSyncStatus, Message,
+  Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, MailboxSnapshotPage, MailboxSyncStatus, Message,
   MessageSummary, Operation, Page, Policy, ProviderDefinition, Query,
   ThreadSummary, MediaNetwork, SendingIdentity, SendingIdentities,
 } from '../src/contracts'
@@ -2123,6 +2126,692 @@ function sse(response: Response) {
   }
 }
 
+describe('bounded host inbox window', () => {
+  test('cold giant conversations with unknown attention stay in Important review, never Other', async () => {
+    const h = await fixture(), database = new Database(':memory:'), raw = h.gate<void>(undefined)
+    await h.seed('alice', 'unknown-window', Array.from({ length: 620 }, (_, index) => native(`unknown-${index}`, {
+      threadId: 'one-giant', receivedAt: new Date(EPOCH - index * 1000).toISOString(), bodyText: BODY_SECRET,
+    })))
+    const guarded: Inbox = { ...h.inbox, mailboxMessagePage: async (...args) => { await raw.wait(); return h.inbox.mailboxMessagePage(...args) } }
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY })
+    const service = createInboxWindowService({ database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: false,
+      inboxPreferences: createInboxViewPreferencesStore(database, guarded, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'),
+      attentionOverrides: createAttentionOverridesStore(database, guarded, 'alice') })
+    cleanup.push(async () => { raw.release(); await service.close(); await ai.close(); database.close() })
+    const query = { account: 'unified', folder: 'Inbox', split: 'Important', search: false, query: '', filter: null }
+    const important = await bounded(service.dispatch('/host/inbox/query', query), 'unknown giant review page') as WindowDTO.InboxWindowPage
+    expect(important.rows).toHaveLength(1)
+    expect(important.rows[0]!.mail.split).toBe('Unknown')
+    expect(important.rows[0]!.counts.messages).toBe(620)
+    expect(important.state.indexing).toBe(true)
+    const other = await bounded(service.dispatch('/host/inbox/query', { ...query, split: 'Other' }), 'unknown giant Other exclusion') as WindowDTO.InboxWindowPage
+    expect(other.rows).toHaveLength(0)
+    expect(other.exhausted).toBe(false)
+    expect(other.totals.conversations).toBeNull()
+  })
+
+  test('first pages stay bounded while overlapping mailboxes, global Boolean search and counts cover off-window history', async () => {
+    const h = await fixture({ eventRetention: 5000 })
+    const domains = ['window-a.example.test', 'window-b.example.test']
+    h.discoveries.set('window-global', { sources: domains.map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const { account, box } = await h.connect('alice', 'window-global', Array.from({ length: 700 }, (_, index) => {
+      const thread = Math.floor(index / 2)
+      return native(`window-${index}`, { threadId: `window-thread-${thread}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(), sourceDomains: domains,
+        from: participant(thread === 340 || thread === 349 ? 'old-window@example.test' : 'sender@example.test'), isStarred: thread === 345,
+        folder: thread === 349 ? 'trash' : 'inbox', bodyText: BODY_SECRET, bodyHtml: `<p>${BODY_SECRET}</p>` })
+    }), SCOPED)
+    for (const domain of domains) await h.inbox.createMailbox('alice', { sourceId: account.id, name: domain, selector: { kind: 'domain', value: domain } })
+    await h.sync('alice', account.id)
+    const providerCalls = structuredClone(box.calls), database = new Database(':memory:'), raw = h.gate<void>(undefined)
+    let bodyReads = 0, inference = 0
+    const guarded: Inbox = { ...h.inbox,
+      message: async () => { bodyReads++; throw new Error('Window reads must not load message bodies') },
+      mailboxMessage: async () => { bodyReads++; throw new Error('Window reads must not load mailbox bodies') },
+      mailboxMessagePage: async (owner, input) => { expect(owner).toBe('alice'); await raw.wait(); return h.inbox.mailboxMessagePage(owner, input) },
+    }
+    const fetcher: typeof fetch = Object.assign(async () => { inference++; throw new Error('Window reads must not run inference') }, {
+      preconnect: () => { inference++; throw new Error('Window reads must not preconnect inference') },
+    })
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY, fetcher })
+    const preferences = createInboxViewPreferencesStore(database, guarded, 'alice')
+    const splitPreferences = createSplitPreferencesStore(database, 'alice')
+    const dependencies = { database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: false,
+      inboxPreferences: preferences, splitPreferences, attentionOverrides: createAttentionOverridesStore(database, guarded, 'alice') }
+    let service = createInboxWindowService(dependencies)
+    cleanup.push(async () => { raw.release(); await service.close(); await ai.close(); database.close() })
+    const call = async <K extends keyof WindowDTO.InboxWindowTransport>(name: K, input: Parameters<WindowDTO.InboxWindowTransport[K]>[0]): Promise<Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>> =>
+      await service.dispatch(WindowDTO.inboxWindowPaths[name], input) as Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>
+    const view: WindowDTO.InboxViewQuery = { account: 'unified', folder: 'All Mail', split: 'Important', search: false, query: '', filter: null }
+    const first = await bounded(call('query', view), 'first bounded host page')
+    expect(first.rows).toHaveLength(100)
+    expect(first.state.indexing).toBe(true); expect(first.exhausted).toBe(false)
+    expect(first.totals.conversations).toBeNull(); expect(first.totals.messages).toBeNull()
+    expect(new Set(first.rows.map(row => row.key)).size).toBe(100)
+    expect(first.rows.every(row => row.counts.messages === 2 && row.counts.memberships === 4 && row.targets.length === 4)).toBe(true)
+    expect(first.rows.flatMap(row => row.mail.messages).every(message => message.body === '' && message.loaded === false)).toBe(true)
+    expect(JSON.stringify(first)).not.toContain(BODY_SECRET)
+    expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(WindowDTO.INBOX_RESPONSE_BYTE_LIMIT)
+    expect((await call('lookup', { account: 'unified', ids: ['missing-window-thread'] })).entries).toEqual([{ id: 'missing-window-thread', status: 'unknown' }])
+    raw.release()
+    const ready = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: first.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'complete host index')
+    expect(ready.rows).toHaveLength(100)
+    // All Mail excludes Trash, but its folder total must still cover the off-window thread.
+    expect(ready.totals).toMatchObject({ conversations: 349, messages: 698, folders: { 'All Mail': 349, Trash: 1 } })
+    expect((await call('counts', { queryId: first.state.queryId })).totals).toEqual(ready.totals)
+    expect((await call('lookup', { account: 'unified', ids: ['missing-window-thread'] })).entries).toEqual([{ id: 'missing-window-thread', status: 'absent' }])
+    const cached = await call('lookup', { account: 'unified', ids: ready.rows.slice(0, 3).map(row => row.key) })
+    expect(cached.entries.every(entry => entry.status === 'found')).toBe(true)
+    expect(cached.entries.map(entry => entry.status === 'found' && entry.row.key)).toEqual(ready.rows.slice(0, 3).map(row => row.key))
+    const search = await call('query', { ...view, search: true, query: '(from:old-window@example.test OR is:starred) -in:trash' })
+    const found = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: search.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'global Boolean search')
+    expect(found.rows.map(row => row.mail.subject).sort()).toEqual(['Subject window-681', 'Subject window-691'])
+    expect(found.rows.every(row => !first.rows.some(resident => resident.key === row.key))).toBe(true)
+    expect(found.totals).toMatchObject({ conversations: 2, messages: 4 }); expect(found.exhausted).toBe(true)
+    const tail = await call('page', { queryId: first.state.queryId, seek: 'end', limit: 10 })
+    const previous = await call('page', { queryId: first.state.queryId, cursor: tail.nextCursor!, direction: 'newer', limit: 10 })
+    expect(tail.rows).toHaveLength(10); expect(previous.rows).toHaveLength(10)
+    expect(tail.rows.some(row => previous.rows.some(other => row.key === other.key))).toBe(false)
+    await expect(call('page', { queryId: first.state.queryId, cursor: 'forged' })).rejects.toMatchObject({ code: 'HOST_INBOX_CURSOR_INVALID' })
+    await expect(call('page', { queryId: search.state.queryId, cursor: ready.nextCursor! })).rejects.toMatchObject({ code: 'HOST_INBOX_CURSOR_INVALID' })
+    await expect(call('query', { ...view, account: 'foreign-mailbox' })).rejects.toMatchObject({ code: 'HOST_INBOX_SCOPE_CHANGED' })
+    await expect(call('query', { ...view, limit: 101 })).rejects.toMatchObject({ code: 'HOST_INBOX_INVALID' })
+    const capture = await call('selectionCreate', { id: randomUUID(), account: 'unified', queryId: first.state.queryId, allMatching: true })
+    const selection = await bounded((async () => {
+      for (;;) { const page = await call('selectionPage', { selectionId: capture.id }); if (page.selection.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'all-matching off-window selection')
+    expect(selection.selection.count).toBe(349); expect(selection.entries).toHaveLength(100); expect(selection.exhausted).toBe(false)
+    const selectionIds = selection.entries.map(entry => entry.id)
+    let cursor = selection.nextCursor
+    while (cursor) {
+      const page = await call('selectionPage', { selectionId: capture.id, cursor })
+      expect(page.entries.length).toBeLessThanOrEqual(100); expect(page.entries.every(entry => entry.status === 'found')).toBe(true)
+      selectionIds.push(...page.entries.map(entry => entry.id)); cursor = page.nextCursor
+    }
+    expect(selectionIds).toHaveLength(349); expect(new Set(selectionIds).size).toBe(349)
+    expect(bodyReads).toBe(0); expect(inference).toBe(0)
+    expect(box.calls.listFolders).toBe(providerCalls.listFolders)
+    expect(box.calls).toEqual(providerCalls)
+    // An accepted multi-page selection keeps its frozen matches across query TTL
+    // expiry/restart, while arrivals remain available to the ordinary live view.
+    const expiring = await call('selectionCreate', { id: randomUUID(), account: 'unified', queryId: first.state.queryId, allMatching: true })
+    expect(expiring.captureComplete).toBe(false)
+    await service.close()
+    database.query('UPDATE local_window_queries SET expires=? WHERE owner=?').run(Date.now() - 1, 'alice')
+    box.put(native('after-frozen-ttl', { threadId: 'after-frozen-ttl', receivedAt: new Date(EPOCH + 1000).toISOString(), sourceDomains: domains }))
+    await h.sync('alice', account.id)
+    service = createInboxWindowService(dependencies)
+    const afterRestart = await call('query', view)
+    const finished = await bounded((async () => {
+      for (;;) { const page = await call('selectionPage', { selectionId: expiring.id }); if (page.selection.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'capture finishes independently of expired query')
+    expect(finished.selection.count).toBe(349)
+    const frozenIds = [...finished.entries.map(entry => entry.id)]
+    let frozenCursor = finished.nextCursor
+    while (frozenCursor) { const page = await call('selectionPage', { selectionId: expiring.id, cursor: frozenCursor }); frozenIds.push(...page.entries.map(entry => entry.id)); frozenCursor = page.nextCursor }
+    expect(new Set(frozenIds)).toEqual(new Set(selectionIds))
+    const liveAfterRestart = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: afterRestart.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'live deltas resume after frozen capture completion')
+    expect(liveAfterRestart.totals.conversations).toBe(350)
+    expect(liveAfterRestart.rows.some(row => row.mail.subject === 'Subject after-frozen-ttl')).toBe(true)
+    const interrupted = await call('zeroCreate', { id: randomUUID(), account: 'unified' })
+    expect(interrupted.status).toBe('capturing')
+    splitPreferences.write({ version: 1, revision: 0, splits: ['Important', 'Other', 'Receipts'], inactiveSplits: [], splitAliases: {}, splitRules: { Receipts: 'subject:receipt' } })
+    const invalidated = await bounded((async () => {
+      for (;;) { const value = await call('zeroResume', { sessionId: interrupted.id, account: 'unified' }); if (value.status === 'found' && value.session.status === 'invalidated') return value.session; await Bun.sleep(10) }
+    })(), 'changed preferences invalidate and unlock unfinished capture')
+    expect(invalidated).toMatchObject({ id: interrupted.id, status: 'invalidated', progress: { decidedCount: 0, captureComplete: true } })
+    await expect(call('zeroPage', { sessionId: interrupted.id })).rejects.toMatchObject({ code: 'HOST_INBOX_SCOPE_CHANGED' })
+    box.put(native('after-capture-invalidation', { threadId: 'after-capture-invalidation', receivedAt: new Date(EPOCH + 2000).toISOString(), sourceDomains: domains }))
+    await h.sync('alice', account.id)
+    const nextView = await call('query', view)
+    const resumed = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: nextView.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'ordinary deltas after capture invalidation')
+    expect(resumed.totals.conversations).toBe(351)
+    expect(resumed.rows.some(row => row.mail.subject === 'Subject after-capture-invalidation')).toBe(true)
+    expect((await call('zeroResume', { sessionId: interrupted.id, account: 'unified' })).status).toBe('found')
+    expect(bodyReads).toBe(0); expect(inference).toBe(0)
+    const current = await preferences.read()
+    await preferences.write({ ...current, unifiedMode: 'selected', includedMailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id] })
+    await expect(call('page', { queryId: nextView.state.queryId })).rejects.toMatchObject({ code: 'HOST_INBOX_SCOPE_CHANGED' })
+  }, 30000)
+
+  test('small selections retain missing IDs and freeze accepted targets rather than including later replies', async () => {
+    const h = await fixture()
+    const { account, box } = await h.seed('alice', 'window-capture', Array.from({ length: 6 }, (_, index) => native(`capture-${index}`, {
+      threadId: `capture-thread-${Math.floor(index / 2)}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(),
+    })))
+    const database = new Database(':memory:')
+    let bodyReads = 0
+    const guarded: Inbox = { ...h.inbox, message: async () => { bodyReads++; throw new Error('Unexpected body read') }, mailboxMessage: async () => { bodyReads++; throw new Error('Unexpected mailbox body read') } }
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY })
+    const service = createInboxWindowService({ database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: true,
+      inboxPreferences: createInboxViewPreferencesStore(database, guarded, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'), attentionOverrides: createAttentionOverridesStore(database, guarded, 'alice') })
+    cleanup.push(async () => { await service.close(); await ai.close(); database.close() })
+    const call = async <K extends keyof WindowDTO.InboxWindowTransport>(name: K, input: Parameters<WindowDTO.InboxWindowTransport[K]>[0]): Promise<Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>> =>
+      await service.dispatch(WindowDTO.inboxWindowPaths[name], input) as Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>
+    const first = await call('query', { account: 'unified', folder: 'Inbox', split: 'Important', search: false, query: '', filter: null })
+    expect(first.rows).toHaveLength(3)
+    const ready = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: first.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'small capture index')
+    expect(ready.totals).toMatchObject({ conversations: 3, messages: 6 })
+    const selected = ready.rows[0]!, missing = 'missing-captured-thread'
+    const detail = await call('messages', { account: 'unified', id: selected.key, limit: 1 })
+    expect(detail.summaries).toHaveLength(1); expect(detail.nextCursor).not.toBeNull()
+    const input: WindowDTO.InboxSelectionInput = { id: randomUUID(), account: 'unified', ids: [selected.key, missing] }
+    const capture = await call('selectionCreate', input)
+    // This arrival follows accepted creation, not just completed capture paging.
+    box.put(native('capture-later', { threadId: 'capture-thread-0', receivedAt: new Date(EPOCH + 1000).toISOString() }))
+    await h.sync('alice', account.id)
+    const page = await bounded((async () => {
+      for (;;) { const result = await call('selectionPage', { selectionId: capture.id }); if (result.selection.captureComplete && result.entries.every(entry => entry.status !== 'unknown')) return result; await Bun.sleep(10) }
+    })(), 'frozen selection and arrival reconciliation')
+    expect(page.selection.count).toBe(2); expect(page.exhausted).toBe(true)
+    expect(page.entries.find(entry => entry.id === missing)).toEqual({ id: missing, status: 'absent' })
+    expect(page.entries.find(entry => entry.id === selected.key)?.status).toBe('changed')
+    await expect(call('messages', { account: 'unified', id: selected.key, cursor: detail.nextCursor!, limit: 1 })).rejects.toMatchObject({ code: 'HOST_INBOX_CONTEXT_CHANGED' })
+    expect((await call('selectionCreate', input)).id).toBe(capture.id)
+    await expect(call('selectionCreate', { ...input, ids: [missing] })).rejects.toMatchObject({ code: 'HOST_ZERO_SESSION_CONFLICT' })
+    const accepted = await h.inbox.setMailboxStates('alice', { id: randomUUID(), done: true, targets: selected.targets })
+    expect(accepted.states).toHaveLength(2)
+    const mailboxIds = (await h.inbox.mailboxes('alice')).map(mailbox => mailbox.id)
+    const aggregate = (await h.inbox.mailboxConversations('alice', { mailboxIds, keys: [{ sourceId: selected.sourceId, threadId: selected.threadId }] })).items[0]!
+    expect(aggregate).toMatchObject({ messageCount: 3, doneMembershipCount: 2 })
+    expect(aggregate.messages.find(message => message.subject === 'Subject capture-later')!.memberships.every(member => !member.done)).toBe(true)
+    expect(bodyReads).toBe(0)
+  }, 15000)
+
+  test('Zero persists review exclusions and credits only owned durable Done, W, Other and Later receipts with conditional Undo and partial replay', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'window-zero', Array.from({ length: 24 }, (_, index) => native(`zero-${index}`, {
+      threadId: `zero-thread-${Math.floor(index / 2)}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(),
+    })))
+    await h.seed('bob', 'window-zero-foreign')
+    const database = new Database(':memory:')
+    let bodyReads = 0, interruptedReceipt: string | null = null
+    const guarded: Inbox = { ...h.inbox,
+      message: async () => { bodyReads++; throw new Error('Zero bookkeeping must not load bodies') },
+      mailboxMessage: async () => { bodyReads++; throw new Error('Zero bookkeeping must not load mailbox bodies') },
+      mailboxStateReceipt: async (owner, id) => {
+        expect(owner).toBe('alice')
+        if (id === interruptedReceipt) { interruptedReceipt = null; throw new InboxError('NETWORK', 'Fictional receipt interruption', 503) }
+        return h.inbox.mailboxStateReceipt(owner, id)
+      },
+    }
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY })
+    const categories = createAttentionOverridesStore(database, h.inbox, 'alice'), feedback = createAttentionFeedbackStore(database, h.inbox, 'alice')
+    const dependencies = { database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: true,
+      inboxPreferences: createInboxViewPreferencesStore(database, guarded, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'), attentionOverrides: categories }
+    let service = createInboxWindowService(dependencies)
+    cleanup.push(async () => { await service.close(); await ai.close(); database.close() })
+    const call = async <K extends keyof WindowDTO.InboxWindowTransport>(name: K, input: Parameters<WindowDTO.InboxWindowTransport[K]>[0]): Promise<Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>> =>
+      await service.dispatch(WindowDTO.inboxWindowPaths[name], input) as Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>
+    const first = await call('query', { account: 'unified', folder: 'All Mail', split: 'Important', search: false, query: '', filter: null })
+    const ready = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: first.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'Zero warm index')
+    expect(ready.rows).toHaveLength(12)
+    const zero = await call('zeroCreate', { id: randomUUID(), account: 'unified' })
+    const queue = await bounded((async () => {
+      for (;;) { const page = await call('zeroPage', { sessionId: zero.id }); if (page.session.progress.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'Zero frozen queue')
+    expect(queue.items).toHaveLength(12)
+    for (const item of queue.items) {
+      expect(item.reviewVersion).toMatch(/^[a-f0-9]{64}$/)
+      if (item.batchCandidate) { expect(item.batchCandidate.reviewVersion).toMatch(/^[a-f0-9]{64}$/); expect(item.batchCandidate.reviewVersion).not.toBe(item.reviewVersion!) }
+    }
+    expect(queue.session.progress).toMatchObject({ initialCount: 12, remainingCount: 12, decidedCount: 0 })
+    const offers = queue.items
+    const rows = new Map(ready.rows.map(row => [row.key, row]))
+    const mailboxIds = (await h.inbox.mailboxes('alice')).map(box => box.id)
+    const resume = async () => {
+      const result = await call('zeroResume', { sessionId: zero.id, account: 'unified' })
+      if (result.status !== 'found') throw new Error('Owned Zero session disappeared')
+      return result.session
+    }
+    const progressInput = async (offer: WindowDTO.InboxZeroItem, decision: WindowDTO.InboxZeroDecisionInput['decision'], receipts: WindowDTO.InboxActionReceiptReference[]): Promise<WindowDTO.InboxZeroProgressInput> => ({
+      sessionId: zero.id, id: randomUUID(), ifRevision: (await resume()).revision, decisions: [{ id: offer.id, decision, reviewVersion: offer.reviewVersion!, receipts }],
+    })
+    const latestTargets = async (offer: WindowDTO.InboxZeroItem) => {
+      const row = rows.get(offer.id)!
+      return (await h.inbox.mailboxConversations('alice', { mailboxIds, keys: [{ sourceId: row.sourceId, threadId: row.threadId }] })).items[0]!.targets
+    }
+    const done = async (offer: WindowDTO.InboxZeroItem) => {
+      const id = randomUUID(); await h.inbox.setMailboxStates('alice', { id, targets: await latestTargets(offer), done: true }); return id
+    }
+    const review = await call('zeroProgress', { sessionId: zero.id, id: randomUUID(), ifRevision: (await resume()).revision,
+      decisions: [], currentId: offers[0]!.id, reviewOnlyIds: [offers[0]!.id], paused: true })
+    expect(review.session.progress.decidedCount).toBe(0)
+    await service.close(); service = createInboxWindowService(dependencies)
+    expect(await resume()).toMatchObject({ paused: true, currentId: offers[0]!.id, progress: { decidedCount: 0 } })
+    const restored = await call('zeroPage', { sessionId: zero.id })
+    expect(restored.items.find(item => item.id === offers[0]!.id)).toMatchObject({ batchEligibility: 'ineligible', batchCandidate: null })
+    await expect(call('zeroProgress', await progressInput(offers[0]!, 'done', [{ kind: 'mailbox-state', id: randomUUID() }]))).rejects.toMatchObject({ code: 'HOST_INBOX_INVALID' })
+    const navigation = await call('zeroProgress', { sessionId: zero.id, id: randomUUID(), ifRevision: (await resume()).revision, decisions: [], phase: 'review', paused: false, currentId: offers[1]!.id })
+    expect(navigation.session.progress.decidedCount).toBe(0)
+    await bounded((async () => { for (;;) { if (!(await call('page', { queryId: first.state.queryId })).state.indexing) return; await Bun.sleep(10) } })(), 'resumed index ready for another capture')
+    const another = await call('zeroCreate', { id: randomUUID(), account: 'unified' })
+    const otherQueue = await bounded((async () => {
+      for (;;) { const page = await call('zeroPage', { sessionId: another.id }); if (page.session.progress.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'independent Zero capture')
+    const doneId = await done(offers[0]!), input = await progressInput(offers[0]!, 'done', [{ kind: 'mailbox-state', id: doneId }])
+    const credited = await call('zeroProgress', input)
+    expect(credited.results).toEqual([{ id: offers[0]!.id, status: 'accepted' }]); expect(credited.session.progress.decidedCount).toBe(1)
+    expect(await call('zeroProgress', input)).toEqual(credited)
+    await expect(call('zeroProgress', { ...input, paused: true })).rejects.toMatchObject({ code: 'HOST_ZERO_SESSION_CONFLICT' })
+    const otherOffer = otherQueue.items.find(item => item.id === offers[0]!.id)!
+    const reused = await call('zeroProgress', { sessionId: another.id, id: randomUUID(), ifRevision: otherQueue.session.revision,
+      decisions: [{ id: otherOffer.id, decision: 'done', reviewVersion: otherOffer.reviewVersion!, receipts: [{ kind: 'mailbox-state', id: doneId }] }] })
+    expect(reused.results[0]!.status).toBe('rejected'); expect(reused.session.progress.decidedCount).toBe(0)
+    const duplicate = await call('zeroProgress', await progressInput(offers[0]!, 'done', [{ kind: 'mailbox-state', id: doneId }]))
+    expect(duplicate.results[0]!.status).toBe('rejected'); expect(duplicate.session.progress.decidedCount).toBe(1)
+    const inverse: WindowDTO.InboxZeroUndoInput = { id: randomUUID(), reference: credited.undo!, receipts: [{ kind: 'mailbox-state', id: doneId }] }
+    expect(await call('zeroUndo', inverse)).toMatchObject({ status: 'pending', session: { progress: { decidedCount: 1 } } })
+    await h.inbox.undoMailboxStates('alice', doneId)
+    const undone = await call('zeroUndo', inverse)
+    expect(undone).toMatchObject({ status: 'accepted', session: { progress: { decidedCount: 0 } } })
+    expect(await call('zeroUndo', inverse)).toEqual(undone)
+    const redoneId = await done(offers[0]!), redone = await call('zeroProgress', await progressInput(offers[0]!, 'done', [{ kind: 'mailbox-state', id: redoneId }]))
+    expect(redone.results[0]!.status).toBe('accepted')
+    expect(await call('zeroUndo', { ...inverse, id: randomUUID() })).toMatchObject({ status: 'rejected', session: { progress: { decidedCount: 1 } } })
+    const feedbackId = randomUUID(), feedbackRow = rows.get(offers[1]!.id)!
+    await feedback.record({ id: feedbackId, targets: (await latestTargets(offers[1]!)).map(target => ({ ...target, sourceId: feedbackRow.sourceId })) })
+    const feedbackCredit = await call('zeroProgress', await progressInput(offers[1]!, 'done', [{ kind: 'attention-feedback', id: feedbackId }]))
+    expect(feedbackCredit.results[0]!.status).toBe('accepted')
+    const otherRow = rows.get(offers[2]!.id)!, values = (await h.inbox.mailboxMessagePage('alice', { mailboxIds, sourceId: otherRow.sourceId, threadId: otherRow.threadId })).items
+      .sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.id.localeCompare(b.id))
+    const context: CategoryContext = { sourceId: otherRow.sourceId, threadId: otherRow.threadId, sourceGeneration: otherRow.sourceGeneration,
+      mailboxIds: [...new Set(values.flatMap(value => value.memberships.map(member => member.mailboxId)))], latestMessageId: values.at(-1)!.id,
+      messages: values.map(value => ({ messageId: value.id, revision: value.revision, bodyRevision: value.bodyRevision ?? null, memberships: value.memberships.map(member => ({ mailboxId: member.mailboxId, revision: member.revision })) })) }
+    const categoryId = randomUUID()
+    await categories.classify({ id: categoryId, category: 'Other', targets: [{ context, ifRevision: 0 }] })
+    const categoryCredit = await call('zeroProgress', await progressInput(offers[2]!, 'other', [{ kind: 'category', id: categoryId }]))
+    expect(categoryCredit.results[0]!.status).toBe('accepted')
+    const laterBefore: MailboxMembership[] = [], laterRefs: WindowDTO.InboxActionReceiptReference[] = []
+    for (const target of await latestTargets(offers[3]!)) {
+      const message = await h.inbox.mailboxMessageSummary('alice', target.mailboxId, target.messageId)
+      laterBefore.push(message.memberships[0]!)
+      const state = await h.inbox.setMailboxState('alice', target.mailboxId, target.messageId, { snoozedUntil: new Date(Date.now() + 3600000).toISOString() }, target.revision)
+      laterRefs.push({ kind: 'mailbox-membership', target: { mailboxId: state.mailboxId, messageId: state.messageId, revision: state.revision } })
+    }
+    const laterCredit = await call('zeroProgress', await progressInput(offers[3]!, 'later', laterRefs))
+    expect(laterCredit.results[0]!.status).toBe('accepted'); expect(laterCredit.session.progress.decidedCount).toBe(4)
+    expect((await call('zeroProgress', await progressInput(offers[4]!, 'done', [{ kind: 'mailbox-state', id: randomUUID() }]))).results[0]!.status).toBe('rejected')
+    const readRow = rows.get(offers[5]!.id)!
+    const read = await h.inbox.mutate('alice', { messageIds: [readRow.summaries[0]!.id], changes: { isRead: true }, idempotencyKey: randomUUID(), viaMailboxId: readRow.targets[0]!.mailboxId })
+    expect((await call('zeroProgress', await progressInput(offers[5]!, 'done', [{ kind: 'operation', id: read.id }]))).results[0]!.status).toBe('rejected')
+    expect((await resume()).progress.decidedCount).toBe(4)
+    const staleId = await done(offers[6]!), stale = (await latestTargets(offers[6]!))[0]!
+    await h.inbox.setMailboxState('alice', stale.mailboxId, stale.messageId, { done: false }, stale.revision)
+    expect((await call('zeroProgress', await progressInput(offers[6]!, 'done', [{ kind: 'mailbox-state', id: staleId }]))).results[0]!.status).toBe('rejected')
+    const bobMailbox = (await h.inbox.mailboxes('bob'))[0]!, bobMessage = (await h.inbox.mailboxMessagePage('bob', { mailboxIds: [bobMailbox.id] })).items[0]!
+    const foreign = await h.inbox.setMailboxStates('bob', { id: randomUUID(), done: true, targets: [{ mailboxId: bobMailbox.id, messageId: bobMessage.id, revision: 1 }] })
+    await expect(h.inbox.mailboxStateReceipt('alice', foreign.id)).rejects.toMatchObject({ status: 404 })
+    expect((await call('zeroProgress', await progressInput(offers[9]!, 'done', [{ kind: 'mailbox-state', id: foreign.id }]))).results[0]!.status).toBe('rejected')
+    const partialIds = [await done(offers[7]!), await done(offers[8]!)]
+    interruptedReceipt = partialIds[1]!
+    const partialInput: WindowDTO.InboxZeroProgressInput = { sessionId: zero.id, id: randomUUID(), ifRevision: (await resume()).revision,
+      decisions: offers.slice(7, 9).map((offer, index) => ({ id: offer.id, decision: 'done', reviewVersion: offer.reviewVersion!, receipts: [{ kind: 'mailbox-state', id: partialIds[index]! }] })) }
+    const partial = await call('zeroProgress', partialInput)
+    expect(partial.results.map(result => result.status)).toEqual(['accepted', 'pending']); expect(partial.session.progress.decidedCount).toBe(5)
+    const completed = await call('zeroProgress', partialInput)
+    expect(completed.results.map(result => result.status)).toEqual(['accepted', 'accepted']); expect(completed.session.progress.decidedCount).toBe(6)
+    expect(await call('zeroProgress', partialInput)).toEqual(completed)
+    const partialInverse: WindowDTO.InboxZeroUndoInput = { id: randomUUID(), reference: completed.undo!, receipts: partialIds.map(id => ({ kind: 'mailbox-state', id })) }
+    await h.inbox.undoMailboxStates('alice', partialIds[0]!)
+    expect(await call('zeroUndo', partialInverse)).toMatchObject({ status: 'pending', session: { progress: { decidedCount: 5 } } })
+    await h.inbox.undoMailboxStates('alice', partialIds[1]!)
+    expect(await call('zeroUndo', partialInverse)).toMatchObject({ status: 'accepted', session: { progress: { decidedCount: 4 } } })
+    await h.inbox.undoMailboxStates('alice', redoneId)
+    expect((await call('zeroUndo', { id: randomUUID(), reference: redone.undo!, receipts: [{ kind: 'mailbox-state', id: redoneId }] })).status).toBe('accepted')
+    await feedback.undo(feedbackId)
+    expect((await call('zeroUndo', { id: randomUUID(), reference: feedbackCredit.undo!, receipts: [{ kind: 'attention-feedback', id: feedbackId }] })).status).toBe('accepted')
+    await categories.undo(categoryId)
+    expect((await call('zeroUndo', { id: randomUUID(), reference: categoryCredit.undo!, receipts: [{ kind: 'category', id: categoryId }] })).status).toBe('accepted')
+    const laterInverse: WindowDTO.InboxActionReceiptReference[] = []
+    for (const before of laterBefore) {
+      const reference = laterRefs.find(reference => reference.kind === 'mailbox-membership' && reference.target.mailboxId === before.mailboxId && reference.target.messageId === before.messageId)!
+      if (reference.kind !== 'mailbox-membership') throw new Error('Missing Later state receipt')
+      const state = await h.inbox.setMailboxState('alice', before.mailboxId, before.messageId, { done: before.done, snoozedUntil: before.snoozedUntil }, reference.target.revision)
+      laterInverse.push({ kind: 'mailbox-membership', target: { mailboxId: state.mailboxId, messageId: state.messageId, revision: state.revision } })
+    }
+    expect(await call('zeroUndo', { id: randomUUID(), reference: laterCredit.undo!, receipts: laterInverse })).toMatchObject({ status: 'accepted', session: { progress: { decidedCount: 0 } } })
+    expect((await call('zeroProgress', await progressInput(offers[0]!, 'done', [{ kind: 'mailbox-state', id: redoneId }]))).results[0]!.status).toBe('rejected')
+    expect((await resume()).progress).toMatchObject({ initialCount: 12, remainingCount: 12, decidedCount: 0 })
+    expect(bodyReads).toBe(0)
+
+    // Real public AI/category services, with fictional model responses only. Host
+    // page/admission reads must neither load bodies nor launch additional inference.
+    const batchFixture = await fixture(), batchDatabase = new Database(':memory:')
+    const body = 'The previous job is complete. Please review the attached proposal tomorrow.'
+    const { account: batchAccount } = await batchFixture.seed('alice', 'batch-provenance', Array.from({ length: 3 }, (_, index) => native(`batch-proof-${index}`, {
+      bodyText: body, bodyHtml: `<p>${body}</p>`, receivedAt: new Date(EPOCH - index * 1000).toISOString(),
+    })))
+    const configuration: AiInferenceConfig = { version: 1, protocol: 'openai-responses', name: 'Fictional batch assessment', endpoint: 'https://inference.example.test/batch', apiKey: 'fictional-batch-key', defaultModel: 'batch-v1', concurrency: 1, timeoutMs: 3000,
+      models: ['batch-v1', 'batch-v2'].map(id => ({ id, label: id, pricing: null })) }
+    const quiet: AiAssessment = { type: 'other', response: 'not_needed', task: 'none', actions: [], urgency: 'none', deadline: null, topics: [], risk: 'none_observed', certainty: 'clear', reason: 'Fictional quiet assessment', evidence: [] }
+    let modelCalls = 0, batchBodyReads = 0, allowModelBodies = true
+    const aiInbox: Inbox = { ...batchFixture.inbox,
+      mailboxMessage: async (...args) => { if (!allowModelBodies) { batchBodyReads++; throw new Error('Batch AI lookup loaded a body') }; return batchFixture.inbox.mailboxMessage(...args) },
+      message: async (...args) => { if (!allowModelBodies) { batchBodyReads++; throw new Error('Batch AI lookup loaded a body') }; return batchFixture.inbox.message(...args) },
+    }
+    const batchAi = createAiTriageService({ database: batchDatabase, inbox: aiInbox, configuration, sessionKey: KEY, now: () => batchFixture.clock.value,
+      fetcher: (async (_url, init) => {
+        modelCalls++; const request = JSON.parse(String(init?.body))
+        const assessment: AiAssessment = request.model === 'batch-v1' ? quiet : { ...quiet, task: 'required', actions: ['review'], reason: 'A current review is required.', evidence: [
+          { messageRef: 'm0', field: 'task', quote: 'Please review the attached proposal tomorrow.' }, { messageRef: 'm0', field: 'action', quote: 'Please review the attached proposal tomorrow.' },
+        ] }
+        return Response.json({ id: `fictional-batch-${modelCalls}`, model: request.model, status: 'completed', usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150 }, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(assessment) }] }] })
+      }) as typeof fetch })
+    const batchGuard: Inbox = { ...batchFixture.inbox, mailboxMessage: async () => { batchBodyReads++; throw new Error('Batch proof loaded a reader body') }, message: async () => { batchBodyReads++; throw new Error('Batch proof loaded a body') } }
+    const batchCategories = createAttentionOverridesStore(batchDatabase, batchFixture.inbox, 'alice')
+    const batchService = createInboxWindowService({ database: batchDatabase, inbox: batchGuard, owner: 'alice', ai: batchAi, sessionKey: KEY, allowProviderWrites: true,
+      inboxPreferences: createInboxViewPreferencesStore(batchDatabase, batchGuard, 'alice'), splitPreferences: createSplitPreferencesStore(batchDatabase, 'alice'), attentionOverrides: batchCategories })
+    cleanup.push(async () => { await batchService.close(); await batchAi.close(); batchDatabase.close() })
+    const batchCall = async <K extends keyof WindowDTO.InboxWindowTransport>(name: K, input: Parameters<WindowDTO.InboxWindowTransport[K]>[0]): Promise<Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>> =>
+      await batchService.dispatch(WindowDTO.inboxWindowPaths[name], input) as Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>
+    await batchAi.configure('alice', { ...(await batchAi.state('alice')).settings, enabled: true, mode: 'preview' })
+    await batchAi.start(); await batchAi.process('alice', { id: 'batch-quiet-seed', scope: 'all', limit: 100 })
+    await bounded((async () => { while ((await batchAi.state('alice')).usage.completed !== 3) await Bun.sleep(10) })(), 'fictional quiet saved assessments')
+    expect(modelCalls).toBe(3); allowModelBodies = false
+    const batchView = await batchCall('query', { account: 'unified', folder: 'Inbox', split: 'Important', search: false, query: '', filter: null })
+    await bounded((async () => { while ((await batchCall('page', { queryId: batchView.state.queryId })).state.indexing) await Bun.sleep(10) })(), 'batch host index')
+    const batchSession = await batchCall('zeroCreate', { id: randomUUID(), account: 'unified' })
+    const batchQueue = await bounded((async () => {
+      for (;;) { const page = await batchCall('zeroPage', { sessionId: batchSession.id }); if (page.session.progress.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'quiet batch offers')
+    expect(batchQueue.items).toHaveLength(3)
+    expect(batchQueue.items.every(item => item.batchEligibility === 'eligible')).toBe(true)
+    for (const item of batchQueue.items) { expect(item.batchCandidate!.reviewVersion).toMatch(/^[a-f0-9]{64}$/); expect(item.batchCandidate!.reviewVersion).not.toBe(item.reviewVersion!) }
+    const [manualOffer, validOffer, staleOffer] = batchQueue.items as [WindowDTO.InboxZeroItem, WindowDTO.InboxZeroItem, WindowDTO.InboxZeroItem]
+    const batchResume = async () => { const result = await batchCall('zeroResume', { sessionId: batchSession.id, account: 'unified' }); if (result.status !== 'found') throw new Error('Batch session lost'); return result.session }
+    const categoryFor = async (offer: WindowDTO.InboxZeroItem, category: 'Important' | 'Other') => {
+      const found = await batchCall('lookup', { account: 'unified', ids: [offer.id] }), entry = found.entries[0]!
+      if (entry.status !== 'found') throw new Error('Batch mail unavailable')
+      const contextValues = (await batchFixture.inbox.mailboxMessagePage('alice', { mailboxIds: entry.row.mail.mailboxIds!, sourceId: entry.row.sourceId, threadId: entry.row.threadId, limit: 500 })).items.sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.id.localeCompare(b.id))
+      const context: CategoryContext = { sourceId: entry.row.sourceId, threadId: entry.row.threadId, sourceGeneration: entry.row.sourceGeneration, mailboxIds: entry.row.mail.mailboxIds!, latestMessageId: contextValues.at(-1)!.id,
+        messages: contextValues.map(message => ({ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: message.memberships.map(state => ({ mailboxId: state.mailboxId, revision: state.revision })) })) }
+      const previous = (await batchCategories.lookup([{ sourceId: entry.row.sourceId, threadId: entry.row.threadId }])).entries[0]!
+      const id = randomUUID(); await batchCategories.classify({ id, category, targets: [{ context, ifRevision: previous.revision }] }); return id
+    }
+    await batchCall('zeroProgress', { id: randomUUID(), sessionId: batchSession.id, ifRevision: (await batchResume()).revision, decisions: [], currentId: manualOffer.id })
+    await categoryFor(manualOffer, 'Important')
+    const manualPage = await batchCall('zeroPage', { sessionId: batchSession.id })
+    expect(manualPage.items.find(item => item.id === manualOffer.id)).toMatchObject({ eligibility: 'eligible', reviewVersion: manualOffer.reviewVersion, batchEligibility: 'ineligible', batchCandidate: null })
+    expect(manualPage.session).toMatchObject({ currentId: manualOffer.id, progress: { decidedCount: 0 } })
+    const validCategory = await categoryFor(validOffer, 'Other')
+    const validInput: WindowDTO.InboxZeroProgressInput = { id: randomUUID(), sessionId: batchSession.id, ifRevision: (await batchResume()).revision,
+      decisions: [{ id: validOffer.id, decision: 'other', reviewVersion: validOffer.batchCandidate!.reviewVersion, receipts: [{ kind: 'category', id: validCategory }] }] }
+    const validBatch = await batchCall('zeroProgress', validInput)
+    expect(validBatch.results).toEqual([{ id: validOffer.id, status: 'accepted' }])
+    expect(await batchCall('zeroProgress', validInput)).toEqual(validBatch)
+    await batchCategories.undo(validCategory)
+    expect((await batchCall('zeroUndo', { id: randomUUID(), reference: validBatch.undo!, receipts: [{ kind: 'category', id: validCategory }] })).status).toBe('accepted')
+    expect(modelCalls).toBe(3); expect(batchBodyReads).toBe(0)
+    const beforeBodyVersions = (await batchFixture.page('alice')).items.map(message => [message.id, message.bodyRevision])
+    allowModelBodies = true
+    await batchAi.configure('alice', { ...(await batchAi.state('alice')).settings, model: 'batch-v2' })
+    await batchAi.process('alice', { id: 'batch-task-refresh', scope: 'all', limit: 100 })
+    await bounded((async () => { while ((await batchAi.state('alice')).usage.completed !== 6) await Bun.sleep(10) })(), 'same-body task assessments')
+    allowModelBodies = false
+    expect((await batchFixture.page('alice')).items.map(message => [message.id, message.bodyRevision])).toEqual(beforeBodyVersions)
+    const changed = await batchCall('zeroPage', { sessionId: batchSession.id })
+    expect(changed.items.find(item => item.id === staleOffer.id)).toMatchObject({ eligibility: 'eligible', reviewVersion: staleOffer.reviewVersion, batchEligibility: 'ineligible', batchCandidate: null })
+    expect(changed.session).toMatchObject({ currentId: manualOffer.id, progress: { decidedCount: 0 } })
+    const taskSummary = (await batchFixture.page('alice')).items.find(message => `unified:${batchAccount.id}:${message.threadId}` === staleOffer.id)!
+    expect((await batchAi.lookup('alice', [{ sourceId: batchAccount.id, threadId: taskSummary.threadId }])).decisions[0]!.assessment!.task).toBe('required')
+    const manualOther = await categoryFor(staleOffer, 'Other')
+    const staleInput: WindowDTO.InboxZeroProgressInput = { id: randomUUID(), sessionId: batchSession.id, ifRevision: (await batchResume()).revision,
+      decisions: [{ id: staleOffer.id, decision: 'other', reviewVersion: staleOffer.batchCandidate!.reviewVersion, receipts: [{ kind: 'category', id: manualOther }] }] }
+    expect((await batchCall('zeroProgress', staleInput)).results).toEqual([{ id: staleOffer.id, status: 'rejected' }])
+    expect((await batchCategories.lookup([{ sourceId: batchAccount.id, threadId: taskSummary.threadId }])).entries[0]!.override!.category).toBe('Other')
+    const individual = await batchCall('zeroProgress', { ...staleInput, id: randomUUID(), ifRevision: (await batchResume()).revision,
+      decisions: [{ ...staleInput.decisions[0]!, reviewVersion: staleOffer.reviewVersion! }] })
+    expect(individual.results).toEqual([{ id: staleOffer.id, status: 'accepted' }])
+    expect(individual.session).toMatchObject({ currentId: manualOffer.id, progress: { decidedCount: 1 } })
+    expect(modelCalls).toBe(6); expect(batchBodyReads).toBe(0)
+  }, 30000)
+})
+
+describe('live bounded mailbox reads', () => {
+  test('cached keyset messages survive ordinary events and reconcile arrivals, backfill and deletion from the first state', async () => {
+    const h = await fixture()
+    const { account, box } = await h.seed('alice', 'live-keyset', Array.from({ length: 6 }, (_, index) => native(`live-${index}`, { bodyText: BODY_SECRET })))
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 2 }
+    const wire = transport(h), client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' }, cacheScope: 'live-keyset' })
+    const first = await client.mailboxMessagePage(scope)
+    expect(first.items).toHaveLength(2)
+    expect(first).not.toHaveProperty('total')
+    const original = (await client.mailboxMessages({ mailboxIds: scope.mailboxIds })).items
+    const deleted = original.find(item => !first.items.some(loaded => loaded.id === item.id))!
+    await client.message(first.items[0]!.id)
+    await client.mailboxCounts({ mailboxIds: scope.mailboxIds })
+    await client.mailboxConversations({ mailboxIds: scope.mailboxIds, limit: 1 })
+    await client.mailboxMessagePage(scope)
+    await client.message(first.items[0]!.id)
+    expect(wire.requests.at(-1)!.status).toBe(304)
+    await client.createDraft({ accountId: account.id, subject: 'Unrelated metadata' })
+    await client.mutate({ messageIds: [first.items[0]!.id], changes: { isRead: true }, idempotencyKey: 'live-flags' })
+    await h.inbox.runDue()
+    box.remove(deleted.subject.replace('Subject ', ''))
+    box.put(native('live-arrival', { receivedAt: new Date(EPOCH + 1000).toISOString() }))
+    box.put(native('live-backfill', { receivedAt: new Date(EPOCH - 86400000).toISOString() }))
+    await h.sync('alice', account.id)
+    const reads = structuredClone(box.calls)
+    const collected = [...first.items]
+    let cursor = first.nextCursor
+    while (cursor) {
+      const page = await client.mailboxMessagePage({ ...scope, cursor })
+      expect(page.state).toBe(first.state); expect(page.scopeState).toBe(first.scopeState)
+      expect(page.items).toHaveLength(Math.min(2, page.items.length))
+      collected.push(...page.items); cursor = page.nextCursor
+    }
+    expect(new Set(collected.map(item => item.id)).size).toBe(collected.length)
+    expect(collected.some(item => item.subject === 'Subject live-arrival')).toBe(false)
+    expect(collected.some(item => item.subject === 'Subject live-backfill')).toBe(true)
+    const current = new Map(collected.map(item => [item.id, item])), affected = new Set<string>()
+    let state = first.state, more = true
+    while (more) {
+      const delta = await client.mailboxChanges({ mailboxIds: scope.mailboxIds, since: state, scopeState: first.scopeState, limit: 2 })
+      expect(delta.resetRequired).toBe(false)
+      for (const item of delta.upserts) current.set(item.id, item)
+      for (const item of delta.removed) current.delete(item.messageId)
+      for (const key of delta.affectedThreads) affected.add(key.threadId)
+      state = delta.state; more = delta.hasMore
+    }
+    expect(affected.has(deleted.threadId)).toBe(true)
+    const latest = await client.mailboxMessagePage({ mailboxIds: scope.mailboxIds })
+    expect([...current.values()].sort((a, b) => a.id.localeCompare(b.id))).toEqual([...latest.items].sort((a, b) => a.id.localeCompare(b.id)))
+    expect(await client.mailboxCounts({ mailboxIds: scope.mailboxIds })).toMatchObject({ messages: 7, conversations: 7, asOfState: latest.state, scopeState: first.scopeState })
+    expect(box.calls).toEqual(reads)
+    expect(JSON.stringify(first)).not.toContain(BODY_SECRET)
+  })
+
+  test('complete conversation aggregates include nonmatching history, bounded previews/targets, native states and exact source/thread identity', async () => {
+    const h = await fixture({ eventRetention: 10000 })
+    const giant = Array.from({ length: 620 }, (_, index) => native(`giant-${index}`, { threadId: 'giant', subject: index ? 'Same subject' : 'Rare matching needle',
+      receivedAt: new Date(EPOCH - index * 1000).toISOString(), isRead: index !== 619, isStarred: index === 619,
+      folder: index === 619 ? 'archive' : 'inbox', ...(index === 619 ? { attachments: [{ id: 'attachment', filename: 'file.txt', contentType: 'text/plain', size: 3, url: 'https://example.test/attachment' }] } : {}) }))
+    const { account, box } = await h.seed('alice', 'live-conversations', [...giant, native('small-a', { threadId: 'small', subject: 'Same subject' }), native('small-b', { threadId: 'small', subject: 'Same subject' })])
+    const sibling = await h.seed('alice', 'live-conversations-sibling', [native('giant-0', { threadId: 'giant', subject: 'Same subject' })])
+    const scope = { mailboxIds: (await h.inbox.mailboxes('alice')).map(box => box.id) }
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    const first = await client.mailboxConversations({ ...scope, limit: 1 })
+    const rows = [...first.items]
+    let cursor = first.nextCursor
+    while (cursor) { const page = await client.mailboxConversations({ ...scope, limit: 1, cursor }); rows.push(...page.items); cursor = page.nextCursor }
+    expect(rows).toHaveLength(3)
+    const aggregate = rows.find(row => row.messageCount === 620)!
+    expect(aggregate).toMatchObject({ sourceId: account.id, isRead: false, isStarred: true, hasAttachments: true, nativeFolders: { inbox: true, archive: true }, messagesComplete: false, targetsComplete: false })
+    expect(aggregate.messages).toHaveLength(50); expect(aggregate.targets).toHaveLength(500)
+    expect(aggregate.messages.every(message => message.isRead && !message.isStarred && !message.hasAttachments)).toBe(true)
+    expect(aggregate.mailboxStates).toEqual([{ mailboxId: scope.mailboxIds.find(id => aggregate.messages[0]!.memberships.some(member => member.mailboxId === id))!, messageCount: 620, doneCount: 0, snoozedCount: 0 }])
+    const key = { sourceId: aggregate.sourceId, threadId: aggregate.threadId }
+    expect((await client.mailboxConversations({ ...scope, keys: [key], query: { search: 'subject:needle' } })).items[0]!.messageCount).toBe(620)
+    expect(await client.mailboxCounts({ ...scope, query: { search: 'subject:needle' } })).toMatchObject({ messages: 1, conversations: 1 })
+    expect(await client.mailboxCounts(scope)).toMatchObject({ messages: 623, conversations: 3 })
+    expect((await client.mailboxConversations({ ...scope, keys: [{ ...key, sourceId: sibling.account.id }] })).items).toEqual([])
+    const history = await client.mailboxMessagePage({ ...scope, ...key, limit: 500 })
+    const tail = await client.mailboxMessagePage({ ...scope, ...key, limit: 500, cursor: history.nextCursor! })
+    expect(history.items).toHaveLength(500); expect(tail.items).toHaveLength(120); expect(tail.nextCursor).toBeNull()
+    const small = rows.find(row => row.messageCount === 2)!
+    expect(small.messagesComplete && small.targetsComplete).toBe(true)
+    box.put(native('small-later', { threadId: 'small', receivedAt: new Date(EPOCH + 1000).toISOString() }))
+    await h.sync('alice', account.id)
+    await client.setMailboxStates({ id: 'captured-small-only', targets: small.targets, done: true })
+    const changed = (await client.mailboxConversations({ ...scope, keys: [{ sourceId: small.sourceId, threadId: small.threadId }] })).items[0]!
+    expect(changed).toMatchObject({ messageCount: 3, mailboxStates: [{ messageCount: 3, doneCount: 2 }] })
+    expect(changed.messages.find(message => message.subject === 'Subject small-later')!.memberships[0]!.done).toBe(false)
+    const database = new Database(h.database)
+    await h.restart(database)
+    const providerCalls = structuredClone(box.calls)
+    database.exec('PRAGMA query_only=ON')
+    expect((await h.inbox.mailboxConversations('alice', { ...scope, keys: [key] })).items[0]!.messageCount).toBe(620)
+    expect((await h.inbox.mailboxMessagePage('alice', { ...scope, ...key })).items).toHaveLength(500)
+    expect(await h.inbox.mailboxCounts('alice', scope)).toMatchObject({ messages: 624, conversations: 3 })
+    expect(box.calls).toEqual(providerCalls)
+  })
+
+  test('factual conversation aggregates include oldest subjects and awake inbox history beyond previews with scoped snooze deduplication', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const domains = ['alpha.example.test', 'beta.example.test', 'gamma.example.test']
+    h.discoveries.set('factual-aggregates', { sources: domains.map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const oldestTime = new Date(EPOCH - 100000).toISOString()
+    const giant = [
+      native('old-a', { threadId: 'awake-history', subject: 'Original oldest A', receivedAt: oldestTime, sourceDomains: [domains[0]!] }),
+      native('old-b', { threadId: 'awake-history', subject: 'Original oldest B', receivedAt: oldestTime, sourceDomains: [domains[0]!] }),
+      ...Array.from({ length: 50 }, (_, index) => native(`sent-${index}`, { threadId: 'awake-history', folder: 'sent', receivedAt: new Date(EPOCH - index * 1000).toISOString(), sourceDomains: [domains[0]!] })),
+    ]
+    const phantom = [native('done-inbox', { threadId: 'done-inbox-awake-archive', subject: 'Original done inbox', receivedAt: oldestTime, sourceDomains: [domains[0]!] }),
+      ...Array.from({ length: 50 }, (_, index) => native(`archive-${index}`, { threadId: 'done-inbox-awake-archive', subject: `New archive ${index}`, folder: 'archive', receivedAt: new Date(EPOCH - index * 1000).toISOString(), sourceDomains: [domains[1]!] })),
+    ]
+    const mixed = [native('mixed-a', { threadId: 'mixed-snooze', receivedAt: new Date(EPOCH - 5000).toISOString(), sourceDomains: domains.slice(0, 2) }),
+      native('mixed-b', { threadId: 'mixed-snooze', receivedAt: new Date(EPOCH - 4000).toISOString(), sourceDomains: domains.slice(0, 2) }),
+      native('mixed-c', { threadId: 'mixed-snooze', receivedAt: new Date(EPOCH - 3000).toISOString(), sourceDomains: domains.slice(0, 2) }),
+      native('unselected-oldest', { threadId: 'mixed-snooze', receivedAt: new Date(EPOCH - 1000000).toISOString(), sourceDomains: [domains[2]!] }),
+    ]
+    const { account, box } = await h.connect('alice', 'factual-aggregates', [...giant, ...phantom, ...mixed], SCOPED)
+    const boxes = [] as Mailbox[]
+    for (const domain of domains) boxes.push(await h.inbox.createMailbox('alice', { sourceId: account.id, name: domain, selector: { kind: 'domain', value: domain } }))
+    const [alpha, beta] = boxes as [Mailbox, Mailbox, Mailbox]
+    const scope = { mailboxIds: [alpha.id, beta.id, alpha.id] }
+    await h.sync('alice', account.id)
+    const all = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    const find = (subject: string) => all.find(message => message.subject === subject)!
+    const oldest = all.filter(message => message.subject.startsWith('Original oldest')).sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.id.localeCompare(b.id))[0]!
+    const done = find('Original done inbox'), a = find('Subject mixed-a'), b = find('Subject mixed-b'), c = find('Subject mixed-c')
+    const firstSnooze = new Date(EPOCH + 1000).toISOString(), secondSnooze = new Date(EPOCH + 2000).toISOString(), lastSnooze = new Date(EPOCH + 3000).toISOString()
+    const excluded = (await h.inbox.mailboxMessagePage('alice', { mailboxIds: [boxes[2]!.id] })).items[0]!
+    await h.inbox.setMailboxState('alice', boxes[2]!.id, excluded.id, { done: true, snoozedUntil: new Date(EPOCH + 500).toISOString() }, 1)
+    await h.inbox.setMailboxState('alice', alpha.id, done.id, { done: true }, 1)
+    await h.inbox.setMailboxState('alice', alpha.id, a.id, { snoozedUntil: firstSnooze }, 1)
+    await h.inbox.setMailboxState('alice', alpha.id, b.id, { done: true, snoozedUntil: lastSnooze }, 1)
+    await h.inbox.setMailboxState('alice', beta.id, b.id, { done: true }, 1)
+    await h.inbox.setMailboxState('alice', alpha.id, c.id, { snoozedUntil: secondSnooze }, 1)
+    await h.inbox.setMailboxState('alice', beta.id, c.id, { snoozedUntil: lastSnooze }, 1)
+    const database = new Database(h.database)
+    await h.restart(database)
+    const calls = structuredClone(box.calls), before = await h.inbox.changes('alice')
+    database.exec('PRAGMA query_only=ON')
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    const page = await client.mailboxConversations(scope)
+    const awake = page.items.find(row => row.threadId === oldest.threadId)!
+    expect(awake).toMatchObject({ firstMessageId: oldest.id, subject: oldest.subject, messageCount: 52, membershipCount: 52, doneMembershipCount: 0, awakeInboxMessageCount: 2, earliestSnoozedUntil: null, messagesComplete: false })
+    expect(awake.messages).toHaveLength(50)
+    expect(awake.messages.every(message => message.folder === 'sent')).toBe(true)
+    const noPhantom = page.items.find(row => row.threadId === done.threadId)!
+    expect(noPhantom).toMatchObject({ firstMessageId: done.id, subject: done.subject, messageCount: 51, membershipCount: 51, doneMembershipCount: 1, awakeInboxMessageCount: 0, earliestSnoozedUntil: null, messagesComplete: false })
+    expect(noPhantom.messages).toHaveLength(50)
+    expect(noPhantom.messages.every(message => message.folder === 'archive' && message.memberships.every(member => !member.done))).toBe(true)
+    const filtered = await client.mailboxConversations({ ...scope, query: { search: 'subject:"New archive"' } })
+    expect(filtered.items).toHaveLength(1)
+    expect(filtered.items[0]).toMatchObject({ firstMessageId: done.id, subject: done.subject, messageCount: 51, doneMembershipCount: 1, awakeInboxMessageCount: 0 })
+    const keys = [{ sourceId: account.id, threadId: a.threadId }]
+    const readMixed = async (mailboxIds = scope.mailboxIds) => (await client.mailboxConversations({ mailboxIds, keys })).items[0]!
+    expect(await readMixed()).toMatchObject({ firstMessageId: a.id, subject: a.subject, messageCount: 3, membershipCount: 6, doneMembershipCount: 2, awakeInboxMessageCount: 1, earliestSnoozedUntil: firstSnooze })
+    expect(await readMixed([alpha.id])).toMatchObject({ messageCount: 3, membershipCount: 3, doneMembershipCount: 1, awakeInboxMessageCount: 0, earliestSnoozedUntil: firstSnooze })
+    expect(await readMixed([beta.id])).toMatchObject({ messageCount: 3, membershipCount: 3, doneMembershipCount: 1, awakeInboxMessageCount: 1, earliestSnoozedUntil: lastSnooze })
+    h.clock.value = EPOCH + 1000
+    expect(await readMixed()).toMatchObject({ awakeInboxMessageCount: 1, earliestSnoozedUntil: secondSnooze })
+    expect(await readMixed([alpha.id])).toMatchObject({ awakeInboxMessageCount: 1, earliestSnoozedUntil: secondSnooze })
+    h.clock.value = EPOCH + 2000
+    expect(await readMixed()).toMatchObject({ awakeInboxMessageCount: 2, earliestSnoozedUntil: lastSnooze })
+    expect(await readMixed([beta.id])).toMatchObject({ awakeInboxMessageCount: 1, earliestSnoozedUntil: lastSnooze })
+    h.clock.value = EPOCH + 3000
+    expect(await readMixed()).toMatchObject({ firstMessageId: a.id, messageCount: 3, membershipCount: 6, doneMembershipCount: 2, awakeInboxMessageCount: 2, earliestSnoozedUntil: null })
+    expect(await readMixed([beta.id])).toMatchObject({ awakeInboxMessageCount: 2, earliestSnoozedUntil: null })
+    expect(await h.inbox.changes('alice', { since: before.state })).toMatchObject({ state: before.state, events: [] })
+    expect(box.calls).toEqual(calls)
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(4 * 1024 * 1024)
+    expect(page.items.reduce((sum, row) => sum + row.targets.length + row.messages.reduce((count, message) => count + message.memberships.length, 0), 0)).toBeLessThanOrEqual(5000)
+  })
+
+  test('more than 100000 SDK-ingested messages page and count without relaxing the legacy inventory cap', async () => {
+    const h = await fixture()
+    for (const source of ['one', 'two']) await h.seed('alice', `over-cap-${source}`, Array.from({ length: 50001 }, (_, index) => native(`scale-${index}`, {
+      threadId: `scale-thread-${Math.floor(index / 2)}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(), bodyText: '', bodyHtml: '',
+    })))
+    const scope = { mailboxIds: (await h.inbox.mailboxes('alice')).map(box => box.id) }
+    const calls = [...h.boxes.values()].map(box => structuredClone(box.calls))
+    const first = await h.inbox.mailboxMessagePage('alice', scope)
+    const ids = new Set(first.items.map(item => item.id))
+    let cursor = first.nextCursor, pages = 1
+    while (cursor) {
+      const page = await h.inbox.mailboxMessagePage('alice', { ...scope, cursor })
+      expect(page.items.length).toBeLessThanOrEqual(500)
+      expect(page.state).toBe(first.state)
+      for (const item of page.items) { expect(ids.has(item.id)).toBe(false); ids.add(item.id) }
+      cursor = page.nextCursor; pages++
+    }
+    expect(ids.size).toBe(100002); expect(pages).toBe(201)
+    expect(await h.inbox.mailboxCounts('alice', scope)).toMatchObject({ messages: 100002, conversations: 50002 })
+    const conversations = await h.inbox.mailboxConversations('alice', { ...scope, limit: 100 })
+    expect(conversations.items).toHaveLength(100)
+    expect(conversations.items.every(row => row.messageCount === 2 && row.messagesComplete && row.targetsComplete)).toBe(true)
+    await expect(h.inbox.mailboxSnapshot('alice', scope)).rejects.toMatchObject({ code: 'SNAPSHOT_LIMIT', status: 413 })
+    expect([...h.boxes.values()].map(box => box.calls)).toEqual(calls)
+  }, 120000)
+
+  test('strict owner/query/limit/kind, retention, restart and source-generation fences apply to live keysets', async () => {
+    const h = await fixture({ eventRetention: 5 })
+    const a = await h.seed('alice', 'live-fences', [native('a'), native('b'), native('c')])
+    await h.seed('bob', 'live-fences-foreign')
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const first = await h.inbox.mailboxMessagePage('alice', scope)
+    const conversations = await h.inbox.mailboxConversations('alice', scope)
+    for (const endpoint of ['/mailbox-message-page', '/mailbox-conversations', '/mailbox-counts']) {
+      const post = (body: unknown) => ({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      await invalid(await h.request(null, endpoint, post({ mailboxIds: scope.mailboxIds })), 401)
+      await invalid(await h.request('bob', endpoint, post({ mailboxIds: scope.mailboxIds })), 404)
+      await invalid(await h.request('alice', endpoint, post({ mailboxIds: scope.mailboxIds, unexpected: true })), 400)
+    }
+    for (const limit of [0, 501, 1.5, NaN]) await expect(h.inbox.mailboxMessagePage('alice', { ...scope, limit })).rejects.toMatchObject({ code: 'VALIDATION' })
+    await expect(h.inbox.mailboxConversations('alice', { ...scope, limit: 101 })).rejects.toMatchObject({ code: 'VALIDATION' })
+    await expect(h.inbox.mailboxCounts('alice', { mailboxIds: scope.mailboxIds, query: { unreadOnly: 'true' } as never })).rejects.toMatchObject({ code: 'VALIDATION' })
+    await expect(h.inbox.mailboxMessagePage('bob', { mailboxIds: [(await h.inbox.mailboxes('bob'))[0]!.id], cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    for (const input of [{ ...scope, limit: 2 }, { ...scope, threadId: first.items[0]!.threadId }]) await expect(h.inbox.mailboxMessagePage('alice', { ...input, cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    await expect(h.inbox.mailboxConversations('alice', { ...scope, cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    await expect(h.inbox.mailboxConversations('alice', { ...scope, keys: [{ sourceId: 'foreign', threadId: 'foreign' }] })).rejects.toMatchObject({ status: 404 })
+    await h.inbox.createLabel('alice', a.account.id, 'Unrelated')
+    await h.restart()
+    expect((await h.inbox.mailboxMessagePage('alice', { ...scope, cursor: first.nextCursor! })).items).toHaveLength(1)
+    expect((await h.inbox.mailboxConversations('alice', { ...scope, cursor: conversations.nextCursor! })).items).toHaveLength(1)
+    for (let i = 0; i < 6; i++) await h.inbox.createLabel('alice', a.account.id, `Retained ${i}`)
+    await expect(h.inbox.mailboxMessagePage('alice', { ...scope, cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'MAILBOX_HISTORY_EXPIRED', status: 410 })
+    expect(await h.inbox.mailboxChanges('alice', { mailboxIds: scope.mailboxIds, since: first.state, scopeState: first.scopeState })).toMatchObject({ resetRequired: true, affectedThreads: [], upserts: [], removed: [] })
+    const fresh = await h.inbox.mailboxMessagePage('alice', scope)
+    await h.inbox.disconnect('alice', a.account.id)
+    await expect(h.inbox.mailboxMessagePage('alice', { ...scope, cursor: fresh.nextCursor! })).rejects.toMatchObject({ code: 'MAILBOX_SCOPE_CHANGED' })
+    expect(await h.inbox.mailboxChanges('alice', { mailboxIds: scope.mailboxIds, since: fresh.state, scopeState: fresh.scopeState })).toMatchObject({ resetRequired: true, resetReason: 'scope', affectedThreads: [] })
+  })
+})
+
 describe('bounded mailbox snapshot and changes', () => {
   test('single mailbox summaries use cached metadata only, including legacy rows, and enforce live owner/source/membership fences', async () => {
     const h = await fixture()
@@ -2185,6 +2874,14 @@ describe('bounded mailbox snapshot and changes', () => {
       expect(box.calls).toEqual(before)
       expect(metadataRows).toBe(2)
       expect(bodyReads).toBe(0)
+      const live = await client.mailboxMessagePage({ mailboxIds: [alpha.id] })
+      expect(live.items[0]!.facts).toBeUndefined()
+      const conversations = await client.mailboxConversations({ mailboxIds: [alpha.id] })
+      expect(conversations.items[0]!.messages[0]!.facts).toBeUndefined()
+      expect(conversations.items[0]!.mailboxStates[0]).toMatchObject({ messageCount: 1, doneCount: 1, snoozedCount: 1 })
+      expect(await client.mailboxCounts({ mailboxIds: [alpha.id], query: { done: true, snoozed: true } })).toMatchObject({ messages: 1, conversations: 1 })
+      expect(bodyReads).toBe(0); expect(box.calls).toEqual(before)
+      expect((await h.inbox.changes('alice')).state).toBe(state.state)
       database.query('UPDATE sdk_messages SET generation=generation-1 WHERE id=?').run(own.id)
       await expect(client.mailboxMessageSummary(alpha.id, own.id)).rejects.toMatchObject({ status: 404 })
       database.query('UPDATE sdk_messages SET generation=generation+1,deleted=1 WHERE id=?').run(own.id)
@@ -2330,6 +3027,22 @@ describe('bounded mailbox snapshot and changes', () => {
       expect(second.items).toHaveLength(2)
       expect(second.nextCursor).toBeNull()
       expect(new Set([...first.items, ...second.items].map(item => item.id)).size).toBe(7)
+      const streamed: MailboxSnapshotPage[] = []
+      for await (const page of client.mailboxSnapshotPages({ mailboxIds: ids })) streamed.push(page)
+      expect(streamed.map(page => page.items.length)).toEqual([5, 2])
+      expect(streamed.flatMap(page => page.items)).toEqual([...first.items, ...second.items])
+      for (const page of streamed) expect(page.items.reduce((count, item) => count + item.memberships.length, 0)).toBeLessThanOrEqual(5000)
+      const live = await client.mailboxMessagePage({ mailboxIds: ids })
+      expect(live.items).toHaveLength(5)
+      expect(live.items.every(item => item.memberships.length === 1000)).toBe(true)
+      const liveTail = await client.mailboxMessagePage({ mailboxIds: ids, cursor: live.nextCursor! })
+      expect(liveTail.items).toHaveLength(2); expect(liveTail.nextCursor).toBeNull()
+      const conversations = await client.mailboxConversations({ mailboxIds: ids })
+      expect(conversations.items.length).toBeGreaterThan(0)
+      expect(conversations.items.reduce((sum, row) => sum + row.targets.length + row.messages.reduce((count, message) => count + message.memberships.length, 0), 0)).toBeLessThanOrEqual(5000)
+      expect(Buffer.byteLength(JSON.stringify(conversations))).toBeLessThanOrEqual(4 * 1024 * 1024)
+      expect(conversations.items.every(row => row.messageCount === 1 && row.mailboxStates.length === 1000 && !row.targetsComplete)).toBe(true)
+      expect(await client.mailboxCounts({ mailboxIds: ids })).toMatchObject({ messages: 7, conversations: 7 })
       const changed = first.items[0]!
       await h.inbox.setMailboxState('alice', ids[0]!, changed.id, { done: true }, 1)
       const delta = await h.inbox.mailboxChanges('alice', { mailboxIds: ids, since: first.state, scopeState: first.scopeState })
@@ -2352,6 +3065,7 @@ describe('bounded mailbox snapshot and changes', () => {
       const nativeState = await h.inbox.mutate('alice', { messageIds: [changed.id], changes: { isRead: true }, idempotencyKey: 'scope-absence-event' })
       const absent = await h.inbox.mailboxChanges('alice', { mailboxIds: ids, since: state, scopeState: first.scopeState })
       expect(absent.removed).toEqual([{ sourceId: account.id, messageId: changed.id, reason: 'unselected', revision: null }])
+      expect(absent.affectedThreads).toEqual([{ sourceId: account.id, threadId: changed.threadId }])
       expect((await h.inbox.operation('alice', nativeState.id)).status).toBe('pending')
     } finally { database.close() }
   })
@@ -2402,6 +3116,20 @@ describe('bounded mailbox snapshot and changes', () => {
       const second = await h.inbox.mailboxSnapshot('alice', { ...scope, cursor: first.nextCursor! })
       expect(second.items).toHaveLength(1)
       expect(second.nextCursor).toBeNull()
+      const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+      const streamed: MailboxSnapshotPage[] = []
+      for await (const page of client.mailboxSnapshotPages(scope)) streamed.push(page)
+      expect(streamed.map(page => page.items.length)).toEqual([1, 1])
+      expect(streamed.flatMap(page => page.items)).toEqual([...first.items, ...second.items])
+      for (const page of streamed) expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(4 * 1024 * 1024)
+      const live = await client.mailboxMessagePage(scope)
+      expect(live.items).toHaveLength(1)
+      expect((await client.mailboxMessagePage({ ...scope, cursor: live.nextCursor! })).items).toHaveLength(1)
+      const conversations = await client.mailboxConversations(scope)
+      expect(conversations.items).toHaveLength(2)
+      expect(conversations.items.every(row => row.messageCount === 1)).toBe(true)
+      expect(Buffer.byteLength(JSON.stringify(conversations))).toBeLessThanOrEqual(4 * 1024 * 1024)
+      expect(conversations.items.some(row => !row.messagesComplete)).toBe(true)
       await h.inbox.mutate('alice', { messageIds: messages.map(message => message.id), changes: { isRead: true }, idempotencyKey: 'large-read-events' })
       const one = await h.inbox.mailboxChanges('alice', { ...scope, since: first.state, scopeState: first.scopeState })
       expect(one.upserts).toHaveLength(1)
@@ -2413,6 +3141,10 @@ describe('bounded mailbox snapshot and changes', () => {
       for (const page of [one, two]) expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(4 * 1024 * 1024)
       database.query("UPDATE sdk_messages SET visible=json_set(visible,'$.preview',?) WHERE account=?").run('x'.repeat(4 * 1024 * 1024), account.id)
       await expect(h.inbox.mailboxSnapshot('alice', scope)).rejects.toMatchObject({ code: 'MAILBOX_READ_TOO_LARGE', status: 413 })
+      await expect(h.inbox.mailboxMessagePage('alice', scope)).rejects.toMatchObject({ code: 'MAILBOX_READ_TOO_LARGE', status: 413 })
+      const oversized = await client.mailboxConversations(scope)
+      expect(oversized.items).toHaveLength(2)
+      expect(oversized.items.every(row => row.messageCount === 1 && row.messages.length === 0 && !row.messagesComplete && row.targetsComplete)).toBe(true)
     } finally { database.close() }
   })
 
@@ -2460,7 +3192,441 @@ describe('bounded mailbox snapshot and changes', () => {
   })
 })
 
+describe('finite mailbox snapshot streams', () => {
+  test('one real socket POST transports 500-row SDK pages and catches up concurrent changes without publishing an incomplete inventory', async () => {
+    const h = await fixture()
+    const { account, box } = await h.seed('alice', 'snapshot-socket', Array.from({ length: 1001 }, (_, index) => native(`socket-${index}`)))
+    await h.seed('bob', 'snapshot-socket-foreign')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const scope = { mailboxIds: [mailbox.id], limit: 500 }
+    const original = h.inbox.mailboxSnapshot.bind(h.inbox)
+    const barrier = h.gate(undefined)
+    let reads = 0, requests = 0
+    const guard = spyOn(h.inbox, 'mailboxSnapshot').mockImplementation(async (...args) => {
+      if (++reads === 2) await barrier.wait()
+      return original(...args)
+    })
+    const base = h.socket()
+    const client = createInboxClient({ baseUrl: base, headers: { authorization: 'Bearer alice' }, fetch: (async (input, init) => {
+      if (new URL(String(input)).pathname === '/v1/mailbox-snapshot') {
+        requests++
+        expect(init?.method).toBe('POST')
+        expect(new Headers(init?.headers).get('accept')).toBe('application/x-ndjson')
+      }
+      const response = await fetch(input, init)
+      if (new URL(String(input)).pathname === '/v1/mailbox-snapshot') {
+        expect(response.headers.get('content-type')).toContain('application/x-ndjson')
+        expect(response.headers.get('cache-control')).toBe('no-store')
+        expect(response.headers.get('content-encoding')).toBeNull()
+        expect(response.headers.get('etag')).toBeNull()
+      }
+      return response
+    }) as typeof fetch })
+    const iterator = client.mailboxSnapshotPages(scope)
+    try {
+      const first: MailboxSnapshotPage = (await bounded(iterator.next(), 'first socket inventory page')).value!
+      expect(first.items).toHaveLength(500)
+      await bounded(barrier.entered, 'next real SDK page')
+      const target = first.items[0]!
+      await h.inbox.mutate('alice', { messageIds: [target.id], changes: { isRead: true, isStarred: true }, idempotencyKey: 'stream-flags' })
+      await h.inbox.setMailboxStates('alice', { id: 'stream-done', targets: [{ mailboxId: mailbox.id, messageId: target.id, revision: target.memberships[0]!.revision }], done: true })
+      box.put(native('stream-arrival'))
+      await h.sync('alice', account.id)
+      const beforeReads = structuredClone(box.calls)
+      barrier.release()
+      const pages = [first]
+      while (true) {
+        const next = await bounded(iterator.next(), 'remaining socket inventory')
+        if (next.done) break
+        pages.push(next.value)
+      }
+      expect(requests).toBe(1); expect(reads).toBe(3)
+      expect(pages.map(page => page.items.length)).toEqual([500, 500, 1])
+      for (const page of pages) {
+        expect(page).toMatchObject({ state: first.state, scopeState: first.scopeState, expiresAt: first.expiresAt, total: 1001 })
+        expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(4 * 1024 * 1024)
+        expect(page.items.every(item => item.sourceId === account.id)).toBe(true)
+        expect(JSON.stringify(page)).not.toContain(BODY_SECRET)
+      }
+      expect(pages.at(-1)!.nextCursor).toBeNull()
+      const current = new Map(pages.flatMap(page => page.items).map(item => [item.id, item]))
+      expect(current.size).toBe(1001)
+      expect([...current.values()].some(item => item.subject === 'Subject stream-arrival')).toBe(false)
+      let since = first.state
+      while (true) {
+        const delta = await client.mailboxChanges({ ...scope, since, scopeState: first.scopeState })
+        expect(delta.resetRequired).toBe(false)
+        for (const row of delta.upserts) current.set(row.id, row)
+        for (const row of delta.removed) current.delete(row.messageId)
+        since = delta.state
+        if (!delta.hasMore) break
+      }
+      expect(current.size).toBe(1002)
+      expect(current.get(target.id)).toMatchObject({ isRead: true, isStarred: true, memberships: [{ done: true }] })
+      expect([...current.values()].some(item => item.subject === 'Subject stream-arrival')).toBe(true)
+      expect(box.calls).toEqual(beforeReads)
+    } finally { barrier.release(); await iterator.return?.(); guard.mockRestore() }
+  })
+
+  test('breaking a real socket iterator disconnects a pending page and does not request further SDK pages', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-socket-cancel', [native('one'), native('two'), native('three')])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const barrier = h.gate(undefined), disconnected = deferred<void>(), settled = deferred<void>()
+    let reads = 0
+    const api = createInboxApi({ inbox: { ...h.inbox, mailboxSnapshot: async (...args) => {
+      const page = await h.inbox.mailboxSnapshot(...args)
+      if (++reads === 2) { await barrier.wait(); settled.resolve() }
+      return page
+    } }, authenticate: () => ({ id: 'alice' }) })
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+      request.signal.addEventListener('abort', () => disconnected.resolve(), { once: true })
+      return api.fetch(request)
+    } })
+    const client = createInboxClient({ baseUrl: `http://127.0.0.1:${server.port}` })
+    const iterator = client.mailboxSnapshotPages(scope)
+    try {
+      for await (const page of iterator) {
+        expect(page.items).toHaveLength(1)
+        await bounded(barrier.entered, 'in-flight socket page')
+        break
+      }
+      await bounded(disconnected.promise, 'socket cancellation')
+      barrier.release()
+      await bounded(settled.promise, 'cancelled SDK page settlement')
+      expect(reads).toBe(2)
+      expect(await iterator.next()).toEqual({ done: true, value: undefined })
+    } finally { barrier.release(); await iterator.return?.(); await server.stop(true) }
+  })
+
+  test('JSON stays single-page, NDJSON does not invalidate body validators, and the route documents both representations', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-negotiation', [native('one'), native('two')])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const wire = transport(h)
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' }, cacheScope: 'snapshot-stream' })
+    const json = await client.mailboxSnapshot(scope)
+    expect(json.items).toHaveLength(1); expect(json.nextCursor).not.toBeNull()
+    await client.message(json.items[0]!.id)
+    const pages: MailboxSnapshotPage[] = []
+    for await (const page of client.mailboxSnapshotPages(scope)) pages.push(page)
+    expect(pages.map(page => page.items.length)).toEqual([1, 1])
+    await client.message(json.items[0]!.id)
+    expect(wire.requests.at(-1)!.status).toBe(304)
+    const disabled = await h.request('alice', '/mailbox-snapshot', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/x-ndjson;q=0, application/json' }, body: JSON.stringify(scope) })
+    expect(disabled.headers.get('content-type')).toContain('application/json')
+    expect((await disabled.json() as MailboxSnapshotPage).items).toHaveLength(1)
+    const schema = await client.request<any>('/openapi.json')
+    const content = schema.paths['/v1/mailbox-snapshot'].post.responses['200'].content
+    expect(Object.keys(content).sort()).toEqual(['application/json', 'application/x-ndjson'])
+    expect(content['application/x-ndjson'].schema.$ref).toEndWith('/MailboxSnapshotFrame')
+  })
+
+  test('per-page authentication and core scope/expiry fences stop further rows with sanitized typed errors', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-fences', [native('one'), native('two')])
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const scope = { mailboxIds: [mailbox.id], limit: 1 }
+    for (const failure of ['revoked', 'owner', 'authentication', 'expired', 'scope'] as const) {
+      let identity: string | null = 'alice', unavailable = false, reads = 0
+      const api = createInboxApi({ inbox: { ...h.inbox, mailboxSnapshot: (...args) => { reads++; return h.inbox.mailboxSnapshot(...args) } }, authenticate: () => {
+        if (unavailable) throw new Error(SECRET)
+        return identity ? { id: identity } : null
+      } })
+      const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: ((input, init) => api.request(new Request(input, init))) as typeof fetch })
+      const iterator = client.mailboxSnapshotPages(scope)
+      expect((await iterator.next()).value!.items).toHaveLength(1)
+      expect(reads).toBe(1) // No eager read while the consumer is suspended.
+      if (failure === 'revoked') identity = null
+      if (failure === 'owner') identity = 'bob'
+      if (failure === 'authentication') unavailable = true
+      if (failure === 'expired') h.clock.value += 300001
+      if (failure === 'scope') await h.inbox.updateMailbox('alice', mailbox.id, { status: 'detached' }, mailbox.revision)
+      const error = await iterator.next().catch(error => error)
+      expect(error).toMatchObject({ name: 'ApiError', code: failure === 'expired' ? 'SNAPSHOT_EXPIRED' : failure === 'scope' ? 'SNAPSHOT_SCOPE_CHANGED' : failure === 'authentication' ? 'AUTHENTICATION_UNAVAILABLE' : 'UNAUTHENTICATED',
+        status: failure === 'expired' ? 410 : failure === 'scope' ? 409 : failure === 'authentication' ? 503 : 401 })
+      expect(error.message).not.toContain(SECRET)
+      expect(reads).toBe(['expired', 'scope'].includes(failure) ? 2 : 1)
+      await iterator.return?.()
+    }
+  })
+
+  test('snapshot slots are four per owner/eight total, independent of SSE, and cancellation releases them', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-slots', [native('one'), native('two')])
+    await h.seed('bob', 'snapshot-slots-bob', [native('one'), native('two')])
+    await h.inbox.connect('charlie', { providerId: FULL, credentials: { mailbox: 'snapshot-slots', accessToken: SECRET } })
+    const boxes = new Map(await Promise.all(['alice', 'bob', 'charlie'].map(async owner => [owner, (await h.inbox.mailboxes(owner))[0]!.id] as const)))
+    const api = createInboxApi({ inbox: h.inbox, authenticate: request => ({ id: request.headers.get('authorization')! }), maxStreamsPerOwner: 1 })
+    const responses: Response[] = []
+    const request = (owner: string) => api.request('/v1/mailbox-snapshot', { method: 'POST', headers: { authorization: owner, 'content-type': 'application/json', accept: 'application/x-ndjson' }, body: JSON.stringify({ mailboxIds: [boxes.get(owner)], limit: 1 }) })
+    try {
+      for (let index = 0; index < 4; index++) { const response = await request('alice'); expect(response.status).toBe(200); responses.push(response) }
+      const limited = await request('alice')
+      expect(limited.headers.get('retry-after')).toBe('1'); await invalid(limited, 429)
+      for (let index = 0; index < 4; index++) { const response = await request('bob'); expect(response.status).toBe(200); responses.push(response) }
+      await invalid(await request('charlie'), 429)
+      const events = await api.request('/v1/events', { headers: { authorization: 'alice' } })
+      expect(events.status).toBe(200); await events.body!.cancel()
+      await responses[0]!.body!.cancel()
+      const replacement = await request('charlie')
+      expect(replacement.status).toBe(200); responses.push(replacement)
+      await invalid(await request('alice'), 429)
+    } finally { await Promise.all(responses.map(response => response.body!.cancel().catch(() => {}))) }
+    const replacement = await request('alice')
+    expect(replacement.status).toBe(200); await replacement.body!.cancel()
+  })
+
+  test('abort and the five-minute deadline release slots even while initial SDK reads are pending', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-pending', [native('one'), native('two')])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const sample = await h.inbox.mailboxSnapshot('alice', scope)
+    const barrier = h.gate(sample)
+    const deadlines: Array<() => void> = []
+    const schedule = globalThis.setTimeout
+    const timers = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+      if (ms === 300000) deadlines.push(() => callback(...args))
+      return schedule(callback, ms, ...args)
+    }) as typeof setTimeout)
+    const api = createInboxApi({ inbox: { ...h.inbox, mailboxSnapshot: () => barrier.wait() }, authenticate: () => ({ id: 'alice' }) })
+    const controllers = Array.from({ length: 4 }, () => h.controller())
+    const requests = controllers.map(controller => Promise.resolve(api.request('/v1/mailbox-snapshot', { method: 'POST', signal: controller.signal,
+      headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' }, body: JSON.stringify(scope) })))
+    try {
+      await bounded(barrier.entered, 'pending snapshot setup')
+      // Let all four setup requests enter before checking the real admission limit.
+      while (deadlines.length < 4) await Bun.sleep(0)
+      controllers[0]!.abort()
+      await bounded(requests[0]!, 'cancelled setup')
+      deadlines[1]!()
+      const expired = await bounded(requests[1]!, 'deadline during setup')
+      expect(expired.status).toBe(504)
+      expect(await expired.json()).toMatchObject({ code: 'SNAPSHOT_STREAM_TIMEOUT', retryable: true })
+      const other = h.controller()
+      const replacement = Promise.resolve(api.request('/v1/mailbox-snapshot', { method: 'POST', signal: other.signal,
+        headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' }, body: JSON.stringify(scope) }))
+      barrier.release()
+      const resumed = await bounded(replacement, 'released snapshot capacity')
+      expect(resumed.status).toBe(200); await resumed.body!.cancel()
+      for (const response of await Promise.all(requests.slice(2))) await response.body!.cancel()
+    } finally { controllers.forEach(controller => controller.abort()); barrier.release(); await Promise.all(requests); timers.mockRestore() }
+  })
+
+  test('client parses split UTF-8 frames and rejects truncation, trailing data, inconsistent metadata and byte/membership overflows', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-parser', [native('one', { subject: 'Résumé 🦉' }), native('two')])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const first = await h.inbox.mailboxSnapshot('alice', scope)
+    const last = await h.inbox.mailboxSnapshot('alice', { ...scope, cursor: first.nextCursor! })
+    const encode = (page: MailboxSnapshotPage) => `${JSON.stringify({ type: 'page', page })}\n`
+    const consume = async (bytes: Uint8Array, split = false) => {
+      let offset = 0
+      const client = createInboxClient({ fetch: (async (_input, _init) => new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (offset === bytes.length) { controller.close(); return }
+          const end = split ? Math.min(bytes.length, offset + 1 + offset % 7) : bytes.length
+          controller.enqueue(bytes.subarray(offset, end)); offset = end
+        },
+      }), { headers: { 'content-type': 'application/x-ndjson' } })) as typeof fetch })
+      const pages: MailboxSnapshotPage[] = []
+      for await (const page of client.mailboxSnapshotPages(scope)) pages.push(page)
+      return pages
+    }
+    const text = encode(first) + encode(last)
+    expect(await consume(Buffer.from(text), true)).toEqual([first, last])
+    const empty = { ...first, items: [] }
+    expect(await consume(Buffer.from(encode(empty) + encode(last)))).toEqual([empty, last])
+    for (const malformed of [encode(first), text.slice(0, -1), text + encode(last), text + 'x', text + '\n',
+      ...['state', 'scopeState', 'expiresAt'].map(key => encode(first) + encode({ ...last, [key]: key === 'expiresAt' ? new Date(EPOCH + 600000).toISOString() : 'different' })),
+      encode(first) + encode({ ...last, total: 3 }), encode(first) + encode({ ...last, nextCursor: first.nextCursor }),
+      encode({ ...first, total: 100001 }), encode({ ...first, items: Array.from({ length: 501 }, () => first.items[0]!) }),
+      encode({ ...first, items: [{ ...first.items[0]!, memberships: Array.from({ length: 5001 }, () => first.items[0]!.memberships[0]!) }] }),
+      encode({ ...empty, total: 0 }), '{"type":"page","page":' + ' '.repeat(4 * 1024 * 1024 + 65),
+    ]) await expect(consume(Buffer.from(malformed))).rejects.toMatchObject({ code: 'INVALID_SNAPSHOT_STREAM' })
+    await expect(consume(new Uint8Array([0xff, 10]))).rejects.toMatchObject({ code: 'INVALID_SNAPSHOT_STREAM' })
+    const oversized = { ...last, extra: '' }
+    oversized.extra = 'x'.repeat(4 * 1024 * 1024 + 1 - Buffer.byteLength(JSON.stringify(oversized)))
+    expect(Buffer.byteLength(JSON.stringify(oversized))).toBe(4 * 1024 * 1024 + 1)
+    await expect(consume(Buffer.from(encode(first) + encode(oversized)))).rejects.toMatchObject({ code: 'INVALID_SNAPSHOT_STREAM' })
+    const client = createInboxClient({ fetch: (async (_input, _init) => Response.json(first)) as typeof fetch })
+    await expect(client.mailboxSnapshotPages(scope).next()).rejects.toMatchObject({ code: 'INVALID_SNAPSHOT_STREAM' })
+  })
+
+  test('client break, pending-read abort, credentials and deadline cancel the body without partial successful EOF', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-client-abort', [native('one'), native('two')])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const page = await h.inbox.mailboxSnapshot('alice', scope)
+    for (const action of ['break', 'abort', 'terminal-abort', 'credentials', 'deadline'] as const) {
+      let cancelled = 0, sent = false, deadline: (() => void) | undefined
+      const schedule = globalThis.setTimeout
+      const timers = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+        if (ms === 300000) deadline = () => callback(...args)
+        return schedule(callback, ms, ...args)
+      }) as typeof setTimeout)
+      const controller = h.controller()
+      const sentPage = action === 'terminal-abort' ? { ...page, nextCursor: null } : page
+      const client = createInboxClient({ fetch: (async (_input, _init) => new Response(new ReadableStream<Uint8Array>({
+        pull(output) { if (!sent) { sent = true; output.enqueue(Buffer.from(`${JSON.stringify({ type: 'page', page: sentPage })}\n`)) } },
+        cancel() { cancelled++ },
+      }, { highWaterMark: 0 }), { headers: { 'content-type': 'application/x-ndjson' } })) as typeof fetch })
+      const iterator = client.mailboxSnapshotPages(scope, { signal: controller.signal })
+      try {
+        if (action === 'break') { for await (const _page of iterator) break }
+        else {
+          expect((await iterator.next()).value).toEqual(sentPage)
+          const pending = iterator.next().catch(error => error)
+          if (action === 'abort' || action === 'terminal-abort') controller.abort()
+          if (action === 'credentials') client.setCredentials({ headers: { authorization: 'Bearer bob' } })
+          if (action === 'deadline') deadline!()
+          expect(await bounded(pending, 'cancelled inventory read')).toMatchObject({ name: action === 'deadline' ? 'TimeoutError' : 'AbortError' })
+        }
+        expect(cancelled).toBe(1)
+      } finally { await iterator.return?.(); timers.mockRestore() }
+    }
+  })
+})
+
 describe('mailbox action HTTP receipts', () => {
+  test('atomic reminder receipts survive lost acknowledgements, restart and elapsed time with exact conditional Undo', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account, box } = await h.seed('alice', 'durable-reminder', [native('remind-one', { threadId: 'reminder-thread' }), native('remind-two', { threadId: 'reminder-thread' })])
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!, scope = { mailboxIds: [mailbox.id] }
+    const original = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    const before: MailboxMembership[] = []
+    for (const [index, message] of original.entries()) before.push(await h.inbox.setMailboxState('alice', mailbox.id, message.id, {
+      done: index === 0, snoozedUntil: new Date(EPOCH + (index + 1) * 86400000).toISOString(),
+    }, message.memberships[0]!.revision))
+    const targets = before.map(({ mailboxId, messageId, revision }) => ({ mailboxId, messageId, revision }))
+    const when = EPOCH + 3 * 86400000
+    const input = { id: 'durable-reminder-command', targets, snoozedUntil: new Date(when).toUTCString() }
+    await expect(h.inbox.setMailboxStates('alice', { ...input, id: 'stale-reminder-target', targets: targets.map((target, index) => index ? { ...target, revision: 999 } : target) })).rejects.toMatchObject({ status: 412 })
+    expect((await h.inbox.mailboxMessagePage('alice', scope)).items.map(message => message.memberships[0])).toEqual(before)
+    await expect(h.inbox.mailboxStateReceipt('alice', 'stale-reminder-target')).rejects.toMatchObject({ status: 404 })
+    const wire = transport(h)
+    let loseAcknowledgement = true
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', headers: { authorization: 'Bearer alice' }, fetch: (async (url, init) => {
+      const response = await wire.fetch(url, init)
+      if (loseAcknowledgement && new URL(String(url)).pathname === '/v1/mailbox-actions' && init?.method === 'POST') { loseAcknowledgement = false; throw new TypeError('Synthetic lost reminder acknowledgement') }
+      return response
+    }) as typeof fetch })
+    await expect(client.setMailboxStates(input)).rejects.toThrow('Synthetic lost reminder acknowledgement')
+    const accepted = await client.mailboxStateReceipt(input.id)
+    expect(accepted).toEqual({ id: input.id, retracted: false, states: before.map(state => ({ ...state, snoozedUntil: new Date(when).toISOString(), revision: state.revision + 1 })) })
+    const acceptedState = (await h.inbox.changes('alice')).state
+    expect(await client.setMailboxStates(input)).toEqual(accepted)
+    expect((await h.inbox.changes('alice')).state).toBe(acceptedState)
+    await h.restart()
+    h.clock.value = when + 1
+    expect(await client.mailboxStateReceipt(input.id)).toEqual(accepted)
+    expect(await client.setMailboxStates(input)).toEqual(accepted)
+    expect((await h.inbox.changes('alice')).state).toBe(acceptedState)
+    await expect(client.setMailboxStates({ ...input, snoozedUntil: new Date(when + 86400000).toISOString() })).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT', status: 409 })
+    await expect(client.setMailboxStates({ ...input, done: false })).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT', status: 409 })
+    box.put(native('later-reminder-reply', { threadId: 'reminder-thread', receivedAt: new Date(h.clock.value).toISOString() }))
+    await h.sync('alice', account.id)
+    const providerCalls = structuredClone(box.calls)
+    const undone = await client.undoMailboxStates(input.id)
+    expect(undone).toEqual({ id: input.id, retracted: true, states: before.map(state => ({ ...state, revision: state.revision + 2 })) })
+    expect(await client.mailboxStateReceipt(input.id)).toEqual(undone)
+    expect(await client.undoMailboxStates(input.id)).toEqual(undone)
+    expect(await client.setMailboxStates(input)).toEqual(undone)
+    const current = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    for (const state of undone.states) expect(current.find(message => message.id === state.messageId)!.memberships[0]).toEqual(state)
+    expect(current.find(message => message.subject === 'Subject later-reminder-reply')!.memberships[0]).toMatchObject({ revision: 1, done: false, snoozedUntil: null })
+    expect(box.calls).toEqual(providerCalls)
+  })
+
+  test('reminder actions validate changes and byte limits, preserve Done on clear, and refuse stale atomic Undo', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { box } = await h.seed('alice', 'reminder-guards', [native('one'), native('two')])
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!, scope = { mailboxIds: [mailbox.id] }
+    const messages = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    const targets = messages.map(message => ({ mailboxId: mailbox.id, messageId: message.id, revision: 1 }))
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    const post = (body: unknown) => h.request('alice', '/mailbox-actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    for (const changes of [{}, { done: null }, { snoozedUntil: false }, { snoozedUntil: '' }, { snoozedUntil: 'invalid' }, { snoozedUntil: new Date(EPOCH).toISOString() }, { snoozedUntil: new Date(EPOCH - 1).toISOString() }, { snoozedUntil: null, force: true }]) {
+      await invalid(await post({ id: 'invalid-reminder', targets, ...changes }), 400)
+      await expect(h.inbox.setMailboxStates('alice', { id: 'invalid-reminder', targets, ...changes } as never)).rejects.toMatchObject({ code: 'VALIDATION' })
+    }
+    const body = JSON.stringify({ id: 'oversized-reminder', targets, snoozedUntil: null }) + ' '.repeat(1024 * 1024)
+    await invalid(await h.request('alice', '/mailbox-actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body }), 413)
+    await expect(client.mailboxStateReceipt('oversized-reminder')).rejects.toMatchObject({ status: 404 })
+    const providerCalls = structuredClone(box.calls), snoozedUntil = new Date(EPOCH + 86400000).toISOString()
+    const input = { id: 'mixed-reminder-command', targets, done: true, snoozedUntil }
+    const accepted = await client.setMailboxStates(input)
+    expect(accepted.states.every(state => state.done && state.snoozedUntil === snoozedUntil && state.revision === 2)).toBe(true)
+    await h.inbox.setMailboxState('alice', mailbox.id, targets[1]!.messageId, { done: false }, 2)
+    const beforeUndo = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    await expect(client.undoMailboxStates(input.id)).rejects.toMatchObject({ code: 'PRECONDITION_FAILED', status: 412 })
+    expect((await h.inbox.mailboxMessagePage('alice', scope)).items).toEqual(beforeUndo)
+    expect(await client.mailboxStateReceipt(input.id)).toEqual(accepted)
+    expect(await client.setMailboxStates(input)).toEqual(accepted)
+    const cleared = await client.setMailboxStates({ id: 'clear-reminder-only', targets: [{ ...targets[0]!, revision: 2 }], snoozedUntil: null })
+    expect(cleared.states[0]).toMatchObject({ done: true, snoozedUntil: null, revision: 3 })
+    const legacy = await client.setMailboxStates({ id: 'legacy-done-clears-reminder', targets: [{ ...targets[1]!, revision: 3 }], done: false })
+    expect(legacy.states[0]).toMatchObject({ done: false, snoozedUntil: null, revision: 4 })
+    expect(box.calls).toEqual(providerCalls)
+  })
+
+  test('receipt GET is uncached, owner-exact and historical without replay, retraction, events, count changes or provider work', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const alice = await h.seed('alice', 'receipt-reader-alice'), bob = await h.seed('bob', 'receipt-reader-bob')
+    const aliceMailbox = (await h.inbox.mailboxes('alice'))[0]!, bobMailbox = (await h.inbox.mailboxes('bob'))[0]!
+    const aliceMessage = (await h.inbox.mailboxMessagePage('alice', { mailboxIds: [aliceMailbox.id] })).items[0]!
+    const bobMessage = (await h.inbox.mailboxMessagePage('bob', { mailboxIds: [bobMailbox.id] })).items[0]!
+    const id = 'r'.repeat(128)
+    const accepted = await h.inbox.setMailboxStates('alice', { id, done: true, targets: [{ mailboxId: aliceMailbox.id, messageId: aliceMessage.id, revision: 1 }] })
+    const foreign = await h.inbox.setMailboxStates('bob', { id, done: true, targets: [{ mailboxId: bobMailbox.id, messageId: bobMessage.id, revision: 1 }] })
+    await h.inbox.setMailboxStates('alice', { id: 'alice-only', done: false, targets: [{ mailboxId: aliceMailbox.id, messageId: aliceMessage.id, revision: 2 }] })
+    const database = new Database(h.database)
+    await h.restart(database)
+    const scope = { mailboxIds: [aliceMailbox.id] }, before = await h.inbox.changes('alice'), counts = await h.inbox.mailboxCounts('alice', scope)
+    const calls = [alice.box, bob.box].map(box => structuredClone(box.calls))
+    const wire = transport(h), client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' }, cacheScope: 'receipt-reader' })
+    const query = database.query.bind(database), statements: string[] = []
+    const guard = spyOn(database, 'query').mockImplementation(((sql: string) => { statements.push(sql); return query(sql) }) as typeof database.query)
+    const undo = spyOn(h.inbox, 'undoMailboxStates').mockImplementation(async () => { throw new Error('Reading must not retract a receipt') })
+    const replay = spyOn(h.inbox, 'setMailboxStates').mockImplementation(async () => { throw new Error('Reading must not replay a receipt') })
+    database.exec('PRAGMA query_only=ON')
+    try {
+      for (let index = 0; index < 10; index++) {
+        const receipt = await client.mailboxStateReceipt(id)
+        expect(receipt).toEqual(accepted)
+        receipt.states[0]!.done = false
+      }
+      expect(undo).not.toHaveBeenCalled(); expect(replay).not.toHaveBeenCalled()
+      expect(statements).toHaveLength(10)
+      expect(statements.every(sql => sql === 'SELECT data FROM sdk_mailbox_actions WHERE owner=? AND id=?')).toBe(true)
+    } finally { guard.mockRestore(); undo.mockRestore(); replay.mockRestore(); database.exec('PRAGMA query_only=OFF') }
+    expect(wire.requests.every(request => request.method === 'GET' && request.status === 200 && request.etag === null && !request.headers.has('if-none-match') && request.body === null)).toBe(true)
+    expect(await h.inbox.changes('alice', { since: before.state })).toMatchObject({ state: before.state, events: [] })
+    expect(await h.inbox.mailboxCounts('alice', scope)).toEqual(counts)
+    expect((await h.inbox.mailboxMessagePage('alice', scope)).items[0]!.memberships[0]!.done).toBe(false)
+    expect([alice.box, bob.box].map(box => box.calls)).toEqual(calls)
+    expect(await h.inbox.mailboxStateReceipt('bob', id)).toEqual(foreign)
+    await expect(h.inbox.mailboxStateReceipt('bob', 'alice-only')).rejects.toMatchObject({ status: 404 })
+    await expect(h.inbox.mailboxStateReceipt('Alice', id)).rejects.toMatchObject({ status: 404 })
+    await expect(h.inbox.mailboxStateReceipt('', id)).rejects.toMatchObject({ status: 401 })
+    for (const invalidId of ['', 'r'.repeat(129), 'bad\nreceipt']) await expect(h.inbox.mailboxStateReceipt('alice', invalidId)).rejects.toMatchObject({ code: 'VALIDATION' })
+    await invalid(await h.request(null, `/mailbox-actions/${id}`), 401)
+    await invalid(await h.request('bob', '/mailbox-actions/alice-only'), 404)
+    await invalid(await h.request('alice', '/mailbox-actions/missing'), 404)
+    await invalid(await h.request('alice', `/mailbox-actions/${'r'.repeat(129)}`), 400)
+    await invalid(await h.request('alice', `/mailbox-actions/${id}?undo=true`), 400)
+    const response = await h.request('alice', `/mailbox-actions/${id}`, { headers: { 'if-none-match': '*' } })
+    expect(response.status).toBe(200); expect(response.headers.get('cache-control')).toBe('no-store')
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer'); expect(response.headers.get('etag')).toBeNull()
+    expect(await response.json()).toEqual(accepted)
+    for (let index = 0; index < 6; index++) await h.inbox.mailboxSnapshot('alice', scope)
+    h.clock.value += 300001
+    await h.inbox.updateMailbox('alice', aliceMailbox.id, { status: 'detached' }, aliceMailbox.revision)
+    await h.inbox.disconnect('alice', alice.account.id)
+    expect(await client.mailboxStateReceipt(id)).toEqual(accepted)
+    expect(await client.mailboxStateReceipt('alice-only')).toMatchObject({ retracted: false, states: [{ done: false, revision: 3 }] })
+  })
+
   test('client Done and Undo return exact body-free memberships without hydration, scans or provider writes', async () => {
     const h = await fixture({ allowProviderWrites: false })
     const { account, box } = await h.seed('alice', 'http-local-done', [native('one'), native('two')])
@@ -2476,11 +3642,18 @@ describe('mailbox action HTTP receipts', () => {
     const accepted = await client.setMailboxStates(input)
     expect(accepted).toEqual({ id: input.id, retracted: false, states: targets.map(target => ({ mailboxId: target.mailboxId, messageId: target.messageId, revision: target.revision + 1, done: true, snoozedUntil: null })) })
     expect(wire.requests.map(request => [request.method, request.path])).toEqual([['POST', '/v1/mailbox-actions']])
+    const legacyHash = createHash('sha256').update(JSON.stringify({ done: true, id: input.id, targets: targets.map(({ mailboxId, messageId, messageRevision, revision }) => ({ mailboxId, messageId, messageRevision, revision })) })).digest('hex')
+    const persisted = new Database(h.database, { readonly: true })
+    try { expect(persisted.query<{ fingerprint: string }, [string, string]>('SELECT fingerprint FROM sdk_mailbox_actions WHERE owner=? AND id=?').get('alice', input.id)?.fingerprint).toBe(legacyHash) }
+    finally { persisted.close() }
+    expect(await h.inbox.setMailboxStates('alice', { ...input, snoozedUntil: undefined })).toEqual(accepted)
+    expect(await client.mailboxStateReceipt(input.id)).toEqual(accepted)
     expect(await client.setMailboxStates(input)).toEqual(accepted)
     const undone = await client.undoMailboxStates(input.id)
     expect(undone.retracted).toBe(true)
     expect(undone.states).toEqual(accepted.states.map(state => ({ ...state, done: false, revision: state.revision + 1 })))
     const newer = await h.inbox.setMailboxState('alice', mailbox.id, messages[0]!.id, { done: true }, undone.states[0]!.revision)
+    expect(await client.mailboxStateReceipt(input.id)).toEqual(undone)
     expect(await client.undoMailboxStates(input.id)).toEqual(undone)
     expect(await client.setMailboxStates(input)).toEqual(undone)
     const current = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.find(message => message.id === newer.messageId)!
@@ -2492,6 +3665,9 @@ describe('mailbox action HTTP receipts', () => {
     const schema = await client.request<any>('/openapi.json')
     expect(schema.components.schemas.MailboxAction.properties.targets.maxItems).toBe(500)
     expect(schema.components.schemas.MailboxStateReceipt.properties.states.maxItems).toBe(500)
+    const read = schema.paths['/v1/mailbox-actions/{id}'].get
+    expect(read.responses['200'].headers['Cache-Control'].schema.const).toBe('no-store')
+    expect(read.responses['304']).toBeUndefined()
   })
 
   test('HTTP local actions retain owner, membership/message fences, atomicity and idempotency conflicts', async () => {
@@ -2520,23 +3696,37 @@ describe('mailbox action HTTP receipts', () => {
     const h = await fixture({ allowProviderWrites: false })
     const { account } = await h.seed('alice', 'http-local-bound', Array.from({ length: 500 }, (_, index) => native(`bound-${index}`)))
     const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
-    const targets: Array<{ mailboxId: string; messageId: string; revision: number }> = []
+    const targets: Array<{ mailboxId: string; messageId: string; revision: number; messageRevision: number }> = []
     let cursor: string | undefined
     do {
       const page = await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id], limit: 100, ...(cursor ? { cursor } : {}) })
-      targets.push(...page.items.map(message => ({ mailboxId: mailbox.id, messageId: message.id, revision: message.memberships[0]!.revision })))
+      targets.push(...page.items.map(message => ({ mailboxId: mailbox.id, messageId: message.id, revision: message.memberships[0]!.revision, messageRevision: message.revision })))
       cursor = page.nextCursor ?? undefined
     } while (cursor)
     const wire = transport(h)
     const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' } })
     await expect(client.setMailboxStates({ id: 'too-many', targets: [...targets, targets[0]!], done: true })).rejects.toMatchObject({ status: 400 })
     await invalid(await h.request('alice', '/mailbox-actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'extra-field', targets: [targets[0]], done: true, force: true }) }), 400)
-    const result = await client.setMailboxStates({ id: 'maximum-targets', targets, done: true })
+    const input = { id: 'maximum-targets', targets, done: true }
+    expect(Buffer.byteLength(JSON.stringify(input))).toBeGreaterThan(64 * 1024)
+    expect(Buffer.byteLength(JSON.stringify(input))).toBeLessThan(1024 * 1024)
+    const result = await client.setMailboxStates(input)
     expect(result.states).toHaveLength(500)
     expect(result.states.every(state => state.done && state.revision === 2)).toBe(true)
+    const acceptedState = (await h.inbox.changes('alice')).state
+    expect(await client.setMailboxStates(input)).toEqual(result)
+    expect((await h.inbox.changes('alice')).state).toBe(acceptedState)
+    expect(await client.mailboxStateReceipt(result.id)).toEqual(result)
     const undone = await client.undoMailboxStates(result.id)
     expect(undone.states).toHaveLength(500)
     expect(undone.states.every(state => !state.done && state.revision === 3)).toBe(true)
+    const reminder = { id: 'maximum-reminder-targets', targets: targets.map(target => ({ ...target, revision: 3 })), snoozedUntil: new Date(EPOCH + 86400000).toISOString() }
+    expect(Buffer.byteLength(JSON.stringify(reminder))).toBeGreaterThan(64 * 1024)
+    const reminded = await client.setMailboxStates(reminder)
+    expect(reminded.states).toHaveLength(500)
+    expect(reminded.states.every(state => !state.done && state.revision === 4 && state.snoozedUntil === reminder.snoozedUntil)).toBe(true)
+    expect(await client.setMailboxStates(reminder)).toEqual(reminded)
+    expect(await client.mailboxStateReceipt(reminder.id)).toEqual(reminded)
   })
 })
 
@@ -9971,6 +11161,70 @@ describe('AI triage service', () => {
     }
   })
 
+  test('saved AI lookup authorizes real assessed decisions through cached metadata without reader bodies or writes', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    h.discoveries.set('ai-lookup-scoped', { sources: ['alpha.example.test', 'beta.example.test'].map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const { account, box } = await h.connect('alice', 'ai-lookup-scoped', [native('lookup-alpha', { sourceDomains: ['alpha.example.test'] }), native('lookup-beta', { sourceDomains: ['beta.example.test'] })], SCOPED)
+    const alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    const beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    await h.sync('alice', account.id)
+    const foreign = await h.seed('bob', 'ai-lookup-foreign')
+    const foreignMessage = (await h.page('bob')).items[0]!
+    let forbidBodies = false, bodyReads = 0, metadataReads = 0, inferenceCalls = 0, summaryFailure: number | null = null
+    const guarded: Inbox = { ...h.inbox,
+      message: async (...args) => { if (forbidBodies) { bodyReads++; throw new Error('Saved lookup must not read a body') }; return h.inbox.message(...args) },
+      mailboxMessage: async (...args) => { if (forbidBodies) { bodyReads++; throw new Error('Saved lookup must not read a mailbox body') }; return h.inbox.mailboxMessage(...args) },
+      mailboxMessageSummary: async (...args) => { metadataReads++; const summary = await h.inbox.mailboxMessageSummary(...args); if (summaryFailure) throw new InboxError('NOT_FOUND', 'Synthetic metadata authorization fence', summaryFailure); return summary },
+    }
+    const options = { database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async () => { inferenceCalls++; return Response.json(response) }) as unknown as typeof fetch }
+    let service = createAiTriageService(options)
+    cleanup.push(async () => { database.exec('PRAGMA query_only=OFF'); await service.close(); database.close() })
+    await service.start(); await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true, mailboxIds: [alpha.id] })
+    await service.process('alice', { id: 'ai-lookup-assessment', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 1) await Bun.sleep(10) })(), 'real lookup assessment')
+    const expected = (await service.results('alice')).decisions[0]!
+    expect(expected).toMatchObject({ state: 'ready', assessment, sourceId: account.id, mailboxIds: [alpha.id] })
+    await service.close()
+    service = createAiTriageService(options) // No background worker while testing saved reads.
+    forbidBodies = true
+    const key = { sourceId: account.id, threadId: expected.threadId }, calls = structuredClone(box.calls), sdkState = (await h.inbox.changes('alice')).state
+    const writes = database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count
+    database.exec('PRAGMA query_only=ON')
+    const beforeMetadata = metadataReads
+    const saved = await service.lookup('alice', Array.from({ length: 100 }, () => key)).catch(error => { expect(bodyReads).toBe(0); throw error })
+    expect(saved.decisions).toEqual([expected])
+    expect(metadataReads - beforeMetadata).toBe(1)
+    expect(await service.lookup('alice', [])).toMatchObject({ decisions: [], removed: [], hasMore: false, resetRequired: false })
+    expect((await service.lookup('bob', [key])).decisions).toEqual([])
+    expect((await service.lookup('alice', [{ sourceId: foreign.account.id, threadId: foreignMessage.threadId }, { sourceId: account.id, threadId: 'missing' }])).decisions).toEqual([])
+    await expect(service.lookup('alice', Array.from({ length: 101 }, () => key))).rejects.toMatchObject({ code: 'AI_LOOKUP_LIMIT' })
+    await expect(service.lookup('alice', [{ sourceId: account.id, threadId: '' }])).rejects.toMatchObject({ code: 'AI_INVALID_KEY' })
+    for (const status of [403, 404, 409]) { summaryFailure = status; expect((await service.lookup('alice', [key])).decisions).toEqual([]) }
+    summaryFailure = null
+    expect(database.query<{ count: number }, []>('SELECT total_changes() count').get()!.count).toBe(writes)
+    expect((await h.inbox.changes('alice')).state).toBe(sdkState)
+    expect(box.calls).toEqual(calls); expect(bodyReads).toBe(0); expect(inferenceCalls).toBe(1)
+    database.exec('PRAGMA query_only=OFF')
+    // Pausing automatic triage preserves a ready receipt; reading must not re-enable it.
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: false })
+    const paused = (await service.state('alice')).settings
+    expect((await service.lookup('alice', [key])).decisions).toEqual([expected])
+    expect((await service.state('alice')).settings).toEqual(paused)
+    await service.configure('alice', { ...paused, mailboxIds: [beta.id] })
+    expect((await service.lookup('alice', [key])).decisions).toEqual([])
+    await service.configure('alice', { ...(await service.state('alice')).settings, mailboxIds: [alpha.id], model: 'fixture-model-next' })
+    expect((await service.lookup('alice', [key])).decisions[0]).toMatchObject({ sourceId: account.id, threadId: key.threadId, state: 'stale', score: null, holdUntil: null, problemCode: 'AI_SETTINGS_CHANGED' })
+    await h.inbox.updateMailbox('alice', alpha.id, { status: 'paused' }, alpha.revision)
+    expect((await service.lookup('alice', [key])).decisions).toEqual([])
+    await h.inbox.updateMailbox('alice', alpha.id, { status: 'active' }, alpha.revision + 1)
+    await h.inbox.disconnect('alice', account.id)
+    expect((await service.lookup('alice', [key])).decisions).toEqual([])
+    await h.inbox.updateMailbox('alice', alpha.id, { status: 'detached' }, alpha.revision + 2)
+    expect((await service.lookup('alice', [key])).decisions).toEqual([])
+    expect(bodyReads).toBe(0); expect(inferenceCalls).toBe(1)
+  })
+
   test('saved AI result and change pages bypass reader presentation while preserving pagination, scope removals and event deduplication', async () => {
     const h = await fixture(), database = new Database(':memory:')
     h.discoveries.set('ai-page-scoped', { sources: ['alpha.example.test', 'beta.example.test'].map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
@@ -10053,6 +11307,9 @@ describe('AI triage service', () => {
       expect([...latest.decisions, ...tail.decisions].map(value => value.threadId).sort()).toEqual([...current.keys()].sort())
       expect(current.has(done.threadId)).toBe(true)
       expect(current.has(snoozed.threadId)).toBe(true)
+      const lookup = await service.lookup('alice', [...selected.slice(0, 9), ...initial.filter(value => !value.mailboxIds.includes(alpha.id))].map(value => ({ sourceId: value.sourceId, threadId: value.threadId })))
+      expect(lookup.decisions.map(value => value.threadId).sort()).toEqual([done.threadId, snoozed.threadId].sort())
+      expect(lookup.decisions.every(value => value.state === 'stale')).toBe(true)
       expect(await h.inbox.mailboxMessageSummary('alice', alpha.id, done.latestMessageId)).toEqual(canonical)
       expect(box.calls).toEqual(before)
       expect(database.query<{ count: number }, []>('SELECT COUNT(*) count FROM local_ai_feedback').get()!.count).toBe(0)

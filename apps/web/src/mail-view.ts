@@ -1,3 +1,4 @@
+import type { InboxTotals } from "../../shared/inbox-window";
 import type { Mail, MailboxOption, Preferences } from "./data.ts";
 import { currentAiDecision, inFolder, UNIFIED_ACCOUNT } from "./mail-model.ts";
 import { compileSearch } from "./mail-search.ts";
@@ -180,6 +181,7 @@ export function selectMailView(
   filter: string | null,
   serverMatches?: ReadonlySet<string>,
   mobile = false,
+  window?: { keys: readonly string[]; totals: InboxTotals },
 ) {
   const rules = preferences.splitRules as Record<string, string> | undefined;
   const aliases = preferences.splitAliases as
@@ -189,15 +191,20 @@ export function selectMailView(
     const query = rules?.[name];
     return [name, { category, matches: !category && typeof query === "string" && query.trim() ? compileSearch(query, false) : undefined }] as const;
   }));
-  const splitCounts = Object.fromEntries(preferences.splits.map(name => [name, 0]));
+  const splitCounts: Record<string, number | null> = window ? window.totals.splits : Object.fromEntries(preferences.splits.map(name => [name, 0]));
   const countedSplits = [...new Set(preferences.splits)];
   const queryMatches = search && !serverMatches ? compileSearch(query) : undefined;
   const searchHidden = /in:(trash|spam)/i.test(query);
   const visibleMail: Mail[] = [];
   const now = Date.now();
   let holdingMail = false;
-  let inboxCount = 0;
-  for (const message of accountMail) {
+  let inboxCount: number | null = window ? window.totals.inbox : 0;
+  const activeKeys = window && new Set(window.keys);
+  if (window) holdingMail = window.totals.holding === true;
+  const byId = window ? new Map(accountMail.map(mail => [mail.id, mail])) : null;
+  const ordered = window ? [...window.keys.flatMap(key => byId!.has(key) ? [byId!.get(key)!] : []), ...accountMail.filter(mail => mail.operationId && !activeKeys!.has(mail.id))] : accountMail;
+  for (const message of ordered) {
+    if (activeKeys) { if (activeKeys.has(message.id) || message.operationId) visibleMail.push(message); continue; }
     const inbox = inFolder(message, "Inbox");
     if (!search && folder === "Inbox" && inbox && (message.aiHoldUntil ?? 0) > now) { holdingMail = true; continue; }
     const attention = inbox || filter === "Important" ? conversationAttention(message) : undefined;
@@ -207,10 +214,10 @@ export function selectMailView(
     };
     let selectedSplit = false;
     if (inbox) {
-      if (attention === "Important") inboxCount++;
+      if (attention === "Important") inboxCount = (inboxCount ?? 0) + 1;
       for (const name of countedSplits) {
         const matches = matchesSplit(name);
-        if (matches) splitCounts[name]++;
+        if (matches) splitCounts[name] = (splitCounts[name] ?? 0) + 1;
         if (name === split) selectedSplit = matches;
       }
       if (!Object.hasOwn(splitCounts, split)) selectedSplit = matchesSplit(split);
@@ -233,7 +240,7 @@ export function selectMailView(
   }
   const shownSplits = preferences.splits.filter(
     (name) =>
-      !preferences.hideEmptySplits || name === split || splitCounts[name] > 0,
+      !preferences.hideEmptySplits || name === split || splitCounts[name] == null || splitCounts[name]! > 0,
   );
   const rowHeight = mobile ? 44 : preferences.density === "Compact" ? 30 : 36;
   const entries: MailListEntry[] = [];

@@ -77,6 +77,9 @@ type ThreadViewProps = {
   accounts: MailboxOption[];
   loadSendingIdentities: LoadSendingIdentities;
   contacts: Array<{ name: string; email: string }>;
+  loadContacts?: (query: string) => Promise<Array<{ name: string; email: string }>>;
+  onLoadMessage?: (id: string) => Promise<void>;
+  onLoadOlder?: () => Promise<void>;
   onBack: () => void;
   onNavigate: (delta: number) => void;
   onAction: (action: string) => void;
@@ -109,6 +112,9 @@ export default function ThreadView({
   accounts,
   loadSendingIdentities,
   contacts,
+  loadContacts,
+  onLoadMessage,
+  onLoadOlder,
   onBack,
   onNavigate,
   onAction,
@@ -130,7 +136,7 @@ export default function ThreadView({
   onAiReading,
   aiReadingEnabled = false,
 }: ThreadViewProps) {
-  const explicitCategory = currentCategoryOverride(mail, mail.attentionOverride?.override)?.category;
+  const explicitCategory = mail.window ? mail.attentionOverride?.override?.category : currentCategoryOverride(mail, mail.attentionOverride?.override)?.category;
   const [expanded, setExpanded] = useState<string[]>([
     messageKey(mail.messages.at(-1)),
   ]);
@@ -148,6 +154,21 @@ export default function ThreadView({
     () => readText(`unsubscribed:${mail.email}`) === "true",
   );
   const scroller = useRef<HTMLDivElement>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const messageCount = mail.window ? mail.window.counts.messages : mail.messages.length;
+  useEffect(() => {
+    if (!mail.window || !onLoadMessage || !scroller.current) return;
+    const missing = new Set(mail.messages.filter(message => message.loaded === false).map(message => message.id));
+    const observer = new IntersectionObserver(entries => {
+      for (const entry of entries) if (entry.isIntersecting) {
+        const id = (entry.target as HTMLElement).dataset.threadMessage;
+        if (id && missing.delete(id)) void onLoadMessage(id).catch(() => {});
+      }
+    }, { root: scroller.current, rootMargin: "200px" });
+    for (const element of scroller.current.querySelectorAll(".thread-message.is-expanded")) observer.observe(element);
+    return () => observer.disconnect();
+  }, [mail, expanded, onLoadMessage]);
   const readerPane = useRef<HTMLElement>(null);
   const messageColumn = useRef<HTMLDivElement>(null);
   const backGutter = useRef<HTMLButtonElement>(null);
@@ -661,9 +682,16 @@ export default function ThreadView({
               {mail.operationId && <button type="button" className="text-button" onClick={() => onAction("cancel")}>Cancel send</button>}
             </div>
           )}
-          {mail.messages.length > 1 && (
+          {mail.window && !mail.window.messagesComplete && !mail.historyExhausted && onLoadOlder && <div role="status">
+            <button type="button" className="text-button" disabled={historyLoading} onClick={() => {
+              setHistoryLoading(true); setHistoryError("");
+              void onLoadOlder().catch(error => setHistoryError(error instanceof Error ? error.message : "Could not load conversation history.")).finally(() => setHistoryLoading(false));
+            }}>{historyLoading ? "Loading history…" : "Load more messages"}</button>
+            {historyError && <span role="alert">{historyError}</span>}
+          </div>}
+          {(messageCount === null || messageCount > 1) && (
             <div className="thread-conversation-controls">
-              <span>{mail.messages.length} messages</span>
+              <span>{messageCount ?? "…"} messages</span>
               <button
                 type="button"
                 title="Expand or collapse all (Shift+O)"
@@ -981,6 +1009,7 @@ export default function ThreadView({
                       accounts={accounts}
                       loadSendingIdentities={loadSendingIdentities}
                       contacts={contacts}
+                      loadContacts={loadContacts}
                       onChange={onDraftChange}
                       onSearch={onSearch}
                       onToggleFocus={onToggleFocus}

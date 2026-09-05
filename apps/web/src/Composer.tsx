@@ -32,6 +32,7 @@ type ComposerProps = {
   accounts: MailboxOption[];
   loadSendingIdentities: LoadSendingIdentities;
   contacts?: Array<{ name: string; email: string }>;
+  loadContacts?: (query: string) => Promise<Array<{ name: string; email: string }>>;
   onChange: (draft: Draft) => void;
   onSend: (draft: Draft, when?: string, options?: SendOptions) => Promise<boolean>;
   onDiscard: () => Promise<boolean>;
@@ -65,6 +66,7 @@ function RecipientField({
   value,
   onChange,
   onExpand,
+  loadContacts,
   contacts,
 }: {
   label: string;
@@ -72,6 +74,7 @@ function RecipientField({
   onChange: (value: string) => void;
   onExpand: () => void;
   contacts: Array<{ name: string; email: string }>;
+  loadContacts?: ComposerProps["loadContacts"];
 }) {
   const id = useId();
   const input = useRef<HTMLInputElement>(null);
@@ -82,7 +85,14 @@ function RecipientField({
   const chips = query.trim()
     ? all.slice(0, Math.max(0, all.length - addresses(query).length))
     : all;
-  const results = contacts
+  const [found, setFound] = useState<{ query: string; contacts: typeof contacts } | null>(null);
+  useEffect(() => {
+    if (!loadContacts || !focused || !query.trim()) return;
+    let stopped = false;
+    const timer = setTimeout(() => { void loadContacts(query).then(contacts => { if (!stopped) setFound({ query, contacts }); }).catch(() => {}); }, 150);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [loadContacts, focused, query]);
+  const results = (loadContacts ? found?.query === query ? found.contacts : [] : contacts)
     .filter(
       (contact) =>
         `${contact.name} ${contact.email}`
@@ -259,6 +269,7 @@ export default function Composer({
   accounts,
   loadSendingIdentities,
   contacts = [],
+  loadContacts,
   onChange,
   onSend,
   onDiscard,
@@ -961,6 +972,7 @@ export default function Composer({
               <RecipientField
                 key={`${draft.id}-to`}
                 contacts={contacts}
+                loadContacts={loadContacts}
                 label="To"
                 value={draft.to}
                 onChange={(to) => update({ to })}
@@ -971,6 +983,7 @@ export default function Composer({
                   <RecipientField
                     key={`${draft.id}-cc`}
                     contacts={contacts}
+                loadContacts={loadContacts}
                     label="Cc"
                     value={draft.cc}
                     onChange={(cc) => update({ cc })}
@@ -979,6 +992,7 @@ export default function Composer({
                   <RecipientField
                     key={`${draft.id}-bcc`}
                     contacts={contacts}
+                loadContacts={loadContacts}
                     label="Bcc"
                     value={draft.bcc}
                     onChange={(bcc) => update({ bcc })}

@@ -1,3 +1,5 @@
+.mail-window-status { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 12px 20px; color: var(--muted); font-size: 13px; }
+.mail-window-status:empty { display: none; }
 .inbox-refresh { padding: 0; }
 .inbox-refresh[aria-busy="true"] .icon { animation: inbox-refresh-spin 900ms linear 150ms infinite; }
 @keyframes inbox-refresh-spin { to { transform: rotate(360deg); } }
