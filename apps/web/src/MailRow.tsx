@@ -24,7 +24,7 @@ function MailRow({
       key={m.id}
       data-motion-id={m.id}
       data-mail-id={m.id}
-      className={`mail-row ${highlighted ? "highlighted" : ""} ${selected ? "selected" : ""} ${m.unread ? "unread" : ""} ${m.mailboxNames?.length ? "has-mailbox" : ""}`}
+      className={`mail-row has-recipients ${highlighted ? "highlighted" : ""} ${selected ? "selected" : ""} ${m.unread ? "unread" : ""}`}
       role="row"
       aria-rowindex={i + 1}
       aria-selected={selected}
@@ -56,7 +56,9 @@ function MailRow({
           {m.labels[0]}
         </span>
       )}
-      {!!m.mailboxNames?.length && <span className="row-mailbox" role="cell" title={m.mailboxNames.join(", ")}>{m.mailboxNames[0]}{m.mailboxNames.length > 1 ? ` +${m.mailboxNames.length - 1}` : ""}</span>}
+      <span className="row-recipients" role="cell" title={m.to ? `To: ${m.to}` : "To recipients not shown"}>
+        {m.to ? `To: ${m.to}` : "To recipients not shown"}
+      </span>
       <span className="row-metadata">
         {m.starred && <Icon name="Star" size={13} className="starred-icon" />}
         {m.messages.some((msg) => msg.hasAttachments || msg.attachments?.length) && (

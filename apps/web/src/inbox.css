@@ -4,11 +4,11 @@
 @media (prefers-reduced-motion: reduce) {
   .inbox-refresh[aria-busy="true"] .icon { animation: none; }
 }
-.row-mailbox { flex: 0 1 130px; max-width: 130px; min-width: 0; margin-inline-start: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-.mail-row.has-mailbox .row-metadata { min-width: 84px; }
+.row-recipients { flex: 0 1 130px; max-width: 130px; min-width: 0; margin-inline-start: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.mail-row.has-recipients .row-metadata { min-width: 84px; }
 @media (min-width: 701px) {
   /* Highlight swaps metadata (8 + 84) for actions (84 - 6 right margin); 14px keeps the swap width-neutral. */
-  .mail-row.has-mailbox .row-actions { margin-left: 14px; }
+  .mail-row.has-recipients .row-actions { margin-left: 14px; }
   .mail-workspace:not([data-folder="Reminders"]):not([data-folder="Scheduled"]) .mail-row {
     --row-status-width: max(93px, calc(9ch + 41px));
   }
