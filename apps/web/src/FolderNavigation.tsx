@@ -6,7 +6,7 @@ type FolderNavigationProps = {
   open: boolean;
   account: string;
   folder: string;
-  inboxCount: number;
+  inboxCount: number | null;
   labels: string[];
   onClose: () => void;
   onAccounts: () => void;
@@ -65,7 +65,7 @@ function FolderNavigation({
                   )}
                 </span>
                 {folder === "Inbox" && (
-                  <span className="folder-count">{inboxCount}</span>
+                  <span className="folder-count">{inboxCount ?? "…"}</span>
                 )}
                 {key && (
                   <span className="shortcut">

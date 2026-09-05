@@ -12,10 +12,12 @@ import {
   type PointerEvent,
 } from "react";
 import { flushSync } from "react-dom";
+import type { InboxViewQuery, InboxSelection, InboxTotals } from "../../shared/inbox-window";
 import { ApiError } from "inbox-sdk/client";
 import { aiSortingStatus } from "../../shared/ai-triage";
 import {
   defaultPreferences,
+  captureActionMail,
   displayDate,
   folders,
   loadSaved,
@@ -55,6 +57,7 @@ import SenderContext from "./SenderContext";
 import { senderContact, senderConversations } from "./sender-context";
 import { normalizeSplits, attentionSplit, type SplitPreferences } from "../../shared/splits";
 
+const unknownTotals: InboxTotals = { conversations: null, messages: null, inbox: null, splits: {}, folders: {}, holding: null };
 type Route = {
   account: string;
   folder: string;
@@ -188,6 +191,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const [highlight, setHighlight] = useState(0);
   const pointerHighlight = useRef<number | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
+  const [windowSelection, setWindowSelection] = useState<InboxSelection | null>(null);
+  const selectedCapture = useRef(new Map<string, Mail>());
+  const overlayCapture = useRef(new Map<string, Mail>());
+  const selectionProjection = useRef<string[] | null>(null);
   const customLabels = inbox.labels[route.account] ?? [];
   const [notice, setNotice] = useState<{
     text: string;
@@ -216,6 +223,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       setNotice({ text: "Account connection could not be completed. Try again in Add Accounts." });
     }
   }, []);
+  const [threadLookupIssue, setThreadLookupIssue] = useState<string | null>(null);
   const [senderSelection, setSenderSelection] = useState<{ threadId: string; messageId: string } | null>(null);
   const [mobileSidebar, setMobileSidebar] = useState(false);
   const [userProfile, setUserProfile] = useState(() =>
@@ -292,13 +300,39 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     () => mail.filter((message) => message.account === route.account),
     [mail, route.account],
   );
+  const windowQuery = useMemo<InboxViewQuery>(() => ({ account: route.account, folder: route.folder, split: route.split,
+    search: search && searchSubmitted, query: search && searchSubmitted ? resultQuery : "", filter: mailFilter as InboxViewQuery["filter"] }),
+    [route.account, route.folder, route.split, search, searchSubmitted, resultQuery, mailFilter]);
+  const activeWindow = inbox.host?.inboxWindow ? inbox.window && JSON.stringify(inbox.window.query) === JSON.stringify(windowQuery)
+    ? inbox.window : { keys: [], totals: unknownTotals } : undefined;
+  useEffect(() => { void store.setWindowQuery(windowQuery).catch(actionError); }, [store, windowQuery]);
+  useEffect(() => {
+    setThreadLookupIssue(null);
+    if (!inbox.host?.inboxWindow || !route.thread) { store.pinWindow("reader", []); return; }
+    let stopped = false;
+    store.pinWindow("reader", [route.thread]);
+    if (inbox.loaded && !mail.some(mail => mail.id === route.thread)) void store.lookupWindow([route.thread], route.account).then(rows => {
+      if (!stopped && !rows.length) setThreadLookupIssue("This conversation is not available in the selected receiving scope.");
+    }).catch(error => { if (!stopped && !(error instanceof DOMException && error.name === "AbortError")) setThreadLookupIssue(error instanceof Error ? error.message : "Could not load this conversation."); });
+    return () => { stopped = true; };
+  }, [store, inbox.host?.inboxWindow, inbox.loaded, route.thread, route.account]);
+  useEffect(() => {
+    const selectedIds = new Set(selected);
+    for (const id of selectedCapture.current.keys()) if (!selectedIds.has(id)) selectedCapture.current.delete(id);
+    for (const id of selected.slice(0, 100)) if (!selectedCapture.current.has(id)) {
+      const captured = mail.find(mail => mail.id === id); if (captured) selectedCapture.current.set(id, captureActionMail(captured));
+    }
+    store.pinWindow("selection", [...selectedCapture.current.keys()], [...selectedCapture.current.values()]);
+    if (selected !== selectionProjection.current) setWindowSelection(null);
+  }, [selected, store]);
+  useEffect(() => { if (!commandMode) { overlayCapture.current.clear(); store.pinWindow("command", []); } }, [commandMode, store]);
   const searchKey = `${route.account}\0${resultQuery}`;
   const searchVersion = useMemo(() => search && searchSubmitted
     ? accountMail.map(mail => `${mail.id}:${mail.folder}:${mail.unread}:${mail.starred}:${mail.labels.join(",")}:${mail.reminder ?? ""}:${mail.messages.map(message => message.revision).join(",")}`).join("|")
     : "", [accountMail, search, searchSubmitted]);
   const serverMatches = useMemo(() => searchSubmitted ? searchResult?.key === searchKey ? searchResult.ids : new Set<string>() : undefined, [searchSubmitted, searchResult, searchKey]);
   useEffect(() => {
-    if (!search || !searchSubmitted || !route.account || !resultQuery.trim()) return;
+    if (inbox.host?.inboxWindow || !search || !searchSubmitted || !route.account || !resultQuery.trim()) return;
     const controller = new AbortController();
     setSearchResult({ key: searchKey, ids: new Set(), loading: true });
     void store.search(route.account, resultQuery, controller.signal).then(ids => {
@@ -317,8 +351,18 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         .slice(0, 30),
     [accountMail],
   );
+  const [contactLookup, setContactLookup] = useState<{ key: string; contacts: Array<{ name: string; email: string }> } | null>(null);
+  const contactKey = `${route.account}:${query}`;
+  useEffect(() => {
+    if (!inbox.host?.inboxWindow || !search || searchSubmitted) return;
+    let stopped = false;
+    const timer = setTimeout(() => { void store.windowTransport.contacts({ account: route.account, query, limit: 30 }).then(result => {
+      if (!stopped) setContactLookup({ key: contactKey, contacts: result.contacts });
+    }).catch(() => {}); }, 150);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [store, inbox.host?.inboxWindow, route.account, query, contactKey, search, searchSubmitted]);
   const contacts = useMemo(
-    () => [
+    () => inbox.host?.inboxWindow ? contactLookup?.key === contactKey ? contactLookup.contacts : [] : [
       ...new Map(
         accountMail.map((message) => [
           message.email,
@@ -326,7 +370,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         ]),
       ).values(),
     ],
-    [accountMail],
+    [accountMail, inbox.host?.inboxWindow, contactLookup, contactKey],
   );
   const {
     visibleMail,
@@ -350,6 +394,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         mailFilter,
         serverMatches,
         mobileViewport,
+        activeWindow,
       ),
     [
       accountMail,
@@ -362,6 +407,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       mailFilter,
       serverMatches,
       mobileViewport,
+      activeWindow,
     ],
   );
   const accountDrafts = useMemo(
@@ -374,6 +420,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const contextContact = useMemo(() => currentMail && !currentMail.operationId
     ? senderContact(currentMail, inbox.senderHistory, inbox.accounts, senderSelection?.threadId === currentMail.id ? senderSelection.messageId : undefined)
     : null, [currentMail, inbox.senderHistory, inbox.accounts, senderSelection]);
+  const loadSenderActivity = useCallback((domain: string | null) => store.senderWindow({ account: route.account, id: route.thread!,
+    selectedMessageId: senderSelection && senderSelection.threadId === route.thread ? senderSelection.messageId : undefined, domain }), [store, route.account, route.thread, senderSelection]);
+  useEffect(() => () => store.clearSenderWindow(), [store, route.account, route.thread]);
+  const loadContacts = useCallback(async (query: string) => (await store.windowTransport.contacts({ account: route.account, query, limit: 30 })).contacts, [store, route.account]);
   const contextMailboxIds = useMemo(() => isUnified ? unifiedMailboxIds : [route.account], [isUnified, unifiedMailboxIds, route.account]);
   const contextSender = currentMail && contextContact ? store.defaultMailbox(route.account, currentMail, contextContact.messageId ?? undefined) : undefined;
   // A reply keeps its thread association when the user changes its From account.
@@ -382,6 +432,11 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     (currentMail
       ? drafts.find((d) => d.threadId === currentMail.id || !!d.sourceMessageId && d.sourceId === currentMail.sourceId && currentMail.messages.some(message => message.id === d.sourceMessageId))
       : undefined);
+  useEffect(() => {
+    if (!currentDraft || !inbox.host?.inboxWindow) return;
+    void store.loadDraftParent(currentDraft.id, route.account).catch(actionError);
+    return () => store.pinWindow(`draft:${currentDraft.id}`, []);
+  }, [store, currentDraft?.id, currentDraft?.sourceMessageId, route.account, inbox.host?.inboxWindow]);
   const zero = useGuidedZero({
     inbox, store, account: route.account, mailboxIds: contextMailboxIds, accountMail, currentMail,
     visible: route.view === "zero" && !settings,
@@ -412,6 +467,24 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     const range = windowed ? mailWindow(entries, top, height, rowHeight) : { start: 0, end: entries.length };
     return { ...range, entries: entries.slice(range.start, range.end) };
   }, [entries, rowHeight]);
+  const pageAnchor = useRef<{ id: string; offset: number; highlighted?: string } | null>(null);
+  const loadOlder = useCallback(() => {
+    if (!inbox.window?.nextCursor || inbox.window.paging) return;
+    const top = list.current?.scrollTop ?? 0, entry = entries.find(entry => !entry.group && entry.top + entry.height > top);
+    if (entry) pageAnchor.current = { id: entry.key, offset: top - entry.top, highlighted: visibleMail[highlight]?.id };
+    void store.loadMoreWindow().catch(actionError);
+  }, [store, inbox.window, entries, visibleMail, highlight]);
+  useLayoutEffect(() => {
+    const anchor = pageAnchor.current; if (!anchor || !list.current || inbox.window?.paging) return;
+    const entry = entries.find(entry => entry.key === anchor.id);
+    if (entry) { list.current.scrollTop = entry.top + anchor.offset; listScroll.current = list.current.scrollTop; }
+    const index = visibleMail.findIndex(mail => mail.id === anchor.highlighted);
+    if (index >= 0) { pointerHighlight.current = index; setHighlight(index); }
+    pageAnchor.current = null;
+  }, [entries, inbox.window?.paging]);
+  useEffect(() => {
+    if (inbox.host?.inboxWindow && visibleMail.length > 0 && highlight >= visibleMail.length - 6) loadOlder();
+  }, [highlight, visibleMail.length]);
   const getHighlightedMail = useCallback((index: number) => entries.find(entry => !entry.group && entry.index === index), [entries]);
   const targetIds = useMemo(() =>
     commandMode && commandMode !== "accounts" && overlayIds
@@ -669,6 +742,14 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       setCommandDraftId(draft?.id || null);
       if (draft) ids = draft.threadId ? [draft.threadId] : [];
     }
+    if (inbox.host?.inboxWindow) {
+      overlayCapture.current.clear();
+      for (const id of ids.slice(0, 100)) {
+        const captured = selectedCapture.current.get(id) ?? mail.find(mail => mail.id === id);
+        if (captured) overlayCapture.current.set(id, captureActionMail(captured));
+      }
+      store.pinWindow("command", [...overlayCapture.current.keys()], [...overlayCapture.current.values()]);
+    }
     setOverlayIds(
       value === "command" || value === "remind" || value === "label"
         ? ids
@@ -696,7 +777,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       }));
   }
   function actionError(error: unknown) {
-    if (error instanceof InboxActionError) return;
+    if (error instanceof InboxActionError || error instanceof DOMException && error.name === "AbortError") return;
     setNotice({ text: error instanceof Error ? error.message : "The inbox action failed. Your data has not been replaced with simulated state." });
   }
   // Retry for background problems only rereads: refresh the snapshot, reconnect live updates, reload the open conversation.
@@ -1035,6 +1116,23 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       throw error;
     }
   }
+  async function selectAllMail() {
+    if (!inbox.host?.inboxWindow) { setSelected(visibleMail.map(mail => mail.id)); return; }
+    try {
+      const captured = await store.createWindowSelection();
+      const projection = visibleMail.map(mail => mail.id); selectionProjection.current = projection;
+      setWindowSelection(captured); setSelected(projection);
+      setNotice({ text: captured.count === null ? "Capturing selection…" : `${captured.count.toLocaleString()} conversations selected` });
+    } catch (error) { actionError(error); }
+  }
+  async function capturedTargets(ids: string[]): Promise<Mail[]> {
+    if (windowSelection && ids === targetIds) return store.resolveWindowSelection(windowSelection);
+    if (!inbox.host?.inboxWindow) return mail.filter(mail => ids.includes(mail.id));
+    if (ids.length > 100) throw new Error("Choose at most 100 individual conversations, or use Select all to capture the full query.");
+    const found = ids.map(id => (commandMode ? overlayCapture.current.get(id) : undefined) ?? selectedCapture.current.get(id) ?? mail.find(mail => mail.id === id));
+    if (found.some(mail => !mail)) throw new Error("Some selected conversations are not available. Reselect them before making changes.");
+    return (found as Mail[]).map(captureActionMail);
+  }
   async function applyAction(action: string, ids = targetIds) {
     if (zero.active && (zero.busy || zero.retry)) return;
     if (action === "more") {
@@ -1054,8 +1152,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (action === "not-important" && inbox.pending) { timing.finish("ignored"); return; }
     const previousRoute = route;
     const previousHighlight = highlight;
-    const selectedIds = new Set(ids);
-    const before = mail.filter((m) => selectedIds.has(m.id));
+    let before: Mail[];
+    try { before = await capturedTargets(ids); } catch (error) { actionError(error); timing.finish("error"); return; }
     if (
       action === "done" &&
       before.every((m) => ["Done", "Trash"].includes(m.folder))
@@ -1095,13 +1193,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       currentMail &&
       ["done", "not-important", "trash", "spam", "inbox", "mute", "cancel"].includes(action)
     ) {
-      const next =
-        visibleMail[
-          visibleMail.findIndex((m) => m.id === currentMail.id) +
-            (preferences.advanceDirection === "Previous conversation" ? -1 : 1)
-        ];
+      const next = preferences.autoAdvance ? await adjacentMail(currentMail, preferences.advanceDirection === "Previous conversation" ? -1 : 1).catch(error => { actionError(error); return undefined; }) : undefined;
       if (preferences.autoAdvance && next) openMail(next);
-      else goBack();
+      else if (!preferences.autoAdvance || !inbox.host?.inboxWindow || store.getSnapshot().window?.exhausted) goBack();
     }
     if (!["star", "unread"].includes(action))
       setHighlight((v) => Math.max(0, Math.min(v, rowCount - 2)));
@@ -1109,7 +1203,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     timing.finish();
   }
   async function remind(when: string) {
-    const before = targets;
+    let before: Mail[];
+    try { before = await capturedTargets(targetIds); } catch (error) { actionError(error); return; }
     const previousRoute = route;
     const previousHighlight = highlight;
     const at = reminderTime(when);
@@ -1123,13 +1218,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setOverlay(null);
     setSelected([]);
     if (currentMail) {
-      const next =
-        visibleMail[
-          visibleMail.findIndex((m) => m.id === currentMail.id) +
-            (preferences.advanceDirection === "Previous conversation" ? -1 : 1)
-        ];
+      const next = preferences.autoAdvance ? await adjacentMail(currentMail, preferences.advanceDirection === "Previous conversation" ? -1 : 1).catch(error => { actionError(error); return undefined; }) : undefined;
       if (preferences.autoAdvance && next) openMail(next);
-      else goBack();
+      else if (!preferences.autoAdvance || !inbox.host?.inboxWindow || store.getSnapshot().window?.exhausted) goBack();
     }
     setNotice({
       text: `Reminder set for ${displayDate(when)}`,
@@ -1142,7 +1233,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       setOverlay(null);
       return;
     }
-    const before = targets;
+    let before: Mail[];
+    try { before = await capturedTargets(targetIds); } catch (error) { actionError(error); return; }
     const previousRoute = route;
     const previousHighlight = highlight;
     const destination = ["Inbox", "Done", "Trash", "Spam"].includes(label);
@@ -1180,7 +1272,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       else if (route.folder === "Starred") applyAction("star");
       return;
     }
-    const before = targets;
+    let before: Mail[];
+    try { before = await capturedTargets(targetIds); } catch (error) { actionError(error); return; }
     const previousRoute = route;
     const previousHighlight = highlight;
     const next =
@@ -1232,14 +1325,27 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setLabelEdit(null);
     setNotice({ text: deleting ? "Label deleted" : "Label renamed" });
   }
-  function navigateThread(delta: number) {
+  async function adjacentMail(current: Mail, delta: number): Promise<Mail | undefined> {
+    const index = visibleMail.findIndex(mail => mail.id === current.id);
+    const neighbor = index >= 0 ? visibleMail[index + delta] : undefined;
+    if (neighbor || !inbox.host?.inboxWindow) return neighbor;
+    if (delta > 0) await store.loadMoreWindow(); else await store.loadNewerWindow();
+    const snapshot = store.getSnapshot(), rows = new Map(snapshot.mail.map(mail => [mail.id, mail]));
+    const ordered = (snapshot.window?.keys ?? []).flatMap(id => rows.has(id) ? [rows.get(id)!] : []);
+    const compare = (mail: Mail) => (current.receivedAt ?? 0) - (mail.receivedAt ?? 0) || mail.id.localeCompare(current.id);
+    return delta > 0 ? ordered.find(mail => compare(mail) > 0) : [...ordered].reverse().find(mail => compare(mail) < 0);
+  }
+  async function navigateThread(delta: number) {
     if (zero.active) { zero.browse(delta); return; }
     const index = visibleMail.findIndex((m) => m.id === currentMail?.id);
+    if (index < 0 && inbox.host?.inboxWindow) { setNotice({ text: "This conversation is outside the current view. Return to the list to continue." }); return; }
     const next = visibleMail[index + delta];
-    if (next) {
-      setHighlight(index + delta);
-      openMail(next);
-    }
+    if (next) { setHighlight(index + delta); openMail(next); return; }
+    if (!inbox.host?.inboxWindow || !currentMail) return;
+    try {
+      const next = await adjacentMail(currentMail, delta);
+      if (next) { setHighlight(store.getSnapshot().window?.keys.indexOf(next.id) ?? 0); openMail(next); }
+    } catch (error) { actionError(error); }
   }
   const commandDraft = drafts.find((draft) => draft.id === commandDraftId);
   const lastFeedback = inbox.attentionFeedback.find(event => event.status === "active");
@@ -1563,13 +1669,19 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         );
         break;
       case "selectAll":
-        setSelected(
-          visibleMail
-            .slice(intent.fromHere ? highlight : 0)
-            .map((mail) => mail.id),
-        );
+        if (intent.fromHere && inbox.host?.inboxWindow && !inbox.window?.exhausted) setNotice({ text: "Select all captures the whole query. Select individual rows to capture a smaller range." });
+        else if (intent.fromHere) setSelected(visibleMail.slice(highlight).map(mail => mail.id));
+        else void selectAllMail();
         break;
       case "jump":
+        if (inbox.host?.inboxWindow) {
+          void store.seekWindow(intent.edge === "top" ? "start" : "end").then(() => {
+            const count = store.getSnapshot().window?.keys.length ?? 0;
+            setHighlight(intent.edge === "top" ? 0 : Math.max(0, count - 1));
+            if (intent.edge === "top" && list.current) list.current.scrollTop = 0;
+          }).catch(actionError);
+          break;
+        }
         if (intent.edge === "top") {
           listScroll.current = 0;
           if (list.current) list.current.scrollTop = 0;
@@ -1692,7 +1804,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     return () => removeEventListener("keydown", onKey);
   }, []);
 
-  if (!inbox.loaded) {
+  if (!inbox.loaded && !inbox.host?.inboxWindow) {
     // Stay blank until the first snapshot arrives; an initial failure adds only the floating notice with Retry.
     return <div className="app" data-inbox-state={inbox.loading ? "loading" : "error"}>{inbox.loading ? null : notices}</div>;
   }
@@ -1704,6 +1816,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       accounts={inbox.accounts}
       loadSendingIdentities={store.sendingIdentities}
       contacts={contacts}
+      loadContacts={inbox.host?.inboxWindow ? loadContacts : undefined}
       onChange={updateDraft}
       onSend={sendDraft}
       onDiscard={() => discardDraft()}
@@ -1801,7 +1914,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         store={store}
         onStartZero={startZero}
         zeroReady={inbox.loaded && contextMailboxIds.length > 0 && !zero.busy}
-        zeroResumable={zero.scoped && !!zero.session?.remainingIds.length}
+        zeroResumable={zero.scoped && zero.remainingCount !== 0}
         onboardingReturn={onboardingReturn}
         onOnboardingDone={() => setOnboardingReturn(null)}
       />}
@@ -1841,8 +1954,19 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           </div>
         ) : route.draft && currentDraft && !currentDraft.popOut ? (
           composer
+        ) : inbox.host?.inboxWindow && route.thread && !currentMail ? (
+          <div className="mail-window-status" role={threadLookupIssue ? "alert" : "status"}>
+            <button type="button" className="text-button" onClick={goBack}>Back to list</button>
+            <span>{threadLookupIssue || "Loading conversation…"}</span>
+            {threadLookupIssue && <button type="button" className="text-button" onClick={() => {
+              setThreadLookupIssue(null);
+              void store.lookupWindow([route.thread!], route.account).then(rows => { if (!rows.length) setThreadLookupIssue("This conversation is not available in the selected receiving scope."); }).catch(error => setThreadLookupIssue(error instanceof Error ? error.message : "Could not load this conversation."));
+            }}>Retry</button>}
+          </div>
         ) : currentMail ? (
           <ThreadView
+            onLoadMessage={id => store.loadThread(currentMail.id, id)}
+            onLoadOlder={() => store.loadMoreMessages(currentMail.id)}
             key={currentMail.id}
             mail={currentMail}
             aiDecision={currentMail.triage}
@@ -1858,6 +1982,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             accounts={inbox.accounts}
             loadSendingIdentities={store.sendingIdentities}
             contacts={contacts}
+            loadContacts={inbox.host?.inboxWindow ? loadContacts : undefined}
             preferences={preferences}
             onBack={goBack}
             onNavigate={navigateThread}
@@ -1932,18 +2057,12 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
               ) : selected.length ? (
                 <div className="selection-toolbar">
                   <button
-                    onClick={() =>
-                      setSelected(
-                        selected.length === visibleMail.length
-                          ? []
-                          : visibleMail.map((m) => m.id),
-                      )
-                    }
+                    onClick={() => windowSelection || selected.length === visibleMail.length ? setSelected([]) : void selectAllMail()}
                   >
                     <span className="select-square checked">
                       <Icon name="Check" size={11} />
                     </span>
-                    <span>{selected.length} selected</span>
+                    <span>{windowSelection ? windowSelection.count ?? "…" : selected.length} selected</span>
                     <Icon name="ChevronDown" size={13} />
                   </button>
                   {[
@@ -1979,7 +2098,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                     >
                       <span className="split-tab-label">{split}</span>
                       <span className="split-tab-count">
-                        {splitCounts[split] || ""}
+                        {splitCounts[split] == null ? "…" : splitCounts[split] || ""}
                       </span>
                     </button>
                   ))}
@@ -1996,7 +2115,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
               {!selected.length && (
                 <div className="header-actions">
                   {!search && route.folder === "Inbox" && <button type="button" className="zero-entry" disabled={!inbox.loaded || !contextMailboxIds.length || zero.busy} onClick={startZero}>
-                    {zero.scoped && zero.session?.remainingIds.length ? "Resume cleanup" : "Get me to zero"}
+                    {zero.scoped && zero.remainingCount !== 0 ? "Resume cleanup" : "Get me to zero"}
                   </button>}
                   <IconButton name="Refresh" title="Refresh inbox" className="inbox-refresh"
                     aria-busy={inbox.refreshing} disabled={!activeAccount || inbox.refreshing}
@@ -2055,7 +2174,14 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
               onClick={handleMailRow}
               onContextMenu={handleMailRow}
               onScroll={(event) => {
+                const previous = listScroll.current;
                 listScroll.current = event.currentTarget.scrollTop;
+                if (inbox.window?.hasNewer && !inbox.window.paging && event.currentTarget.scrollTop < previous && event.currentTarget.scrollTop < rowHeight * 6) {
+                  const entry = entries.find(entry => !entry.group && entry.top + entry.height > event.currentTarget.scrollTop);
+                  if (entry) pageAnchor.current = { id: entry.key, offset: event.currentTarget.scrollTop - entry.top, highlighted: visibleMail[highlight]?.id };
+                  void store.loadNewerWindow().catch(actionError);
+                }
+                if (event.currentTarget.scrollHeight - event.currentTarget.scrollTop - event.currentTarget.clientHeight < rowHeight * 6) loadOlder();
               }}
               aria-label={
                 search
@@ -2156,7 +2282,12 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                   onWindowCommit={motion.refreshHighlight}
                 />
               )}
+              {inbox.host?.inboxWindow && !currentMail && <div className="mail-window-status" role="status">
+                {inbox.loading ? "Loading conversations…" : inbox.window?.state.indexing ? "Indexing conversations; totals are not ready yet." : null}
+                {inbox.window?.nextCursor && <button type="button" className="text-button" disabled={inbox.window.paging} onClick={loadOlder}>{inbox.window.paging ? "Loading older conversations…" : "Load older conversations"}</button>}
+              </div>}
               {rowCount === 0 &&
+                (!inbox.host?.inboxWindow || !!inbox.window?.exhausted && !inbox.window.state.indexing && inbox.window.state.catchup === "current" && inbox.window.totals.conversations === 0) &&
                 !holdingMail &&
                 !(search && searchResult?.key === searchKey && (searchResult.loading || searchResult.error)) &&
                 !motion.hasExits &&
@@ -2169,14 +2300,14 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                     )}
                     {(search || route.folder !== "Inbox") && (
                       <h2>
-                        {search ? "No results" : "No conversations found here."}
+                        {inbox.host?.inboxWindow ? "No matches in cached mail." : search ? "No results" : "No conversations found here."}
                       </h2>
                     )}
                     <p>
                       {search
                         ? "Try another search or check your spelling."
                         : route.folder === "Inbox"
-                          ? "You are all done."
+                          ? inbox.host?.inboxWindow ? "No matching conversations in cached mail." : "You are all done."
                           : ""}
                     </p>
                     {route.folder === "Inbox" && (
@@ -2239,6 +2370,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             <SenderContext
               key={`${route.account}:${contextContact.email.toLowerCase()}`}
               contact={contextContact}
+              loadActivity={inbox.host?.inboxWindow ? loadSenderActivity : undefined}
               history={inbox.senderHistory}
               mailboxIds={contextMailboxIds}
               getConversations={getSenderConversations}

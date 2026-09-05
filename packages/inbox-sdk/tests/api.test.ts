@@ -22,6 +22,9 @@ import { createAttentionFeedbackStore } from '../../../apps/local-host/src/atten
 import { createAttentionOverridesStore, CATEGORY_STORAGE_LIMITS } from '../../../apps/local-host/src/attention-overrides'
 import { isCategoryCommand, isCategoryEntry, type CategoryCommand, type CategoryContext, type CategoryEntry } from '../../../apps/shared/attention-overrides'
 import { createSplitPreferencesStore } from '../../../apps/local-host/src/split-preferences'
+import { createInboxViewPreferencesStore } from '../../../apps/local-host/src/inbox-preferences'
+import { createInboxWindowService } from '../../../apps/local-host/src/inbox-window'
+import * as WindowDTO from '../../../apps/shared/inbox-window'
 import { classifyAttention } from '../../../apps/shared/mail-attention'
 import { normalizeSplits } from '../../../apps/shared/splits'
 import { mailFacts } from '../src/mail-facts'
@@ -2122,6 +2125,436 @@ function sse(response: Response) {
     },
   }
 }
+
+describe('bounded host inbox window', () => {
+  test('first pages stay bounded while overlapping mailboxes, global Boolean search and counts cover off-window history', async () => {
+    const h = await fixture({ eventRetention: 5000 })
+    const domains = ['window-a.example.test', 'window-b.example.test']
+    h.discoveries.set('window-global', { sources: domains.map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const { account, box } = await h.connect('alice', 'window-global', Array.from({ length: 700 }, (_, index) => {
+      const thread = Math.floor(index / 2)
+      return native(`window-${index}`, { threadId: `window-thread-${thread}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(), sourceDomains: domains,
+        from: participant(thread === 340 || thread === 349 ? 'old-window@example.test' : 'sender@example.test'), isStarred: thread === 345,
+        folder: thread === 349 ? 'trash' : 'inbox', bodyText: BODY_SECRET, bodyHtml: `<p>${BODY_SECRET}</p>` })
+    }), SCOPED)
+    for (const domain of domains) await h.inbox.createMailbox('alice', { sourceId: account.id, name: domain, selector: { kind: 'domain', value: domain } })
+    await h.sync('alice', account.id)
+    const providerCalls = structuredClone(box.calls), database = new Database(':memory:'), raw = h.gate<void>(undefined)
+    let bodyReads = 0, inference = 0
+    const guarded: Inbox = { ...h.inbox,
+      message: async () => { bodyReads++; throw new Error('Window reads must not load message bodies') },
+      mailboxMessage: async () => { bodyReads++; throw new Error('Window reads must not load mailbox bodies') },
+      mailboxMessagePage: async (owner, input) => { expect(owner).toBe('alice'); await raw.wait(); return h.inbox.mailboxMessagePage(owner, input) },
+    }
+    const fetcher: typeof fetch = Object.assign(async () => { inference++; throw new Error('Window reads must not run inference') }, {
+      preconnect: () => { inference++; throw new Error('Window reads must not preconnect inference') },
+    })
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY, fetcher })
+    const preferences = createInboxViewPreferencesStore(database, guarded, 'alice')
+    const splitPreferences = createSplitPreferencesStore(database, 'alice')
+    const dependencies = { database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: false,
+      inboxPreferences: preferences, splitPreferences, attentionOverrides: createAttentionOverridesStore(database, guarded, 'alice') }
+    let service = createInboxWindowService(dependencies)
+    cleanup.push(async () => { raw.release(); await service.close(); await ai.close(); database.close() })
+    const call = async <K extends keyof WindowDTO.InboxWindowTransport>(name: K, input: Parameters<WindowDTO.InboxWindowTransport[K]>[0]): Promise<Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>> =>
+      await service.dispatch(WindowDTO.inboxWindowPaths[name], input) as Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>
+    const view: WindowDTO.InboxViewQuery = { account: 'unified', folder: 'All Mail', split: 'Important', search: false, query: '', filter: null }
+    const first = await bounded(call('query', view), 'first bounded host page')
+    expect(first.rows).toHaveLength(100)
+    expect(first.state.indexing).toBe(true); expect(first.exhausted).toBe(false)
+    expect(first.totals.conversations).toBeNull(); expect(first.totals.messages).toBeNull()
+    expect(new Set(first.rows.map(row => row.key)).size).toBe(100)
+    expect(first.rows.every(row => row.counts.messages === 2 && row.counts.memberships === 4 && row.targets.length === 4)).toBe(true)
+    expect(first.rows.flatMap(row => row.mail.messages).every(message => message.body === '' && message.loaded === false)).toBe(true)
+    expect(JSON.stringify(first)).not.toContain(BODY_SECRET)
+    expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(WindowDTO.INBOX_RESPONSE_BYTE_LIMIT)
+    expect((await call('lookup', { account: 'unified', ids: ['missing-window-thread'] })).entries).toEqual([{ id: 'missing-window-thread', status: 'unknown' }])
+    raw.release()
+    const ready = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: first.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'complete host index')
+    expect(ready.rows).toHaveLength(100)
+    // All Mail excludes Trash, but its folder total must still cover the off-window thread.
+    expect(ready.totals).toMatchObject({ conversations: 349, messages: 698, folders: { 'All Mail': 349, Trash: 1 } })
+    expect((await call('counts', { queryId: first.state.queryId })).totals).toEqual(ready.totals)
+    expect((await call('lookup', { account: 'unified', ids: ['missing-window-thread'] })).entries).toEqual([{ id: 'missing-window-thread', status: 'absent' }])
+    const cached = await call('lookup', { account: 'unified', ids: ready.rows.slice(0, 3).map(row => row.key) })
+    expect(cached.entries.every(entry => entry.status === 'found')).toBe(true)
+    expect(cached.entries.map(entry => entry.status === 'found' && entry.row.key)).toEqual(ready.rows.slice(0, 3).map(row => row.key))
+    const search = await call('query', { ...view, search: true, query: '(from:old-window@example.test OR is:starred) -in:trash' })
+    const found = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: search.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'global Boolean search')
+    expect(found.rows.map(row => row.mail.subject).sort()).toEqual(['Subject window-681', 'Subject window-691'])
+    expect(found.rows.every(row => !first.rows.some(resident => resident.key === row.key))).toBe(true)
+    expect(found.totals).toMatchObject({ conversations: 2, messages: 4 }); expect(found.exhausted).toBe(true)
+    const tail = await call('page', { queryId: first.state.queryId, seek: 'end', limit: 10 })
+    const previous = await call('page', { queryId: first.state.queryId, cursor: tail.nextCursor!, direction: 'newer', limit: 10 })
+    expect(tail.rows).toHaveLength(10); expect(previous.rows).toHaveLength(10)
+    expect(tail.rows.some(row => previous.rows.some(other => row.key === other.key))).toBe(false)
+    await expect(call('page', { queryId: first.state.queryId, cursor: 'forged' })).rejects.toMatchObject({ code: 'HOST_INBOX_CURSOR_INVALID' })
+    await expect(call('page', { queryId: search.state.queryId, cursor: ready.nextCursor! })).rejects.toMatchObject({ code: 'HOST_INBOX_CURSOR_INVALID' })
+    await expect(call('query', { ...view, account: 'foreign-mailbox' })).rejects.toMatchObject({ code: 'HOST_INBOX_SCOPE_CHANGED' })
+    await expect(call('query', { ...view, limit: 101 })).rejects.toMatchObject({ code: 'HOST_INBOX_INVALID' })
+    const capture = await call('selectionCreate', { id: randomUUID(), account: 'unified', queryId: first.state.queryId, allMatching: true })
+    const selection = await bounded((async () => {
+      for (;;) { const page = await call('selectionPage', { selectionId: capture.id }); if (page.selection.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'all-matching off-window selection')
+    expect(selection.selection.count).toBe(349); expect(selection.entries).toHaveLength(100); expect(selection.exhausted).toBe(false)
+    const selectionIds = selection.entries.map(entry => entry.id)
+    let cursor = selection.nextCursor
+    while (cursor) {
+      const page = await call('selectionPage', { selectionId: capture.id, cursor })
+      expect(page.entries.length).toBeLessThanOrEqual(100); expect(page.entries.every(entry => entry.status === 'found')).toBe(true)
+      selectionIds.push(...page.entries.map(entry => entry.id)); cursor = page.nextCursor
+    }
+    expect(selectionIds).toHaveLength(349); expect(new Set(selectionIds).size).toBe(349)
+    expect(bodyReads).toBe(0); expect(inference).toBe(0)
+    expect(box.calls.listFolders).toBe(providerCalls.listFolders)
+    expect(box.calls).toEqual(providerCalls)
+    // An accepted multi-page selection keeps its frozen matches across query TTL
+    // expiry/restart, while arrivals remain available to the ordinary live view.
+    const expiring = await call('selectionCreate', { id: randomUUID(), account: 'unified', queryId: first.state.queryId, allMatching: true })
+    expect(expiring.captureComplete).toBe(false)
+    await service.close()
+    database.query('UPDATE local_window_queries SET expires=? WHERE owner=?').run(Date.now() - 1, 'alice')
+    box.put(native('after-frozen-ttl', { threadId: 'after-frozen-ttl', receivedAt: new Date(EPOCH + 1000).toISOString(), sourceDomains: domains }))
+    await h.sync('alice', account.id)
+    service = createInboxWindowService(dependencies)
+    const afterRestart = await call('query', view)
+    const finished = await bounded((async () => {
+      for (;;) { const page = await call('selectionPage', { selectionId: expiring.id }); if (page.selection.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'capture finishes independently of expired query')
+    expect(finished.selection.count).toBe(349)
+    const frozenIds = [...finished.entries.map(entry => entry.id)]
+    let frozenCursor = finished.nextCursor
+    while (frozenCursor) { const page = await call('selectionPage', { selectionId: expiring.id, cursor: frozenCursor }); frozenIds.push(...page.entries.map(entry => entry.id)); frozenCursor = page.nextCursor }
+    expect(new Set(frozenIds)).toEqual(new Set(selectionIds))
+    const liveAfterRestart = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: afterRestart.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'live deltas resume after frozen capture completion')
+    expect(liveAfterRestart.totals.conversations).toBe(350)
+    expect(liveAfterRestart.rows.some(row => row.mail.subject === 'Subject after-frozen-ttl')).toBe(true)
+    const interrupted = await call('zeroCreate', { id: randomUUID(), account: 'unified' })
+    expect(interrupted.status).toBe('capturing')
+    splitPreferences.write({ version: 1, revision: 0, splits: ['Important', 'Other', 'Receipts'], inactiveSplits: [], splitAliases: {}, splitRules: { Receipts: 'subject:receipt' } })
+    const invalidated = await bounded((async () => {
+      for (;;) { const value = await call('zeroResume', { sessionId: interrupted.id, account: 'unified' }); if (value.status === 'found' && value.session.status === 'invalidated') return value.session; await Bun.sleep(10) }
+    })(), 'changed preferences invalidate and unlock unfinished capture')
+    expect(invalidated).toMatchObject({ id: interrupted.id, status: 'invalidated', progress: { decidedCount: 0, captureComplete: true } })
+    await expect(call('zeroPage', { sessionId: interrupted.id })).rejects.toMatchObject({ code: 'HOST_INBOX_SCOPE_CHANGED' })
+    box.put(native('after-capture-invalidation', { threadId: 'after-capture-invalidation', receivedAt: new Date(EPOCH + 2000).toISOString(), sourceDomains: domains }))
+    await h.sync('alice', account.id)
+    const nextView = await call('query', view)
+    const resumed = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: nextView.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'ordinary deltas after capture invalidation')
+    expect(resumed.totals.conversations).toBe(351)
+    expect(resumed.rows.some(row => row.mail.subject === 'Subject after-capture-invalidation')).toBe(true)
+    expect((await call('zeroResume', { sessionId: interrupted.id, account: 'unified' })).status).toBe('found')
+    expect(bodyReads).toBe(0); expect(inference).toBe(0)
+    const current = await preferences.read()
+    await preferences.write({ ...current, unifiedMode: 'selected', includedMailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id] })
+    await expect(call('page', { queryId: nextView.state.queryId })).rejects.toMatchObject({ code: 'HOST_INBOX_SCOPE_CHANGED' })
+  }, 30000)
+
+  test('small selections retain missing IDs and freeze accepted targets rather than including later replies', async () => {
+    const h = await fixture()
+    const { account, box } = await h.seed('alice', 'window-capture', Array.from({ length: 6 }, (_, index) => native(`capture-${index}`, {
+      threadId: `capture-thread-${Math.floor(index / 2)}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(),
+    })))
+    const database = new Database(':memory:')
+    let bodyReads = 0
+    const guarded: Inbox = { ...h.inbox, message: async () => { bodyReads++; throw new Error('Unexpected body read') }, mailboxMessage: async () => { bodyReads++; throw new Error('Unexpected mailbox body read') } }
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY })
+    const service = createInboxWindowService({ database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: true,
+      inboxPreferences: createInboxViewPreferencesStore(database, guarded, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'), attentionOverrides: createAttentionOverridesStore(database, guarded, 'alice') })
+    cleanup.push(async () => { await service.close(); await ai.close(); database.close() })
+    const call = async <K extends keyof WindowDTO.InboxWindowTransport>(name: K, input: Parameters<WindowDTO.InboxWindowTransport[K]>[0]): Promise<Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>> =>
+      await service.dispatch(WindowDTO.inboxWindowPaths[name], input) as Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>
+    const first = await call('query', { account: 'unified', folder: 'Inbox', split: 'Important', search: false, query: '', filter: null })
+    expect(first.rows).toHaveLength(3)
+    const ready = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: first.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'small capture index')
+    expect(ready.totals).toMatchObject({ conversations: 3, messages: 6 })
+    const selected = ready.rows[0]!, missing = 'missing-captured-thread'
+    const detail = await call('messages', { account: 'unified', id: selected.key, limit: 1 })
+    expect(detail.summaries).toHaveLength(1); expect(detail.nextCursor).not.toBeNull()
+    const input: WindowDTO.InboxSelectionInput = { id: randomUUID(), account: 'unified', ids: [selected.key, missing] }
+    const capture = await call('selectionCreate', input)
+    // This arrival follows accepted creation, not just completed capture paging.
+    box.put(native('capture-later', { threadId: 'capture-thread-0', receivedAt: new Date(EPOCH + 1000).toISOString() }))
+    await h.sync('alice', account.id)
+    const page = await bounded((async () => {
+      for (;;) { const result = await call('selectionPage', { selectionId: capture.id }); if (result.selection.captureComplete && result.entries.every(entry => entry.status !== 'unknown')) return result; await Bun.sleep(10) }
+    })(), 'frozen selection and arrival reconciliation')
+    expect(page.selection.count).toBe(2); expect(page.exhausted).toBe(true)
+    expect(page.entries.find(entry => entry.id === missing)).toEqual({ id: missing, status: 'absent' })
+    expect(page.entries.find(entry => entry.id === selected.key)?.status).toBe('changed')
+    await expect(call('messages', { account: 'unified', id: selected.key, cursor: detail.nextCursor!, limit: 1 })).rejects.toMatchObject({ code: 'HOST_INBOX_CONTEXT_CHANGED' })
+    expect((await call('selectionCreate', input)).id).toBe(capture.id)
+    await expect(call('selectionCreate', { ...input, ids: [missing] })).rejects.toMatchObject({ code: 'HOST_ZERO_SESSION_CONFLICT' })
+    const accepted = await h.inbox.setMailboxStates('alice', { id: randomUUID(), done: true, targets: selected.targets })
+    expect(accepted.states).toHaveLength(2)
+    const mailboxIds = (await h.inbox.mailboxes('alice')).map(mailbox => mailbox.id)
+    const aggregate = (await h.inbox.mailboxConversations('alice', { mailboxIds, keys: [{ sourceId: selected.sourceId, threadId: selected.threadId }] })).items[0]!
+    expect(aggregate).toMatchObject({ messageCount: 3, doneMembershipCount: 2 })
+    expect(aggregate.messages.find(message => message.subject === 'Subject capture-later')!.memberships.every(member => !member.done)).toBe(true)
+    expect(bodyReads).toBe(0)
+  }, 15000)
+
+  test('Zero persists review exclusions and credits only owned durable Done, W, Other and Later receipts with conditional Undo and partial replay', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'window-zero', Array.from({ length: 24 }, (_, index) => native(`zero-${index}`, {
+      threadId: `zero-thread-${Math.floor(index / 2)}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(),
+    })))
+    await h.seed('bob', 'window-zero-foreign')
+    const database = new Database(':memory:')
+    let bodyReads = 0, interruptedReceipt: string | null = null
+    const guarded: Inbox = { ...h.inbox,
+      message: async () => { bodyReads++; throw new Error('Zero bookkeeping must not load bodies') },
+      mailboxMessage: async () => { bodyReads++; throw new Error('Zero bookkeeping must not load mailbox bodies') },
+      mailboxStateReceipt: async (owner, id) => {
+        expect(owner).toBe('alice')
+        if (id === interruptedReceipt) { interruptedReceipt = null; throw new InboxError('NETWORK', 'Fictional receipt interruption', 503) }
+        return h.inbox.mailboxStateReceipt(owner, id)
+      },
+    }
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY })
+    const categories = createAttentionOverridesStore(database, h.inbox, 'alice'), feedback = createAttentionFeedbackStore(database, h.inbox, 'alice')
+    const dependencies = { database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: true,
+      inboxPreferences: createInboxViewPreferencesStore(database, guarded, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'), attentionOverrides: categories }
+    let service = createInboxWindowService(dependencies)
+    cleanup.push(async () => { await service.close(); await ai.close(); database.close() })
+    const call = async <K extends keyof WindowDTO.InboxWindowTransport>(name: K, input: Parameters<WindowDTO.InboxWindowTransport[K]>[0]): Promise<Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>> =>
+      await service.dispatch(WindowDTO.inboxWindowPaths[name], input) as Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>
+    const first = await call('query', { account: 'unified', folder: 'All Mail', split: 'Important', search: false, query: '', filter: null })
+    const ready = await bounded((async () => {
+      for (;;) { const page = await call('page', { queryId: first.state.queryId }); if (!page.state.indexing) return page; await Bun.sleep(10) }
+    })(), 'Zero warm index')
+    expect(ready.rows).toHaveLength(12)
+    const zero = await call('zeroCreate', { id: randomUUID(), account: 'unified' })
+    const queue = await bounded((async () => {
+      for (;;) { const page = await call('zeroPage', { sessionId: zero.id }); if (page.session.progress.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'Zero frozen queue')
+    expect(queue.items).toHaveLength(12)
+    for (const item of queue.items) {
+      expect(item.reviewVersion).toMatch(/^[a-f0-9]{64}$/)
+      if (item.batchCandidate) { expect(item.batchCandidate.reviewVersion).toMatch(/^[a-f0-9]{64}$/); expect(item.batchCandidate.reviewVersion).not.toBe(item.reviewVersion!) }
+    }
+    expect(queue.session.progress).toMatchObject({ initialCount: 12, remainingCount: 12, decidedCount: 0 })
+    const offers = queue.items
+    const rows = new Map(ready.rows.map(row => [row.key, row]))
+    const mailboxIds = (await h.inbox.mailboxes('alice')).map(box => box.id)
+    const resume = async () => {
+      const result = await call('zeroResume', { sessionId: zero.id, account: 'unified' })
+      if (result.status !== 'found') throw new Error('Owned Zero session disappeared')
+      return result.session
+    }
+    const progressInput = async (offer: WindowDTO.InboxZeroItem, decision: WindowDTO.InboxZeroDecisionInput['decision'], receipts: WindowDTO.InboxActionReceiptReference[]): Promise<WindowDTO.InboxZeroProgressInput> => ({
+      sessionId: zero.id, id: randomUUID(), ifRevision: (await resume()).revision, decisions: [{ id: offer.id, decision, reviewVersion: offer.reviewVersion!, receipts }],
+    })
+    const latestTargets = async (offer: WindowDTO.InboxZeroItem) => {
+      const row = rows.get(offer.id)!
+      return (await h.inbox.mailboxConversations('alice', { mailboxIds, keys: [{ sourceId: row.sourceId, threadId: row.threadId }] })).items[0]!.targets
+    }
+    const done = async (offer: WindowDTO.InboxZeroItem) => {
+      const id = randomUUID(); await h.inbox.setMailboxStates('alice', { id, targets: await latestTargets(offer), done: true }); return id
+    }
+    const review = await call('zeroProgress', { sessionId: zero.id, id: randomUUID(), ifRevision: (await resume()).revision,
+      decisions: [], currentId: offers[0]!.id, reviewOnlyIds: [offers[0]!.id], paused: true })
+    expect(review.session.progress.decidedCount).toBe(0)
+    await service.close(); service = createInboxWindowService(dependencies)
+    expect(await resume()).toMatchObject({ paused: true, currentId: offers[0]!.id, progress: { decidedCount: 0 } })
+    const restored = await call('zeroPage', { sessionId: zero.id })
+    expect(restored.items.find(item => item.id === offers[0]!.id)).toMatchObject({ batchEligibility: 'ineligible', batchCandidate: null })
+    await expect(call('zeroProgress', await progressInput(offers[0]!, 'done', [{ kind: 'mailbox-state', id: randomUUID() }]))).rejects.toMatchObject({ code: 'HOST_INBOX_INVALID' })
+    const navigation = await call('zeroProgress', { sessionId: zero.id, id: randomUUID(), ifRevision: (await resume()).revision, decisions: [], phase: 'review', paused: false, currentId: offers[1]!.id })
+    expect(navigation.session.progress.decidedCount).toBe(0)
+    await bounded((async () => { for (;;) { if (!(await call('page', { queryId: first.state.queryId })).state.indexing) return; await Bun.sleep(10) } })(), 'resumed index ready for another capture')
+    const another = await call('zeroCreate', { id: randomUUID(), account: 'unified' })
+    const otherQueue = await bounded((async () => {
+      for (;;) { const page = await call('zeroPage', { sessionId: another.id }); if (page.session.progress.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'independent Zero capture')
+    const doneId = await done(offers[0]!), input = await progressInput(offers[0]!, 'done', [{ kind: 'mailbox-state', id: doneId }])
+    const credited = await call('zeroProgress', input)
+    expect(credited.results).toEqual([{ id: offers[0]!.id, status: 'accepted' }]); expect(credited.session.progress.decidedCount).toBe(1)
+    expect(await call('zeroProgress', input)).toEqual(credited)
+    await expect(call('zeroProgress', { ...input, paused: true })).rejects.toMatchObject({ code: 'HOST_ZERO_SESSION_CONFLICT' })
+    const otherOffer = otherQueue.items.find(item => item.id === offers[0]!.id)!
+    const reused = await call('zeroProgress', { sessionId: another.id, id: randomUUID(), ifRevision: otherQueue.session.revision,
+      decisions: [{ id: otherOffer.id, decision: 'done', reviewVersion: otherOffer.reviewVersion!, receipts: [{ kind: 'mailbox-state', id: doneId }] }] })
+    expect(reused.results[0]!.status).toBe('rejected'); expect(reused.session.progress.decidedCount).toBe(0)
+    const duplicate = await call('zeroProgress', await progressInput(offers[0]!, 'done', [{ kind: 'mailbox-state', id: doneId }]))
+    expect(duplicate.results[0]!.status).toBe('rejected'); expect(duplicate.session.progress.decidedCount).toBe(1)
+    const inverse: WindowDTO.InboxZeroUndoInput = { id: randomUUID(), reference: credited.undo!, receipts: [{ kind: 'mailbox-state', id: doneId }] }
+    expect(await call('zeroUndo', inverse)).toMatchObject({ status: 'pending', session: { progress: { decidedCount: 1 } } })
+    await h.inbox.undoMailboxStates('alice', doneId)
+    const undone = await call('zeroUndo', inverse)
+    expect(undone).toMatchObject({ status: 'accepted', session: { progress: { decidedCount: 0 } } })
+    expect(await call('zeroUndo', inverse)).toEqual(undone)
+    const redoneId = await done(offers[0]!), redone = await call('zeroProgress', await progressInput(offers[0]!, 'done', [{ kind: 'mailbox-state', id: redoneId }]))
+    expect(redone.results[0]!.status).toBe('accepted')
+    expect(await call('zeroUndo', { ...inverse, id: randomUUID() })).toMatchObject({ status: 'rejected', session: { progress: { decidedCount: 1 } } })
+    const feedbackId = randomUUID(), feedbackRow = rows.get(offers[1]!.id)!
+    await feedback.record({ id: feedbackId, targets: (await latestTargets(offers[1]!)).map(target => ({ ...target, sourceId: feedbackRow.sourceId })) })
+    const feedbackCredit = await call('zeroProgress', await progressInput(offers[1]!, 'done', [{ kind: 'attention-feedback', id: feedbackId }]))
+    expect(feedbackCredit.results[0]!.status).toBe('accepted')
+    const otherRow = rows.get(offers[2]!.id)!, values = (await h.inbox.mailboxMessagePage('alice', { mailboxIds, sourceId: otherRow.sourceId, threadId: otherRow.threadId })).items
+      .sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.id.localeCompare(b.id))
+    const context: CategoryContext = { sourceId: otherRow.sourceId, threadId: otherRow.threadId, sourceGeneration: otherRow.sourceGeneration,
+      mailboxIds: [...new Set(values.flatMap(value => value.memberships.map(member => member.mailboxId)))], latestMessageId: values.at(-1)!.id,
+      messages: values.map(value => ({ messageId: value.id, revision: value.revision, bodyRevision: value.bodyRevision ?? null, memberships: value.memberships.map(member => ({ mailboxId: member.mailboxId, revision: member.revision })) })) }
+    const categoryId = randomUUID()
+    await categories.classify({ id: categoryId, category: 'Other', targets: [{ context, ifRevision: 0 }] })
+    const categoryCredit = await call('zeroProgress', await progressInput(offers[2]!, 'other', [{ kind: 'category', id: categoryId }]))
+    expect(categoryCredit.results[0]!.status).toBe('accepted')
+    const laterBefore: MailboxMembership[] = [], laterRefs: WindowDTO.InboxActionReceiptReference[] = []
+    for (const target of await latestTargets(offers[3]!)) {
+      const message = await h.inbox.mailboxMessageSummary('alice', target.mailboxId, target.messageId)
+      laterBefore.push(message.memberships[0]!)
+      const state = await h.inbox.setMailboxState('alice', target.mailboxId, target.messageId, { snoozedUntil: new Date(Date.now() + 3600000).toISOString() }, target.revision)
+      laterRefs.push({ kind: 'mailbox-membership', target: { mailboxId: state.mailboxId, messageId: state.messageId, revision: state.revision } })
+    }
+    const laterCredit = await call('zeroProgress', await progressInput(offers[3]!, 'later', laterRefs))
+    expect(laterCredit.results[0]!.status).toBe('accepted'); expect(laterCredit.session.progress.decidedCount).toBe(4)
+    expect((await call('zeroProgress', await progressInput(offers[4]!, 'done', [{ kind: 'mailbox-state', id: randomUUID() }]))).results[0]!.status).toBe('rejected')
+    const readRow = rows.get(offers[5]!.id)!
+    const read = await h.inbox.mutate('alice', { messageIds: [readRow.summaries[0]!.id], changes: { isRead: true }, idempotencyKey: randomUUID(), viaMailboxId: readRow.targets[0]!.mailboxId })
+    expect((await call('zeroProgress', await progressInput(offers[5]!, 'done', [{ kind: 'operation', id: read.id }]))).results[0]!.status).toBe('rejected')
+    expect((await resume()).progress.decidedCount).toBe(4)
+    const staleId = await done(offers[6]!), stale = (await latestTargets(offers[6]!))[0]!
+    await h.inbox.setMailboxState('alice', stale.mailboxId, stale.messageId, { done: false }, stale.revision)
+    expect((await call('zeroProgress', await progressInput(offers[6]!, 'done', [{ kind: 'mailbox-state', id: staleId }]))).results[0]!.status).toBe('rejected')
+    const bobMailbox = (await h.inbox.mailboxes('bob'))[0]!, bobMessage = (await h.inbox.mailboxMessagePage('bob', { mailboxIds: [bobMailbox.id] })).items[0]!
+    const foreign = await h.inbox.setMailboxStates('bob', { id: randomUUID(), done: true, targets: [{ mailboxId: bobMailbox.id, messageId: bobMessage.id, revision: 1 }] })
+    await expect(h.inbox.mailboxStateReceipt('alice', foreign.id)).rejects.toMatchObject({ status: 404 })
+    expect((await call('zeroProgress', await progressInput(offers[9]!, 'done', [{ kind: 'mailbox-state', id: foreign.id }]))).results[0]!.status).toBe('rejected')
+    const partialIds = [await done(offers[7]!), await done(offers[8]!)]
+    interruptedReceipt = partialIds[1]!
+    const partialInput: WindowDTO.InboxZeroProgressInput = { sessionId: zero.id, id: randomUUID(), ifRevision: (await resume()).revision,
+      decisions: offers.slice(7, 9).map((offer, index) => ({ id: offer.id, decision: 'done', reviewVersion: offer.reviewVersion!, receipts: [{ kind: 'mailbox-state', id: partialIds[index]! }] })) }
+    const partial = await call('zeroProgress', partialInput)
+    expect(partial.results.map(result => result.status)).toEqual(['accepted', 'pending']); expect(partial.session.progress.decidedCount).toBe(5)
+    const completed = await call('zeroProgress', partialInput)
+    expect(completed.results.map(result => result.status)).toEqual(['accepted', 'accepted']); expect(completed.session.progress.decidedCount).toBe(6)
+    expect(await call('zeroProgress', partialInput)).toEqual(completed)
+    const partialInverse: WindowDTO.InboxZeroUndoInput = { id: randomUUID(), reference: completed.undo!, receipts: partialIds.map(id => ({ kind: 'mailbox-state', id })) }
+    await h.inbox.undoMailboxStates('alice', partialIds[0]!)
+    expect(await call('zeroUndo', partialInverse)).toMatchObject({ status: 'pending', session: { progress: { decidedCount: 5 } } })
+    await h.inbox.undoMailboxStates('alice', partialIds[1]!)
+    expect(await call('zeroUndo', partialInverse)).toMatchObject({ status: 'accepted', session: { progress: { decidedCount: 4 } } })
+    await h.inbox.undoMailboxStates('alice', redoneId)
+    expect((await call('zeroUndo', { id: randomUUID(), reference: redone.undo!, receipts: [{ kind: 'mailbox-state', id: redoneId }] })).status).toBe('accepted')
+    await feedback.undo(feedbackId)
+    expect((await call('zeroUndo', { id: randomUUID(), reference: feedbackCredit.undo!, receipts: [{ kind: 'attention-feedback', id: feedbackId }] })).status).toBe('accepted')
+    await categories.undo(categoryId)
+    expect((await call('zeroUndo', { id: randomUUID(), reference: categoryCredit.undo!, receipts: [{ kind: 'category', id: categoryId }] })).status).toBe('accepted')
+    const laterInverse: WindowDTO.InboxActionReceiptReference[] = []
+    for (const before of laterBefore) {
+      const reference = laterRefs.find(reference => reference.kind === 'mailbox-membership' && reference.target.mailboxId === before.mailboxId && reference.target.messageId === before.messageId)!
+      if (reference.kind !== 'mailbox-membership') throw new Error('Missing Later state receipt')
+      const state = await h.inbox.setMailboxState('alice', before.mailboxId, before.messageId, { done: before.done, snoozedUntil: before.snoozedUntil }, reference.target.revision)
+      laterInverse.push({ kind: 'mailbox-membership', target: { mailboxId: state.mailboxId, messageId: state.messageId, revision: state.revision } })
+    }
+    expect(await call('zeroUndo', { id: randomUUID(), reference: laterCredit.undo!, receipts: laterInverse })).toMatchObject({ status: 'accepted', session: { progress: { decidedCount: 0 } } })
+    expect((await call('zeroProgress', await progressInput(offers[0]!, 'done', [{ kind: 'mailbox-state', id: redoneId }]))).results[0]!.status).toBe('rejected')
+    expect((await resume()).progress).toMatchObject({ initialCount: 12, remainingCount: 12, decidedCount: 0 })
+    expect(bodyReads).toBe(0)
+
+    // Real public AI/category services, with fictional model responses only. Host
+    // page/admission reads must neither load bodies nor launch additional inference.
+    const batchFixture = await fixture(), batchDatabase = new Database(':memory:')
+    const body = 'The previous job is complete. Please review the attached proposal tomorrow.'
+    const { account: batchAccount } = await batchFixture.seed('alice', 'batch-provenance', Array.from({ length: 3 }, (_, index) => native(`batch-proof-${index}`, {
+      bodyText: body, bodyHtml: `<p>${body}</p>`, receivedAt: new Date(EPOCH - index * 1000).toISOString(),
+    })))
+    const configuration: AiInferenceConfig = { version: 1, protocol: 'openai-responses', name: 'Fictional batch assessment', endpoint: 'https://inference.example.test/batch', apiKey: 'fictional-batch-key', defaultModel: 'batch-v1', concurrency: 1, timeoutMs: 3000,
+      models: ['batch-v1', 'batch-v2'].map(id => ({ id, label: id, pricing: null })) }
+    const quiet: AiAssessment = { type: 'other', response: 'not_needed', task: 'none', actions: [], urgency: 'none', deadline: null, topics: [], risk: 'none_observed', certainty: 'clear', reason: 'Fictional quiet assessment', evidence: [] }
+    let modelCalls = 0, batchBodyReads = 0, allowModelBodies = true
+    const aiInbox: Inbox = { ...batchFixture.inbox,
+      mailboxMessage: async (...args) => { if (!allowModelBodies) { batchBodyReads++; throw new Error('Batch AI lookup loaded a body') }; return batchFixture.inbox.mailboxMessage(...args) },
+      message: async (...args) => { if (!allowModelBodies) { batchBodyReads++; throw new Error('Batch AI lookup loaded a body') }; return batchFixture.inbox.message(...args) },
+    }
+    const batchAi = createAiTriageService({ database: batchDatabase, inbox: aiInbox, configuration, sessionKey: KEY, now: () => batchFixture.clock.value,
+      fetcher: (async (_url, init) => {
+        modelCalls++; const request = JSON.parse(String(init?.body))
+        const assessment: AiAssessment = request.model === 'batch-v1' ? quiet : { ...quiet, task: 'required', actions: ['review'], reason: 'A current review is required.', evidence: [
+          { messageRef: 'm0', field: 'task', quote: 'Please review the attached proposal tomorrow.' }, { messageRef: 'm0', field: 'action', quote: 'Please review the attached proposal tomorrow.' },
+        ] }
+        return Response.json({ id: `fictional-batch-${modelCalls}`, model: request.model, status: 'completed', usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150 }, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(assessment) }] }] })
+      }) as typeof fetch })
+    const batchGuard: Inbox = { ...batchFixture.inbox, mailboxMessage: async () => { batchBodyReads++; throw new Error('Batch proof loaded a reader body') }, message: async () => { batchBodyReads++; throw new Error('Batch proof loaded a body') } }
+    const batchCategories = createAttentionOverridesStore(batchDatabase, batchFixture.inbox, 'alice')
+    const batchService = createInboxWindowService({ database: batchDatabase, inbox: batchGuard, owner: 'alice', ai: batchAi, sessionKey: KEY, allowProviderWrites: true,
+      inboxPreferences: createInboxViewPreferencesStore(batchDatabase, batchGuard, 'alice'), splitPreferences: createSplitPreferencesStore(batchDatabase, 'alice'), attentionOverrides: batchCategories })
+    cleanup.push(async () => { await batchService.close(); await batchAi.close(); batchDatabase.close() })
+    const batchCall = async <K extends keyof WindowDTO.InboxWindowTransport>(name: K, input: Parameters<WindowDTO.InboxWindowTransport[K]>[0]): Promise<Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>> =>
+      await batchService.dispatch(WindowDTO.inboxWindowPaths[name], input) as Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>
+    await batchAi.configure('alice', { ...(await batchAi.state('alice')).settings, enabled: true, mode: 'preview' })
+    await batchAi.start(); await batchAi.process('alice', { id: 'batch-quiet-seed', scope: 'all', limit: 100 })
+    await bounded((async () => { while ((await batchAi.state('alice')).usage.completed !== 3) await Bun.sleep(10) })(), 'fictional quiet saved assessments')
+    expect(modelCalls).toBe(3); allowModelBodies = false
+    const batchView = await batchCall('query', { account: 'unified', folder: 'Inbox', split: 'Important', search: false, query: '', filter: null })
+    await bounded((async () => { while ((await batchCall('page', { queryId: batchView.state.queryId })).state.indexing) await Bun.sleep(10) })(), 'batch host index')
+    const batchSession = await batchCall('zeroCreate', { id: randomUUID(), account: 'unified' })
+    const batchQueue = await bounded((async () => {
+      for (;;) { const page = await batchCall('zeroPage', { sessionId: batchSession.id }); if (page.session.progress.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'quiet batch offers')
+    expect(batchQueue.items).toHaveLength(3)
+    expect(batchQueue.items.every(item => item.batchEligibility === 'eligible')).toBe(true)
+    for (const item of batchQueue.items) { expect(item.batchCandidate!.reviewVersion).toMatch(/^[a-f0-9]{64}$/); expect(item.batchCandidate!.reviewVersion).not.toBe(item.reviewVersion!) }
+    const [manualOffer, validOffer, staleOffer] = batchQueue.items as [WindowDTO.InboxZeroItem, WindowDTO.InboxZeroItem, WindowDTO.InboxZeroItem]
+    const batchResume = async () => { const result = await batchCall('zeroResume', { sessionId: batchSession.id, account: 'unified' }); if (result.status !== 'found') throw new Error('Batch session lost'); return result.session }
+    const categoryFor = async (offer: WindowDTO.InboxZeroItem, category: 'Important' | 'Other') => {
+      const found = await batchCall('lookup', { account: 'unified', ids: [offer.id] }), entry = found.entries[0]!
+      if (entry.status !== 'found') throw new Error('Batch mail unavailable')
+      const contextValues = (await batchFixture.inbox.mailboxMessagePage('alice', { mailboxIds: entry.row.mail.mailboxIds!, sourceId: entry.row.sourceId, threadId: entry.row.threadId, limit: 500 })).items.sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.id.localeCompare(b.id))
+      const context: CategoryContext = { sourceId: entry.row.sourceId, threadId: entry.row.threadId, sourceGeneration: entry.row.sourceGeneration, mailboxIds: entry.row.mail.mailboxIds!, latestMessageId: contextValues.at(-1)!.id,
+        messages: contextValues.map(message => ({ messageId: message.id, revision: message.revision, bodyRevision: message.bodyRevision ?? null, memberships: message.memberships.map(state => ({ mailboxId: state.mailboxId, revision: state.revision })) })) }
+      const previous = (await batchCategories.lookup([{ sourceId: entry.row.sourceId, threadId: entry.row.threadId }])).entries[0]!
+      const id = randomUUID(); await batchCategories.classify({ id, category, targets: [{ context, ifRevision: previous.revision }] }); return id
+    }
+    await batchCall('zeroProgress', { id: randomUUID(), sessionId: batchSession.id, ifRevision: (await batchResume()).revision, decisions: [], currentId: manualOffer.id })
+    await categoryFor(manualOffer, 'Important')
+    const manualPage = await batchCall('zeroPage', { sessionId: batchSession.id })
+    expect(manualPage.items.find(item => item.id === manualOffer.id)).toMatchObject({ eligibility: 'eligible', reviewVersion: manualOffer.reviewVersion, batchEligibility: 'ineligible', batchCandidate: null })
+    expect(manualPage.session).toMatchObject({ currentId: manualOffer.id, progress: { decidedCount: 0 } })
+    const validCategory = await categoryFor(validOffer, 'Other')
+    const validInput: WindowDTO.InboxZeroProgressInput = { id: randomUUID(), sessionId: batchSession.id, ifRevision: (await batchResume()).revision,
+      decisions: [{ id: validOffer.id, decision: 'other', reviewVersion: validOffer.batchCandidate!.reviewVersion, receipts: [{ kind: 'category', id: validCategory }] }] }
+    const validBatch = await batchCall('zeroProgress', validInput)
+    expect(validBatch.results).toEqual([{ id: validOffer.id, status: 'accepted' }])
+    expect(await batchCall('zeroProgress', validInput)).toEqual(validBatch)
+    await batchCategories.undo(validCategory)
+    expect((await batchCall('zeroUndo', { id: randomUUID(), reference: validBatch.undo!, receipts: [{ kind: 'category', id: validCategory }] })).status).toBe('accepted')
+    expect(modelCalls).toBe(3); expect(batchBodyReads).toBe(0)
+    const beforeBodyVersions = (await batchFixture.page('alice')).items.map(message => [message.id, message.bodyRevision])
+    allowModelBodies = true
+    await batchAi.configure('alice', { ...(await batchAi.state('alice')).settings, model: 'batch-v2' })
+    await batchAi.process('alice', { id: 'batch-task-refresh', scope: 'all', limit: 100 })
+    await bounded((async () => { while ((await batchAi.state('alice')).usage.completed !== 6) await Bun.sleep(10) })(), 'same-body task assessments')
+    allowModelBodies = false
+    expect((await batchFixture.page('alice')).items.map(message => [message.id, message.bodyRevision])).toEqual(beforeBodyVersions)
+    const changed = await batchCall('zeroPage', { sessionId: batchSession.id })
+    expect(changed.items.find(item => item.id === staleOffer.id)).toMatchObject({ eligibility: 'eligible', reviewVersion: staleOffer.reviewVersion, batchEligibility: 'ineligible', batchCandidate: null })
+    expect(changed.session).toMatchObject({ currentId: manualOffer.id, progress: { decidedCount: 0 } })
+    const taskSummary = (await batchFixture.page('alice')).items.find(message => `unified:${batchAccount.id}:${message.threadId}` === staleOffer.id)!
+    expect((await batchAi.lookup('alice', [{ sourceId: batchAccount.id, threadId: taskSummary.threadId }])).decisions[0]!.assessment!.task).toBe('required')
+    const manualOther = await categoryFor(staleOffer, 'Other')
+    const staleInput: WindowDTO.InboxZeroProgressInput = { id: randomUUID(), sessionId: batchSession.id, ifRevision: (await batchResume()).revision,
+      decisions: [{ id: staleOffer.id, decision: 'other', reviewVersion: staleOffer.batchCandidate!.reviewVersion, receipts: [{ kind: 'category', id: manualOther }] }] }
+    expect((await batchCall('zeroProgress', staleInput)).results).toEqual([{ id: staleOffer.id, status: 'rejected' }])
+    expect((await batchCategories.lookup([{ sourceId: batchAccount.id, threadId: taskSummary.threadId }])).entries[0]!.override!.category).toBe('Other')
+    const individual = await batchCall('zeroProgress', { ...staleInput, id: randomUUID(), ifRevision: (await batchResume()).revision,
+      decisions: [{ ...staleInput.decisions[0]!, reviewVersion: staleOffer.reviewVersion! }] })
+    expect(individual.results).toEqual([{ id: staleOffer.id, status: 'accepted' }])
+    expect(individual.session).toMatchObject({ currentId: manualOffer.id, progress: { decidedCount: 1 } })
+    expect(modelCalls).toBe(6); expect(batchBodyReads).toBe(0)
+  }, 30000)
+})
 
 describe('live bounded mailbox reads', () => {
   test('cached keyset messages survive ordinary events and reconcile arrivals, backfill and deletion from the first state', async () => {

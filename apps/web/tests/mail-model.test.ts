@@ -200,7 +200,7 @@ test("guided zero snapshots and persisted sessions are bounded, immutable-scope 
   ])), zeroStorageKey(zeroScope(UNIFIED_ACCOUNT, ["a", "b"], [{ ...boxes[0], id: "a" }, { ...boxes[0], id: "b" }])));
 });
 
-for (const scenario of ["scope and sparse reload", "lost acknowledgements and late pages", "snooze receipts before refresh"]) test(`SDK-backed manual categories ${scenario}`, async () => {
+for (const scenario of ["scope and sparse reload", "lost acknowledgements and late pages", "snooze receipts before refresh", "durable cleanup reload", "feedback cleanup reload"]) test(`SDK-backed manual categories ${scenario}`, async () => {
   // Isolate owner-lifetime state and exercise the real Bun-backed SDK in either runner.
   if (process.env.INBOX_CATEGORY_TEST_CHILD !== scenario) {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
@@ -224,11 +224,17 @@ for (const scenario of ["scope and sparse reload", "lost acknowledgements and la
   const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 37).toString("base64"), token: "fictional-category-client-token-for-tests", allowProviderWrites: false });
   let database = new Database(join(root, "categories.sqlite"));
   let categories = createAttentionOverridesStore(database, host.inbox, host.owner), stop: (() => void) | undefined;
+  const feedback = scenario === "feedback cleanup reload" ? (await import("../../local-host/src/attention-feedback.ts")).createAttentionFeedbackStore(database, host.inbox, host.owner) : null;
+  let lostFeedbackAcks = 0, lostFeedbackUndoAcks = 0;
+  const feedbackCommands: Array<{ id: string; targets: import("../src/host.ts").AttentionFeedbackTarget[] }> = [], feedbackUndos: string[] = [];
   let bodyReads = 0, providerReads = 0, providerWrites = 0, aiRequests = 0, inventories = 0, lostAcks = 0;
   let holdPage = false, pageHeld = false, releasePage: (() => void) | undefined, returnedPages = 0;
   let holdDelta = false, deltaHeld = false, releaseDelta: (() => void) | undefined, stateWrites = 0, failStateWrite = 0;
   const pages: Array<{ after: number; count: number; cursor: number }> = [];
   const commands: import("../../shared/attention-overrides.ts").CategoryCommand[] = [];
+  let commandPlan: import("../src/inbox.ts").InboxCommandRecovery | undefined, lostStateAcks = 0, lostInverseAcks = 0;
+  const stateCommands: unknown[] = [], inverseCommands: string[] = [];
+  const capturePlan = (plan: import("../src/inbox.ts").InboxCommandRecovery) => { commandPlan = JSON.parse(JSON.stringify(plan)); };
   const until = async (check: () => boolean) => {
     for (let attempt = 0; attempt < 800 && !check(); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.ok(check(), "category SDK fixture reached the expected state");
@@ -239,6 +245,7 @@ for (const scenario of ["scope and sparse reload", "lost acknowledgements and la
     const source = { owner: host.owner, storeId: nativeBox.id, accountId: host.store.link(host.owner, nativeBox.id)!.accountId };
     const native = host.store.receive(source, { from: "category-fixture@example.test", to: nativeBox.email, subject: "Manual category fixture", text: "Fictional unassessed request.", isRead: false });
     host.store.receive(source, { from: "unrelated@example.test", to: nativeBox.email, subject: "Unrelated category fixture", text: "A separate fictional conversation." });
+    if (scenario === "durable cleanup reload") for (let i = 0; i < 60; i++) host.store.receive(source, { from: "fixture@example.test", to: nativeBox.email, subject: `Recovery group ${i}`, text: "Fictional recovery content." });
     await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
     const primary = (await host.inbox.mailboxes(host.owner)).find(box => box.sourceId === source.accountId)!;
     const candidate = (await host.inbox.mailboxCandidates(host.owner, primary.connectionId)).find(value => value.sourceId === source.accountId && value.selector.kind === "domain")!;
@@ -260,7 +267,29 @@ for (const scenario of ["scope and sparse reload", "lost acknowledgements and la
         return Response.json(preferences);
       }
       if (url.pathname === "/host/split-preferences") return Response.json({ ...normalizeSplits({}), revision: 1 });
-      if (url.pathname === "/host/attention-feedback") return Response.json([]);
+      if (url.pathname.startsWith("/host/attention-feedback")) {
+        if (!feedback) return Response.json([]);
+        try {
+          if (url.pathname.endsWith("/undo")) {
+            const id = url.pathname.split("/")[3]; feedbackUndos.push(id);
+            const event = await feedback.undo(id);
+            if (lostFeedbackUndoAcks) { lostFeedbackUndoAcks--; throw new TypeError("Lost feedback Undo acknowledgement"); }
+            return Response.json(event);
+          }
+          if (init?.method === "POST") {
+            const input = JSON.parse(String(init.body)); feedbackCommands.push(input);
+            assert.ok(commandPlan?.kind === "attention-feedback");
+            assert.deepEqual(commandPlan.input, input, "feedback ID and targets are saved before every dispatch");
+            const event = await feedback.record(input);
+            if (lostFeedbackAcks) { lostFeedbackAcks--; throw new TypeError("Lost feedback acknowledgement"); }
+            return Response.json(event);
+          }
+          return Response.json(await feedback.list());
+        } catch (error) {
+          if (error instanceof InboxError) return Response.json({ code: error.code, error: error.message }, { status: error.status });
+          throw error;
+        }
+      }
       if (url.pathname.startsWith("/host/ai-triage")) { aiRequests++; throw new Error("Manual categorization must not contact AI."); }
       if (url.pathname.startsWith("/host/attention-overrides")) {
         try {
@@ -268,6 +297,11 @@ for (const scenario of ["scope and sparse reload", "lost acknowledgements and la
           if (url.pathname.endsWith("/undo")) return Response.json(await categories.undo(url.pathname.split("/")[3]));
           if (init?.method === "POST") {
             const command = JSON.parse(String(init.body)); commands.push(command);
+            if (scenario === "durable cleanup reload") {
+              assert.equal(commandPlan?.kind, "category");
+              assert.deepEqual(commandPlan!.kind === "category" && commandPlan!.groups.find(group => group.input.id === command.id)?.input, command, "every exact category body is persisted before POST");
+              if (commands.length === 2) lostAcks = 2;
+            }
             const receipt = await categories.classify(command);
             if (lostAcks) { lostAcks--; throw new TypeError("Controlled lost category acknowledgement"); }
             return Response.json(receipt);
@@ -288,9 +322,17 @@ for (const scenario of ["scope and sparse reload", "lost acknowledgements and la
       });
       if (/\/mailboxes\/[^/]+\/messages\/[^/]+$/.test(url.pathname)) bodyReads++;
       if (url.pathname === "/v1/mailbox-snapshot") inventories++;
-      if (url.pathname.endsWith("/state") && init?.method === "PATCH" && ++stateWrites === failStateWrite) return Response.json({ code: "CONFLICT", error: "Controlled membership conflict" }, { status: 412 });
+      if ((url.pathname.endsWith("/state") && init?.method === "PATCH" || url.pathname === "/v1/mailbox-actions" && init?.method === "POST") && ++stateWrites === failStateWrite) return Response.json({ code: "CONFLICT", error: "Controlled membership conflict" }, { status: 412 });
+      if (scenario === "durable cleanup reload" && url.pathname === "/v1/mailbox-actions" && init?.method === "POST") {
+        const command = JSON.parse(String(init.body)); stateCommands.push(command);
+        assert.equal(commandPlan?.kind, "mailbox-state");
+        assert.deepEqual(commandPlan!.kind === "mailbox-state" && commandPlan!.input, command, "mailbox command is durable before dispatch");
+      }
+      if (scenario === "durable cleanup reload" && /\/v1\/mailbox-actions\/[^/]+\/undo$/.test(url.pathname)) inverseCommands.push(url.pathname);
       const headers = new Headers(init?.headers); headers.set("Authorization", "Bearer fictional-category-client-token-for-tests");
       const response = await host.fetch(new Request(url, { ...init, headers }));
+      if (response.ok && url.pathname === "/v1/mailbox-actions" && init?.method === "POST" && lostStateAcks) { lostStateAcks--; throw new TypeError("Lost mailbox command acknowledgement"); }
+      if (response.ok && /\/v1\/mailbox-actions\/[^/]+\/undo$/.test(url.pathname) && lostInverseAcks) { lostInverseAcks--; throw new TypeError("Lost mailbox inverse acknowledgement"); }
       if (url.pathname === "/v1/mailbox-changes" && holdDelta) {
         holdDelta = false; deltaHeld = true;
         await new Promise<void>(resolve => { releaseDelta = resolve; });
@@ -300,6 +342,135 @@ for (const scenario of ["scope and sparse reload", "lost acknowledgements and la
     let store = new InboxStore(); stop = store.start();
     const current = (account = UNIFIED_ACCOUNT) => store.getSnapshot().mail.find(mail => mail.account === account && mail.subject === "Manual category fixture")!;
     await until(() => store.getSnapshot().loaded && !!current() && returnedPages > 0);
+    if (scenario === "feedback cleanup reload") {
+      const { validInboxCommandRecovery } = await import("../src/inbox.ts");
+      const initial = current();
+      lostFeedbackAcks = 2;
+      await assert.rejects(store.action([initial], "not-important", undefined, capturePlan), /Lost feedback acknowledgement/);
+      assert.ok(commandPlan?.kind === "attention-feedback" && commandPlan.status === "uncertain");
+      assert.ok(validInboxCommandRecovery(commandPlan));
+      assert.equal(JSON.stringify(commandPlan).includes(initial.subject), false); assert.equal(JSON.stringify(commandPlan).includes("@"), false);
+      const livePlan = JSON.parse(JSON.stringify(commandPlan));
+      assert.equal(feedbackCommands.length, 2); assert.deepEqual(feedbackCommands[0], feedbackCommands[1]);
+      const liveUndo = await store.replayCommand(livePlan, capturePlan);
+      assert.deepEqual(feedbackCommands[2], feedbackCommands[0], "the original tab retries the same feedback command after two lost responses");
+      assert.deepEqual(liveUndo.receipts, [{ kind: "attention-feedback", id: livePlan.input.id }]);
+      const once = await host.inbox.mailboxStateReceipt(host.owner, `attention:${livePlan.input.id}`);
+      assert.equal(once.states[0].revision, livePlan.input.targets[0].revision + 1, "one durable Done is applied despite repeated feedback requests");
+      assert.equal((await feedback!.list()).length, 1);
+      await liveUndo(); await store.retry();
+      const captured = current(); lostFeedbackAcks = 2;
+      await assert.rejects(store.action([captured], "not-important", undefined, capturePlan), /Lost feedback acknowledgement/);
+      const reloadPlan = JSON.parse(JSON.stringify(commandPlan));
+      const postCount = feedbackCommands.length;
+      host.store.receive(source, { from: "fixture@example.test", to: nativeBox.email, subject: captured.subject, threadId: native.threadId, text: "New reply after frozen feedback." });
+      await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+      stop!(); store = new InboxStore(); stop = store.start(); await until(() => store.getSnapshot().loaded && !!current());
+      assert.equal(feedbackCommands.length, postCount, "reload does not automatically replay feedback mutations");
+      const reloadedUndo = await store.replayCommand(reloadPlan, capturePlan);
+      assert.deepEqual(feedbackCommands.at(-1), reloadPlan.input, "explicit reload Retry sends the original ID and body without newer reply targets");
+      assert.equal((await feedback!.list()).length, 2, "each user choice creates exactly one feedback event");
+      assert.ok(current().messages.some(message => !captured.messages.some(old => old.id === message.id) && message.memberships?.every(state => !state.done)), "feedback recovery never inherits a newer reply");
+      lostFeedbackUndoAcks = 1;
+      await assert.rejects(reloadedUndo(), /Lost feedback Undo acknowledgement/);
+      const inverse = JSON.parse(JSON.stringify(commandPlan));
+      stop!(); store = new InboxStore(); stop = store.start(); await until(() => store.getSnapshot().loaded && !!current());
+      assert.deepEqual(await store.undoCommand(inverse, capturePlan), [{ kind: "attention-feedback", id: reloadPlan.input.id }]);
+      assert.equal(feedbackUndos.at(-1), feedbackUndos.at(-2), "lost inverse acknowledgement reuses the feedback ID");
+      assert.ok(current().messages.every(message => message.memberships?.every(state => !state.done)));
+      await store.action([current()], "not-important", undefined, capturePlan);
+      const stale = JSON.parse(JSON.stringify(commandPlan));
+      const receipt = await host.inbox.mailboxStateReceipt(host.owner, `attention:${stale.input.id}`), member = receipt.states[0];
+      const newer = await host.inbox.setMailboxState(host.owner, member.mailboxId, member.messageId, { done: false }, member.revision);
+      await assert.rejects(store.undoCommand(stale, capturePlan), /Newer mailbox changes were not overwritten/);
+      assert.deepEqual((await host.inbox.mailboxMessageSummary(host.owner, member.mailboxId, member.messageId)).memberships.find(state => state.mailboxId === member.mailboxId), newer);
+      assert.equal(commandPlan?.kind === "attention-feedback" && commandPlan.undoStatus, "rejected", "a rejected conditional mail inverse cannot credit Zero Undo");
+      assert.equal(providerWrites, 0); assert.equal(aiRequests, 0); return;
+    }
+    if (scenario === "durable cleanup reload") {
+      const { validInboxCommandRecovery, InboxRecoveryRejected } = await import("../src/inbox.ts");
+      const { ZeroActionRecovery, restoreZeroRecovery } = await import("../src/GuidedZero.tsx");
+      const selected = store.getSnapshot().mail.filter(mail => mail.account === UNIFIED_ACCOUNT && mail.subject.startsWith("Recovery group "));
+      assert.equal(selected.length, 60);
+      await assert.rejects(store.classify(selected, "Other", capturePlan), error => error instanceof InboxClassificationError && error.completed === 50 && !!error.retry);
+      assert.equal(commandPlan?.kind, "category");
+      const categoryPlan = JSON.parse(JSON.stringify(commandPlan)) as import("../src/inbox.ts").InboxCommandRecovery;
+      assert.ok(validInboxCommandRecovery(categoryPlan));
+      if (categoryPlan.kind !== "category") throw new Error("Expected category recovery");
+      assert.deepEqual(categoryPlan.groups.map(group => group.status), ["accepted", "uncertain"]);
+      assert.equal(categoryPlan.groups[0].input.targets.length, 50); assert.equal(categoryPlan.groups[1].input.targets.length, 10);
+      assert.equal(JSON.stringify(categoryPlan).includes("Recovery group"), false);
+      assert.equal(JSON.stringify(categoryPlan).includes("@"), false);
+      const categoryBodies = commands.length;
+      stop!(); store = new InboxStore(); stop = store.start();
+      await until(() => store.getSnapshot().loaded && !!current());
+      assert.equal(commands.length, categoryBodies, "mount/reload never replays saved mutations");
+      const reverseCategories = await store.replayCommand(categoryPlan, capturePlan);
+      assert.equal(commands.length, categoryBodies + 1, "accepted groups are not re-executed");
+      assert.deepEqual(commands.at(-1), categoryPlan.groups[1].input, "unconfirmed category group reuses its original ID and exact captured body after reload");
+      assert.equal(reverseCategories.receipts?.length, 2);
+      await store.undoCommand(commandPlan!, capturePlan);
+      assert.equal(commandPlan!.kind === "category" && commandPlan!.groups.every(group => group.status === "retracted"), true);
+      await store.retry();
+      // Done was accepted, but both transport acknowledgements were lost.
+      const chosen = current(); lostStateAcks = 2;
+      await assert.rejects(store.action([chosen], "done", undefined, capturePlan), /Lost mailbox command/);
+      const donePlan = JSON.parse(JSON.stringify(commandPlan)) as import("../src/inbox.ts").InboxCommandRecovery;
+      assert.equal(donePlan.kind, "mailbox-state");
+      assert.deepEqual(stateCommands.at(-1), stateCommands.at(-2), "even immediate ambiguous retries use the same membership-only body");
+      const postCount = stateCommands.length;
+      host.store.receive(source, { from: "fixture@example.test", to: nativeBox.email, subject: chosen.subject, threadId: native.threadId, text: "New reply after the captured command." });
+      await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+      stop!(); store = new InboxStore(); stop = store.start(); await until(() => store.getSnapshot().loaded && !!current());
+      const recoveredDone = await store.replayCommand(donePlan, capturePlan);
+      assert.equal(stateCommands.length, postCount, "receipt lookup recovers accepted Done without new mutation");
+      assert.equal(recoveredDone.receipts?.[0].kind, "mailbox-state");
+      assert.ok(current().messages.some(message => !chosen.messages.some(old => old.id === message.id) && message.memberships?.every(state => !state.done)), "later replies never enter recovered targets");
+      await store.undoCommand(commandPlan!, capturePlan); await store.retry();
+      // Reminder uses the same SDK durable local-state command, not PATCH.
+      const at = new Date(Date.now() + 86400000).toISOString(); lostStateAcks = 2;
+      await assert.rejects(store.action([current()], "remind", at, capturePlan), /Lost mailbox command/);
+      const pendingReminder = JSON.parse(JSON.stringify(commandPlan)) as import("../src/inbox.ts").InboxCommandRecovery;
+      assert.equal(pendingReminder.kind, "mailbox-state");
+      assert.ok(pendingReminder.kind === "mailbox-state" && pendingReminder.before.length === pendingReminder.input.targets.length);
+      stop!(); store = new InboxStore(); stop = store.start(); await until(() => store.getSnapshot().loaded && !!current());
+      await store.replayCommand(pendingReminder, capturePlan);
+      assert.ok(commandPlan?.kind === "mailbox-state" && commandPlan.accepted.every(state => state.snoozedUntil === at));
+      lostInverseAcks = 1;
+      await assert.rejects(store.undoCommand(commandPlan!, capturePlan), /Lost mailbox inverse/);
+      const pendingInverse = JSON.parse(JSON.stringify(commandPlan)) as import("../src/inbox.ts").InboxCommandRecovery;
+      assert.ok(pendingInverse.kind === "mailbox-state" && pendingInverse.undoStatus === "uncertain");
+      const inversePath = inverseCommands.at(-1);
+      stop!(); store = new InboxStore(); stop = store.start(); await until(() => store.getSnapshot().loaded && !!current());
+      const inverses = await store.undoCommand(pendingInverse, capturePlan);
+      assert.equal(inverseCommands.at(-1), inversePath, "lost Undo response reuses the server-owned inverse by original receipt ID");
+      assert.equal(inverses[0].kind, "mailbox-state");
+      assert.ok(current().messages.every(message => message.memberships?.every(state => !state.done && state.snoozedUntil === null)));
+      await store.action([current()], "remind", at, capturePlan);
+      const stale = JSON.parse(JSON.stringify(commandPlan)) as import("../src/inbox.ts").InboxCommandRecovery;
+      if (stale.kind !== "mailbox-state") throw new Error("Expected reminder plan");
+      const accepted = stale.accepted[0];
+      const later = await host.inbox.setMailboxState(host.owner, accepted.mailboxId, accepted.messageId, { snoozedUntil: null, done: true }, accepted.revision);
+      await assert.rejects(store.undoCommand(stale, capturePlan), error => !!error && typeof error === "object" && "status" in error && error.status === 412);
+      assert.deepEqual((await host.inbox.mailboxMessageSummary(host.owner, accepted.mailboxId, accepted.messageId)).memberships.find(state => state.mailboxId === accepted.mailboxId), later, "stale reminder inverse cannot overwrite newer state even when original values look reusable");
+      const writesBeforeFence = stateCommands.length;
+      const otherOwner = { ...stale, owner: "a".repeat(64) };
+      await assert.rejects(store.replayCommand(otherOwner, capturePlan), error => error instanceof InboxRecoveryRejected);
+      const otherGeneration = structuredClone(stale); otherGeneration.sources[0].generation++;
+      await assert.rejects(store.replayCommand(otherGeneration, capturePlan), error => error instanceof InboxRecoveryRejected);
+      assert.equal(stateCommands.length, writesBeforeFence);
+      assert.equal(validInboxCommandRecovery({ ...stale, subject: "must not persist" }), false);
+      // Rehydrating a UI journal only restores data; its explicit Retry owns I/O.
+      const session = { version: 2 as const, id: "zero-reload", account: primary.id, scopeKey: "frozen-scope", revision: 1, startedAt: 1, phase: "review" as const, paused: true, currentId: chosen.id, status: "ready" as const,
+        progress: { initialCount: 1, remainingCount: 1, decidedCount: 0, ineligibleCount: 0, unknownCount: 0, captureComplete: true } };
+      const journal = { version: 1 as const, session, selection: [{ id: chosen.id, reviewVersion: "opaque-review-token", decision: "done" as const }], command: donePlan,
+        completedIds: [], undoneIds: [], receipts: [], inverseReceipts: [], attempts: [], mailPending: true, undoRequested: false, problem: "" };
+      const restored = restoreZeroRecovery(JSON.parse(JSON.stringify(journal)), session); assert.ok(restored);
+      let replayCount = 0;
+      new ZeroActionRecovery(restored!, { transport: {} as any, save: () => true, session: () => {}, undoMail: async () => [], replayMail: async () => { replayCount++; throw new Error("must be explicit"); } });
+      assert.equal(replayCount, 0);
+      assert.equal(providerWrites, 0); return;
+    }
     if (scenario === "snooze receipts before refresh") {
       await store.setViewPreferences({ unifiedMode: "selected", includedMailboxIds: [primary.id, overlap.id], pinnedMailboxIds: [] });
       await store.retry();
@@ -325,11 +496,11 @@ for (const scenario of ["scope and sparse reload", "lost acknowledgements and la
       let sawPartialSnooze = false;
       const unsubscribe = store.subscribe(() => { sawPartialSnooze ||= current().messages.some(message => message.memberships?.some(state => state.snoozedUntil === when)); });
       try {
-        const beforeRollback = stateWrites; failStateWrite = beforeRollback + 2;
+        const beforeRollback = stateWrites; failStateWrite = beforeRollback + 1;
         await assert.rejects(store.action([current()], "remind", when));
-        assert.equal(stateWrites - beforeRollback, 3, "the failed second membership triggers a conditional rollback of the first");
+        assert.equal(stateWrites - beforeRollback, 1, "one atomic durable reminder command rejects without sequential PATCH rollback");
       } finally { unsubscribe(); }
-      assert.equal(sawPartialSnooze, true, "the successful first membership receipt was published before rollback");
+      assert.equal(sawPartialSnooze, false, "a rejected durable reminder never publishes partial membership changes");
       assert.equal(zeroEligible(current(), scope), true);
       assert.ok(current().messages.every(message => message.memberships?.every(state => !state.done && state.snoozedUntil === null)), "rollback receipts restore all represented memberships immediately");
       assert.equal(inventories, inventoryBaseline, "action completion does not wait for or restart a full inventory");
@@ -2508,6 +2679,434 @@ test("sender selection follows the exact message or outgoing recipient, never th
   assert.equal(senderContact(thread, history, boxes, incoming.id).email, incoming.from.email);
   assert.deepEqual(senderContact(thread, history, boxes, outgoing.id), { ...incoming.from, messageId: outgoing.id, role: "recipient" });
   assert.equal(senderContact({ ...thread, messages: [thread.messages[2]] }, history, boxes).role, "recipient");
+});
+
+test("host-service-backed bounded startup pages, lookup and search without browser inventories", async () => {
+  if (process.env.INBOX_WINDOW_TEST_CHILD !== "1") {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "host-service-backed bounded", "--timeout", "60000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_WINDOW_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const [{ createMockHost }, { InboxStore }, { Database }, { createInboxWindowService }, { createInboxViewPreferencesStore },
+    { createSplitPreferencesStore }, { createAttentionOverridesStore }, { createAiTriageService }, fs, { tmpdir }, { join }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("bun:sqlite"), import("../../local-host/src/inbox-window.ts"),
+    import("../../local-host/src/inbox-preferences.ts"), import("../../local-host/src/split-preferences.ts"), import("../../local-host/src/attention-overrides.ts"),
+    import("../../local-host/src/ai-triage.ts"), import("node:fs/promises"), import("node:os"), import("node:path"),
+  ]);
+  const root = await fs.mkdtemp(join(tmpdir(), "host-window-client-"));
+  const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
+  const globals = ["location", "window", "document", "localStorage"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  console.info = () => {}; console.warn = () => {};
+  const token = "fictional-window-client-token-only";
+  const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 48).toString("base64"), token, allowProviderWrites: false });
+  const database = new Database(join(root, "host-window.sqlite"));
+  const preferences = createInboxViewPreferencesStore(database, host.inbox, host.owner);
+  const splits = createSplitPreferencesStore(database, host.owner);
+  const categories = createAttentionOverridesStore(database, host.inbox, host.owner);
+  const ai = createAiTriageService({ database, inbox: host.inbox, configuration: null, sessionKey: token });
+  const service = createInboxWindowService({ database, inbox: host.inbox, owner: host.owner, sessionKey: token, allowProviderWrites: false,
+    inboxPreferences: preferences, splitPreferences: splits, attentionOverrides: categories, ai });
+  let stop: (() => void) | undefined;
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  const until = async (check: () => boolean, message: string) => {
+    const deadline = Date.now() + 20000; while (!check() && Date.now() < deadline) await sleep(20); assert.ok(check(), message);
+  };
+  try {
+    const nativeBox = host.store.mailboxes(host.owner)[0];
+    const source = { owner: host.owner, storeId: nativeBox.id, accountId: host.store.link(host.owner, nativeBox.id)!.accountId };
+    let firstNative: ReturnType<typeof host.store.receive> | undefined;
+    for (let index = 0; index < 1200; index++) {
+      const received = host.store.receive(source, { from: "window-fixture@example.test", to: nativeBox.email,
+        subject: `Window fixture ${String(index).padStart(4, "0")}`, text: "Fictional bounded inbox context." });
+      if (!index) firstNative = received;
+    }
+    let more = true;
+    while (more) more = (await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 })).hasMore;
+    const box = (await host.inbox.mailboxes(host.owner)).find(box => box.sourceId === source.accountId)!;
+    const storage = new Map<string, string>();
+    Object.assign(globalThis, { location: new URL(`http://localhost:41999/#/account=${box.id}&folder=All%20Mail&split=Important`), window: new EventTarget(),
+      document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
+      localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+    });
+    let inventories = 0, pages = 0, bodyReads = 0;
+    let holdQuery = false, heldQuery = false, releaseQuery: (() => void) | undefined;
+    const published: number[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: false, providers: [], inboxWindow: true });
+      if (url.pathname === "/host/inbox-preferences") return Response.json(await preferences.read());
+      if (url.pathname.startsWith("/host/inbox/")) {
+        assert.equal(init?.method, "POST"); assert.equal(init?.credentials, "include");
+        if (url.pathname === "/host/inbox/page") pages++;
+        try {
+          const body = JSON.parse(String(init?.body));
+          const result = await service.dispatch(url.pathname, body);
+          if (holdQuery && url.pathname === "/host/inbox/query" && body.folder === "Trash") {
+            heldQuery = true;
+            await new Promise<void>(resolve => { releaseQuery = resolve; init?.signal?.addEventListener("abort", () => setTimeout(resolve, 100), { once: true }); });
+          }
+          return Response.json(result);
+        }
+        catch (cause) { const error = cause as { status?: number; code?: string; message?: string }; return Response.json({ code: error.code, error: error.message }, { status: error.status ?? 500 }); }
+      }
+      if (url.pathname.includes("mailbox-snapshot") || url.pathname === "/v1/mailbox-messages") inventories++;
+      if (/\/messages\//.test(url.pathname)) bodyReads++;
+      if (url.pathname === "/v1/events") return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("Stopped", "AbortError")); if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      const headers = new Headers(init?.headers); headers.set("Authorization", `Bearer ${token}`);
+      return host.fetch(new Request(url, { ...init, headers }));
+    }) as typeof fetch;
+    // Finish the host's local index, independently of browser loading. This is not a browser inventory.
+    const query = { account: box.id, folder: "All Mail", split: "Important", search: false, query: "", filter: null };
+    let warm = await service.dispatch("/host/inbox/query", query) as import("../../shared/inbox-window").InboxWindowPage;
+    for (let attempts = 0; warm.state.indexing && attempts < 400; attempts++) {
+      await sleep(25); warm = await service.dispatch("/host/inbox/page", { queryId: warm.state.queryId, seek: "start", limit: 100 }) as typeof warm;
+    }
+    assert.equal(warm.state.indexing, false, "fictional host index is ready");
+    const store = new InboxStore(); store.subscribe(() => { if (store.getSnapshot().loaded) published.push(store.getSnapshot().window?.keys.length ?? 0); }); stop = store.start();
+    await until(() => store.getSnapshot().window?.keys.length === 300, "first 300 conversations prefetched");
+    assert.equal(published[0], 100, "first 100 are usable before prefetch");
+    const prefetched = pages; await sleep(150); assert.equal(pages, prefetched, "automatic paging stops at 300");
+    assert.equal(inventories, 0, "new host never uses the legacy browser inventory"); assert.equal(bodyReads, 0, "initial rows are body-free");
+    const first = store.getSnapshot().mail[0]; store.pinWindow("reader", [first.id]);
+    for (let count = 0; count < 8; count++) await store.loadMoreWindow();
+    assert.ok(store.getSnapshot().mail.length <= 1000); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), first, "pinned unchanged row identity survives paging");
+    assert.ok(!store.getSnapshot().window!.keys.includes(first.id), "a pinned evicted reader does not inflate the active window");
+    await store.loadThread(first.id);
+    const cached = store.getSnapshot().mail.find(mail => mail.id === first.id), reads = bodyReads;
+    await store.loadThread(first.id);
+    assert.equal(bodyReads, reads, "cached open performs no additional body read");
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), cached, "cached open preserves row identity");
+    await store.setWindowQuery({ ...query, search: true, query: "subject:\"Window fixture 0000\"" });
+    await until(() => store.getSnapshot().mail.some(mail => mail.subject === "Window fixture 0000"), "host search reaches outside the old browser window");
+    const before = [...store.getSnapshot().window!.keys]; await store.lookupWindow([first.id]);
+    assert.deepEqual(store.getSnapshot().window!.keys, before, "off-view lookup never inflates active rows or totals");
+    // Reader/flag work may have advanced the SDK since the last query page.
+    // A 503 is an explicit refusal to capture, not a partially frozen selection.
+    let selected: Awaited<ReturnType<typeof store.createWindowSelection>> | undefined;
+    for (let attempt = 0; !selected && attempt < 400; attempt++) {
+      try { selected = await store.createWindowSelection(); }
+      catch (error) { assert.equal((error as { status?: number }).status, 503, "only index-not-current capture rejection is retryable here"); await sleep(25); }
+    }
+    assert.ok(selected, "capture is accepted only after the host index is current");
+    let selectionPage = await store.windowTransport.selectionPage({ selectionId: selected.id });
+    for (let attempt = 0; !selectionPage.selection.captureComplete && attempt < 100; attempt++) { await sleep(20); selectionPage = await store.windowTransport.selectionPage({ selectionId: selected.id }); }
+    assert.ok(selectionPage.selection.captureComplete, "selection capture completes server-side");
+    const captured = await store.resolveWindowSelection(selected); assert.ok(captured.every(mail => mail.window?.targetsComplete));
+    assert.equal(captured.length, 1);
+    const later = host.store.receive(source, { from: "window-fixture@example.test", to: nativeBox.email, subject: "Window fixture 0000", text: "Fictional later reply.", threadId: firstNative!.threadId });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    const reverse = await store.action(captured, "done");
+    assert.ok(reverse.receipts?.some(receipt => receipt.kind === "mailbox-state"), "accepted Done exposes typed receipt references for cleanup");
+    const original = await host.inbox.mailboxMessageSummary(host.owner, box.id, captured[0].messages[0].id);
+    assert.equal(original.memberships[0].done, true);
+    const threadPage = await host.inbox.mailboxMessages(host.owner, { mailboxIds: [box.id], search: 'subject:"Window fixture 0000"', limit: 100 });
+    const newer = threadPage.items.find(message => message.id !== original.id && message.threadId === original.threadId)!;
+    assert.ok(newer, `later fictional reply ${later.id} is indexed`); assert.equal(newer.memberships[0].done, false, "captured Done never inherits a later reply");
+    store.pinWindow("reader", []); await store.setWindowQuery({ ...query, folder: "Sent" });
+    assert.ok(!store.getSnapshot().mail.some(mail => mail.id === captured[0].id), "captured action row is evicted outside its view");
+    await reverse();
+    assert.equal((await host.inbox.mailboxMessageSummary(host.owner, box.id, original.id)).memberships[0].done, false, "Undo restores its receipt after eviction");
+    holdQuery = true;
+    const stale = store.setWindowQuery({ ...query, folder: "Trash" }).catch(error => error);
+    await until(() => heldQuery, "old host response is held");
+    await store.setWindowQuery(query); releaseQuery?.();
+    assert.equal((await stale)?.name, "AbortError");
+    assert.equal(store.getSnapshot().window?.query.folder, "All Mail", "late prior-view response cannot replace the active window");
+    stop(); stop = undefined;
+  } finally {
+    stop?.(); await service.close(); await ai.close(); await host.close(); database.close();
+    globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    for (const [key, descriptor] of globals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); }
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("guided zero recovery protocol preserves partial credit, exact retries, Undo and legacy traversal", async () => {
+  if (!process.versions.bun) {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "guided zero recovery protocol", "--timeout", "10000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const { ZeroActionRecovery, restoreZeroRecovery, legacyZeroPage, confirmZeroReservation, boundedZeroBatch, assertZeroMembershipBudget, revalidateZeroBatch } = await import("../src/GuidedZero.tsx");
+  const { InboxClassificationError } = await import("../src/inbox.ts");
+  type Session = import("../../shared/inbox-window").InboxZeroSession;
+  type Input = import("../../shared/inbox-window").InboxZeroProgressInput;
+  type Result = import("../../shared/inbox-window").InboxZeroProgressResult;
+  type UndoInput = import("../../shared/inbox-window").InboxZeroUndoInput;
+  type Journal = import("../src/GuidedZero.tsx").ZeroRecoveryJournal;
+  type Reverse = import("../src/inbox.ts").InboxUndo;
+  const initialSession = (): Session => ({ version: 2, id: "zero-session", account: "box", scopeKey: "captured-scope", revision: 1,
+    startedAt: 1, phase: "batches", paused: false, currentId: "a", status: "ready",
+    progress: { initialCount: 3, remainingCount: 3, decidedCount: 0, ineligibleCount: 0, unknownCount: 0, captureComplete: true } });
+  const journal = (): Journal => ({ version: 1, session: initialSession(), selection: ["a", "b", "c"].map(id => ({ id, decision: "other", reviewVersion: `captured:${id}` })),
+    completedIds: [], undoneIds: [], receipts: [], inverseReceipts: [], attempts: [], mailPending: true, undoRequested: false, problem: "" });
+  const reverse = (...ids: string[]): Reverse => Object.assign(async () => { throw new Error("The original classifier-wide Undo must not retire pending groups."); }, {
+    receipts: ids.map(id => ({ kind: "category" as const, id })),
+  });
+  // This is a pure protocol fixture, not an SDK or host-service replacement.
+  function protocol() {
+    let session = initialSession(), saved: Journal | null = null, statuses: Record<string, "accepted" | "pending" | "rejected"> = {};
+    let loseProgress = false, loseUndo = false;
+    const requests: Input[] = [], inverseRequests: UndoInput[] = [], mailUndos: string[][] = [];
+    const persisted = new Map<string, Input>(), inverseBodies = new Map<string, UndoInput>(), credited = new Set<string>();
+    const progressResults = new Map<string, Result>();
+    const update = () => { session = { ...session, revision: session.revision + 1, progress: { ...session.progress, decidedCount: credited.size, remainingCount: 3 - credited.size } }; return structuredClone(session); };
+    const io = {
+      save: (value: Journal) => { saved = structuredClone(value); return true; },
+      session: (_value: Session) => {},
+      undoMail: async (references: import("../../shared/inbox-window").InboxActionReceiptReference[]) => { mailUndos.push(references.map(reference => "id" in reference ? reference.id : reference.target.messageId)); return structuredClone(references); },
+      transport: {
+        zeroResume: async () => ({ status: "found" as const, session: structuredClone(session) }),
+        zeroProgress: async (input: Input): Promise<Result> => {
+          assert.deepEqual(saved!.attempts.find(attempt => attempt.input.id === input.id)?.input, input, "the exact progress body is durable before POST");
+          if (persisted.has(input.id)) assert.deepEqual(input, persisted.get(input.id), "idempotency identity never receives a rebased/subset body");
+          else persisted.set(input.id, structuredClone(input));
+          requests.push(structuredClone(input));
+          const previous = progressResults.get(input.id);
+          const results = input.decisions.map(decision => {
+            const before = previous?.results.find(result => result.id === decision.id)?.status;
+            return { id: decision.id, status: before && before !== "pending" ? before : statuses[decision.id] ?? "accepted" as const };
+          });
+          for (const result of results) if (result.status === "accepted") credited.add(result.id);
+          const result: Result = { session: update(), results, undo: results.some(result => result.status === "accepted") ? { sessionId: session.id, progressId: input.id } : null };
+          progressResults.set(input.id, structuredClone(result));
+          if (loseProgress) { loseProgress = false; throw new TypeError("Lost accepted progress response"); }
+          return result;
+        },
+        zeroUndo: async (input: UndoInput) => {
+          assert.deepEqual(saved!.attempts.find(attempt => attempt.input.id === input.reference.progressId)?.undoInput, input, "inverse progress identity is saved before POST");
+          if (inverseBodies.has(input.id)) assert.deepEqual(input, inverseBodies.get(input.id)); else inverseBodies.set(input.id, structuredClone(input));
+          inverseRequests.push(structuredClone(input));
+          for (const result of progressResults.get(input.reference.progressId)?.results ?? []) if (result.status === "accepted") credited.delete(result.id);
+          const result = { status: "accepted" as const, session: update() };
+          if (loseUndo) { loseUndo = false; throw new TypeError("Lost accepted Undo response"); }
+          return result;
+        },
+      },
+    };
+    return { io, requests, inverseRequests, mailUndos, get saved() { return saved!; }, get session() { return session; },
+      statuses: (value: typeof statuses) => { statuses = value; }, loseProgress: () => { loseProgress = true; }, loseUndo: () => { loseUndo = true; } };
+  }
+  {
+    const api = protocol(); let newCommands = 0, exactRetries = 0;
+    const record = new ZeroActionRecovery(journal(), api.io);
+    const originalRetry = async () => { exactRetries++; return reverse("category-a", "category-bc"); };
+    await record.begin(async () => { newCommands++; throw new InboxClassificationError("HOST_CATEGORY_ACK_PENDING", 1, 2, originalRetry, reverse("category-a")); });
+    assert.equal(api.session.progress.decidedCount, 1); assert.equal(record.complete, false); assert.equal(record.blocked, true); assert.equal(record.canUndo, true);
+    assert.deepEqual(api.requests[0].decisions.map(item => item.id), ["a"], "partial command counts only acknowledged conversations");
+    record.journal.session.paused = true; record.checkpoint(); // UI pause does not replace the runtime command closure.
+    await record.undo();
+    assert.equal(api.session.progress.decidedCount, 0); assert.equal(exactRetries, 0);
+    assert.deepEqual(api.mailUndos, [["category-a"]], "Undo targets only acknowledged receipts while later groups remain recoverable");
+    assert.equal(record.blocked, true); assert.deepEqual(record.journal.undoneIds, ["a"]);
+    await record.retry();
+    assert.equal(newCommands, 1); assert.equal(exactRetries, 1, "recovery invokes error.retry, not a new classify call");
+    assert.deepEqual(api.requests.at(-1)!.decisions.map(item => item.id), ["b", "c"], "retracted/previously credited prefixes are never credited again");
+    assert.equal(api.session.progress.decidedCount, 2); assert.equal(record.complete, true);
+  }
+  {
+    const api = protocol(); let originalRetries = 0;
+    const record = new ZeroActionRecovery(journal(), api.io);
+    await record.begin(async () => { throw new InboxClassificationError("HOST_CATEGORY_ACK_PENDING", 1, 2,
+      async () => { originalRetries++; return reverse("category-a", "category-bc"); }, reverse("category-a")); });
+    const reloaded = new ZeroActionRecovery(restoreZeroRecovery(api.saved, initialSession())!, api.io);
+    await assert.rejects(reloaded.retry(), /replay is unavailable after reload/);
+    assert.equal(originalRetries, 0); assert.equal(api.session.progress.decidedCount, 1);
+    assert.equal(reloaded.canUndo, true); assert.deepEqual(reloaded.journal.selection.map(item => item.id), ["a", "b", "c"]);
+    await reloaded.undo();
+    assert.equal(api.session.progress.decidedCount, 0); assert.equal(reloaded.blocked, true, "unconfirmed original commands remain retained, never silently recreated");
+  }
+  {
+    const api = protocol(); let writes = 0;
+    api.loseProgress();
+    const record = new ZeroActionRecovery(journal(), api.io);
+    await assert.rejects(record.begin(async () => { writes++; return reverse("category-all"); }), /Lost accepted progress/);
+    const exact = structuredClone(api.requests[0]);
+    const restored = restoreZeroRecovery(JSON.parse(JSON.stringify(api.saved)), initialSession());
+    assert.ok(restored); assert.equal(record.blocked, true);
+    const reloaded = new ZeroActionRecovery(restored!, api.io);
+    await reloaded.retry();
+    assert.equal(writes, 1); assert.deepEqual(api.requests[1], exact, "reload resumes the original approved progress ID and body");
+    assert.equal(api.session.progress.decidedCount, 3); assert.equal(reloaded.complete, true);
+    api.loseUndo();
+    await assert.rejects(reloaded.undo(), /Lost accepted Undo/);
+    const inverse = structuredClone(api.inverseRequests[0]);
+    const resumedUndo = new ZeroActionRecovery(restoreZeroRecovery(api.saved, initialSession())!, api.io);
+    await resumedUndo.retry();
+    assert.equal(api.mailUndos.length, 1, "reload of an acknowledged mail Undo does not issue it again");
+    assert.deepEqual(api.inverseRequests[1], inverse); assert.equal(api.session.progress.decidedCount, 0);
+  }
+  {
+    const api = protocol(); let writes = 0;
+    api.statuses({ b: "pending", c: "rejected" });
+    const record = new ZeroActionRecovery(journal(), api.io);
+    await record.begin(async () => { writes++; return reverse("category-all"); });
+    const original = structuredClone(api.requests[0]);
+    assert.equal(record.complete, false); assert.equal(api.session.progress.decidedCount, 1);
+    api.statuses({ c: "rejected" }); await record.retry();
+    assert.equal(record.complete, false); assert.equal(api.session.progress.decidedCount, 2);
+    api.statuses({}); await record.retry();
+    assert.equal(record.complete, false, "a definitive rejected progress result never becomes a synthetic success"); assert.equal(writes, 1);
+    assert.equal(api.session.progress.decidedCount, 2);
+    assert.ok(api.requests.every(request => JSON.stringify(request) === JSON.stringify(original)), "accepted/pending/rejected results preserve one original body");
+    const foreign = { ...initialSession(), scopeKey: "different-scope" };
+    assert.equal(restoreZeroRecovery(api.saved, foreign), null, "captured recovery never widens to another scope");
+  }
+  {
+    const api = protocol();
+    const record = new ZeroActionRecovery(journal(), { ...api.io, save: () => false });
+    let writes = 0;
+    await assert.rejects(record.begin(async () => { writes++; return reverse("category-all"); }), /could not be saved/);
+    assert.equal(writes, 0, "storage failure before dispatch cannot create an unrecoverable new command");
+  }
+  {
+    type Item = import("../../shared/inbox-window").InboxZeroItem;
+    const items: Item[] = Array.from({ length: 50 }, (_, i) => ({ id: `batch-${i}`, eligibility: "eligible", batchEligibility: "eligible", reviewVersion: `opaque-${i}`,
+      batchCandidate: { id: `batch-${i}`, basis: "no-outstanding-work", membershipCount: 11, reviewVersion: `opaque-${i}` } }));
+    let remaining = [...items], server = { ...initialSession(), progress: { ...initialSession().progress, initialCount: 50, remainingCount: 50 } };
+    const mail = (item: Item): Mail => ({ ...inbox, id: item.id, messages: Array.from({ length: 11 }, (_, i) => ({ ...inbox.messages[0], id: `${item.id}-message-${i}`, pending: false,
+      memberships: [{ mailboxId: "box", messageId: `${item.id}-message-${i}`, revision: 1, done: false, snoozedUntil: null }] })) });
+    const posts: Input[] = [], readRequests: unknown[] = [], classifications: string[][] = [];
+    const read = async (input: Parameters<import("../../shared/inbox-window").InboxWindowTransport["zeroPage"]>[0]) => {
+      readRequests.push(input); return { session: server, items: remaining, nextCursor: null, exhausted: true };
+    };
+    assert.equal(boundedZeroBatch(items).length, 45, "50 safe conversations with 11 memberships offer a 495-membership prefix, not 550");
+    assert.throws(() => assertZeroMembershipBudget(items.map(mail)), /at most 500/, "runtime-expanded checked mail is rejected before classification");
+    await assert.rejects(revalidateZeroBatch({ sessionId: server.id, cursor: "original-captured-page" }, items, read), /membership budget/);
+    assert.equal(readRequests.length, 0, "an oversized edited list cannot even reach batch dispatch preparation");
+    while (remaining.length) {
+      const offered = boundedZeroBatch(remaining);
+      assertZeroMembershipBudget(offered.map(mail));
+      await revalidateZeroBatch({ sessionId: server.id, cursor: "original-captured-page" }, offered, read);
+      const captured: Journal = { ...journal(), session: server, selection: offered.map(item => ({ id: item.id, decision: "other", reviewVersion: item.reviewVersion! })) };
+      const record = new ZeroActionRecovery(captured, { save: () => true, session: next => { server = next; }, undoMail: async refs => refs,
+        transport: { zeroResume: async () => ({ status: "found", session: server }), zeroUndo: async () => ({ status: "accepted", session: server }),
+          zeroProgress: async input => {
+            assert.ok(input.decisions.reduce((sum, decision) => sum + items.find(item => item.id === decision.id)!.batchCandidate!.membershipCount, 0) <= 500, "every progress body stays within the unchanged host limit");
+            posts.push(structuredClone(input)); remaining = remaining.filter(item => !input.decisions.some(decision => decision.id === item.id));
+            server = { ...server, revision: server.revision + 1, progress: { ...server.progress, remainingCount: remaining.length, decidedCount: 50 - remaining.length } };
+            return { session: server, results: input.decisions.map(item => ({ id: item.id, status: "accepted" })), undo: { sessionId: server.id, progressId: input.id } };
+          } } });
+      await record.begin(async () => { classifications.push(offered.map(item => item.id)); return reverse(`bounded-command-${posts.length}`); });
+      assert.equal(record.complete, true);
+    }
+    assert.deepEqual(classifications.map(ids => ids.length), [45, 5]);
+    assert.deepEqual(posts.flatMap(post => post.decisions.map(item => item.id)), items.map(item => item.id), "the suffix remains available for the next confirmed batch, with no selected decisions discarded");
+    assert.equal(server.progress.decidedCount, 50);
+    assert.ok(readRequests.every(input => (input as { cursor: string }).cursor === "original-captured-page"), "fresh validation never recaptures or widens the queue");
+    const reserved = { ...items[0], batchEligibility: "ineligible" as const, batchCandidate: null };
+    assert.equal(boundedZeroBatch([reserved, ...items.slice(1)]).some(item => item.id === reserved.id), false, "persisted unchecked reservations never re-enter a later batch");
+  }
+  {
+    const scope = zeroScope("box", [], [{ id: "box", sourceId: "source", sourceGeneration: 1, name: "Box", email: "me@example.test", canSend: false }]);
+    const ai = { configured: true, settings: { enabled: true, revision: 2, model: "fixture-model", mode: "apply" } } as AiTriageState;
+    const decision: AiDecision = { sourceId: "source", threadId: "thread", revision: 1, settingsRevision: 2, state: "ready", mailboxIds: ["box"], messageIds: ["message"],
+      contextVersions: [{ messageId: "message", bodyRevision: "body-1" }], latestMessageId: "message", inputHash: "fixture-hash", model: "fixture-model", schemaVersion: AI_TRIAGE_VERSION, updatedAt: deadline, holdUntil: null,
+      assessment: { type: "newsletter", response: "not_needed", task: "none", actions: [], urgency: "none", deadline: null, topics: [], risk: "none_observed", certainty: "clear", reason: "Fictional quiet campaign", evidence: [{ messageRef: "m1", field: "type", quote: "Newsletter" }] },
+      score: { category: "Important", score: 55, reasons: [], contributions: [], version: "preference-2" }, override: null, problemCode: null };
+    const mail: Mail = { ...inbox, id: "box:thread", account: "box", mailboxId: "box", sourceId: "source", sdkThreadId: "thread", locations: ["Inbox"], attentionCategory: "Important", triage: decision,
+      messages: [{ ...inbox.messages[0], id: "message", bodyRevision: "body-1", revision: 1, nativeFolder: "inbox", outgoing: false,
+        memberships: [{ mailboxId: "box", messageId: "message", revision: 1, done: false, snoozedUntil: null }] }] };
+    const candidate = zeroBatchCandidate(mail, scope, ai, Date.parse(deadline))!; assert.ok(candidate);
+    const selected: import("../../shared/inbox-window").InboxZeroItem = { id: mail.id, eligibility: "eligible", batchEligibility: "eligible", reviewVersion: "opaque-same-content", batchCandidate: { ...candidate, reviewVersion: "opaque-same-content" } };
+    const changed = { ...mail, triage: { ...decision, revision: 2, assessment: { ...decision.assessment!, task: "required" as const } } };
+    assert.equal(zeroReviewVersion(changed, scope), zeroReviewVersion(mail, scope), "a new AI task receipt changes safety without changing the mail body/review identity");
+    assert.equal(zeroBatchCandidate(changed, scope, ai, Date.parse(deadline)), null);
+    let writes = 0, reads = 0;
+    for (const state of ["ineligible", "unknown"] as const) {
+      await assert.rejects((async () => {
+        await revalidateZeroBatch({ sessionId: initialSession().id, cursor: "frozen-page" }, [selected], async input => {
+          reads++; assert.equal(input.cursor, "frozen-page");
+          return { session: initialSession(), items: [{ ...selected, batchEligibility: state, batchCandidate: null }], nextCursor: null, exhausted: true };
+        });
+        writes++;
+      })(), /Review it individually/);
+    }
+    assert.equal(reads, 2); assert.equal(writes, 0, "task/stale/manual/unavailable fresh proof cannot reach automatic batch classification");
+    assert.equal(zeroEligible(changed, scope, Date.parse(deadline)), true, "the conversation remains available for an individual manual decision");
+  }
+  {
+    const api = protocol(); let writes = 0, saves = 0;
+    const raw = journal(); raw.selection[0].reviewVersion = JSON.stringify(["Private subject", "person@example.test", "snippet"]);
+    const record = new ZeroActionRecovery(raw, { ...api.io, save: () => { saves++; return true; } });
+    await assert.rejects(record.begin(async () => { writes++; return reverse("category-all"); }), /opaque cleanup review tokens/);
+    assert.equal(writes, 0); assert.equal(saves, 0, "legacy content-bearing host review versions never enter browser recovery storage");
+    assert.equal(restoreZeroRecovery(raw, initialSession()), null);
+  }
+  {
+    const api = protocol(); let writes = 0, replays = 0;
+    const command: import("../src/inbox.ts").InboxCommandRecovery = { version: 1, owner: null, sources: [{ sourceId: "source", generation: 1, mailboxIds: ["box"] }], kind: "mailbox-state",
+      input: { id: "frozen-done-command", done: true, targets: ["a", "b", "c"].map(messageId => ({ mailboxId: "box", messageId, revision: 1 })) }, status: "uncertain", before: [], accepted: [] };
+    const record = new ZeroActionRecovery(journal(), api.io);
+    await assert.rejects(record.begin(async sink => { sink(command); writes++; throw new TypeError("Lost original command acknowledgement"); }), /Lost original/);
+    const restored = restoreZeroRecovery(JSON.parse(JSON.stringify(api.saved)), initialSession()); assert.ok(restored);
+    const reloaded = new ZeroActionRecovery(restored!, { ...api.io, replayMail: async (captured, sink) => {
+      replays++; assert.deepEqual(captured, command, "reload hands the exact frozen command to the store, never fresh mail");
+      sink({ ...captured, status: "accepted" } as typeof command);
+      return Object.assign(async () => {}, { receipts: [{ kind: "mailbox-state" as const, id: command.input.id }] });
+    } });
+    assert.equal(replays, 0, "rehydration never dispatches a mail mutation");
+    await reloaded.retry(); assert.equal(replays, 1); assert.equal(writes, 1); assert.equal(reloaded.complete, true);
+    assert.equal(api.saved.command?.kind, "mailbox-state");
+  }
+  {
+    const input: Input = { sessionId: initialSession().id, id: "original-reservation", ifRevision: 1, decisions: [], reviewOnlyIds: ["a"] };
+    let saved: Input | null = null, sends = 0, acknowledged = false;
+    const requests: Input[] = [];
+    const persist = (value: Input | null) => { saved = structuredClone(value); return true; };
+    const send = async (value: Input): Promise<Result> => {
+      assert.deepEqual(saved, input, "checkbox exclusion is durable before the host call");
+      requests.push(structuredClone(value));
+      if (++sends === 1) throw new TypeError("Lost reservation acknowledgement");
+      acknowledged = true; return { session: { ...initialSession(), revision: 2 }, results: [], undo: null };
+    };
+    await assert.rejects(confirmZeroReservation(input, persist, send), /Lost reservation/);
+    assert.deepEqual(saved, input); assert.equal(acknowledged, false);
+    await confirmZeroReservation(JSON.parse(JSON.stringify(saved)), persist, send);
+    assert.equal(saved, null); assert.equal(acknowledged, true); assert.deepEqual(requests[0], requests[1], "reload replays the same reservation ID/body instead of silently losing unchecked IDs");
+    await assert.rejects(confirmZeroReservation(input, () => false, send), /could not be saved/);
+    assert.equal(sends, 2, "a reservation storage failure blocks dispatch and dependent decisions");
+  }
+  {
+    const ids = Array.from({ length: ZERO_QUEUE_LIMIT }, (_, index) => `legacy-${index}`);
+    const original = [...ids], requests: string[][] = [];
+    const first = await legacyZeroPage(ids, 0, 1, async wanted => { requests.push(wanted); return []; });
+    const second = await legacyZeroPage(ids, first.next, 1, async wanted => { requests.push(wanted); throw new Error("Captured eligibility unknown"); });
+    assert.ok(second.error); assert.equal(second.next, 200);
+    const found = { ...inbox, id: ids[230] };
+    const third = await legacyZeroPage(ids, second.next, 1, async wanted => { requests.push(wanted); return [found]; });
+    assert.deepEqual(third.rows, [found]); assert.ok(requests.every(request => request.length === 100));
+    const last = await legacyZeroPage(ids, ids.length - 10, 1, async wanted => { requests.push(wanted); return []; });
+    assert.equal(last.exhausted, true); assert.equal(last.rows.length, 0);
+    assert.deepEqual(ids, original, "unavailable pages and captured-ID exhaustion never truncate the legacy queue or credit decisions");
+    const previous = await legacyZeroPage(ids, 230, -1, async wanted => { requests.push(wanted); return []; });
+    assert.equal(previous.next, 130); assert.equal(previous.requested[0], ids[230]);
+  }
+});
+
+test("bounded host windows expose only the active server view and retain unknown totals", () => {
+  const base = inbox;
+  const pinned = { ...base, id: "pinned", folder: "Done", split: "Other" };
+  const active = { ...base, id: "active", split: "Other", unread: false };
+  const window = { keys: [active.id], totals: { conversations: null, messages: null, inbox: null, splits: { Important: null, Other: null }, folders: {}, holding: null } };
+  const view = selectMailView([pinned, active], base.account, "Inbox", "Important", { ...defaultPreferences, hideEmptySplits: true }, false, "", "Unread", undefined, false, window);
+  assert.deepEqual(view.visibleMail, [active], "host predicate wins over partial local flags and inactive/pinned rows never enter the view");
+  assert.equal(view.inboxCount, null);
+  assert.equal(view.splitCounts.Important, null);
+  assert.ok(view.shownSplits.includes("Other"), "an unknown split is not an empty split");
 });
 
 test("sender host extraction normalizes IDNs without accepting URLs, extra addresses or IP literals", () => {

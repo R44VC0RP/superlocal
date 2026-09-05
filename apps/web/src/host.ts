@@ -1,3 +1,4 @@
+import { inboxWindowPaths, INBOX_RESPONSE_BYTE_LIMIT, type InboxWindowTransport } from "../../shared/inbox-window";
 import type { SplitPreferences } from "../../shared/splits";
 import type { MailboxMembership } from "inbox-sdk/types";
 import { configurePerformanceLogging, measureRequest } from "./browser-logs";
@@ -30,6 +31,7 @@ export type HostConfiguration = {
   performanceLogging?: boolean;
   aiTriage?: boolean;
   attentionOverrides?: boolean;
+  inboxWindow?: boolean;
   providers: HostProvider[];
 };
 
@@ -181,6 +183,47 @@ export function createCategoryTransport(signal: () => AbortSignal, fetcher: type
     },
     classify: input => receipt("", input.id, input),
     undo: id => receipt(`/${encodeURIComponent(id)}/undo`, id),
+  };
+}
+
+/** Application windows are authenticated host operations, not invented SDK aliases. */
+export function createInboxWindowTransport(signal: () => AbortSignal, fetcher: typeof privateFetch = privateFetch): InboxWindowTransport {
+  async function call<T>(name: keyof typeof inboxWindowPaths, input: unknown): Promise<T> {
+    const requestSignal = signal(), path = inboxWindowPaths[name], finish = measureRequest(path, "POST");
+    let response: Response;
+    try {
+      response = await fetcher(path, { method: "POST", credentials: "include", cache: "no-store", signal: requestSignal,
+        headers: { "Content-Type": "application/json", "X-Superlocal": "1" }, body: JSON.stringify(input) });
+      finish(response.status);
+    } catch (error) { finish(0); throw error; }
+    // Enforce the wire bound while reading, before allocating an unbounded JSON string.
+    const reader = response.body?.getReader(), chunks: Uint8Array[] = [];
+    let size = 0;
+    if (reader) try {
+      for (;;) {
+        const part = await reader.read(); requestSignal.throwIfAborted();
+        if (part.done) break;
+        size += part.value.byteLength;
+        if (size > INBOX_RESPONSE_BYTE_LIMIT) throw new InboxViewPreferencesError("This inbox page exceeds the safe loading limit.", 413, "HOST_INBOX_TOO_LARGE");
+        chunks.push(part.value);
+      }
+    } finally { await reader.cancel().catch(() => {}); }
+    const bytes = new Uint8Array(size); let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    const result = (() => { try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return null; } })();
+    requestSignal.throwIfAborted();
+    if (!response.ok || !result || typeof result !== "object") throw new InboxViewPreferencesError(
+      typeof result?.error === "string" ? result.error : "This inbox window could not be loaded. Retry the current view.",
+      response.status, typeof result?.code === "string" ? result.code : "HOST_INBOX_UNAVAILABLE");
+    return result as T;
+  }
+  return {
+    query: input => call("query", input), page: input => call("page", input), counts: input => call("counts", input),
+    lookup: input => call("lookup", input), changes: input => call("changes", input), messages: input => call("messages", input),
+    sender: input => call("sender", input), contacts: input => call("contacts", input),
+    selectionCreate: input => call("selectionCreate", input), selectionPage: input => call("selectionPage", input),
+    zeroCreate: input => call("zeroCreate", input), zeroResume: input => call("zeroResume", input), zeroPage: input => call("zeroPage", input),
+    zeroProgress: input => call("zeroProgress", input), zeroUndo: input => call("zeroUndo", input),
   };
 }
 
