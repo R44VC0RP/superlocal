@@ -2430,8 +2430,9 @@ describe('Inbound bounded multi-source snapshots', () => {
       created_at: '2026-01-01T00:00:00.000Z', subject: `Source ${index}`,
     }]]))
     const stats = { heads: [] as URL[], listings: [] as URL[], discoveries: [] as URL[], details: 0,
-      activeHeads: 0, maxHeads: 0, settledHeads: 0 }
-    const controls: { head?: (url: URL, signal: AbortSignal) => Promise<Response | void>; envelopeRecipients?: boolean } = {}
+      activeHeads: 0, maxHeads: 0, settledHeads: 0, activePages: 0, maxPages: 0, settledPages: 0 }
+    const controls: { head?: (url: URL, signal: AbortSignal) => Promise<Response | void>;
+      page?: (url: URL, signal: AbortSignal) => Promise<Response | void>; envelopeRecipients?: boolean } = {}
     const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(input instanceof Request ? input.url : String(input))
       expect(url.origin).toBe('https://inbound.invalid')
@@ -2453,12 +2454,10 @@ describe('Inbound bounded multi-source snapshots', () => {
         if (head) {
           stats.heads.push(url); stats.activeHeads++
           stats.maxHeads = Math.max(stats.maxHeads, stats.activeHeads)
-        }
+        } else { stats.activePages++; stats.maxPages = Math.max(stats.maxPages, stats.activePages) }
         try {
-          if (head) {
-            const override = await controls.head?.(url, init!.signal!)
-            if (override) return override
-          }
+          const override = await (head ? controls.head : controls.page)?.(url, init!.signal!)
+          if (override) return override
           const domain = url.searchParams.get('domain')
           const type = url.searchParams.get('type')
           expect(url.searchParams.get('time_range')).toBe('all')
@@ -2473,6 +2472,7 @@ describe('Inbound bounded multi-source snapshots', () => {
             pagination: { offset, limit, total: values.length, has_more: offset + limit < values.length } })
         } finally {
           if (head) { stats.activeHeads--; stats.settledHeads++ }
+          else { stats.activePages--; stats.settledPages++ }
         }
       }
       for (const values of mail.values()) {
@@ -2828,19 +2828,21 @@ describe('Inbound bounded multi-source snapshots', () => {
     } finally { Date.now = now; await provider.disconnect() }
   })
 
-  for (const scenario of ['queries', 'heads', 'entries', 'thread-identities'] as const) test(`${scenario} metadata stays inside the shared 8 MiB snapshot budget`, async () => {
+  for (const scenario of ['queries', 'heads', 'entries', 'thread-identities'] as const) test(`${scenario} metadata stays inside the shared 16 MiB snapshot budget`, async () => {
     const h = peer(1_000)
     const scopes = h.domains.map(domain => ({ kind: 'domain' as const, value: domain.domain }))
     if (scenario === 'heads' || scenario === 'entries') {
       for (const values of h.mail.values()) {
-        const large = { ...values[0], id: `${values[0]!.id}-large`, from_name: 'n'.repeat(2_048),
+        const large = { ...values[0], id: `${values[0]!.id}-large`.padEnd(2_048, 'x'), from_name: 'n'.repeat(2_048),
           message_id: 'm'.repeat(2_048), thread_id: 't'.repeat(2_048) }
         if (scenario === 'heads') values[0] = large
         else values.push(large)
       }
     }
     if (scenario === 'thread-identities') {
-      for (const values of h.mail.values()) Object.assign(values[0]!, { from_name: 'n'.repeat(1_000), thread_id: 't'.repeat(2_048) })
+      for (const values of h.mail.values()) Object.assign(values[0]!, {
+        from_name: 'n'.repeat(2_048), message_id: 'm'.repeat(1_000), thread_id: 't'.repeat(2_048),
+      })
       h.controls.head = async url => Response.json({
         data: h.mail.get(url.searchParams.get('domain')!)!.map(message => ({ ...message, thread_id: undefined })),
         pagination: { offset: 0, limit: 1, total: 1, has_more: false },
@@ -2858,7 +2860,7 @@ describe('Inbound bounded multi-source snapshots', () => {
           let cursor: string | null = null
           do {
             const page = await provider.listMessages({ limit: 100, cursor,
-              ...(scenario === 'queries' ? { search: 'q'.repeat(2_100) } : {}) })
+              ...(scenario === 'queries' ? { search: 'q'.repeat(4_200) } : {}) })
             cursor = page.nextCursor
           } while (cursor)
         }
@@ -2879,33 +2881,287 @@ describe('Inbound bounded multi-source snapshots', () => {
     } finally { Date.now = now; await provider.disconnect() }
   })
 
-  test('aggregate item totals accept 10000 as incomplete history and fail explicitly above it', async () => {
-    for (const perSource of [10, 11]) {
+  test('aggregate item totals accept 20000 as incomplete history and reject 20001 before hydration', async () => {
+    for (const total of [20_000, 20_001]) {
       const h = peer(1_000)
-      for (const [domain, values] of h.mail) h.mail.set(domain, Array.from({ length: perSource }, (_, index) => ({
-        ...values[0], id: `${values[0]!.id}-${index}`,
-      })))
+      for (const [source, [domain, values]] of [...h.mail].entries()) {
+        h.mail.set(domain, Array.from({ length: 20 + Number(source === 0 && total === 20_001) }, (_, index) => ({
+          ...values[0], id: `${values[0]!.id}-${index}`,
+        })))
+      }
       const provider = await h.create(h.domains.map(domain => ({ kind: 'domain', value: domain.domain })))
       const now = Date.now
       let clock = now()
       Date.now = () => (clock += 111)
       try {
-        if (perSource === 10) {
+        if (total === 20_000) {
           const first = await provider.sync(null, { limit: 1 })
           expect(first).toMatchObject({ hasMore: true, snapshotComplete: false })
           expect(first.cursor).not.toBeNull()
           expect(first.messages).toHaveLength(1)
-          expect(h.stats.heads).toHaveLength(1_000)
         } else {
           await failure(() => provider.sync(null, { limit: 1 }), 'UPSTREAM', false)
-          expect(h.stats.heads.length).toBeLessThan(1_000)
           expect(h.stats.details).toBe(0)
         }
+        expect(h.stats.heads).toHaveLength(1_000)
+        expect(h.stats.settledHeads).toBe(1_000)
         expect(h.stats.activeHeads).toBe(0)
         expect(h.stats.maxHeads).toBe(4)
       } finally { Date.now = now; await provider.disconnect() }
     }
   })
+
+  test('rolling lookahead keeps four unconsumed pages, validates out of order arrivals in offset order, and replays', async () => {
+    const h = peer(1)
+    const native = Array.from({ length: 900 }, (_, index) => ({ ...h.mail.get(h.domains[0]!.domain)![0], id: `rolling-${index}` }))
+    h.mail.set(h.domains[0]!.domain, native)
+    const provider = await h.create([{ kind: 'domain', value: h.domains[0]!.domain }])
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      let cursor: SyncCursor | null = null
+      for (let index = 0; index < 6; index++) cursor = (await provider.sync(cursor, { limit: 100 })).cursor
+      native.unshift(...Array.from({ length: 3 }, (_, index) => ({ ...native[0], id: `new-arrival-${index}` })))
+      const releases = new Map<number, () => void>()
+      let ready!: () => void, completed!: () => void
+      const windowReady = new Promise<void>(resolve => { ready = resolve })
+      const outOfOrder = new Promise<void>(resolve => { completed = resolve })
+      const finished: number[] = []
+      h.controls.page = async (url, signal) => {
+        const offset = Number(url.searchParams.get('offset'))
+        if (offset < 100 || offset > 400) return
+        await new Promise<void>((resolve, reject) => {
+          const abort = () => reject(signal.reason)
+          signal.addEventListener('abort', abort, { once: true })
+          releases.set(offset, () => { signal.removeEventListener('abort', abort); resolve() })
+          if (releases.size === 4) ready()
+        })
+        finished.push(offset)
+        if (finished.length === 3) completed()
+      }
+      const before = h.stats.listings.length
+      const operation = provider.sync(cursor, { limit: 100 })
+      await windowReady
+      for (const offset of [400, 300, 200]) releases.get(offset)!()
+      await outOfOrder
+      expect(h.stats.listings.slice(before).map(url => Number(url.searchParams.get('offset')))).toEqual([0, 100, 200, 300, 400])
+      releases.get(100)!()
+      const page = await operation
+      expect(finished).toEqual([400, 300, 200, 100])
+      expect(page.messages.map(message => message.id)).toEqual(Array.from({ length: 100 }, (_, index) => `rolling-${600 + index}`))
+      expect(page.snapshotComplete).toBe(false)
+      expect(h.stats.maxPages).toBe(4)
+      expect(h.stats.activePages).toBe(0)
+      expect(h.stats.listings.slice(before).map(url => Number(url.searchParams.get('offset')))).toEqual([0, 100, 200, 300, 400, 500, 600, 700])
+      const beforeReplay = h.stats.listings.length
+      expect((await provider.sync(cursor, { limit: 100 })).messages.map(message => message.id)).toEqual(page.messages.map(message => message.id))
+      expect(h.stats.listings).toHaveLength(beforeReplay)
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  for (const scenario of ['smaller-limits', 'request-budget'] as const) test(`lookahead settles guessed offsets before ${scenario} sequential continuation`, async () => {
+    const h = peer(1)
+    const native = Array.from({ length: 900 }, (_, index) => ({ ...h.mail.get(h.domains[0]!.domain)![0], id: `limits-${index}` }))
+    h.mail.set(h.domains[0]!.domain, native)
+    const provider = await h.create([{ kind: 'domain', value: h.domains[0]!.domain }])
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      let cursor: SyncCursor | null = null
+      for (let index = 0; index < 6; index++) cursor = (await provider.sync(cursor, { limit: 100 })).cursor
+      let guessing = true, aborted = 0
+      h.controls.page = async (url, signal) => {
+        const offset = Number(url.searchParams.get('offset'))
+        if (offset === 0) return
+        if (guessing && [200, 300, 400].includes(offset)) {
+          await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => {
+            guessing = false; aborted++; reject(signal.reason)
+          }, { once: true }))
+        }
+        const limit = scenario === 'request-budget' ? 1 : offset % 2 ? 17 : 37
+        return Response.json({ data: native.slice(offset, offset + limit), pagination: {
+          offset, limit, total: native.length, has_more: offset + limit < native.length,
+        } })
+      }
+      const before = h.stats.listings.length, details = h.stats.details
+      if (scenario === 'request-budget') {
+        await failure(() => provider.sync(cursor, { limit: 100 }), 'INVALID_CURSOR', false)
+        expect(h.stats.listings.length - before).toBe(200)
+        expect(Number(h.stats.listings.at(-1)!.searchParams.get('offset'))).toBe(295)
+        expect(h.stats.details).toBe(details)
+      } else {
+        const page = await provider.sync(cursor, { limit: 100 })
+        expect(page.messages.map(message => message.id)).toEqual(Array.from({ length: 100 }, (_, index) => `limits-${600 + index}`))
+        expect(h.stats.listings.slice(before, before + 6).map(url => Number(url.searchParams.get('offset')))).toEqual([0, 100, 200, 300, 400, 137])
+      }
+      expect(aborted).toBe(3)
+      expect(h.stats.activePages).toBe(0)
+      expect(h.stats.maxPages).toBe(4)
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  for (const scenario of ['http-failure', 'invalid-schema', 'disconnect'] as const) test(`${scenario} aborts and settles lookahead without hiding a missing page`, async () => {
+    const h = peer(1)
+    const native = Array.from({ length: 900 }, (_, index) => ({ ...h.mail.get(h.domains[0]!.domain)![0], id: `failure-${index}` }))
+    h.mail.set(h.domains[0]!.domain, native)
+    const provider = await h.create([{ kind: 'domain', value: h.domains[0]!.domain }])
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      let cursor: SyncCursor | null = null
+      for (let index = 0; index < 6; index++) cursor = (await provider.sync(cursor, { limit: 100 })).cursor
+      let ready!: () => void, failPage!: () => void, entered = 0, aborted = 0
+      const windowReady = new Promise<void>(resolve => { ready = resolve })
+      h.controls.page = async (url, signal) => {
+        const offset = Number(url.searchParams.get('offset'))
+        if (offset === 0) return
+        return new Promise<Response>((resolve, reject) => {
+          const abort = () => { aborted++; reject(signal.reason) }
+          signal.addEventListener('abort', abort, { once: true })
+          if (offset === 200) failPage = () => {
+            signal.removeEventListener('abort', abort)
+            resolve(scenario === 'http-failure' ? Response.json({ error: 'Controlled listing failure' }, { status: 500 }) : Response.json({ data: null }))
+          }
+          if (++entered === 4) ready()
+        })
+      }
+      const before = h.stats.listings.length, details = h.stats.details
+      const operation = provider.sync(cursor, { limit: 100 }).then(result => ({ result }), error => ({ error }))
+      await windowReady
+      if (scenario === 'disconnect') await provider.disconnect()
+      else failPage()
+      expect(await operation).toMatchObject({ error: scenario === 'disconnect' ? { code: 'NETWORK', retryable: true }
+        : scenario === 'http-failure' ? { code: 'UPSTREAM', status: 500, retryable: true } : { code: 'UPSTREAM', retryable: false } })
+      expect(aborted).toBe(scenario === 'disconnect' ? 4 : 3)
+      expect(h.stats.activePages).toBe(0)
+      expect(h.stats.listings.length - before).toBe(5)
+      expect(h.stats.details).toBe(details)
+      if (scenario !== 'disconnect') {
+        h.controls.page = undefined
+        expect((await provider.sync(cursor, { limit: 100 })).messages.map(message => message.id)).toEqual(Array.from({ length: 100 }, (_, index) => `failure-${600 + index}`))
+      }
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  for (const scenario of ['prefix', 'duplicate', 'total'] as const) test(`parallel prefix verification still rejects changed ${scenario}`, async () => {
+    const h = peer(1)
+    const native = Array.from({ length: 900 }, (_, index) => ({ ...h.mail.get(h.domains[0]!.domain)![0], id: `changed-${index}` }))
+    h.mail.set(h.domains[0]!.domain, native)
+    const provider = await h.create([{ kind: 'domain', value: h.domains[0]!.domain }])
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      let cursor: SyncCursor | null = null
+      for (let index = 0; index < 6; index++) cursor = (await provider.sync(cursor, { limit: 100 })).cursor
+      if (scenario === 'prefix') [native[250], native[251]] = [native[251]!, native[250]!]
+      if (scenario === 'duplicate') native[650] = { ...native[650], id: native[500]!.id }
+      if (scenario === 'total') native.pop()
+      const details = h.stats.details
+      await failure(() => provider.sync(cursor, { limit: 100 }), 'INVALID_CURSOR', false)
+      expect(h.stats.details).toBe(details)
+      expect(h.stats.activePages).toBe(0)
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  for (const stage of ['head', 'page'] as const) test(`bounds successful ${stage} response streams before JSON parsing without limiting details`, async () => {
+    const h = peer(1)
+    const native = h.mail.get(h.domains[0]!.domain)![0]!
+    const provider = await h.create([{ kind: 'domain', value: h.domains[0]!.domain }])
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    let pulls = 0, cancelled = 0
+    const oversized = async () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) { pulls++; controller.enqueue(new Uint8Array(1024 * 1024)) },
+      cancel() { cancelled++ },
+    }), { headers: { 'content-type': 'application/json', 'content-length': '1' } })
+    try {
+      if (stage === 'head') h.controls.head = oversized
+      else {
+        h.mail.get(h.domains[0]!.domain)!.push({ ...native, id: 'second-bounded-message' })
+        h.controls.page = oversized
+      }
+      await expect(provider.sync(null, { limit: 100 })).rejects.toMatchObject({ code: 'UPSTREAM', status: 200,
+        message: 'inbound response exceeds the supported size limit' })
+      expect(cancelled).toBe(1)
+      expect(pulls).toBeLessThanOrEqual(6)
+      expect(h.stats.details).toBe(0)
+      expect(h.stats.activePages).toBe(0)
+      native.text = 'x'.repeat(4 * 1024 * 1024 + 1)
+      expect((await provider.getMessage(native.id)).bodyText).toHaveLength(native.text.length)
+    } finally { Date.now = now; await provider.disconnect() }
+  })
+
+  test('fully traverses 15482 realistic records in two receiving domains and replays an old cursor', async () => {
+    const h = peer(3)
+    const counts = [2_957, 12_525]
+    const expected = new Map<string, { source: number; index: number; messageId: string }>()
+    for (const [source, count] of counts.entries()) {
+      const domain = h.domains[source]!.domain
+      const base = h.mail.get(domain)![0]!
+      h.mail.set(domain, Array.from({ length: count }, (_, index) => {
+        const id = `00000000-0000-400${source}-8000-${String(index).padStart(12, '0')}`
+        const messageId = `<${id}@fictional.example.test>`
+        expected.set(id, { source, index, messageId })
+        return { ...base, id, thread_id: `10000000-0000-400${source}-8000-${String(index).padStart(12, '0')}`,
+          from_name: `Fictional Sender ${source}`, message_id: messageId,
+          received_at: '2026-01-01T00:00:00.000Z', sent_at: null,
+          envelope_recipient: index % 3 ? h.addresses[source]!.address : null,
+          text: `Fictional message ${index}.` }
+      }))
+    }
+    const scopes = h.domains.slice(0, 2).map(domain => ({ kind: 'domain' as const, value: domain.domain }))
+    const provider = await h.create(scopes)
+    const now = Date.now
+    let clock = now()
+    Date.now = () => (clock += 111)
+    try {
+      const ids: string[] = []
+      let cursor: SyncCursor | null = null
+      let replayCursor: SyncCursor | null = null
+      let replayIds: string[] = []
+      let pages = 0
+      do {
+        const before = h.stats.listings.length
+        const page = await provider.sync(cursor, { limit: 100, mailboxScopes: pages % 2 ? [...scopes].reverse() : scopes })
+        expect(page.fullSync).toBe(true)
+        expect(page.snapshotComplete).toBe(!page.hasMore)
+        expect(page.deletedMessageIds).toEqual([])
+        expect(h.stats.listings.length - before).toBeLessThanOrEqual(200)
+        expect(h.stats.heads).toHaveLength(2)
+        for (const message of page.messages) {
+          const native = expected.get(message.id)!
+          expect(native).toBeDefined()
+          expect(message.sourceDomains).toEqual([h.domains[native.source]!.domain])
+          expect(message.deliveryRecipients).toEqual(native.index % 3 ? [h.addresses[native.source]!.address] : undefined)
+          expect(message.from.name).toBe(`Fictional Sender ${native.source}`)
+          expect(message.rfcMessageId).toBe(native.messageId)
+          expect(message.isRead).toBe(native.source % 2 === 0)
+          ids.push(message.id)
+        }
+        if (pages === 0) replayCursor = page.cursor
+        if (pages === 1) replayIds = page.messages.map(message => message.id)
+        cursor = page.cursor
+        pages++
+        expect(pages).toBeLessThanOrEqual(Math.ceil(expected.size / 100))
+      } while (cursor)
+      expect(ids).toHaveLength(15_482)
+      expect(new Set(ids).size).toBe(expected.size)
+      expect(ids.slice().sort()).toEqual([...expected.keys()].sort())
+      expect(h.stats.details).toBe(expected.size)
+      const beforeReplay = h.stats.listings.length
+      const replay = await provider.sync(replayCursor, { limit: 100, mailboxScopes: [...scopes].reverse() })
+      expect(replay.messages.map(message => message.id)).toEqual(replayIds)
+      expect(replay.snapshotComplete).toBe(false)
+      expect(h.stats.listings).toHaveLength(beforeReplay)
+      expect(h.stats.heads.every(url => scopes.some(scope => scope.value === url.searchParams.get('domain')))).toBe(true)
+      expect(h.stats.activeHeads).toBe(0)
+    } finally { Date.now = now; await provider.disconnect() }
+  }, 60_000)
 })
 
 describe('Inbound E2 metadata and cursor boundaries', () => {
@@ -3187,7 +3443,7 @@ describe('Inbound E2 metadata and cursor boundaries', () => {
         if (url.pathname.endsWith('/email-addresses')) return Response.json({ data: [{ address, domainId: domain, isActive: true, isReceiptRuleConfigured: true }],
           pagination: { hasMore: false, offset: 0, limit: 100, total: 1 } })
         if (url.pathname.endsWith('/emails')) return Response.json({ data: [native], pagination: {
-          offset: 0, limit: 1, total: scenario === 'oversized' ? 10_001 : 1, has_more: scenario === 'oversized' } })
+          offset: 0, limit: 1, total: scenario === 'oversized' ? 20_001 : 1, has_more: scenario === 'oversized' } })
         if (url.pathname.endsWith(`/emails/${scenario}`)) return Response.json(native)
         throw new Error('Unexpected bounded Inbound request')
       }) as typeof fetch
