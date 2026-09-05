@@ -28,6 +28,200 @@ const inbox = seedMail().find(
     mail.messages.every((message) => message.email !== mail.account),
 )!;
 const deadline = "2026-10-01T12:00:00.000Z";
+
+test("SDK-backed sending identities stay composer-scoped and preserve explicit draft senders", async () => {
+  // Isolate the irreversible owner lock from the other existing SDK cases.
+  if (process.env.INBOX_SENDER_TEST_CHILD !== "1") {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "SDK-backed sending identities", "--timeout", "30000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_SENDER_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output);
+    return;
+  }
+  const [{ createMockHost }, { InboxStore }, { ApiError }, { bindApplicationScope }, fs, { tmpdir }, { join }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("inbox-sdk/client"), import("../src/application-scope.ts"),
+    import("node:fs/promises"), import("node:os"), import("node:path"),
+  ]);
+  const root = await fs.mkdtemp(join(tmpdir(), "sending-identities-client-"));
+  const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
+  const globals = ["location", "window", "document", "localStorage"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  let host: Awaited<ReturnType<typeof createMockHost>> | undefined, stop: (() => void) | undefined;
+  let identityGate: Promise<void> | undefined, releaseIdentity: (() => void) | undefined, identityHeld = false, failIdentity = false;
+  const identityReads: URL[] = [], created: Array<Record<string, unknown>> = [];
+  const until = async (check: () => boolean) => {
+    for (let attempt = 0; attempt < 800 && !check(); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(check(), "SDK fixture reached the expected state");
+  };
+  try {
+    console.info = () => {}; console.warn = () => {};
+    host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 33).toString("base64"), token: "fictional-sender-client-token-for-tests", allowProviderWrites: true });
+    const [nativeBox, secondBox] = host.store.mailboxes(host.owner);
+    const sourceId = host.store.link(host.owner, nativeBox.id)!.accountId;
+    const alias = nativeBox.aliases[0]!;
+    host.store.receive({ owner: host.owner, storeId: nativeBox.id, accountId: sourceId }, {
+      from: "sender@example.test", to: alias, subject: "Explicit alias reply", text: "Fictional alias recipient.",
+    });
+    await host.inbox.sync(host.owner, sourceId, { folder: "all", lane: "latest", limit: 100 });
+    const storage = new Map<string, string>();
+    Object.assign(globalThis, { location: new URL("http://localhost:41999"), window: new EventTarget(),
+      document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
+      localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+    });
+    const binding = bindApplicationScope("b".repeat(64));
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], preferenceScope: "fictional-sender-client" });
+      if (url.pathname === "/host/inbox-preferences") return Response.json({ revision: 1, unifiedMode: "all", includedMailboxIds: [], pinnedMailboxIds: [] });
+      if (url.pathname === "/host/split-preferences") return Response.json({ ...normalizeSplits({}), revision: 1 });
+      if (url.pathname === "/host/attention-feedback") return Response.json([]);
+      if (url.pathname === "/v1/events") return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("Request cancelled", "AbortError"));
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      const identities = url.pathname.endsWith("/sending-identities");
+      if (identities) {
+        identityReads.push(url);
+        assert.equal(new Headers(init?.headers).get("X-Superlocal-Scope"), binding.scope);
+        assert.equal(init?.cache, "no-store");
+        if (failIdentity) return Response.json({ code: "PROVIDER_UNAVAILABLE", error: "Sending addresses are temporarily unavailable." }, { status: 503 });
+      }
+      if (url.pathname === "/v1/drafts" && init?.method === "POST") created.push(JSON.parse(String(init.body)));
+      const headers = new Headers(init?.headers); headers.set("Authorization", "Bearer fictional-sender-client-token-for-tests");
+      const response = await host!.fetch(new Request(url, { ...init, headers }));
+      if (identities && identityGate) { identityHeld = true; await identityGate; } // Deliberately ignore abort to exercise the owner fence.
+      return response;
+    }) as typeof fetch;
+    const store = new InboxStore(); stop = store.start();
+    await until(() => store.getSnapshot().loaded);
+    assert.equal(identityReads.length, 0, "inbox bootstrap never discovers sending identities");
+    const primary = store.getSnapshot().accounts.find(box => box.sourceId === sourceId)!;
+    const secondary = store.getSnapshot().accounts.find(box => box.sourceId === host!.store.link(host!.owner, secondBox.id)!.accountId)!;
+    assert.equal(primary.sourceGeneration, (await host.inbox.account(host.owner, sourceId)).generation);
+    const values = await store.sendingIdentities(primary.id);
+    assert.equal(values.sourceId, sourceId);
+    assert.ok(values.identities.some(identity => identity.email === alias));
+    assert.ok(identityReads.every(url => url.pathname === `/v1/accounts/${sourceId}/sending-identities`), "only the active composer's source is read");
+    const beforeFailure = identityReads.length;
+    failIdentity = true;
+    await assert.rejects(store.sendingIdentities(primary.id, { refresh: true }), error => error instanceof ApiError && error.code === "PROVIDER_UNAVAILABLE");
+    assert.equal(identityReads.length, beforeFailure + 1, "lookup failure does not poll or retry silently");
+    failIdentity = false;
+    await store.sendingIdentities(primary.id, { refresh: true });
+    assert.equal(identityReads.at(-1)!.searchParams.get("refresh"), "true", "manual retry forces a fresh lookup");
+
+    const compose = await store.newDraft(primary.id, { to: "recipient@example.test", subject: "Explicit sender", body: "<p>Keep this writing</p>" });
+    assert.equal(created.at(-1)!.from, primary.email, "new compose retains the existing mailbox default");
+    store.editDraft({ ...compose, from: alias, popOut: true });
+    await store.flushDraft(compose.id);
+    await store.reloadDraft(compose.id);
+    let saved = store.getSnapshot().drafts.find(draft => draft.id === compose.id)!;
+    assert.equal(saved.from, alias); assert.equal(saved.id, compose.id); assert.equal(saved.account, primary.id); assert.equal(saved.popOut, true);
+    assert.equal(created.length, 1, "same-source alias changes update rather than recreate the draft");
+    const mail = store.getSnapshot().mail.find(mail => mail.account === primary.id && mail.subject === "Explicit alias reply")!;
+    const sourceMessageId = mail.messages.at(-1)!.id;
+    assert.equal(mail.to, alias, "row To is the actual header recipient, not the source owner");
+    assert.deepEqual(mail.toAddresses, [alias]);
+    assert.deepEqual(store.getSnapshot().mail.find(value => value.account === UNIFIED_ACCOUNT && value.subject === mail.subject)!.toAddresses, [alias]);
+    for (const mode of ["reply", "replyAll"] as const) {
+      const reply = await store.newDraft(primary.id, { mode, mail, sourceMessageId });
+      assert.equal(Object.hasOwn(created.at(-1)!, "from"), false, "implicit replies leave sender selection to the SDK");
+      assert.equal(reply.from, alias, "SDK's chosen verified reply alias is retained");
+      await store.discardDraft(reply.id);
+    }
+    const forward = await store.newDraft(primary.id, { mode: "forward", mail, sourceMessageId });
+    assert.equal(created.at(-1)!.from, primary.email, "forward default is unchanged");
+    await store.discardDraft(forward.id);
+
+    store.editDraft({ ...saved, from: "removed@example.test" });
+    await store.flushDraft(saved.id);
+    saved = store.getSnapshot().drafts.find(draft => draft.id === compose.id)!;
+    await assert.rejects(store.submit(saved), error => error instanceof ApiError && error.code === "FORBIDDEN_SENDER");
+    saved = store.getSnapshot().drafts.find(draft => draft.id === compose.id)!;
+    assert.equal(saved.from, "removed@example.test"); assert.equal(saved.body, "<p>Keep this writing</p>");
+    assert.equal(saved.sendError?.code, "FORBIDDEN_SENDER", "send rejection remains visible on the kept draft");
+    store.editDraft({ ...saved, body: "<p>Still kept</p>", popOut: false });
+    await store.flushDraft(saved.id);
+    saved = store.getSnapshot().drafts.find(draft => draft.id === compose.id)!;
+    assert.equal(saved.sendError?.code, "FORBIDDEN_SENDER", "typing, autosave, and popout changes cannot erase a sender failure");
+    await store.reloadDraft(saved.id);
+    saved = store.getSnapshot().drafts.find(draft => draft.id === compose.id)!;
+    assert.equal(saved.from, "removed@example.test", "reload never replaces an unavailable saved sender");
+    store.editDraft({ ...saved, from: alias }); await store.flushDraft(saved.id);
+    assert.equal(store.getSnapshot().drafts.find(draft => draft.id === compose.id)!.sendError, undefined);
+
+    identityGate = new Promise(resolve => { releaseIdentity = resolve; }); identityHeld = false;
+    const detachedRead = store.sendingIdentities(secondary.id, { refresh: true });
+    const rejectedDetached = assert.rejects(detachedRead, error => error instanceof DOMException && error.name === "AbortError");
+    await until(() => identityHeld);
+    const box = await host.inbox.mailbox(host.owner, secondary.id);
+    await host.inbox.updateMailbox(host.owner, secondary.id, { status: "detached" }, box.revision);
+    await store.refresh(true);
+    releaseIdentity!(); identityGate = undefined; await rejectedDetached;
+
+    identityGate = new Promise(resolve => { releaseIdentity = resolve; }); identityHeld = false;
+    const lateRead = store.sendingIdentities(primary.id, { refresh: true });
+    const rejectedLate = assert.rejects(lateRead, error => error instanceof DOMException && error.name === "AbortError");
+    await until(() => identityHeld); stop(); stop = undefined;
+    const stopped = store.getSnapshot();
+    releaseIdentity!(); identityGate = undefined; await rejectedLate;
+    assert.strictEqual(store.getSnapshot(), stopped, "late lookup cannot publish into a stopped store generation");
+    stop = store.start(); await store.refresh(true);
+    identityGate = new Promise(resolve => { releaseIdentity = resolve; }); identityHeld = false;
+    const ownerRead = store.sendingIdentities(primary.id, { refresh: true });
+    const rejectedOwner = assert.rejects(ownerRead, error => error instanceof DOMException && error.name === "AbortError");
+    await until(() => identityHeld); binding.lock(); releaseIdentity!(); identityGate = undefined; await rejectedOwner;
+    const lockedReads = identityReads.length;
+    await assert.rejects(store.sendingIdentities(primary.id), error => error instanceof DOMException && error.name === "AbortError");
+    assert.equal(identityReads.length, lockedReads, "owner lock fences cached lookups before dispatch");
+  } finally {
+    releaseIdentity?.(); stop?.(); await host?.close(); await fs.rm(root, { recursive: true, force: true });
+    globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
+  }
+});
+
+test("MailRow renders actual To recipients without mailbox or Bcc substitution", async () => {
+  if (!process.versions.bun) {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "MailRow renders actual To"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const [{ createElement }, { renderToStaticMarkup }, { default: MailRow }] = await Promise.all([
+    import("react"), import("react-dom/server"), import("../src/MailRow.tsx"),
+  ]);
+  const render = (to: string, sent = false, unified = false, toAddresses?: string[]) => renderToStaticMarkup(createElement(MailRow, {
+    mail: { ...inbox, to, toAddresses, account: unified ? UNIFIED_ACCOUNT : inbox.account, accountEmail: "owner@example.test",
+      mailboxNames: unified ? ["Receiving mailbox"] : undefined,
+      messages: [{ ...inbox.messages[0], to, cc: "cc-only@example.test", bcc: "private-bcc@example.test" }] },
+    index: 0, highlighted: false, selected: false, sent, showSnippets: false,
+  }));
+  const alias = render("Project <project@example.test>");
+  assert.match(alias, /To: Project &lt;project@example.test&gt;/);
+  assert.match(alias, /title="To: Project &lt;project@example.test&gt;"/);
+  const projectedAlias = render("Project <project@example.test>", false, false, ["project@example.test"]);
+  assert.match(projectedAlias, />To: project@example.test<\/span>/);
+  assert.match(projectedAlias, /title="To: Project &lt;project@example.test&gt;"/);
+  const multiple = render("first@example.test, second@example.test", false, true);
+  assert.match(multiple, /To: first@example.test, second@example.test/);
+  assert.match(render("recipient@example.test", true), /To: recipient@example.test/, "sent rows use the real To too");
+  const absent = render("");
+  assert.match(absent, /No To recipients/);
+  assert.match(render("owner@example.test", false, true, []), /No To recipients/, "an authoritative empty To never falls back to an ownership address");
+  for (const html of [alias, projectedAlias, multiple, absent, render("", true, true), render("owner@example.test", false, true, [])]) {
+    assert.doesNotMatch(html, /private-bcc@example.test|cc-only@example.test|owner@example.test/);
+  }
+});
 test("SDK-backed optimistic flags retain conditional intent through latency, failures and overlapping views", async () => {
   // The ordinary web runner is Node; the actual SDK intentionally uses
   // bun:sqlite. Run this same existing test in an isolated Bun process rather

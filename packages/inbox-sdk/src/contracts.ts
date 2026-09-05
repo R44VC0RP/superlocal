@@ -1,10 +1,17 @@
 import type { Database } from 'bun:sqlite'
-import type { InboxProvider, ProviderCredentials, MessageMutation, SyncCursor } from '../server/sdk/types'
+import type { InboxProvider, ProviderCredentials, MessageMutation, SyncCursor, SendingIdentity } from '../server/sdk/types'
 import type { Participant, ProviderCapabilities } from './types'
 import type { ConnectionSources } from '../server/sdk/mail-sources'
 
 export const API_VERSION = '1' as const
-export type { Participant, ProviderCapabilities }
+export type { Participant, ProviderCapabilities, SendingIdentity }
+
+export interface SendingIdentities {
+  sourceId: string
+  identities: SendingIdentity[]
+  /** Provider lookup completion time; null for legacy provider metadata. */
+  checkedAt: string | null
+}
 
 export class InboxError extends Error {
   readonly name = 'InboxError'
@@ -436,6 +443,7 @@ export interface Inbox {
   disconnect(owner: string, id: string): Promise<void>
   accounts(owner: string): Promise<Account[]>
   account(owner: string, id: string): Promise<Account>
+  sendingIdentities(owner: string, sourceId: string, input?: { refresh?: boolean }): Promise<SendingIdentities>
   connections(owner: string): Promise<Connection[]>
   connection(owner: string, id: string): Promise<Connection>
   /** identity is a trusted server-side assertion, never accepted from an unauthenticated request body. */

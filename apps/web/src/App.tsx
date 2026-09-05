@@ -1011,8 +1011,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       setSendFeedback({ id: operation.id, threadId: conversation?.id, scheduled: when });
       return true;
     } catch (error) {
-      actionError(error);
-      return false;
+      // Composer owns persistent send feedback; a toast alone disappears while the draft stays open.
+      throw error;
     }
   }
   async function applyAction(action: string, ids = targetIds) {
@@ -1673,6 +1673,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       draft={currentDraft}
       preferences={preferences}
       accounts={inbox.accounts}
+      loadSendingIdentities={store.sendingIdentities}
       contacts={contacts}
       onChange={updateDraft}
       onSend={sendDraft}
@@ -1813,6 +1814,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             draft={currentDraft}
             account={route.account}
             accounts={inbox.accounts}
+            loadSendingIdentities={store.sendingIdentities}
             contacts={contacts}
             preferences={preferences}
             onBack={goBack}

@@ -136,6 +136,9 @@ const schemas = {
     sync: z.object({ lastSyncAt: z.string().nullable(), coverage: z.enum(['empty', 'partial', 'complete']), problem: z.string().nullable() }),
     revision, connectionId: id.optional(),
   }),
+  SendingIdentities: z.strictObject({ sourceId: id, identities: z.array(z.strictObject({
+    email: z.string().min(1).max(1024), isPrimary: z.boolean(), isDefault: z.boolean(),
+  })).max(100), checkedAt: date.nullable() }),
   Connection: z.object({
     id, providerId: name, name: z.string(), status: z.enum(['connected', 'disconnected', 'reconnect_required']),
     generation: revision, sourceIds: z.array(id),
@@ -458,6 +461,9 @@ export function createInboxApi(options: InboxApiOptions) {
     })
   }
 
+  route('get', '/v1/accounts/:id/sending-identities', { summary: 'List current sending identities, separate from receiving scopes', output: 'SendingIdentities', noStore: true,
+    query: z.strictObject({ refresh: z.enum(['true', 'false']).optional() }) }, async (c) =>
+    c.json(validate(schemas.SendingIdentities, await inbox.sendingIdentities(c.get('owner'), pathId(c), { refresh: c.req.query('refresh') === 'true' }))))
   route('get', '/v1/providers', { summary: 'List configured providers', output: 'Provider[]' }, (c) => json(c, inbox.providers()))
   route('get', '/v1/connections', { summary: 'List owned connections', output: 'Connection[]' }, async (c) => json(c, validate(z.array(schemas.Connection), await inbox.connections(c.get('owner')))))
   route('post', '/v1/connections', { summary: 'Create a connection', input: 'Connect', output: 'Connection', status: 201 }, async (c) => json(c, validate(schemas.Connection, await inbox.createConnection(c.get('owner'), body(c, schemas.Connect))), 201))

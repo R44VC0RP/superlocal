@@ -418,6 +418,7 @@ async function httpHarness(id: Exclude<BuiltIn, 'imap'>): Promise<ContractHarnes
     }
     if (id === 'gmail') {
       if (path === '/users/me/profile') return json({ emailAddress: account.email, historyId: '100' })
+      if (path === '/users/me/settings/sendAs' && method === 'GET') return json({ sendAs: [{ sendAsEmail: account.email, isPrimary: true, isDefault: true }] })
       if (path === '/users/me/labels/INBOX' && method === 'GET') return json({ id: 'INBOX', messagesUnread: 3 })
       if (path === '/users/me/labels' && method === 'GET') return json({ labels: [...account.folders].map(([id, name]) => ({ id, name, type: /^[A-Z]+$/.test(id) ? 'system' : 'user' })) })
       if (path === '/users/me/labels' && method === 'POST') {
@@ -3500,6 +3501,219 @@ test('Gmail rotating download handles retain stable MIME attachment identity and
     expect(legacy.attachment.id).toBe('persisted-handle')
     await failure(() => provider.getAttachment('other-message', 'persisted-handle'), 'NOT_FOUND', false)
   } finally { await provider.disconnect() }
+})
+
+describe('Gmail sending identities', () => {
+  test('requests only identity fields and returns the canonical primary plus accepted custom addresses', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    const calls: URL[] = []
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      calls.push(url)
+      expect(url.origin).toBe('https://gmail.invalid')
+      expect(url.pathname).toBe('/gmail/v1/users/me/settings/sendAs')
+      expect([...url.searchParams]).toEqual([['fields', 'sendAs(sendAsEmail,isPrimary,isDefault,verificationStatus)']])
+      expect(init?.method).toBe('GET')
+      expect(init?.body).toBeUndefined()
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer offline-token')
+      return Response.json({ sendAs: [
+        { sendAsEmail: PRIMARY.toUpperCase(), isPrimary: true, isDefault: false },
+        { sendAsEmail: 'Sales.Team+launch@brand.example.test', isPrimary: false, isDefault: true, verificationStatus: 'accepted',
+          displayName: 'Unused name', replyToAddress: 'unused@example.test', signature: 'Unused signature', smtpMsa: { host: 'unused.example.test' } },
+        { sendAsEmail: 'sales.team+launch@BRAND.example.test', isPrimary: false, isDefault: true, verificationStatus: 'accepted' },
+        { sendAsEmail: 'secondary@another.example.test', verificationStatus: 'accepted' },
+        { sendAsEmail: 'pending@example.test', isPrimary: false, isDefault: false, verificationStatus: 'pending' },
+        { sendAsEmail: 'missing@example.test', isPrimary: false, isDefault: false },
+        { sendAsEmail: 'unspecified@example.test', verificationStatus: 'verificationStatusUnspecified' },
+        { sendAsEmail: 'unknown@example.test', verificationStatus: 'future-status' },
+        { sendAsEmail: 'wrong-case@example.test', verificationStatus: 'ACCEPTED' },
+      ] })
+    }) as typeof fetch
+    const provider = await definition.create({ accountId: 'gmail-identities', email: PRIMARY, accessToken: 'offline-token',
+      scopes: ['https://www.googleapis.com/auth/gmail.modify'], baseUrl: 'https://gmail.invalid/gmail/v1', fetch: fetcher })
+    try {
+      expect(await provider.getSendingIdentities!()).toEqual([
+        { email: PRIMARY, isPrimary: true, isDefault: false },
+        { email: 'Sales.Team+launch@brand.example.test', isPrimary: false, isDefault: true },
+        { email: 'secondary@another.example.test', isPrimary: false, isDefault: false },
+      ])
+      expect(calls).toHaveLength(1)
+    } finally { await provider.disconnect() }
+  })
+
+  test('rejects malformed rows, invalid addresses and conflicting primary or default identities', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    const primary = { sendAsEmail: PRIMARY, isPrimary: true, isDefault: true }
+    const alias = { sendAsEmail: 'alias@example.test', isPrimary: false, isDefault: false, verificationStatus: 'accepted' }
+    let body: unknown
+    const provider = await definition.create({ accountId: 'gmail-invalid-identities', email: PRIMARY, accessToken: 'offline-token',
+      fetch: (async () => Response.json(body)) as unknown as typeof fetch })
+    try {
+      for (const invalid of [
+        null, [], {}, { sendAs: null }, { sendAs: {} }, { sendAs: [] }, { sendAs: [alias] },
+        ...[null, [], false, 1, 'alias', {},
+          { ...alias, isPrimary: 'false' }, { ...alias, isDefault: 0 }, { ...alias, isDefault: null },
+          { ...alias, isPrimary: null }, { ...alias, verificationStatus: true }, { ...alias, verificationStatus: null },
+          { ...alias, isPrimary: true }, { ...alias, isDefault: true },
+        ].map(row => ({ sendAs: [primary, row] })),
+        ...[undefined, null, 123, '', 'Alias <alias@example.test>', 'alias@example.test,other@example.test',
+          ' alias@example.test', 'alias@example.test ', 'alias\r\n@example.test', 'ali\u0000as@example.test',
+          'ali\u007fas@example.test', 'ali as@example.test', 'alias', 'alias@@example.test',
+          '.alias@example.test', 'alias.@example.test', 'ali..as@example.test', 'alias@-example.test',
+          'alias@example-.test', 'alias@example..test', 'alias@example.test.', 'alias@exa_mple.test',
+          `${'a'.repeat(65)}@example.test`, `alias@${'a'.repeat(64)}.test`, `alias@${'a'.repeat(60)}.${'a'.repeat(60)}.${'a'.repeat(60)}.${'a'.repeat(60)}.example.test`,
+        ].map(sendAsEmail => ({ sendAs: [primary, { ...alias, sendAsEmail }] })),
+        { sendAs: [primary, { ...primary, isPrimary: false }] },
+        { sendAs: [primary, { ...primary, isDefault: false }] },
+        { sendAs: [primary, alias, { ...alias, sendAsEmail: alias.sendAsEmail.toUpperCase(), verificationStatus: 'pending' }] },
+        { sendAs: [primary, { ...alias, isDefault: false }, { ...alias, isDefault: true }] },
+        { sendAs: [{ ...primary, isDefault: false }, { ...alias, isDefault: true },
+          { sendAsEmail: 'pending@example.test', verificationStatus: 'pending', isDefault: true }] },
+      ]) {
+        body = invalid
+        await failure(() => provider.getSendingIdentities!(), 'UPSTREAM', false)
+      }
+    } finally { await provider.disconnect() }
+  })
+
+  test('matches only the authenticated primary without plus, dot, domain or default substitutions', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    let email = 'reader.name@gmail.com'
+    let calls = 0
+    const fetcher = (async () => {
+      calls++
+      return Response.json({ sendAs: [{ sendAsEmail: email, isPrimary: true, isDefault: true }] })
+    }) as unknown as typeof fetch
+    const credentials = { accountId: 'gmail-primary-identity', email: 'reader.name@gmail.com', accessToken: 'offline-token', fetch: fetcher }
+    const provider = await definition.create(credentials)
+    try {
+      for (email of ['reader.name+tag@gmail.com', 'readername@gmail.com', 'reader.name@googlemail.com', 'other@gmail.com']) {
+        await failure(() => provider.getSendingIdentities!(), 'UPSTREAM', false)
+      }
+      email = 'READER.NAME@GMAIL.COM'
+      expect(await provider.getSendingIdentities!()).toEqual([{ email: credentials.email, isPrimary: true, isDefault: true }])
+      const before = calls
+      for (const primary of [undefined, '', 'Display <reader.name@gmail.com>', 'reader.name@gmail.com\n']) {
+        const invalid = await definition.create({ ...credentials, email: primary })
+        try { await failure(() => invalid.getSendingIdentities!(), 'VALIDATION', false) }
+        finally { await invalid.disconnect() }
+      }
+      expect(calls).toBe(before)
+    } finally { await provider.disconnect() }
+  })
+
+  test('refreshes removed or unverified aliases on every lookup and does not reuse a failed response', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    let calls = 0
+    const primary = { sendAsEmail: PRIMARY, isPrimary: true, isDefault: true }
+    const fetcher = (async () => {
+      calls++
+      if (calls === 4) return Response.json({ error: { message: 'Denied' } }, { status: 403 })
+      return Response.json({ sendAs: [primary, ...(calls < 3 ? [{ sendAsEmail: 'removed@example.test',
+        verificationStatus: calls === 1 ? 'accepted' : 'pending' }] : [])] })
+    }) as unknown as typeof fetch
+    const provider = await definition.create({ accountId: 'gmail-refreshed-identities', email: PRIMARY, accessToken: 'offline-token', fetch: fetcher })
+    try {
+      expect((await provider.getSendingIdentities!()).map(identity => identity.email)).toEqual([PRIMARY, 'removed@example.test'])
+      expect((await provider.getSendingIdentities!()).map(identity => identity.email)).toEqual([PRIMARY])
+      expect((await provider.getSendingIdentities!()).map(identity => identity.email)).toEqual([PRIMARY])
+      await failure(() => provider.getSendingIdentities!(), 'AUTHORIZATION', false)
+      expect(calls).toBe(4)
+    } finally { await provider.disconnect() }
+  })
+
+  test('fails explicitly above 100 raw entries or 64 KiB and cancels oversized streams', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    const primary = { sendAsEmail: PRIMARY, isPrimary: true, isDefault: true }
+    let response = () => Response.json({ sendAs: [primary, ...Array.from({ length: 99 }, (_, index) => ({
+      sendAsEmail: `alias-${index}@example.test`, verificationStatus: 'accepted',
+    }))] })
+    const provider = await definition.create({ accountId: 'gmail-bounded-identities', email: PRIMARY, accessToken: 'offline-token',
+      fetch: (async () => response()) as unknown as typeof fetch })
+    try {
+      expect(await provider.getSendingIdentities!()).toHaveLength(100)
+      response = () => Response.json({ sendAs: Array.from({ length: 101 }, () => primary) })
+      await expect(provider.getSendingIdentities!()).rejects.toMatchObject({ code: 'UPSTREAM', message: 'Gmail returned too many sending identities' })
+      const body = JSON.stringify({ sendAs: [primary] })
+      for (const size of [64 * 1024, 64 * 1024 + 1]) {
+        response = () => new Response(body.padEnd(size, ' '), { headers: { 'Content-Length': '0' } })
+        if (size === 64 * 1024) expect(await provider.getSendingIdentities!()).toEqual([{ email: PRIMARY, isPrimary: true, isDefault: true }])
+        else await expect(provider.getSendingIdentities!()).rejects.toMatchObject({ code: 'UPSTREAM', message: 'gmail response exceeds the supported size limit' })
+      }
+      for (const status of [403, 503]) {
+        response = () => new Response(body.padEnd(64 * 1024 + 1, ' '), { status })
+        await expect(provider.getSendingIdentities!()).rejects.toMatchObject({ code: 'UPSTREAM', status,
+          message: 'gmail response exceeds the supported size limit' })
+      }
+      let cancelled = false
+      response = () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(body.padEnd(32 * 1024, ' ')))
+          controller.enqueue(new Uint8Array(32 * 1024 + 1).fill(32))
+        },
+        cancel() { cancelled = true },
+      }))
+      await failure(() => provider.getSendingIdentities!(), 'UPSTREAM', false)
+      expect(cancelled).toBe(true)
+      response = () => new Response('{')
+      await failure(() => provider.getSendingIdentities!(), 'UPSTREAM', false)
+      response = () => new Response(new ReadableStream({ start(controller) { controller.error(new Error('Interrupted identity response')) } }))
+      await failure(() => provider.getSendingIdentities!(), 'NETWORK', true)
+    } finally { await provider.disconnect() }
+  })
+
+  test('keeps profile-based getAccount unchanged and never attaches sending aliases to it', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    const calls: string[] = []
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      calls.push(url.pathname)
+      expect(init?.method ?? 'GET').toBe('GET')
+      if (url.pathname.endsWith('/profile')) return Response.json({ emailAddress: PRIMARY })
+      if (url.pathname.endsWith('/labels/INBOX')) return Response.json({ messagesUnread: 7 })
+      if (url.pathname.endsWith('/settings/sendAs')) return Response.json({ sendAs: [
+        { sendAsEmail: PRIMARY, isPrimary: true, isDefault: false },
+        { sendAsEmail: 'default@example.test', isDefault: true, verificationStatus: 'accepted' },
+      ] })
+      throw new Error('Unexpected account request')
+    }) as typeof fetch
+    const provider = await definition.create({ accountId: 'gmail-account-identities', email: PRIMARY, name: 'Profile account',
+      accessToken: 'offline-token', baseUrl: 'https://gmail.invalid/gmail/v1', fetch: fetcher })
+    try {
+      const account = await provider.getAccount()
+      expect(account).toEqual({ id: 'gmail-account-identities', name: 'Profile account', email: PRIMARY, provider: 'gmail',
+        color: '#64748b', syncStatus: 'connected', unreadCount: 7 })
+      expect(calls).toEqual(['/gmail/v1/users/me/profile', '/gmail/v1/users/me/labels/INBOX'])
+      expect(await provider.getSendingIdentities!()).toHaveLength(2)
+      expect(await provider.getAccount()).toEqual(account)
+      expect(calls.slice(2)).toEqual(['/gmail/v1/users/me/settings/sendAs', '/gmail/v1/users/me/profile', '/gmail/v1/users/me/labels/INBOX'])
+    } finally { await provider.disconnect() }
+  })
+
+  test('preserves the exact selected alias in composed MIME without adding adapter-side lookup security', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    const alias = 'Sales.Team+launch@brand.example.test'
+    let calls = 0
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls++
+      expect(String(input)).toBe('https://gmail.invalid/gmail/v1/users/me/messages/send')
+      expect(init?.method).toBe('POST')
+      const body = JSON.parse(String(init?.body))
+      const mime = readMime(Buffer.from(body.raw, 'base64url'))
+      expect(mime.headers.from).toBe(`Brand Support <${alias}>`)
+      expect(mime.headers.to).toBe(SECONDARY)
+      expect(mime.headers['reply-to']).toBeUndefined()
+      expect(mime.content.toString('utf8').trim()).toBe('Alias composition only.')
+      return Response.json({ id: 'alias-sent', threadId: 'alias-thread' })
+    }) as typeof fetch
+    const provider = await definition.create({ accountId: 'gmail-alias-mime', email: PRIMARY, accessToken: 'offline-token',
+      scopes: ['https://www.googleapis.com/auth/gmail.modify'], baseUrl: 'https://gmail.invalid/gmail/v1', fetch: fetcher })
+    try {
+      expect(await provider.send({ from: { name: 'Brand Support', email: alias }, to: SECONDARY,
+        subject: 'Alias MIME', bodyText: 'Alias composition only.' })).toMatchObject({ id: 'alias-sent', threadId: 'alias-thread' })
+      expect(calls).toBe(1)
+    } finally { await provider.disconnect() }
+  })
 })
 
 describe('Gmail read-only body and pagination regressions', () => {

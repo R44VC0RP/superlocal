@@ -36,6 +36,7 @@ import {
   type ProviderCredentials,
   type ProviderFolder,
   type ProviderListResult,
+  type SendingIdentity,
   type SendInput,
   type SendResult,
   type SyncCursor,
@@ -513,14 +514,14 @@ export class GmailProvider implements InboxProvider {
     this.fetcher = credentials.fetch ?? globalThis.fetch
   }
 
-  private request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  private request<T>(path: string, init: RequestInit = {}, maxBytes?: number): Promise<T> {
     const headers = new Headers(init.headers)
     headers.set('Authorization', `Bearer ${this.credentials.accessToken}`)
     headers.set('Accept', 'application/json')
     if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
     return providerJson<T>('gmail', this.fetcher, `${this.baseUrl}${path}`, {
       ...init, headers, signal: init.signal ? AbortSignal.any([init.signal, this.requests.signal]) : this.requests.signal,
-    }, this.credentials.timeoutMs)
+    }, this.credentials.timeoutMs, maxBytes)
   }
 
   private async attachmentData(messageId: string, attachmentId: string): Promise<string> {
@@ -662,6 +663,61 @@ export class GmailProvider implements InboxProvider {
       name: this.credentials.name ?? profile.emailAddress,
       unreadCount: inbox.messagesUnread ?? 0,
     })
+  }
+
+  async getSendingIdentities(): Promise<readonly SendingIdentity[]> {
+    const validAddress = (value: unknown): value is string => {
+      if (typeof value !== 'string' || value.length > 254) return false
+      const parts = value.split('@')
+      const local = parts[0]!
+      const domain = parts[1]
+      return parts.length === 2 && local.length <= 64 &&
+        /^[a-z\d!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z\d!#$%&'*+/=?^_`{|}~-]+)*$/i.test(local) &&
+        Boolean(domain && domain.split('.').every(label =>
+          /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/i.test(label)))
+    }
+    // The host stores the authenticated profile address in credentials, never a send-as default.
+    const primary = this.credentials.email
+    if (!validAddress(primary)) throw new ProviderError('gmail', 'VALIDATION', 'An authenticated primary email address is required')
+    const result = await this.request<unknown>(
+      '/users/me/settings/sendAs?fields=sendAs(sendAsEmail,isPrimary,isDefault,verificationStatus)',
+      { method: 'GET' }, 64 * 1024,
+    )
+    const invalid = () => new ProviderError('gmail', 'UPSTREAM', 'Gmail returned invalid sending identities')
+    if (!result || typeof result !== 'object' || Array.isArray(result) || !('sendAs' in result) ||
+      !Array.isArray(result.sendAs)) throw invalid()
+    if (result.sendAs.length > 100) throw new ProviderError('gmail', 'UPSTREAM', 'Gmail returned too many sending identities')
+    const seen = new Map<string, { isPrimary: boolean; isDefault: boolean; verificationStatus: unknown }>()
+    const identities: SendingIdentity[] = []
+    let primaryCount = 0
+    let defaultCount = 0
+    for (const row of result.sendAs as unknown[]) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) throw invalid()
+      const entry = row as Record<string, unknown>
+      if (!validAddress(entry.sendAsEmail) ||
+        entry.isPrimary !== undefined && typeof entry.isPrimary !== 'boolean' ||
+        entry.isDefault !== undefined && typeof entry.isDefault !== 'boolean' ||
+        entry.verificationStatus !== undefined && typeof entry.verificationStatus !== 'string') throw invalid()
+      // Gmail may omit false flags. Do not coerce other values or infer primary/default from each other.
+      const isPrimary = entry.isPrimary === true
+      const isDefault = entry.isDefault === true
+      const key = entry.sendAsEmail.toLowerCase()
+      if (isPrimary !== (key === primary.toLowerCase())) throw invalid()
+      const previous = seen.get(key)
+      if (previous) {
+        if (previous.isPrimary !== isPrimary || previous.isDefault !== isDefault ||
+          previous.verificationStatus !== entry.verificationStatus) throw invalid()
+        continue
+      }
+      seen.set(key, { isPrimary, isDefault, verificationStatus: entry.verificationStatus })
+      if (isPrimary) primaryCount++
+      if (isDefault && ++defaultCount > 1) throw invalid()
+      if (isPrimary || entry.verificationStatus === 'accepted') identities.push({
+        email: isPrimary ? primary : entry.sendAsEmail, isPrimary, isDefault,
+      })
+    }
+    if (primaryCount !== 1) throw invalid()
+    return identities
   }
 
   async listFolders(): Promise<ProviderFolder[]> {

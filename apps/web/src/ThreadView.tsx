@@ -16,6 +16,7 @@ import {
   type Preferences,
   type SendOptions,
   type MailboxOption,
+  type LoadSendingIdentities,
 } from "./data";
 import "./message.css";
 import "./thread-comments.css";
@@ -71,6 +72,7 @@ type ThreadViewProps = {
   preferences: Preferences;
   account: string;
   accounts: MailboxOption[];
+  loadSendingIdentities: LoadSendingIdentities;
   contacts: Array<{ name: string; email: string }>;
   onBack: () => void;
   onNavigate: (delta: number) => void;
@@ -101,6 +103,7 @@ export default function ThreadView({
   preferences,
   account,
   accounts,
+  loadSendingIdentities,
   contacts,
   onBack,
   onNavigate,
@@ -970,6 +973,7 @@ export default function ThreadView({
                       snippetRequest={snippetRequest}
                       preferences={preferences}
                       accounts={accounts}
+                      loadSendingIdentities={loadSendingIdentities}
                       contacts={contacts}
                       onChange={onDraftChange}
                       onSearch={onSearch}

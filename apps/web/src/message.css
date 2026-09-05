@@ -368,6 +368,35 @@
   margin-left: 7px;
   color: var(--subtle);
 }
+.compose-sender-status {
+  padding-left: 50px;
+  color: var(--muted);
+  font-size: var(--ui-small);
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+.compose-sender-status:empty {
+  display: none;
+}
+.compose-sender-status.is-error {
+  color: #efa2a2;
+}
+.compose-sender-status button {
+  margin-left: 8px;
+  min-height: 40px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.compose-from select:focus-visible,
+.compose-sender-status button:focus-visible {
+  outline: 2px solid var(--muted);
+  outline-offset: 2px;
+}
 .compose-subject {
   display: block;
   width: 100%;
