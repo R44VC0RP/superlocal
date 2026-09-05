@@ -9,7 +9,7 @@ import { createMediaStore } from './media'
 import { mailFacts } from './mail-facts'
 import { mailPreview } from './mail-preview'
 import { ProviderError, ProviderMutationError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
-import { CredentialError, InboxError, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
+import { CredentialError, InboxError, MAILBOX_SYNC_PROBLEM_CODES, type MailboxSyncStatus, type MailboxSyncProblemCode, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
   type DraftInput, type Folder, type Inbox, type InboxOptions, type Label, type Message,
   type MessageSummary, type MutationInput, type Operation, type Participant, type Policy,
   type Problem, type Query, type SyncCheckpoint, type SyncRequest, type ThreadSummary, type Connection, type ConnectionIdentity,
@@ -153,6 +153,10 @@ export function createInbox(options: InboxOptions): Inbox {
   const refreshes = new Map<string, Promise<ConnectionRow>>()
   const credentialUpdates = new Set<Promise<CredentialState>>()
   const syncing = new Map<string, Promise<{ synchronized: number; hasMore: boolean; state: string }>>()
+  type SyncActivity = { owner: string; sourceId: string; binding: string; folder: string; lane: 'latest' | 'backfill'; visible: boolean }
+  const syncActivity = new Map<string, SyncActivity>()
+  const syncCompletions = new Map<string, { binding: string; batch: NonNullable<MailboxSyncStatus['lastBatch']> }>()
+  const SYNC_COMPLETIONS = 1000
   const listeners = new Map<string, Set<() => void>>()
   const inventories = new Map<string, MailboxInventory>()
   let inventoryBytes = 0
@@ -174,6 +178,7 @@ export function createInbox(options: InboxOptions): Inbox {
       instances.clear()
       listeners.clear()
       inventories.clear(); inventoryBytes = 0
+      syncActivity.clear(); syncCompletions.clear()
       if (ownsDatabase) db.close()
     }),
   ))
@@ -269,7 +274,13 @@ export function createInbox(options: InboxOptions): Inbox {
     }
   }
 
+  function forgetSyncStatus(owner: string, id: string): void {
+    syncCompletions.delete(`${owner}\0${id}`)
+    for (const [key, activity] of syncActivity) if (activity.owner === owner && activity.sourceId === id) syncActivity.delete(key)
+  }
+
   function retireSource(owner: string, id: string, abort = true, version = Number.MAX_SAFE_INTEGER): void {
+    if (abort) forgetSyncStatus(owner, id)
     const prefix = `${owner}\0${id}\0`
     for (const key of new Set([...controllers.keys(), ...instances.keys()])) {
       if (key.startsWith(prefix) && (abort || (instanceVersions.get(key) ?? 0) <= version)) retireInstance(key, abort)
@@ -356,6 +367,14 @@ export function createInbox(options: InboxOptions): Inbox {
     const values = selected.map(row => JSON.parse(row.selector) as MailboxSelector)
     return { key: fingerprint(values), count: values.length,
       scopes: values.some(value => value.kind === 'all') ? undefined : values.filter((value): value is { kind: 'domain' | 'address'; value: string } => value.kind !== 'all') }
+  }
+
+  function syncScopeBinding(row: Pick<AccountRow, 'owner' | 'id' | 'generation' | 'connection_id' | 'connection_generation'>, selection: ReturnType<typeof sourceSelection>): string {
+    return fingerprint([row.owner, row.id, row.generation, row.connection_id, row.connection_generation, selection.key])
+  }
+
+  function syncProblem(code: string | null): MailboxSyncProblemCode | null {
+    return code === null ? null : MAILBOX_SYNC_PROBLEM_CODES.includes(code as MailboxSyncProblemCode) ? code as MailboxSyncProblemCode : 'INTERNAL'
   }
 
   function token(owner: string, seq: number, query?: string): string {
@@ -551,7 +570,7 @@ export function createInbox(options: InboxOptions): Inbox {
       WHERE b.owner=? AND b.id IN (SELECT value FROM json_each(?)) ORDER BY b.id`).all(owner, json)
     if (rows.length !== ids.length) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
     const sources = new Set(rows.map(row => row.source))
-    return { ids, json, sources, sourceJson: JSON.stringify([...sources]), hash: fingerprint(ids), binding: fingerprint(rows),
+    return { ids, rows, json, sources, sourceJson: JSON.stringify([...sources]), hash: fingerprint(ids), binding: fingerprint(rows),
       attached: rows.every(row => row.status === 'active' || row.status === 'paused'), overhead: 4096 + json.length * 2 + JSON.stringify(rows).length * 2 }
   }
 
@@ -1616,40 +1635,42 @@ export function createInbox(options: InboxOptions): Inbox {
 
   function synchronizeSource(owner: string, id: string, request: SyncRequest = {}, mailboxScoped = false): Promise<{ synchronized: number; hasMore: boolean; state: string }> {
     const scope = request.folder ?? 'inbox'; const lane = request.lane ?? 'latest'
-    let generation: number
-    let connectionGeneration: number
-    let selection: ReturnType<typeof sourceSelection> | undefined
+    let source: AccountRow
+    let effectiveSelection: ReturnType<typeof sourceSelection>
     try {
       if (closed || stopping) throw new InboxError('CLOSED', 'The inbox instance is closed.', 503)
-      const source = accountRow(owner, id)
-      generation = source.generation; connectionGeneration = source.connection_generation
-      if (mailboxScoped) {
-        selection = sourceSelection(owner, id)
-        if (!selection.count) throw new InboxError('MAILBOX_SELECTION_REQUIRED', 'Select an active mailbox before synchronizing.', 409)
-      }
+      source = accountRow(owner, id)
+      effectiveSelection = sourceSelection(owner, id)
+      if (mailboxScoped && !effectiveSelection.count) throw new InboxError('MAILBOX_SELECTION_REQUIRED', 'Select an active mailbox before synchronizing.', 409)
     } catch (error) { return Promise.reject(failure(error)) }
+    const selection = mailboxScoped ? effectiveSelection : undefined
+    const binding = syncScopeBinding(source, effectiveSelection)
     const checkpointScope = selection ? `mailboxes:${selection.key}:${scope}` : scope
-    const key = `${owner}\0${id}\0${generation}\0${connectionGeneration}\0${checkpointScope}\0${lane}\0${!!request.reset}`
+    const key = `${owner}\0${id}\0${source.generation}\0${source.connection_generation}\0${checkpointScope}\0${lane}\0${!!request.reset}`
     const existing = syncing.get(key)
     if (existing) return existing
+    const activity: SyncActivity = { owner, sourceId: id, binding, folder: scope, lane,
+      visible: scope === 'inbox' && effectiveSelection.count > 0 && (mailboxScoped || !effectiveSelection.scopes) }
+    syncActivity.set(key, activity)
     const promise = run(async () => {
       const row = accountRow(owner, id, true)
       const scopeCurrent = () => !selection || sourceSelection(owner, id).key === selection.key
       if (!scopeCurrent()) throw new InboxError('SCOPE_CHANGED', 'Mailbox selection changed. Retry synchronization.', 409)
       const cooldown = db.query<{ next_at: number; failures: number; hard: number }, [string]>('SELECT next_at,failures,hard FROM sdk_cooldowns WHERE account=?').get(id)
       if (cooldown?.hard && cooldown.next_at > now()) throw new InboxError('RATE_LIMITED', 'This mailbox is waiting before retrying synchronization.', 429, true)
-      const saved = db.query<{ data: string }, [string, number, string, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND scope=? AND lane=?').get(id, row.generation, checkpointScope, lane)
-      const checkpoint: SyncCheckpoint = request.reset || !saved ? { cursor: null, initialized: false } : JSON.parse(saved.data)
-      let fence: number
-      const known = db.query<{ native_id: string; is_read: number; is_starred: number }, [string, number]>(
-        "SELECT native_id,json_extract(confirmed,'$.isRead') is_read,json_extract(confirmed,'$.isStarred') is_starred FROM sdk_messages WHERE account=? AND generation=? AND deleted=0").all(id, row.generation)
-      const syncOptions = { folder: scope, limit: request.limit ?? 100, ...(selection?.scopes ? { mailboxScopes: selection.scopes } : {}) }
-      // Runtime hints are separate from providers' validated operation input.
-      const syncContext = {
-        knownMessageIds: known.map(message => message.native_id),
-        knownMessageStates: known.map(message => ({ id: message.native_id, isRead: Boolean(message.is_read), isStarred: Boolean(message.is_starred) })) }
-      let page: SyncResult
+      let providerReturned = false
       try {
+        const saved = db.query<{ data: string }, [string, number, string, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND scope=? AND lane=?').get(id, row.generation, checkpointScope, lane)
+        const checkpoint: SyncCheckpoint = request.reset || !saved ? { cursor: null, initialized: false } : JSON.parse(saved.data)
+        let fence: number
+        const known = db.query<{ native_id: string; is_read: number; is_starred: number }, [string, number]>(
+          "SELECT native_id,json_extract(confirmed,'$.isRead') is_read,json_extract(confirmed,'$.isStarred') is_starred FROM sdk_messages WHERE account=? AND generation=? AND deleted=0").all(id, row.generation)
+        const syncOptions = { folder: scope, limit: request.limit ?? 100, ...(selection?.scopes ? { mailboxScopes: selection.scopes } : {}) }
+        // Runtime hints are separate from providers' validated operation input.
+        const syncContext = {
+          knownMessageIds: known.map(message => message.native_id),
+          knownMessageStates: known.map(message => ({ id: message.native_id, isRead: Boolean(message.is_read), isStarred: Boolean(message.is_starred) })) }
+        let page: SyncResult
         const provider = await providerFor(row)
         if (!provider.capabilities.sync) throw new InboxError('UNSUPPORTED_OPERATION', 'Synchronization is unavailable.', 409)
         fence = sequence(owner)
@@ -1659,9 +1680,69 @@ export function createInbox(options: InboxOptions): Inbox {
           checkpoint.cursor = null; checkpoint.initialized = false
           page = await io(row, p => p.sync(null, syncOptions, syncContext))
         }
+        providerReturned = true
+        if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed during synchronization.', 409)
+        if (!scopeCurrent()) throw new InboxError('SCOPE_CHANGED', 'Mailbox selection changed during synchronization.', 409)
+        if (!Array.isArray(page.messages) || (page.hasMore && !page.cursor)) throw new InboxError('INVALID_PROVIDER', 'Provider returned an invalid synchronization page.', 502)
+        if (page.hasMore && checkpoint.cursor && fingerprint(page.cursor) === fingerprint(checkpoint.cursor)) throw new InboxError('INVALID_CURSOR', 'Provider synchronization did not advance.', 502)
+        transaction(() => {
+          if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed.', 409)
+          if (!scopeCurrent()) throw new InboxError('SCOPE_CHANGED', 'Mailbox selection changed during synchronization.', 409)
+          const reason = lane === 'backfill' ? 'backfill' : page.fullSync || !checkpoint.initialized ? 'initial' : 'arrival'
+          for (const message of page.messages) persist(row, message, reason, undefined, fence)
+          for (const nativeId of page.retiredMessageIds ?? []) {
+            const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
+            if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
+            // A mailbox-scoped identity vanished. Hide this instance, without inventing an
+            // Archive membership or permanently tombstoning possible later authoritative evidence.
+            db.query('UPDATE sdk_messages SET deleted=2,revision=revision+1 WHERE id=?').run(removed.id)
+            event(owner, 'mail.changed', id, removed.id, 'deleted')
+          }
+          for (const nativeId of page.deletedMessageIds) {
+            const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
+            if (removed && lane !== 'backfill' && removed.last_mutation_seq <= fence) {
+              db.query('UPDATE sdk_messages SET deleted=1,revision=revision+1 WHERE id=?').run(removed.id)
+              event(owner, 'mail.changed', id, removed.id, 'deleted')
+            }
+          }
+          for (const nativeId of page.removedMessageIds ?? []) {
+            const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
+            if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
+            const value: MessageSummary = JSON.parse(removed.confirmed)
+            const folderIds = db.query<{ id: string }, [string, string, string]>('SELECT id FROM sdk_folders WHERE account=? AND (native_id=? OR json_extract(data,\'$.role\')=?)').all(id, scope, scope)
+            value.folderIds = value.folderIds.filter(fid => !folderIds.some(folder => folder.id === fid))
+            if (value.folder === scope) value.folder = 'archive'
+            db.query('UPDATE sdk_messages SET confirmed=? WHERE id=?').run(JSON.stringify(value), removed.id)
+            project(removed.id); event(owner, 'mail.changed', id, removed.id)
+          }
+          const cursor = lane === 'backfill' ? (page.hasMore ? page.cursor : null) : page.recentCursor ?? page.cursor
+          if (lane === 'backfill' && !page.hasMore && page.recentCursor) {
+            db.query('INSERT INTO sdk_checkpoints VALUES (?,?,?,?,?) ON CONFLICT(account,generation,scope,lane) DO UPDATE SET data=excluded.data').run(id, row.generation, checkpointScope, 'latest', JSON.stringify({ cursor: page.recentCursor, initialized: true }))
+          }
+          db.query('INSERT INTO sdk_checkpoints VALUES (?,?,?,?,?) ON CONFLICT(account,generation,scope,lane) DO UPDATE SET data=excluded.data').run(id, row.generation, checkpointScope, lane, JSON.stringify({ cursor, initialized: true }))
+          const account = JSON.parse(accountRow(owner, id).data) as Account
+          // An incremental poll finishing is not proof that older history was imported.
+          const coverage = scope !== 'inbox' ? account.sync.coverage
+            : page.hasMore ? 'partial' : page.snapshotComplete === false ? account.sync.coverage : 'complete'
+          const changed = account.sync.coverage !== coverage || account.sync.problem !== null
+          account.sync = { lastSyncAt: new Date(now()).toISOString(), coverage, problem: null }
+          if (changed) account.revision += 1
+          db.query('UPDATE sdk_accounts SET data=? WHERE id=?').run(JSON.stringify(account), id)
+          db.query('DELETE FROM sdk_cooldowns WHERE account=?').run(id)
+          if (changed) event(owner, 'account.updated', id, id)
+        })
+        // Telemetry follows the current selection; it never decides whether a page may commit.
+        if (activity.visible && syncActivity.get(key) === activity && current(row) && syncScopeBinding(row, sourceSelection(owner, id)) === binding) {
+          const completionKey = `${owner}\0${id}`
+          syncCompletions.delete(completionKey)
+          syncCompletions.set(completionKey, { binding, batch: { lane, processed: page.messages.length, completedAt: new Date(now()).toISOString(), hasMore: page.hasMore } })
+          while (syncCompletions.size > SYNC_COMPLETIONS) syncCompletions.delete(syncCompletions.keys().next().value!)
+        }
+        return { synchronized: page.messages.length, hasMore: page.hasMore, state: token(owner, sequence(owner)) }
       } catch (error) {
         if (error instanceof CredentialError && error.reason === 'revoked') throw error
         if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed.', 409)
+        if (providerReturned && error instanceof InboxError && error.code === 'SCOPE_CHANGED') throw error
         const problem = failure(error)
         transaction(() => {
           const account = JSON.parse(accountRow(owner, id).data) as Account
@@ -1672,7 +1753,9 @@ export function createInbox(options: InboxOptions): Inbox {
             const delay = Math.max(after, Math.min(300_000, 1000 * 2 ** failures))
             db.query('INSERT INTO sdk_cooldowns VALUES (?,?,?,?) ON CONFLICT(account) DO UPDATE SET next_at=excluded.next_at,failures=excluded.failures,hard=excluded.hard').run(id, now() + delay, failures, Number(problem.code === 'RATE_LIMITED'))
           }
-          if (problem.code === 'INVALID_CURSOR') {
+          // Only an upstream cursor rejection triggers the existing recovery policy. A
+          // locally detected nonadvancing page must keep its last committed checkpoint.
+          if (!providerReturned && problem.code === 'INVALID_CURSOR') {
             account.sync.coverage = 'partial'
             db.query('DELETE FROM sdk_checkpoints WHERE account=? AND generation=? AND scope=? AND lane=?').run(id, row.generation, checkpointScope, lane)
           }
@@ -1682,58 +1765,10 @@ export function createInbox(options: InboxOptions): Inbox {
         })
         throw problem
       }
-      if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed during synchronization.', 409)
-      if (!scopeCurrent()) throw new InboxError('SCOPE_CHANGED', 'Mailbox selection changed during synchronization.', 409)
-      if (!Array.isArray(page.messages) || (page.hasMore && !page.cursor)) throw new InboxError('INVALID_PROVIDER', 'Provider returned an invalid synchronization page.', 502)
-      if (page.hasMore && checkpoint.cursor && fingerprint(page.cursor) === fingerprint(checkpoint.cursor)) throw new InboxError('INVALID_CURSOR', 'Provider synchronization did not advance.', 502)
-      transaction(() => {
-        if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed.', 409)
-        if (!scopeCurrent()) throw new InboxError('SCOPE_CHANGED', 'Mailbox selection changed during synchronization.', 409)
-        const reason = lane === 'backfill' ? 'backfill' : page.fullSync || !checkpoint.initialized ? 'initial' : 'arrival'
-        for (const message of page.messages) persist(row, message, reason, undefined, fence)
-        for (const nativeId of page.retiredMessageIds ?? []) {
-          const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
-          if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
-          // A mailbox-scoped identity vanished. Hide this instance, without inventing an
-          // Archive membership or permanently tombstoning possible later authoritative evidence.
-          db.query('UPDATE sdk_messages SET deleted=2,revision=revision+1 WHERE id=?').run(removed.id)
-          event(owner, 'mail.changed', id, removed.id, 'deleted')
-        }
-        for (const nativeId of page.deletedMessageIds) {
-          const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
-          if (removed && lane !== 'backfill' && removed.last_mutation_seq <= fence) {
-            db.query('UPDATE sdk_messages SET deleted=1,revision=revision+1 WHERE id=?').run(removed.id)
-            event(owner, 'mail.changed', id, removed.id, 'deleted')
-          }
-        }
-        for (const nativeId of page.removedMessageIds ?? []) {
-          const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
-          if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
-          const value: MessageSummary = JSON.parse(removed.confirmed)
-          const folderIds = db.query<{ id: string }, [string, string, string]>('SELECT id FROM sdk_folders WHERE account=? AND (native_id=? OR json_extract(data,\'$.role\')=?)').all(id, scope, scope)
-          value.folderIds = value.folderIds.filter(fid => !folderIds.some(folder => folder.id === fid))
-          if (value.folder === scope) value.folder = 'archive'
-          db.query('UPDATE sdk_messages SET confirmed=? WHERE id=?').run(JSON.stringify(value), removed.id)
-          project(removed.id); event(owner, 'mail.changed', id, removed.id)
-        }
-        const cursor = lane === 'backfill' ? (page.hasMore ? page.cursor : null) : page.recentCursor ?? page.cursor
-        if (lane === 'backfill' && !page.hasMore && page.recentCursor) {
-          db.query('INSERT INTO sdk_checkpoints VALUES (?,?,?,?,?) ON CONFLICT(account,generation,scope,lane) DO UPDATE SET data=excluded.data').run(id, row.generation, checkpointScope, 'latest', JSON.stringify({ cursor: page.recentCursor, initialized: true }))
-        }
-        db.query('INSERT INTO sdk_checkpoints VALUES (?,?,?,?,?) ON CONFLICT(account,generation,scope,lane) DO UPDATE SET data=excluded.data').run(id, row.generation, checkpointScope, lane, JSON.stringify({ cursor, initialized: true }))
-        const account = JSON.parse(accountRow(owner, id).data) as Account
-        // An incremental poll finishing is not proof that older history was imported.
-        const coverage = scope !== 'inbox' ? account.sync.coverage
-          : page.hasMore ? 'partial' : page.snapshotComplete === false ? account.sync.coverage : 'complete'
-        const changed = account.sync.coverage !== coverage || account.sync.problem !== null
-        account.sync = { lastSyncAt: new Date(now()).toISOString(), coverage, problem: null }
-        if (changed) account.revision += 1
-        db.query('UPDATE sdk_accounts SET data=? WHERE id=?').run(JSON.stringify(account), id)
-        db.query('DELETE FROM sdk_cooldowns WHERE account=?').run(id)
-        if (changed) event(owner, 'account.updated', id, id)
-      })
-      return { synchronized: page.messages.length, hasMore: page.hasMore, state: token(owner, sequence(owner)) }
-    }).finally(() => syncing.delete(key))
+    }).finally(() => {
+      if (syncActivity.get(key) === activity) syncActivity.delete(key)
+      if (syncing.get(key) === promise) syncing.delete(key)
+    })
     syncing.set(key, promise)
     return promise
   }
@@ -1872,6 +1907,29 @@ export function createInbox(options: InboxOptions): Inbox {
       return { items: rows.map(row => mailboxSummary(row, selection.ids)), total, state: page.state,
         nextCursor: page.offset + rows.length < total ? token(owner, sequence(owner), `${page.hash}:${page.offset + rows.length}`) : null }
     }),
+    mailboxSyncStatus: (owner, input) => run(() => db.transaction(() => {
+      if (!input || Object.keys(input).some(key => key !== 'mailboxIds')) throw new InboxError('VALIDATION', 'Invalid mailbox sync status input.')
+      const scope = mailboxReadScope(owner, input.mailboxIds)
+      const sources = [...new Set(scope.rows.filter(row => row.status !== 'detached').map(row => row.source))].sort()
+      return sources.map(sourceId => {
+        const row = accountRow(owner, sourceId)
+        const account = JSON.parse(row.data) as Account
+        const selection = sourceSelection(owner, sourceId)
+        const binding = syncScopeBinding(row, selection)
+        const connected = current(row)
+        const paused = !selection.count
+        const activeLanes = (['latest', 'backfill'] as const).filter(lane => connected && !paused &&
+          [...syncActivity.values()].some(activity => activity.visible && activity.binding === binding && activity.lane === lane))
+        const cooldown = db.query<{ next_at: number; hard: number }, [string]>('SELECT next_at,hard FROM sdk_cooldowns WHERE account=?').get(sourceId)
+        const retryAt = connected && !paused && cooldown && Number.isFinite(cooldown.next_at) && cooldown.next_at > now()
+          ? new Date(cooldown.next_at).toISOString() : null
+        const problemCode = !connected ? 'RECONNECT_REQUIRED' : paused ? null : syncProblem(account.sync.problem) ?? (retryAt && cooldown?.hard ? 'RATE_LIMITED' : null)
+        const completed = syncCompletions.get(`${owner}\0${sourceId}`)
+        return { sourceId, scopeKey: binding, state: !connected ? 'error' : paused ? 'paused' : activeLanes.length ? 'syncing' : retryAt ? 'waiting' : problemCode ? 'error' : 'idle',
+          activeLanes, retryAt, problemCode, lastBatch: connected && !paused && completed?.binding === binding ? { ...completed.batch } : null,
+          lastSyncAt: account.sync.lastSyncAt } satisfies MailboxSyncStatus
+      })
+    }).deferred()),
     mailboxSnapshot: (owner, input) => run(() => db.transaction(() => {
       if (!input || Object.keys(input).some(key => !['mailboxIds', 'cursor', 'limit'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox snapshot input.')
       const scope = mailboxReadScope(owner, input.mailboxIds)

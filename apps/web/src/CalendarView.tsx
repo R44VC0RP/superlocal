@@ -292,6 +292,7 @@ function Calendar({
   }, [view]);
   useEffect(() => setMiniMonth(`${day.slice(0, 7)}-01`), [day]);
   const shortcut = useEffectEvent((event: KeyboardEvent) => {
+    if (document.querySelector(".app.settings-open")) return;
     if (
       event.defaultPrevented ||
       event.isComposing ||

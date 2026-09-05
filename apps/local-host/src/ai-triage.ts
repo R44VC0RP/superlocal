@@ -1,7 +1,7 @@
 import type { Database } from 'bun:sqlite'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { InboxError, type Inbox, type Mailbox, type Message, type MessageSummary } from 'inbox-sdk'
-import { AI_TRIAGE_VERSION, type AiAssessment, type AiDecision, type AiDecisionPage, type AiDiagnosticAttempt, type AiFeedbackInput, type AiHistoryJob, type AiInferenceResult, type AiReadingInput, type AiSettings, type AiThreadKey, type AiTriageInput, type AiTriageState, type AiUsageSummary } from '../../shared/ai-triage'
+import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, type AiAssessment, type AiDecision, type AiDecisionPage, type AiDiagnosticAttempt, type AiFeedbackInput, type AiHistoryJob, type AiInferenceResult, type AiReadingInput, type AiSettings, type AiThreadKey, type AiTriageInput, type AiTriageState, type AiUsageSummary } from '../../shared/ai-triage'
 import { inferAiTriage, prepareAiText, publicAiProvider, type AiInferenceConfig } from './ai-inference'
 import { countAiTopicMatches, normalizeAiTopics, scoreAiTriage } from './ai-preferences'
 
@@ -9,7 +9,7 @@ type Options = { database: Database; inbox: Inbox; configuration: AiInferenceCon
 type SettingsRow = { owner: string; data: string; generation: number; cursor: string | null; baseline: number }
 type QueueRow = { owner: string; source: string; thread: string; fingerprint: string; generation: number; lane: 'incoming' | 'history'; queued: number; due: number; attempts: number; status: string; job: string | null }
 type DecisionRow = { data: string; fingerprint: string; sender: string; seq: number }
-type JobRow = { owner: string; id: string; data: string; generation: number; boxes: string; enumerated: number; bytes: number; examined: number }
+type JobRow = { owner: string; id: string; data: string; generation: number; boxes: string; enumerated: number; bytes: number; examined: number; input_policy: string }
 type RecoveryRow = { owner: string; generation: number; baseline: number; target: string; boxes: string; status: string; problem: string | null; examined: number; bytes: number; restarts: number }
 type RescoreRow = { owner: string; token: string; revision: number; through: number; after: number; stale: number; force: number; problem: string | null }
 type AffinityVote = { sender: string; topics: string; choice: number; at: number }
@@ -30,6 +30,15 @@ const emptyUsage = (): AiUsageSummary => ({ attempts: 0, completed: 0, failed: 0
 const insufficient: AiAssessment = { type: 'unknown', response: 'unknown', actions: [], urgency: 'unknown', deadline: null, topics: [], risk: 'unknown', certainty: 'insufficient', reason: 'Not enough usable cached context.', evidence: [] }
 function fail(code: string, status = 400): never { throw new InboxError(code, 'AI triage could not complete this request.', status) }
 const stamp = (time: number) => new Date(time).toISOString()
+const quietCampaign = (assessment: AiAssessment) =>
+  ['promotion', 'newsletter', 'cold_outreach'].includes(assessment.type) && assessment.response === 'not_needed' &&
+  assessment.actions.length === 0 && assessment.urgency === 'none' && assessment.deadline === null &&
+  assessment.risk === 'none_observed' && assessment.evidence.some(item => item.field === 'type')
+const legacyCampaign = (assessment: AiAssessment | null, policy?: string) =>
+  (!policy || policy === 'input-1') && assessment?.certainty === 'insufficient' && quietCampaign(assessment)
+const reusableDecision = (decision: AiDecision, model: string, refreshLegacy: boolean) =>
+  decision.state === 'ready' && decision.model === model &&
+  !(refreshLegacy && !decision.override && legacyCampaign(decision.assessment, decision.inputPolicyVersion))
 
 /** Host-owned, opt-in projection. Every mail read goes through the owner-scoped public SDK. */
 export function createAiTriageService({ database: db, inbox, configuration, configurationProblem, sessionKey, now = Date.now, fetcher }: Options) {
@@ -43,7 +52,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     CREATE INDEX IF NOT EXISTS local_ai_decisions_holds ON local_ai_decisions(owner) WHERE json_extract(data,'$.holdUntil') IS NOT NULL;
     CREATE TABLE IF NOT EXISTS local_ai_message_refs (owner TEXT NOT NULL, message TEXT NOT NULL, source TEXT NOT NULL, thread TEXT NOT NULL, PRIMARY KEY(owner,message,source,thread)) STRICT;
     CREATE INDEX IF NOT EXISTS local_ai_message_refs_thread ON local_ai_message_refs(owner,source,thread);
-    CREATE TABLE IF NOT EXISTS local_ai_cache (owner TEXT NOT NULL, hash TEXT NOT NULL, assessment TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(owner,hash)) STRICT;
+    CREATE TABLE IF NOT EXISTS local_ai_cache (owner TEXT NOT NULL, hash TEXT NOT NULL, assessment TEXT NOT NULL, at INTEGER NOT NULL, input_policy TEXT NOT NULL DEFAULT 'input-1', PRIMARY KEY(owner,hash)) STRICT;
     CREATE INDEX IF NOT EXISTS local_ai_cache_at ON local_ai_cache(owner,at);
     CREATE TABLE IF NOT EXISTS local_ai_counts (owner TEXT PRIMARY KEY, decisions INTEGER NOT NULL DEFAULT 0, events INTEGER NOT NULL DEFAULT 0, cache INTEGER NOT NULL DEFAULT 0) STRICT;
     CREATE TABLE IF NOT EXISTS local_ai_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, source TEXT NOT NULL, thread TEXT NOT NULL, removed INTEGER NOT NULL) STRICT;
@@ -63,7 +72,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     CREATE TRIGGER IF NOT EXISTS local_ai_queue_removed AFTER DELETE ON local_ai_queue BEGIN UPDATE local_ai_global SET queued=queued-1 WHERE id=1; END;
     CREATE TRIGGER IF NOT EXISTS local_ai_decision_added AFTER INSERT ON local_ai_decisions BEGIN UPDATE local_ai_global SET decisions=decisions+1 WHERE id=1; END;
     CREATE TRIGGER IF NOT EXISTS local_ai_decision_removed AFTER DELETE ON local_ai_decisions BEGIN UPDATE local_ai_global SET decisions=decisions-1 WHERE id=1; END;
-    CREATE TABLE IF NOT EXISTS local_ai_jobs (owner TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, generation INTEGER NOT NULL, boxes TEXT NOT NULL, enumerated INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(owner,id)) STRICT;
+    CREATE TABLE IF NOT EXISTS local_ai_jobs (owner TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, generation INTEGER NOT NULL, boxes TEXT NOT NULL, enumerated INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, input_policy TEXT NOT NULL DEFAULT 'input-1', PRIMARY KEY(owner,id)) STRICT;
     CREATE TABLE IF NOT EXISTS local_ai_job_items (owner TEXT NOT NULL, job TEXT NOT NULL, source TEXT NOT NULL, thread TEXT NOT NULL, status TEXT NOT NULL, PRIMARY KEY(owner,job,source,thread)) STRICT;
     CREATE INDEX IF NOT EXISTS local_ai_job_items_thread ON local_ai_job_items(owner,source,thread,status);
     CREATE TABLE IF NOT EXISTS local_ai_attempts (seq INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, id TEXT NOT NULL UNIQUE, data TEXT NOT NULL, config TEXT NOT NULL, finished INTEGER NOT NULL DEFAULT 0) STRICT;
@@ -85,6 +94,8 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     CREATE TRIGGER IF NOT EXISTS local_ai_recovery_seen_removed AFTER DELETE ON local_ai_recovery_seen BEGIN UPDATE local_ai_recovery_global SET seen=seen-1 WHERE id=1; END;
   `)
   // Only host-owned schema is inspected. Existing durable queues survive this additive upgrade.
+  if (!db.query<{ name: string }, []>('PRAGMA table_info(local_ai_cache)').all().some(column => column.name === 'input_policy')) db.exec("ALTER TABLE local_ai_cache ADD COLUMN input_policy TEXT NOT NULL DEFAULT 'input-1'")
+  if (!db.query<{ name: string }, []>('PRAGMA table_info(local_ai_jobs)').all().some(column => column.name === 'input_policy')) db.exec("ALTER TABLE local_ai_jobs ADD COLUMN input_policy TEXT NOT NULL DEFAULT 'input-1'")
   if (!db.query<{ name: string }, []>('PRAGMA table_info(local_ai_message_refs)').all().some(column => column.name === 'fingerprint')) db.exec("ALTER TABLE local_ai_message_refs ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''")
   if (!db.query<{ name: string }, []>('PRAGMA table_info(local_ai_jobs)').all().some(column => column.name === 'examined')) db.exec('ALTER TABLE local_ai_jobs ADD COLUMN examined INTEGER NOT NULL DEFAULT 0')
   db.transaction(() => {
@@ -281,7 +292,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     }
     if (previous && unchanged && !existing) {
       const prior: AiDecision = JSON.parse(previous.data)
-      if (prior.state === 'ready' && prior.model === (JSON.parse(row.data) as AiSettings).model) { if (job) { db.query("UPDATE local_ai_job_items SET status='completed' WHERE owner=? AND job=? AND source=? AND thread=?").run(owner, job, source, thread); refreshJob(owner, job) }; return false }
+      if (reusableDecision(prior, (JSON.parse(row.data) as AiSettings).model, lane === 'history' && !!job && jobRow(owner, job)?.input_policy === AI_INPUT_POLICY_VERSION)) { if (job) { db.query("UPDATE local_ai_job_items SET status='completed' WHERE owner=? AND job=? AND source=? AND thread=?").run(owner, job, source, thread); refreshJob(owner, job) }; return false }
     }
     const count = db.query<{ queued: number }, [string]>('SELECT queued FROM local_ai_queue_counts WHERE owner=?').get(owner)?.queued ?? 0
     if (!existing && count >= (lane === 'history' ? HISTORY_LIMIT : QUEUE_LIMIT)) fail('AI_QUEUE_FULL', 429)
@@ -494,7 +505,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         row.examined++; row.bytes += size; saveJob(row, job)
         if (db.query('SELECT 1 FROM local_ai_job_items WHERE owner=? AND job=? AND source=? AND thread=?').get(owner, id, summary.sourceId, summary.threadId)) continue
         const previous = decisionRow(owner, summary.sourceId, summary.threadId)
-        if (previous && knownMessage(owner, summary)) { const decision: AiDecision = JSON.parse(previous.data); if (decision.state === 'ready' && decision.model === (JSON.parse(current.data) as AiSettings).model) continue }
+        if (previous && knownMessage(owner, summary)) { const decision: AiDecision = JSON.parse(previous.data); if (reusableDecision(decision, (JSON.parse(current.data) as AiSettings).model, row.input_policy === AI_INPUT_POLICY_VERSION)) continue }
         let selected = sourceScopes.get(summary.sourceId)
         if (!selected) { selected = await scope(owner, JSON.parse(current.data), summary.sourceId); sourceScopes.set(summary.sourceId, selected) }
         if (closed || settingsRow(owner)?.generation !== row.generation || JSON.parse(jobRow(owner, id)!.data).status !== 'running') return
@@ -542,7 +553,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
   function beginAttempt(queue: QueueRow, model: string, inputHash: string): AiDiagnosticAttempt {
     const attempt: AiDiagnosticAttempt = { id: randomUUID(), sourceId: queue.source, threadId: queue.thread, at: stamp(now()), finishedAt: null, lane: queue.lane, outcome: 'dispatching', code: null, model, queueMs: Math.max(0, now() - queue.queued), durationMs: null, httpStatus: null, requestId: null, responseId: null, usage: null, estimate: null }
     transaction(() => {
-      db.query('INSERT INTO local_ai_attempts(owner,id,data,config) VALUES (?,?,?,?)').run(queue.owner, attempt.id, JSON.stringify(attempt), JSON.stringify({ configurationVersion: configVersion, settingsRevision: settings(queue.owner).revision, schemaVersion: AI_TRIAGE_VERSION, inputHash, rate: configuration?.models.find(item => item.id === model)?.pricing ?? null }))
+      db.query('INSERT INTO local_ai_attempts(owner,id,data,config) VALUES (?,?,?,?)').run(queue.owner, attempt.id, JSON.stringify(attempt), JSON.stringify({ configurationVersion: configVersion, settingsRevision: settings(queue.owner).revision, schemaVersion: AI_TRIAGE_VERSION, inputPolicyVersion: AI_INPUT_POLICY_VERSION, inputHash, rate: configuration?.models.find(item => item.id === model)?.pricing ?? null }))
       updateUsage(queue.owner, value => { value.attempts++; value.unknownUsage++; value.unpriced++ })
     })
     return attempt
@@ -571,7 +582,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       db.query('DELETE FROM local_ai_attempts WHERE owner=? AND finished=1 AND seq<(SELECT seq FROM local_ai_attempts WHERE owner=? ORDER BY seq DESC LIMIT 1 OFFSET 1999)').run(owner, owner)
     })
   }
-  function finishDecision(queue: QueueRow, context: Context | null, assessment: AiAssessment | null, problem: string | null) {
+  function finishDecision(queue: QueueRow, context: Context | null, assessment: AiAssessment | null, problem: string | null, inputPolicyVersion?: string) {
     if (!permitted(queue)) return
     const row = decisionRow(queue.owner, queue.source, queue.thread)
     if (!row) { db.query('DELETE FROM local_ai_queue WHERE owner=? AND source=? AND thread=?').run(queue.owner, queue.source, queue.thread); settleItems(queue.owner, queue.source, queue.thread, false); return }
@@ -579,6 +590,8 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     decision.updatedAt = stamp(now()); decision.holdUntil = null; decision.settingsRevision = value.revision
     decision.state = assessment ? 'ready' : 'failed'; decision.problemCode = problem
     decision.assessment = assessment
+    if (inputPolicyVersion) decision.inputPolicyVersion = inputPolicyVersion
+    else delete decision.inputPolicyVersion
     if (context) {
       decision.inputHash = context.hash; decision.contextVersions = context.versions; decision.messageIds = context.messages.map(message => message.id); decision.latestMessageId = context.messages[0]!.id; decision.mailboxIds = context.boxes
       if (decision.override?.inputHash !== context.hash) decision.override = null
@@ -586,7 +599,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     decision.score = assessment ? score(queue.owner, assessment, context?.sender ?? row.sender, value, decision.override) : null
     if (assessment && context && !problem) {
       const fresh = !db.query('SELECT 1 FROM local_ai_cache WHERE owner=? AND hash=?').get(queue.owner, context.hash)
-      db.query('INSERT INTO local_ai_cache VALUES (?,?,?,?) ON CONFLICT(owner,hash) DO UPDATE SET assessment=excluded.assessment,at=excluded.at').run(queue.owner, context.hash, JSON.stringify(assessment), now())
+      db.query('INSERT INTO local_ai_cache(owner,hash,assessment,at,input_policy) VALUES (?,?,?,?,?) ON CONFLICT(owner,hash) DO UPDATE SET assessment=excluded.assessment,at=excluded.at,input_policy=excluded.input_policy').run(queue.owner, context.hash, JSON.stringify(assessment), now(), inputPolicyVersion ?? 'input-1')
       if (fresh) db.query('UPDATE local_ai_counts SET cache=cache+1 WHERE owner=?').run(queue.owner)
       if ((db.query<{ cache: number }, [string]>('SELECT cache FROM local_ai_counts WHERE owner=?').get(queue.owner)?.cache ?? 0) > 10000) { const deleted = db.query('DELETE FROM local_ai_cache WHERE owner=? AND hash IN (SELECT hash FROM local_ai_cache WHERE owner=? ORDER BY at LIMIT 1)').run(queue.owner, queue.owner).changes; db.query('UPDATE local_ai_counts SET cache=cache-? WHERE owner=?').run(deleted, queue.owner) }
     }
@@ -609,9 +622,16 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     if (!permitted(queue) || controller.signal.aborted) return
     if (!context) { transaction(() => remove(queue.owner, queue.source, queue.thread)); return }
     if (context.insufficient) { transaction(() => finishDecision(queue, context, insufficient, 'AI_INSUFFICIENT_CONTEXT')); return }
-    const cached = db.query<{ assessment: string }, [string, string]>('SELECT assessment FROM local_ai_cache WHERE owner=? AND hash=?').get(queue.owner, context.hash)
-    if (cached) { transaction(() => { updateUsage(queue.owner, value => { value.reused++ }); finishDecision(queue, context, JSON.parse(cached.assessment), null) }); return }
+    const cached = db.query<{ assessment: string; input_policy: string }, [string, string]>('SELECT assessment,input_policy FROM local_ai_cache WHERE owner=? AND hash=?').get(queue.owner, context.hash)
     const row = decisionRow(queue.owner, queue.source, queue.thread)
+    if (cached) {
+      const assessment: AiAssessment = JSON.parse(cached.assessment)
+      const override: AiDecision['override'] = row ? JSON.parse(row.data).override : null
+      // Only an explicit history job refreshes affected legacy campaigns. Preserve
+      // old clear results, actual new-policy uncertainty and captured manual choices.
+      const refresh = queue.lane === 'history' && !!queue.job && jobRow(queue.owner, queue.job)?.input_policy === AI_INPUT_POLICY_VERSION && legacyCampaign(assessment, cached.input_policy) && override?.inputHash !== context.hash
+      if (!refresh) { transaction(() => { updateUsage(queue.owner, value => { value.reused++ }); finishDecision(queue, context, assessment, null, cached.input_policy) }); return }
+    }
     if (row) transaction(() => {
       const decision: AiDecision = JSON.parse(row.data)
       decision.state = 'processing'; decision.updatedAt = stamp(now()); decision.inputHash = context!.hash
@@ -636,8 +656,11 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       return
     }
     if (result.outcome === 'completed' && result.assessment) {
-      const assessment = context.input.messages.some(message => message.truncated) ? { ...result.assessment, certainty: 'insufficient' as const } : result.assessment
-      transaction(() => finishDecision(queue, current, assessment, null)); return
+      // Complete source coverage is not required for a positively grounded, clear
+      // non-actionable campaign. Never manufacture clarity from model uncertainty.
+      const clearCampaign = result.assessment.certainty === 'clear' && quietCampaign(result.assessment)
+      const assessment = context.input.messages.some(message => message.truncated) && !clearCampaign ? { ...result.assessment, certainty: 'insufficient' as const } : result.assessment
+      transaction(() => finishDecision(queue, current, assessment, null, AI_INPUT_POLICY_VERSION)); return
     }
     if (result.retryable && queue.attempts < 2) {
       const delay = Math.max(1000 * 2 ** queue.attempts, Math.min(300_000, Math.max(0, result.retryAfterMs ?? 0)))
@@ -829,7 +852,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       const activeJobs = db.query<{ count: number }, [string]>("SELECT COUNT(*) count FROM local_ai_jobs WHERE owner=? AND json_extract(data,'$.status') IN ('running','paused')").get(owner)!.count
       if (activeJobs >= 3) fail('AI_JOB_LIMIT', 429)
       const job: AiHistoryJob = { id: input.id, status: 'running', scope: input.scope, limit: input.limit, scanned: 0, queued: 0, completed: 0, failed: 0, createdAt: stamp(now()), problemCode: null }
-      db.query('INSERT INTO local_ai_jobs(owner,id,data,generation,boxes) VALUES (?,?,?,?,?)').run(owner, job.id, JSON.stringify(job), row.generation, JSON.stringify(selected.boxes.map(box => box.id)))
+      db.query('INSERT INTO local_ai_jobs(owner,id,data,generation,boxes,input_policy) VALUES (?,?,?,?,?,?)').run(owner, job.id, JSON.stringify(job), row.generation, JSON.stringify(selected.boxes.map(box => box.id)), AI_INPUT_POLICY_VERSION)
       const old = db.query<{ id: string }, [string]>("SELECT id FROM local_ai_jobs WHERE owner=? AND json_extract(data,'$.status') NOT IN ('running','paused') ORDER BY rowid DESC LIMIT 100 OFFSET 17").all(owner)
       for (const item of old) { db.query('DELETE FROM local_ai_job_items WHERE owner=? AND job=?').run(owner, item.id); db.query('DELETE FROM local_ai_jobs WHERE owner=? AND id=?').run(owner, item.id) }
       startInventory(owner, job.id)

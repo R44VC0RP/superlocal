@@ -34,7 +34,7 @@ import { MockMailStore } from '../../../apps/mock-api/src/store'
 import { seedMockMail } from '../../../apps/mock-api/src/seed'
 import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
-  Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, Message,
+  Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, MailboxSyncStatus, Message,
   MessageSummary, Operation, Page, Policy, ProviderDefinition, Query,
   ThreadSummary, MediaNetwork,
 } from '../src/contracts'
@@ -6266,6 +6266,286 @@ test('close drains an in-flight foreground refresh and preserves rotated credent
   expect(box.calls.createFolder).toEqual([])
 })
 
+describe('mailbox sync status', () => {
+  test('polls held primary lanes read-only, preserves client caches and reports only committed batch records', async () => {
+    const h = await fixture()
+    const { account, box } = await h.connect('alice', 'status-held')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const database = new Database(h.database)
+    await h.restart(database)
+    const input = { mailboxIds: [mailbox.id] }
+    const before = await h.inbox.mailboxSyncStatus('alice', input)
+    expect(before).toEqual([{ sourceId: account.id, scopeKey: expect.any(String), state: 'idle', activeLanes: [], retryAt: null, problemCode: null, lastBatch: null, lastSyncAt: null }])
+    let wakes = 0
+    const unsubscribe = h.inbox.subscribe('alice', () => { wakes++ })
+    const baseline = await h.inbox.changes('alice')
+    const latest = h.gate(receipt([native('same'), native('same')], 'latest-held', { hasMore: true }))
+    const backfill = h.gate(receipt([native('older')], 'backfill-held'))
+    box.nextSync(latest.wait)
+    const syncingLatest = h.pending(h.inbox.syncMailbox('alice', mailbox.id))
+    await bounded(latest.entered, 'held latest page')
+    box.nextSync(backfill.wait)
+    const syncingBackfill = h.pending(h.inbox.syncMailbox('alice', mailbox.id, { lane: 'backfill' }))
+    await bounded(backfill.entered, 'held backfill page')
+    // A fresh instance sharing the same durable state cannot claim this process's active work.
+    expect(await h.worker().mailboxSyncStatus('alice', input)).toEqual(before)
+    const requests: Array<{ path: string; headers: Headers; method: string; body: unknown; status: number }> = []
+    const client = createInboxClient({ baseUrl: 'https://inbox.example.test', cacheScope: 'alice', headers: { authorization: 'Bearer alice' },
+      fetch: (async (url, init) => {
+        const request = new Request(url, init)
+        const response = await h.api.fetch(request)
+        requests.push({ path: new URL(request.url).pathname, headers: request.headers, method: request.method,
+          body: typeof init?.body === 'string' ? JSON.parse(init.body) : null, status: response.status })
+        return response
+      }) as typeof fetch })
+    await client.account(account.id)
+    const calls = structuredClone(box.calls)
+    const queries: string[] = []
+    const query = database.query.bind(database)
+    const guard = spyOn(database, 'query').mockImplementation(((sql: string) => {
+      queries.push(sql)
+      if (!/^\s*SELECT\b/i.test(sql) || /sdk_(messages|memberships|blobs|events|states|checkpoints)\b/.test(sql)) throw new Error('Status read accessed mail data or wrote state')
+      return query(sql)
+    }) as typeof database.query)
+    try {
+      expect(await client.mailboxSyncStatus(input)).toEqual([{ ...before[0], state: 'syncing', activeLanes: ['latest', 'backfill'] }])
+      const response = await h.request('alice', '/mailbox-sync/status', { method: 'POST', headers: { 'content-type': 'application/json', 'if-none-match': '*' }, body: JSON.stringify(input) })
+      expect(response.status).toBe(200)
+      expect(response.headers.get('cache-control')).toBe('no-store')
+      expect(response.headers.get('etag')).toBeNull()
+      expect(await response.json()).toEqual([{ ...before[0], state: 'syncing', activeLanes: ['latest', 'backfill'] }])
+      expect(queries.length).toBeGreaterThan(0)
+      expect(box.calls).toEqual(calls)
+      expect(wakes).toBe(0)
+    } finally { guard.mockRestore(); unsubscribe() }
+    expect((await h.inbox.changes('alice', { since: baseline.state })).events).toEqual([])
+    await client.account(account.id)
+    expect(requests.at(-1)).toMatchObject({ status: 304 })
+    expect(requests.at(-1)!.headers.has('if-none-match')).toBe(true)
+    const posted = requests.find(request => request.path === '/v1/mailbox-sync/status')!
+    expect(posted).toMatchObject({ method: 'POST', body: input })
+    expect(posted.headers.has('if-none-match')).toBe(false)
+    latest.release()
+    await bounded(syncingLatest, 'latest commit')
+    expect(await client.mailboxSyncStatus(input)).toEqual([{ ...before[0], state: 'syncing', activeLanes: ['backfill'],
+      lastBatch: { lane: 'latest', processed: 2, completedAt: new Date(EPOCH).toISOString(), hasMore: true }, lastSyncAt: new Date(EPOCH).toISOString() }])
+    expect((await h.page()).total).toBe(1) // Two committed records, one canonical message; never unique-new progress.
+    h.clock.value += 1000
+    backfill.release()
+    await bounded(syncingBackfill, 'backfill commit')
+    expect((await client.mailboxSyncStatus(input))[0]).toMatchObject({ state: 'idle', activeLanes: [], lastBatch: { lane: 'backfill', processed: 1, hasMore: false } })
+    const folder = h.gate(receipt([], 'sent-held'))
+    box.nextSync(folder.wait)
+    const syncingFolder = h.pending(h.inbox.sync('alice', account.id, { folder: 'sent' }))
+    await bounded(folder.entered, 'held non-primary folder')
+    expect((await client.mailboxSyncStatus(input))[0]).toMatchObject({ state: 'idle', activeLanes: [], lastBatch: { lane: 'backfill', processed: 1 } })
+    h.clock.value += 1000
+    folder.release()
+    await syncingFolder
+    const completedAt = new Date(h.clock.value).toISOString()
+    expect((await client.mailboxSyncStatus(input))[0]).toMatchObject({ lastSyncAt: completedAt, lastBatch: { lane: 'backfill', processed: 1 } })
+    const callsAfterFolder = box.calls.sync.length
+    h.clock.value = EPOCH + 61_000 // Primary batch would be due; the later source sync still suppresses polling.
+    await h.inbox.poll()
+    expect(box.calls.sync).toHaveLength(callsAfterFolder)
+    await h.restart()
+    const restarted = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+    expect(restarted).toMatchObject({ state: 'idle', activeLanes: [], lastBatch: null, lastSyncAt: completedAt, scopeKey: before[0]!.scopeKey })
+  })
+
+  test('normalizes provider, validation and rolled-back persistence failures and always clears activity', async () => {
+    const h = await fixture()
+    const { account, box } = await h.connect('alice', 'status-failed')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const database = new Database(h.database)
+    await h.restart(database)
+    const input = { mailboxIds: [mailbox.id] }
+    box.nextSync(new ProviderError(FULL, 'UPSTREAM', SECRET, { cause: new Error(BODY_SECRET), details: { secret: SECRET } }))
+    await expect(h.inbox.syncMailbox('alice', mailbox.id)).rejects.toMatchObject({ code: 'UPSTREAM' })
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], problemCode: 'UPSTREAM', lastBatch: null })
+    box.nextSync(receipt([], 'invalid', { hasMore: true, cursor: null }))
+    await expect(h.inbox.syncMailbox('alice', mailbox.id)).rejects.toMatchObject({ code: 'INVALID_PROVIDER' })
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], problemCode: 'INVALID_PROVIDER', lastBatch: null })
+    database.exec("CREATE TEMP TRIGGER fail_status_persistence BEFORE INSERT ON sdk_messages BEGIN SELECT RAISE(ABORT, 'private persistence failure'); END")
+    box.nextSync(receipt([native('rollback')], 'rollback'))
+    await expect(h.inbox.syncMailbox('alice', mailbox.id)).rejects.toMatchObject({ code: 'INTERNAL' })
+    expect((await h.page()).total).toBe(0)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], problemCode: 'INTERNAL', lastBatch: null, lastSyncAt: null })
+    database.exec('DROP TRIGGER fail_status_persistence')
+    database.query("UPDATE sdk_accounts SET data=json_set(data,'$.sync.problem',?) WHERE id=?").run(SECRET, account.id)
+    const response = await h.json<MailboxSyncStatus[]>('alice', '/mailbox-sync/status', input, 'POST')
+    expect(response[0]!.problemCode).toBe('INTERNAL')
+    expect(JSON.stringify(response)).not.toContain(SECRET)
+    expect(JSON.stringify(response)).not.toContain(BODY_SECRET)
+    box.nextSync(receipt([native('success')], 'success'))
+    await h.inbox.syncMailbox('alice', mailbox.id)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', activeLanes: [], problemCode: null, lastBatch: { processed: 1 } })
+    box.nextSync(receipt([], 'success', { hasMore: true }))
+    await expect(h.inbox.syncMailbox('alice', mailbox.id)).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], problemCode: 'INVALID_CURSOR', lastBatch: { processed: 1 } })
+    box.nextSync(receipt([], 'after-nonadvancing'))
+    await h.inbox.syncMailbox('alice', mailbox.id)
+    expect(cursorValue(box.calls.sync.at(-1)!.cursor)).toBe('success')
+  })
+
+  test('binds overlapping source views to their union, excludes detached scopes and fences stale scope attempts', async () => {
+    const h = await fixture()
+    h.discoveries.set('status-union', { sources: [
+      { kind: 'domain', value: 'alpha.example.test', canReceive: true, canSend: true, canFilter: true },
+      { kind: 'domain', value: 'beta.example.test', canReceive: true, canSend: true, canFilter: true },
+      { kind: 'address', value: 'help@alpha.example.test', canReceive: true, canSend: true, canFilter: true },
+    ], identities: [{ email: 'help@alpha.example.test' }, { email: 'help@beta.example.test' }] })
+    const { account, box } = await h.connect('alice', 'status-union', [], SCOPED)
+    const alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    const beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    const address = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Help', selector: { kind: 'address', value: 'help@alpha.example.test' } })
+    const input = { mailboxIds: [alpha.id, beta.id, address.id, alpha.id] }
+    const before = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+    const old = h.gate(receipt([native('stale', { sourceDomains: ['alpha.example.test'] })], 'stale'))
+    box.nextSync(old.wait)
+    const stale = h.pending(h.inbox.syncMailbox('alice', alpha.id))
+    await bounded(old.entered, 'old selected union')
+    expect(box.calls.sync.at(-1)!.options.mailboxScopes).toHaveLength(3)
+    expect(await h.inbox.mailboxSyncStatus('alice', { mailboxIds: [beta.id] })).toEqual([{ ...before, state: 'syncing', activeLanes: ['latest'] }])
+    expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([{ ...before, state: 'syncing', activeLanes: ['latest'] }])
+    const paused = await h.inbox.updateMailbox('alice', alpha.id, { status: 'paused' }, alpha.revision)
+    const replacement = h.gate(receipt([native('current', { sourceDomains: ['beta.example.test'] })], 'current'))
+    box.nextSync(replacement.wait)
+    const newer = h.pending(h.inbox.syncMailbox('alice', beta.id))
+    await bounded(replacement.entered, 'replacement selected union')
+    const active = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+    expect(active.scopeKey).not.toBe(before.scopeKey)
+    old.release()
+    await expect(stale).rejects.toMatchObject({ code: 'SCOPE_CHANGED' })
+    expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([active])
+    replacement.release()
+    await newer
+    expect((await h.page()).total).toBe(1)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', lastBatch: { processed: 1 } })
+    const detached = await h.inbox.updateMailbox('alice', address.id, { status: 'detached' }, address.revision)
+    expect(await h.inbox.mailboxSyncStatus('alice', { mailboxIds: [detached.id] })).toEqual([])
+    expect((await h.inbox.mailbox('alice', paused.id)).status).toBe('paused')
+    await h.inbox.updateMailbox('alice', beta.id, { status: 'paused' }, beta.revision)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'paused', activeLanes: [], lastBatch: null, retryAt: null })
+    await expect(h.inbox.mailboxSyncStatus('bob', input)).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(h.inbox.mailboxSyncStatus('', input)).rejects.toMatchObject({ code: 'UNAUTHORIZED' })
+    const calls = structuredClone(box.calls)
+    expect(await h.inbox.mailboxSyncStatus('alice', { mailboxIds: Array(1000).fill(alpha.id) })).toHaveLength(1)
+    for (const mailboxIds of [[], Array(1001).fill(alpha.id), ['missing']]) {
+      await invalid(await h.request('alice', '/mailbox-sync/status', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mailboxIds }) }), mailboxIds[0] === 'missing' ? 404 : 400)
+    }
+    await invalid(await h.request('bob', '/mailbox-sync/status', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }), 404)
+    await invalid(await h.request('alice', '/mailbox-sync/status', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...input, owner: 'bob' }) }), 400)
+    expect(box.calls).toEqual(calls)
+  })
+
+  test.each([true, false])('metadata edits preserve in-flight sync and deduplication (mailboxScoped=%s)', async mailboxScoped => {
+    const h = await fixture()
+    h.discoveries.set('status-metadata', { sources: [
+      { kind: 'domain', value: 'alpha.example.test', canReceive: true, canSend: true, canFilter: true },
+      { kind: 'domain', value: 'beta.example.test', canReceive: true, canSend: true, canFilter: true },
+      { kind: 'address', value: 'help@alpha.example.test', canReceive: true, canSend: true, canFilter: true },
+    ], identities: [{ email: 'help@alpha.example.test' }, { email: 'help@beta.example.test' }] })
+    const { account, box } = await h.connect('alice', 'status-metadata', [], SCOPED)
+    let alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    let beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    let address = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Help', selector: { kind: 'address', value: 'help@alpha.example.test' } })
+    beta = await h.inbox.updateMailbox('alice', beta.id, { status: 'paused' }, beta.revision)
+    address = await h.inbox.updateMailbox('alice', address.id, { status: 'detached' }, address.revision)
+    const input = { mailboxIds: [alpha.id, beta.id] }
+    const barrier = h.gate(receipt([native('metadata-kept', { sourceDomains: ['alpha.example.test'] })], 'metadata-kept'))
+    box.nextSync(barrier.wait)
+    const first = h.pending(mailboxScoped ? h.inbox.syncMailbox('alice', alpha.id) : h.inbox.sync('alice', account.id))
+    await bounded(barrier.entered, 'sync before mailbox metadata edits')
+    const before = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+    alpha = await h.inbox.updateMailbox('alice', alpha.id, { name: 'Renamed alpha', defaultSender: null }, alpha.revision)
+    beta = await h.inbox.updateMailbox('alice', beta.id, { name: 'Renamed paused beta', defaultSender: null }, beta.revision)
+    address = await h.inbox.updateMailbox('alice', address.id, { name: 'Renamed detached help', defaultSender: null }, address.revision)
+    expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([before])
+    // Returning to the original selectors preserves the SDK's original pause/resume behavior.
+    alpha = await h.inbox.updateMailbox('alice', alpha.id, { status: 'paused' }, alpha.revision)
+    alpha = await h.inbox.updateMailbox('alice', alpha.id, { status: 'active' }, alpha.revision)
+    expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([before])
+    if (!mailboxScoped) {
+      // A legacy all-source operation has never been fenced by the selected mailbox union.
+      beta = await h.inbox.updateMailbox('alice', beta.id, { status: 'active' }, beta.revision)
+    }
+    const duplicate = h.pending(mailboxScoped ? h.inbox.syncMailbox('alice', alpha.id) : h.inbox.sync('alice', account.id))
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(box.calls.sync).toHaveLength(1)
+    expect(box.calls.sync[0]!.options.mailboxScopes).toEqual(mailboxScoped ? [{ kind: 'domain', value: 'alpha.example.test' }] : undefined)
+    barrier.release()
+    const results = await bounded(Promise.all([first, duplicate]), 'unchanged in-flight sync and duplicate')
+    expect(results[0]).toEqual(results[1])
+    expect(results[0]!.synchronized).toBe(1)
+    expect((await h.page()).total).toBe(1)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', activeLanes: [], problemCode: null })
+    if (mailboxScoped) {
+      const committed = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+      await h.inbox.updateMailbox('alice', beta.id, { name: 'Still paused beta' }, beta.revision)
+      expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([committed])
+    }
+  })
+
+  test.each([false, true])('provider rate limits retain their failure and backoff after mailbox edits (changedScope=%s)', async changedScope => {
+    const h = await fixture()
+    h.discoveries.set('status-failure-scope', { sources: [
+      { kind: 'domain', value: 'alpha.example.test', canReceive: true, canSend: true, canFilter: true },
+      { kind: 'domain', value: 'beta.example.test', canReceive: true, canSend: true, canFilter: true },
+    ], identities: [] })
+    const { account, box } = await h.connect('alice', 'status-failure-scope', [], SCOPED)
+    let alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
+    const beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
+    const barrier = h.gate<void>(undefined)
+    box.nextSync(async () => { await barrier.wait(); throw new ProviderRateLimitError(SCOPED, SECRET, { retryAfter: 120 }) })
+    const pending = h.pending(h.inbox.syncMailbox('alice', alpha.id))
+    await bounded(barrier.entered, 'provider failure before mailbox edit')
+    alpha = await h.inbox.updateMailbox('alice', alpha.id, { name: 'Renamed alpha' }, alpha.revision)
+    if (changedScope) await h.inbox.updateMailbox('alice', beta.id, { status: 'paused' }, beta.revision)
+    barrier.release()
+    await expect(pending).rejects.toMatchObject({ code: 'RATE_LIMITED', status: 429, retryable: true })
+    const input = { mailboxIds: [alpha.id] }
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'waiting', problemCode: 'RATE_LIMITED', retryAt: new Date(EPOCH + 120_000).toISOString(), activeLanes: [], lastBatch: null })
+    await expect(h.inbox.syncMailbox('alice', alpha.id)).rejects.toMatchObject({ code: 'RATE_LIMITED' })
+    expect(box.calls.sync).toHaveLength(1)
+    await h.restart()
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'waiting', problemCode: 'RATE_LIMITED', retryAt: new Date(EPOCH + 120_000).toISOString() })
+    expect((await h.inbox.account('alice', account.id)).sync.problem).toBe('RATE_LIMITED')
+  })
+
+  test('disconnect and reconnect cannot resurrect old activity or clear a replacement attempt', async () => {
+    const h = await fixture()
+    const { account, box } = await h.connect('alice', 'status-disconnect')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const input = { mailboxIds: [mailbox.id] }
+    const old = h.gate(receipt([native('old')], 'old'))
+    box.nextSync(old.wait)
+    const stale = h.pending(h.inbox.syncMailbox('alice', mailbox.id))
+    await bounded(old.entered, 'sync before disconnect')
+    const binding = (await h.inbox.mailboxSyncStatus('alice', input))[0]!.scopeKey
+    const paused = await h.inbox.updateMailbox('alice', mailbox.id, { status: 'paused' }, mailbox.revision)
+    await h.inbox.disconnect('alice', account.id)
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], lastBatch: null, problemCode: 'RECONNECT_REQUIRED' })
+    await h.inbox.reconnect('alice', account.id, { mailbox: box.key, accessToken: SECRET })
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'paused', problemCode: null })
+    await h.inbox.updateMailbox('alice', mailbox.id, { status: 'active' }, paused.revision)
+    const next = h.gate(receipt([native('new')], 'new'))
+    box.nextSync(next.wait)
+    const current = h.pending(h.inbox.syncMailbox('alice', mailbox.id))
+    await bounded(next.entered, 'sync after reconnect')
+    const replacement = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
+    expect(replacement).toMatchObject({ state: 'syncing', activeLanes: ['latest'], lastBatch: null })
+    expect(replacement.scopeKey).not.toBe(binding)
+    old.release()
+    await expect(stale).rejects.toMatchObject({ code: 'RECONNECT_REQUIRED' })
+    expect(await h.inbox.mailboxSyncStatus('alice', input)).toEqual([replacement])
+    next.release()
+    await current
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', activeLanes: [], lastBatch: { processed: 1 } })
+    expect((await h.page()).total).toBe(1)
+  })
+})
+
 test('refresh-hook rate limits persist Retry-After cooldown and sync problems across restart', async () => {
   const box = referenceMailbox('refresh-cooldown', 'refresh-cooldown@example.test', [])
   const refreshTokens: unknown[] = []
@@ -6288,10 +6568,12 @@ test('refresh-hook rate limits persist Retry-After cooldown and sync problems ac
     },
   }] })
   const source = await h.inbox.connect('alice', { providerId: 'gmail', credentials: initial })
+  const input = { mailboxIds: (await h.inbox.mailboxes('alice')).map(mailbox => mailbox.id) }
   h.clock.value = EPOCH + 60_000
   const retryAt = h.clock.value + retryAfter * 1000
   await expect(h.inbox.sync('alice', source.id)).rejects.toMatchObject({ code: 'RATE_LIMITED', status: 429, retryable: true })
   expect(refreshTokens).toEqual([initial.refreshToken])
+  expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'waiting', activeLanes: [], retryAt: new Date(retryAt).toISOString(), problemCode: 'RATE_LIMITED', lastBatch: null })
   expect(await h.inbox.account('alice', source.id)).toMatchObject({
     status: 'connected', sync: { lastSyncAt: null, problem: 'RATE_LIMITED' },
   })
@@ -6304,13 +6586,17 @@ test('refresh-hook rate limits persist Retry-After cooldown and sync problems ac
     id: source.id, connectionId: source.connectionId, status: 'connected',
     sync: { lastSyncAt: null, problem: 'RATE_LIMITED' },
   })
+  expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'waiting', activeLanes: [], retryAt: new Date(retryAt).toISOString(), problemCode: 'RATE_LIMITED', lastBatch: null })
   h.clock.value = retryAt - 1
   await h.inbox.poll()
   await expect(h.inbox.sync('alice', source.id)).rejects.toMatchObject({ code: 'RATE_LIMITED', status: 429, retryable: true })
   expect(refreshTokens).toEqual([initial.refreshToken])
   expect(box.calls.sync).toEqual([])
   h.clock.value = retryAt
+  expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'error', activeLanes: [], retryAt: null, problemCode: 'RATE_LIMITED', lastBatch: null })
+  expect(refreshTokens).toEqual([initial.refreshToken]) // A due cooldown is not evidence of a scheduled or running job.
   await h.inbox.poll()
+  expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', activeLanes: [], retryAt: null, problemCode: null, lastBatch: { processed: 0 } })
   expect(refreshTokens).toEqual([initial.refreshToken, initial.refreshToken])
   expect(box.calls.create.at(-1)).toMatchObject({ ...rotated, accountId: source.id, userId: 'alice' })
   expect(box.calls.sync).toHaveLength(1)
@@ -7723,7 +8009,7 @@ describe('bounded thread ordering', () => {
 
 import { inferAiTriage, loadAiInferenceConfig, prepareAiText, publicAiProvider, validateAiAssessment, type AiInferenceConfig } from '../../../apps/local-host/src/ai-inference'
 import { countAiTopicMatches, normalizeAiTopics, scoreAiTriage } from '../../../apps/local-host/src/ai-preferences'
-import type { AiAssessment, AiDecision, AiScoreSignals, AiTriageInput } from '../../../apps/shared/ai-triage'
+import { AI_INPUT_POLICY_VERSION, AI_PREFERENCE_VERSION, AI_TRIAGE_VERSION, type AiAssessment, type AiDecision, type AiScoreSignals, type AiTriageInput } from '../../../apps/shared/ai-triage'
 
 describe('AI triage inference and local scoring', () => {
   const configuration: AiInferenceConfig = {
@@ -7805,6 +8091,8 @@ describe('AI triage inference and local scoring', () => {
       [{ ...request.evidence[0]!, quote: 'Fabricated approval' }],
       [{ ...request.evidence[0]!, quote: '' }],
       [{ ...request.evidence[0]!, quote: 'Please  approve the proposal' }],
+      [{ ...request.evidence[0]!, quote: 'Please…approve the proposal' }],
+      [{ ...request.evidence[0]!, quote: 'Please\u00a0approve the proposal' }],
     ]) expect(() => validateAiAssessment({ ...request, evidence }, input)).toThrow('AI_EVIDENCE_INVALID')
     for (const field of ['type', 'response', 'action', 'urgency']) {
       expect(() => validateAiAssessment({ ...request, evidence: request.evidence.filter(item => item.field !== field) }, input)).toThrow('AI_EVIDENCE_REQUIRED')
@@ -7820,6 +8108,11 @@ describe('AI triage inference and local scoring', () => {
     expect(prepareAiText({ preview: 'Only the preview' })).toEqual({ text: 'Only the preview', truncated: true })
     expect(prepareAiText({ bodyText: 'abcd😀ef' }, 5)).toEqual({ text: 'abcd', truncated: true })
     expect(prepareAiText({})).toEqual({ text: '', truncated: false })
+    const unicode = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional offer – save 20%\nDetails', truncated: true }] }
+    const campaign: AiAssessment = { ...unknown, type: 'promotion', response: 'not_needed', urgency: 'none', risk: 'none_observed', certainty: 'clear',
+      evidence: [{ messageRef: 'message-1', quote: 'offer – save 20%\nDetails', field: 'type' }] }
+    expect(validateAiAssessment(campaign, unicode)).toEqual(campaign)
+    expect(() => validateAiAssessment({ ...campaign, evidence: [{ ...campaign.evidence[0]!, quote: 'offer – save 20% Details' }] }, unicode)).toThrow('AI_EVIDENCE_INVALID')
     expect(() => validateAiAssessment(unknown, { ...input, messages: [...input.messages, ...input.messages] })).toThrow('AI_INPUT_INVALID')
   })
 
@@ -7858,12 +8151,13 @@ describe('AI triage inference and local scoring', () => {
       { data: { ...response, output: [] }, outcome: 'invalid', code: 'AI_RESPONSE_INVALID' },
       { data: { ...response, output: [{ type: 'function_call', name: 'pay' }] }, outcome: 'invalid', code: 'AI_RESPONSE_INVALID' },
       { data: { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '{}' }] }] }, outcome: 'invalid', code: 'AI_ASSESSMENT_INVALID' },
+      { data: { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify({ ...request, evidence: [{ ...request.evidence[0]!, quote: 'Please  approve the proposal' }] }) }] }] }, outcome: 'invalid', code: 'AI_EVIDENCE_INVALID' },
       { data: { ...response, status: 'failed', error: { message: configuration.apiKey } }, outcome: 'error', code: 'AI_RESPONSE_FAILED' },
     ]
     for (const variant of variants) {
       const result = await inferAiTriage(input, configuration, { model: 'fixture-model', signal: new AbortController().signal,
         fetcher: (async () => Response.json(variant.data)) as unknown as typeof fetch })
-      expect(result).toMatchObject({ outcome: variant.outcome, code: variant.code, assessment: null,
+      expect(result).toMatchObject({ outcome: variant.outcome, code: variant.code, assessment: null, retryable: false,
         usage: { input: 1000, output: 100, cachedInput: 200, cacheWriteInput: 100, reasoningOutput: 40 } })
       expect(result.estimate?.minimumUsd).toBeGreaterThan(0)
       expect(JSON.stringify(result)).not.toContain(configuration.apiKey)
@@ -8187,6 +8481,61 @@ describe('AI triage service', () => {
     expect(uploaded).toHaveLength(calls)
   })
 
+  test('bounded campaign evidence preserves model clarity without clearing genuine uncertainty, requests, deadlines or risk', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const cases: Array<{ id: string; change: Partial<AiAssessment>; category: 'Important' | 'Other'; clear?: boolean }> = [
+      { id: 'promotion', change: {}, category: 'Other', clear: true },
+      { id: 'newsletter', change: { type: 'newsletter' }, category: 'Other', clear: true },
+      { id: 'cold', change: { type: 'cold_outreach' }, category: 'Other', clear: true },
+      { id: 'insufficient', change: { certainty: 'insufficient' }, category: 'Important' },
+      { id: 'ambiguous', change: { certainty: 'ambiguous' }, category: 'Important' },
+      { id: 'unknown-risk', change: { risk: 'unknown' }, category: 'Important' },
+      { id: 'action', change: { actions: ['review'] }, category: 'Important' },
+      { id: 'reply', change: { response: 'needed' }, category: 'Important' },
+      { id: 'deadline', change: { urgency: 'deadline', deadline: '2026-09-15' }, category: 'Important' },
+      { id: 'personal', change: { type: 'request', response: 'needed', actions: ['reply'] }, category: 'Important' },
+      { id: 'phishing', change: { risk: 'phishing_suspected' }, category: 'Other' },
+    ]
+    await h.seed('alice', 'ai-long-campaigns', cases.map(item => native(`campaign-${item.id}`, {
+      subject: item.id, bodyText: `${['action', 'reply', 'personal', 'deadline'].includes(item.id) ? 'Please reply and review by 2026-09-15.' : item.id === 'phishing' ? 'Enter your password on this suspicious sign-in page.' : 'Fictional offer. Read product details.'}\n${'Long fictional footer. '.repeat(300)}`,
+    })))
+    const uploaded: AiTriageInput[] = []
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async (_url, init) => {
+        const envelope = String(init?.body), input: AiTriageInput = JSON.parse(JSON.parse(envelope).input[0].content)
+        uploaded.push(input)
+        expect(Buffer.byteLength(envelope)).toBeLessThanOrEqual(32768)
+        const message = input.messages[0]!, item = cases.find(item => item.id === message.subject)!
+        const result: AiAssessment = { ...assessment, type: 'promotion', ...item.change, reason: item.id,
+          evidence: [{ messageRef: message.ref, quote: message.subject, field: 'type' }] }
+        const quote = message.text.split('\n')[0]!
+        if (result.response === 'needed') result.evidence.push({ messageRef: message.ref, quote, field: 'response' })
+        if (result.actions.length) result.evidence.push({ messageRef: message.ref, quote, field: 'action' })
+        if (result.urgency === 'deadline') result.evidence.push({ messageRef: message.ref, quote, field: 'urgency' })
+        if (result.risk === 'phishing_suspected') result.evidence.push({ messageRef: message.ref, quote, field: 'risk' })
+        return Response.json({ ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(result) }] }] })
+      }) as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start()
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true, personalization: false })
+    await service.process('alice', { id: 'ai-long-campaign-history', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs[0]?.status === 'running') await Bun.sleep(10) })(), 'bounded campaign classifications')
+    expect(uploaded).toHaveLength(cases.length)
+    expect(uploaded.every(input => input.messages.length === 1 && input.messages[0]!.truncated && Buffer.byteLength(input.messages[0]!.text) <= 3000)).toBe(true)
+    const decisions = (await service.results('alice')).decisions
+    for (const item of cases) {
+      const decision = decisions.find(decision => decision.assessment?.reason === item.id)!
+      expect(decision).toMatchObject({ state: 'ready', schemaVersion: AI_TRIAGE_VERSION, inputPolicyVersion: AI_INPUT_POLICY_VERSION,
+        assessment: { certainty: item.clear ? 'clear' : 'insufficient', ...item.change, ...(item.clear ? {} : { certainty: 'insufficient' }) },
+        score: { category: item.category, version: AI_PREFERENCE_VERSION } })
+    }
+    expect(decisions.find(item => item.assessment?.reason === 'promotion')!.score).toMatchObject({ score: -53, category: 'Other' })
+    expect(decisions.find(item => item.assessment?.reason === 'insufficient')!.score?.contributions).toContainEqual({ name: 'uncertainty_gate', value: 73 })
+    const request = decisions.find(item => item.assessment?.reason === 'personal')!
+    const manual = await service.feedback('alice', { sourceId: request.sourceId, threadId: request.threadId, revision: request.revision, id: 'ai-long-manual-other', category: 'Other' })
+    expect(manual).toMatchObject({ override: { category: 'Other' }, score: { category: 'Other' }, assessment: { response: 'needed', certainty: 'insufficient' } })
+  })
+
   test('feedback is revision-conditional and idempotent, manual clear removes its own vote, and a new reply changes the captured input', async () => {
     const h = await fixture(), database = new Database(':memory:')
     const { account, box } = await h.seed('alice', 'ai-feedback', [native('feedback-first', { threadId: 'feedback-thread' })])
@@ -8326,6 +8675,82 @@ describe('AI triage service', () => {
     expect((await service.results('alice')).decisions).toHaveLength(4)
     expect(calls).toBe(4)
     expect((await service.results('alice')).decisions.every(item => item.holdUntil === null)).toBe(true)
+  })
+
+  test('only a newly requested bounded history job refreshes affected legacy campaigns while restart and clear-cache reuse remain free', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const names = ['refresh-clear', 'refresh-insufficient', 'preserve-clear', 'preserve-ambiguous', 'preserve-manual', 'preserve-unknown']
+    const { account } = await h.seed('alice', 'ai-policy-migration', names.map(name => native(name, { subject: name, bodyText: 'A fictional product campaign with no personal request.' })))
+    const calls: string[] = []
+    const fetcher = (async (_url, init) => {
+      const input: AiTriageInput = JSON.parse(JSON.parse(String(init?.body)).input[0].content), message = input.messages[0]!
+      calls.push(message.subject)
+      const result: AiAssessment = { ...assessment, type: message.subject === 'preserve-unknown' ? 'unknown' : 'promotion',
+        certainty: message.subject === 'preserve-ambiguous' ? 'ambiguous' : ['refresh-insufficient', 'preserve-manual', 'preserve-unknown'].includes(message.subject) ? 'insufficient' : 'clear',
+        reason: message.subject, evidence: [{ messageRef: message.ref, quote: 'fictional product campaign', field: 'type' }] }
+      return Response.json({ ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(result) }] }] })
+    }) as typeof fetch
+    let service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start()
+    await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true, personalization: false })
+    const initialJob = await service.process('alice', { id: 'ai-policy-before-upgrade', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs[0]?.status === 'running') await Bun.sleep(10) })(), 'policy migration seed')
+    expect(calls).toHaveLength(names.length)
+    const manual = (await service.results('alice')).decisions.find(item => item.assessment?.reason === 'preserve-manual')!
+    await service.feedback('alice', { sourceId: account.id, threadId: manual.threadId, revision: manual.revision, id: 'ai-policy-manual-choice', category: 'Other' })
+    await service.close()
+    // Recreate the legacy on-disk shape using only this fictional SDK-backed cache.
+    for (const row of database.query<{ data: string }, []>('SELECT data FROM local_ai_decisions').all()) {
+      const decision: AiDecision = JSON.parse(row.data)
+      delete decision.inputPolicyVersion
+      if (decision.assessment!.reason === 'refresh-clear') {
+        decision.assessment!.certainty = 'insufficient'
+        decision.score = scoreAiTriage(decision.assessment!, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 })
+      }
+      database.query('UPDATE local_ai_decisions SET data=? WHERE owner=? AND source=? AND thread=?').run(JSON.stringify(decision), 'alice', decision.sourceId, decision.threadId)
+      database.query('UPDATE local_ai_cache SET assessment=? WHERE owner=? AND hash=?').run(JSON.stringify(decision.assessment), 'alice', decision.inputHash!)
+    }
+    database.exec('ALTER TABLE local_ai_cache DROP COLUMN input_policy; ALTER TABLE local_ai_jobs DROP COLUMN input_policy')
+    const legacyJob = { ...initialJob, status: 'running', scanned: 0, queued: 0, completed: 0, failed: 0 }
+    database.query('UPDATE local_ai_jobs SET data=?,enumerated=0,examined=0,bytes=0 WHERE id=?').run(JSON.stringify(legacyJob), initialJob.id)
+    database.query('DELETE FROM local_ai_job_items WHERE job=?').run(initialJob.id)
+    const before = database.query<{ data: string }, []>('SELECT data FROM local_ai_decisions ORDER BY thread').all()
+    service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
+    await service.start()
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === initialJob.id)?.status === 'running') await Bun.sleep(10) })(), 'old history restart does not gain refresh consent')
+    expect(calls).toHaveLength(names.length)
+    expect(database.query<{ data: string }, []>('SELECT data FROM local_ai_decisions ORDER BY thread').all()).toEqual(before)
+    expect((await service.results('alice')).decisions.every(item => item.inputPolicyVersion === undefined)).toBe(true)
+    expect((await service.state('alice')).jobs[0]).toMatchObject({ scanned: 0, completed: 0 })
+    const original = (await service.results('alice')).decisions
+    const refresh = await service.process('alice', { id: 'ai-policy-explicit-refresh', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === refresh.id)?.status === 'running') await Bun.sleep(10) })(), 'explicit legacy campaign refresh')
+    expect(calls.slice(names.length).sort()).toEqual(['refresh-clear', 'refresh-insufficient'])
+    expect((await service.state('alice')).jobs.find(item => item.id === refresh.id)).toMatchObject({ scanned: 2, completed: 2, failed: 0 })
+    const current = (await service.results('alice')).decisions
+    for (const old of original) {
+      const decision = current.find(item => item.threadId === old.threadId)!
+      if (!old.assessment!.reason.startsWith('refresh-')) expect(decision).toEqual(old)
+      else {
+        expect(decision.inputHash).toBe(old.inputHash)
+        expect(decision).toMatchObject({ inputPolicyVersion: AI_INPUT_POLICY_VERSION, schemaVersion: AI_TRIAGE_VERSION,
+          assessment: { certainty: old.assessment!.reason === 'refresh-clear' ? 'clear' : 'insufficient' },
+          score: { category: old.assessment!.reason === 'refresh-clear' ? 'Other' : 'Important', version: AI_PREFERENCE_VERSION } })
+      }
+    }
+    // A real model-insufficient result under this policy must not be billed again.
+    const again = await service.process('alice', { id: 'ai-policy-repeat-refresh', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === again.id)?.status === 'running') await Bun.sleep(10) })(), 'repeat history skips current policy')
+    expect(calls).toHaveLength(names.length + 2)
+    // Clearing only a fictional saved decision forces the actual cache-hit path.
+    const clear = current.find(item => item.assessment?.reason === 'preserve-clear')!
+    database.query('DELETE FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?').run('alice', clear.sourceId, clear.threadId)
+    const reuse = await service.process('alice', { id: 'ai-policy-clear-cache-reuse', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === reuse.id)?.status === 'running') await Bun.sleep(10) })(), 'legacy clear assessment cache reuse')
+    expect(calls).toHaveLength(names.length + 2)
+    expect((await service.lookup('alice', [clear])).decisions[0]).toMatchObject({ inputHash: clear.inputHash, inputPolicyVersion: 'input-1', assessment: clear.assessment, score: clear.score })
+    expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: names.length + 2, completed: names.length + 2, reused: 1 })
   })
 
   test('stale context responses are not applied but retain priced usage, and model changes or job cancellation fence in-flight requests', async () => {

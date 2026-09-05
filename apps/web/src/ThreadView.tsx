@@ -320,6 +320,7 @@ export default function ThreadView({
   }
 
   const shortcut = useEffectEvent((event: KeyboardEvent, bodyMessage?: HTMLElement) => {
+    if (readerPane.current?.closest(".settings-open")) return;
     if (
       event.defaultPrevented ||
       event.isComposing ||

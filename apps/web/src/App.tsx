@@ -30,7 +30,6 @@ import Settings from "./Settings";
 import CalendarView from "./CalendarView";
 import Snippets from "./Snippets";
 import { useMailMotion } from "./mail-motion";
-import { shortcutGroups } from "./shortcuts";
 import { readSessionText, removeSaved, writeSessionText } from "./storage";
 import { usePersistence } from "./use-persistence";
 import { useInbox } from "./use-inbox";
@@ -38,6 +37,7 @@ import "./inbox.css";
 import FolderNavigation from "./FolderNavigation";
 import MailRows from "./MailRows";
 import RecentOpens from "./RecentOpens";
+import { MailSyncStatus } from "./MailSyncStatus";
 import { selectMailView, mailWindow } from "./mail-view";
 import { UNIFIED_ACCOUNT } from "./mail-model";
 import { plainText } from "./mail-text";
@@ -99,6 +99,16 @@ function readRoute(): Route {
   };
 }
 
+function readSettingsPage(): string | null {
+  return new URLSearchParams(location.hash.replace(/^#\/?/, "")).get("settings");
+}
+function routeUrl(route: Route, settingsPage: string | null = null): string {
+  const params = new URLSearchParams();
+  Object.entries(route).forEach(([key, value]) => { if (value) params.set(key, value); });
+  if (settingsPage !== null) params.set("settings", settingsPage);
+  return `#/${params}`;
+}
+
 export default function App({ applicationUser, onSignOut }: { applicationUser?: { name: string; email: string }; onSignOut?: () => void } = {}) {
   const [route, setRoute] = useState<Route>(readRoute);
   const inbox = useInbox();
@@ -109,8 +119,30 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     return { ...defaultPreferences, ...saved, ...splits };
   });
   const [navigation, setNavigation] = useState(false);
-  const [settings, setSettings] = useState(false);
-  const [settingsPage, setSettingsPage] = useState<string>();
+  const [settings, setSettings] = useState(() => readSettingsPage() !== null);
+  const [settingsPage, setSettingsPage] = useState<string | undefined>(() => readSettingsPage() ?? undefined);
+  const [settingsJumpRequest, setSettingsJumpRequest] = useState(0);
+  const settingsOpen = useRef(settings);
+  settingsOpen.current = settings;
+  const settingsExitGuard = useRef<(() => boolean) | null>(null);
+  const setSettingsExitGuard = useCallback((guard: (() => boolean) | null) => { settingsExitGuard.current = guard; }, []);
+  const settingsFocus = useRef<HTMLElement | null>(null);
+  const settingsScroll = useRef<Array<{ element: HTMLElement; top: number; left: number }>>([]);
+  const historyPosition = useRef<number>(history.state?.superlocalIndex ?? 0);
+  const restoringHistory = useRef(false);
+  useLayoutEffect(() => {
+    history.replaceState({ ...history.state, superlocalIndex: historyPosition.current }, "");
+  }, []);
+  useLayoutEffect(() => {
+    if (settings) return;
+    for (const { element, top, left } of settingsScroll.current) {
+      if (element.isConnected) { element.scrollTop = top; element.scrollLeft = left; }
+    }
+    settingsScroll.current = [];
+    const target = settingsFocus.current;
+    settingsFocus.current = null;
+    if (target?.isConnected) target.focus({ preventScroll: true });
+  }, [settings]);
   const [overlay, setOverlay] = useState<Overlay>(null);
   const [issueReporter, setIssueReporter] = useState<{
     draft: IssueReport | null;
@@ -172,13 +204,11 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     const providerId = url.searchParams.get("provider") || "gmail";
     const connectionId = url.searchParams.get("connectionId");
     for (const key of ["connection", "provider", "connectionId"]) url.searchParams.delete(key);
-    history.replaceState(null, "", url);
+    history.replaceState(history.state, "", url);
     if (connection === "connected") {
-      // Resume onboarding in Add Accounts so the user sees connecting → connected, then lands back in the inbox.
+      // Resume inline setup without closing any other settings draft on completion.
       setOnboardingReturn({ providerId, connectionId: /^[A-Za-z0-9_-]{1,128}$/.test(connectionId ?? "") ? connectionId : null });
-      setSettingsPage("Add Accounts");
-      setSettings(true);
-      setMobileSidebar(true);
+      openSettings("Add Accounts");
     } else {
       setNotice({ text: "Account connection could not be completed. Try again in Add Accounts." });
     }
@@ -361,7 +391,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setPreferences(previous => Object.entries(values).every(([key, value]) => JSON.stringify(previous[key]) === JSON.stringify(value)) ? previous : { ...previous, ...values });
     if (!saved.splits.includes(route.split)) {
       const original = attentionSplit({ splitRules: (preferences.splitRules as Record<string, string>) || {}, splitAliases: (preferences.splitAliases as Record<string, string>) || {} }, route.split);
-      navigate({ split: saved.splits.find(name => original && attentionSplit(saved, name) === original) || saved.splits[0] || "Important" });
+      navigate({ split: saved.splits.find(name => original && attentionSplit(saved, name) === original) || saved.splits[0] || "Important" }, true);
     }
   }, [inbox.splitPreferences, route.split]);
   useEffect(() => {
@@ -374,7 +404,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (!inbox.accounts.length || route.account === UNIFIED_ACCOUNT || inbox.accounts.some(account => account.id === route.account)) return;
     const account = inbox.accounts.find(account => account.email === route.account);
     const next: Route = { account: account?.id ?? UNIFIED_ACCOUNT, folder: "Inbox", split: preferences.splits[0] || "Important" };
-    history.replaceState(null, "", `#/${new URLSearchParams({ account: next.account, folder: next.folder, split: next.split })}`);
+    history.replaceState(history.state, "", routeUrl(next, settingsOpen.current ? settingsPage || "" : null));
     setRoute(next);
   }, [inbox.accounts, route.account, preferences.splits]);
   useEffect(() => {
@@ -387,14 +417,41 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       preferences.themeStyle === "Classic" ? "Classic" : "Superlocal";
     document.documentElement.dataset.density =
       preferences.density.toLowerCase();
-    document.title = `${currentMail?.subject || (route.draft ? "New Message" : route.folder === "Inbox" ? route.split : route.folder)} - Superlocal`;
+    document.title = `${settings ? "Settings" : currentMail?.subject || (route.draft ? "New Message" : route.folder === "Inbox" ? route.split : route.folder)} - Superlocal`;
   }, [
     dark,
+    settings,
     preferences.themeStyle,
     preferences.density,
     currentMail?.subject,
     route,
   ]);
+  const onHistoryChange = useEffectEvent(() => {
+    if (restoringHistory.current) { restoringHistory.current = false; return; }
+    const nextPage = readSettingsPage();
+    const next = readRoute();
+    const nextIndex = typeof history.state?.superlocalIndex === "number" ? history.state.superlocalIndex as number : null;
+    const routeChanged = JSON.stringify(next) !== JSON.stringify(route);
+    if (settingsOpen.current && (nextPage === null || routeChanged) && settingsExitGuard.current?.() === false) {
+      if (nextIndex !== null && nextIndex !== historyPosition.current) {
+        restoringHistory.current = true;
+        history.go(historyPosition.current - nextIndex);
+      } else {
+        history.pushState({ superlocalIndex: historyPosition.current, superlocalSettings: true }, "", routeUrl(route, settingsPage || ""));
+      }
+      return;
+    }
+    historyPosition.current = nextIndex ?? historyPosition.current + 1;
+    if (nextIndex === null) history.replaceState({ ...history.state, superlocalIndex: historyPosition.current }, "");
+    if (!settingsOpen.current && nextPage !== null) rememberSettingsFocus();
+    settingsOpen.current = nextPage !== null;
+    setSettings(nextPage !== null);
+    setSettingsPage(nextPage ?? undefined);
+    setMobileSidebar(false);
+    closeNavigation();
+    // A settings history entry changes the visible page, not the preserved mail selection.
+    if (routeChanged) { setRoute(next); setSelected([]); settingsFocus.current = null; settingsScroll.current = []; }
+  });
   useEffect(() => {
     const media = matchMedia("(prefers-color-scheme: dark)");
     const mobile = matchMedia("(max-width: 700px)");
@@ -402,11 +459,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     mobile.addEventListener("change", resize);
     const listener = () => setSystemDark(media.matches);
     media.addEventListener("change", listener);
-    const pop = () => {
-      setRoute(readRoute());
-      closeNavigation();
-      setSelected([]);
-    };
+    const pop = () => onHistoryChange();
     addEventListener("popstate", pop);
     return () => {
       media.removeEventListener("change", listener);
@@ -461,17 +514,21 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       ?.scrollIntoView({ block: "nearest" });
   }, [highlight]);
 
-  function navigate(patch: Partial<Route>) {
+  function navigate(patch: Partial<Route>, preserveSettings = false) {
+    if (!preserveSettings && !leaveSettings()) return false;
     const next = { ...route, ...patch };
-    const params = new URLSearchParams();
-    Object.entries(next).forEach(([key, value]) => {
-      if (value) params.set(key, value);
-    });
-    history.pushState(null, "", `#/${params}`);
+    const replaceSettings = readSettingsPage() !== null;
+    if (!replaceSettings) historyPosition.current += 1;
+    history[replaceSettings ? "replaceState" : "pushState"](
+      { superlocalIndex: historyPosition.current, ...(preserveSettings && settingsOpen.current ? { superlocalSettings: history.state?.superlocalSettings } : {}) },
+      "", routeUrl(next, preserveSettings && settingsOpen.current ? settingsPage || "" : null),
+    );
+    if (!preserveSettings) { settingsFocus.current = null; settingsScroll.current = []; }
     setRoute(next);
     closeNavigation();
     setSenderSelection(null);
     setMobileSidebar(false);
+    return true;
   }
   function closeNavigation() {
     const active = document.activeElement;
@@ -483,6 +540,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     folder: string,
     split = preferences.splits[0] || "Important",
   ) {
+    if (!leaveSettings()) return;
     motion.prepare("switch");
     listScroll.current = 0;
     if (list.current) list.current.scrollTop = 0;
@@ -500,6 +558,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setHighlight(0);
   }
   function openOverlay(value: Overlay, ids = targetIds) {
+    if (value === "shortcuts") { openSettings("Shortcuts"); return; }
     if (value === "label") setLabelMode("toggle");
     if (value === "command") {
       const draft =
@@ -618,10 +677,43 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       setCapturingIssue(false);
     }
   }
+  function rememberSettingsFocus() {
+    settingsScroll.current = [...document.querySelectorAll<HTMLElement>(".mail-workspace .mail-list, .mail-workspace .message-view-scroll, .mail-workspace [contenteditable=true]")]
+      .map(element => ({ element, top: element.scrollTop, left: element.scrollLeft }));
+    const active = document.activeElement;
+    settingsFocus.current = active instanceof HTMLIFrameElement
+      ? active.contentDocument?.activeElement as HTMLElement | null
+      : active instanceof HTMLElement ? active : null;
+  }
+  function leaveSettings() {
+    if (!settingsOpen.current) return true;
+    if (settingsExitGuard.current?.() === false) return false;
+    settingsOpen.current = false;
+    setSettings(false);
+    setMobileSidebar(false);
+    return true;
+  }
+  function closeSettings() {
+    if (!leaveSettings()) return;
+    if (history.state?.superlocalSettings) history.back();
+    else history.replaceState({ superlocalIndex: historyPosition.current }, "", routeUrl(route));
+  }
   function openSettings(page?: string) {
+    const alreadyOpen = settingsOpen.current;
+    if (!alreadyOpen) {
+      rememberSettingsFocus();
+      historyPosition.current += 1;
+    }
+    history[alreadyOpen ? "replaceState" : "pushState"](
+      { superlocalIndex: historyPosition.current, superlocalSettings: alreadyOpen ? history.state?.superlocalSettings : true },
+      "", routeUrl(route, page || ""),
+    );
+    settingsOpen.current = true;
     setSettingsPage(page);
+    setSettingsJumpRequest(value => value + 1);
     setSettings(true);
-    setMobileSidebar(true);
+    setMobileSidebar(false);
+    sequence.current.key = "";
     closeNavigation();
     setOverlay(null);
   }
@@ -1268,6 +1360,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     },
   ];
   function selectAccount(account: string) {
+    if (!leaveSettings()) return;
     motion.prepare("switch");
     setMailFilter(null);
     listScroll.current = 0;
@@ -1342,10 +1435,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       case "escape":
         if (overlay) setOverlay(null);
         else if (navigation) closeNavigation();
-        else if (settings) {
-          setSettings(false);
-          setMobileSidebar(false);
-        } else if (route.thread || route.draft || route.view) goBack();
+        else if (settings) closeSettings();
+        else if (route.thread || route.draft || route.view) goBack();
         else if (search) {
           if (searchSubmitted && !searchFocused) {
             searchInput.current?.focus();
@@ -1548,13 +1639,13 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           <IconButton
             name="Envelope"
             title="Mail"
-            className={route.view !== "calendar" ? "active" : ""}
+            className={!settings && route.view !== "calendar" ? "active" : ""}
             onClick={() => goFolder("Inbox")}
           />
           <IconButton
             name="Calendar"
             title="Calendar"
-            className={route.view === "calendar" ? "active" : ""}
+            className={!settings && route.view === "calendar" ? "active" : ""}
             onClick={() =>
               navigate({
                 view: "calendar",
@@ -1568,19 +1659,37 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           <IconButton
             name="Gear"
             title="Settings"
-            onClick={() => openSettings()}
+            className={settings ? "active" : ""}
+            onClick={() => settings ? closeSettings() : openSettings()}
           />
           <IconButton
             name="Eye"
             title="Recent Opens"
             onClick={() => {
-              setSettings(false);
+              if (!leaveSettings()) return;
+              history.replaceState({ superlocalIndex: historyPosition.current }, "", routeUrl(route));
               setMobileSidebar(true);
             }}
           />
         </div>
       </nav>
-      <main className="mail-workspace" data-folder={route.folder}>
+      {settings && <Settings
+        preferences={preferences}
+        onChange={updatePreferences}
+        onClose={closeSettings}
+        onExitGuardChange={setSettingsExitGuard}
+        initialPage={settingsPage}
+        jumpRequest={settingsJumpRequest}
+        account={accountEmail}
+        accounts={inbox.accounts.map(account => account.email)}
+        host={inbox.host}
+        aiActions={store.ai}
+        aiMailboxes={inbox.accounts}
+        store={store}
+        onboardingReturn={onboardingReturn}
+        onOnboardingDone={() => setOnboardingReturn(null)}
+      />}
+      <main className="mail-workspace" data-folder={route.folder} hidden={settings} inert={settings} aria-hidden={settings || undefined}>
         {route.view === "calendar" ? (
           <CalendarView
             initialView={calendarInitialView}
@@ -1959,13 +2068,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       </main>
       <aside
         className="right-sidebar"
-        aria-label={
-          settings
-            ? "Settings"
-            : currentMail || route.draft
-              ? "Sender context"
-              : "Recent Opens"
-        }
+        hidden={settings}
+        inert={settings}
+        aria-hidden={settings || undefined}
+        aria-label={currentMail || route.draft ? "Sender context" : "Recent Opens"}
       >
         <IconButton
           className="mobile-sidebar-close"
@@ -1984,32 +2090,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             if (message) openMail(message);
           }}
         >
-          {settings ? (
-            <Settings
-              key={settingsPage || "root"}
-              preferences={preferences}
-              onChange={updatePreferences}
-              onClose={() => {
-                setSettings(false);
-                setMobileSidebar(false);
-              }}
-              onOpenShortcuts={() => openOverlay("shortcuts")}
-              initialPage={settingsPage}
-              account={accountEmail}
-              accounts={inbox.accounts.map(account => account.email)}
-              host={inbox.host}
-              aiActions={store.ai}
-              aiMailboxes={inbox.accounts}
-              store={store}
-              onboardingReturn={onboardingReturn}
-              onOnboardingDone={() => {
-                setOnboardingReturn(null);
-                setSettings(false);
-                setMobileSidebar(false);
-                void store.refresh(true);
-              }}
-            />
-          ) : search && !currentMail ? (
+          {search && !currentMail ? (
             <section className="search-sidebar">
               <h2>Tips</h2>
               <div>
@@ -2105,6 +2186,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             </div>
           )}
         </div>
+        <MailSyncStatus client={inbox.store.client} mailboxes={inbox.mailboxes} sources={inbox.sources} enabled={inbox.loaded && !settings && !route.view} onMailboxes={() => openSettings("Mailboxes")} />
         <footer className="sidebar-footer">
           {applicationUser && onSignOut && (
             <button className="application-sign-out" type="button" title={`Sign out ${applicationUser.email}`} onClick={onSignOut}>Sign out</button>
@@ -2130,7 +2212,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
               name="Gear"
               title="Settings"
               className={settings ? "active" : ""}
-              onClick={() => (settings ? setSettings(false) : openSettings())}
+              onClick={() => (settings ? closeSettings() : openSettings())}
             />
           </div>
         </footer>
@@ -2157,7 +2239,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         mode={commandMode ?? "command"}
         open={commandMode !== null}
         onClose={() => setOverlay(null)}
-        commands={commandItems.filter(item => inbox.host?.allowProviderWrites || !["Star", "Mark Unread", "Move to Trash", "Report Spam", "Compose", "Reply", "Reply All", "Forward"].includes(item.label))}
+        commands={commandItems.filter(item => (!settings || item.label.startsWith("Go to ") || ["Settings", "AI triage", "Theme", "Split Inbox", "Signatures", "Manage mailboxes", "Keyboard Shortcuts", "Switch Account", "Unified inbox", "Snippets", "Issue", "Saved issues"].includes(item.label)) && (inbox.host?.allowProviderWrites || !["Star", "Mark Unread", "Move to Trash", "Report Spam", "Compose", "Reply", "Reply All", "Forward"].includes(item.label)))}
         labels={customLabels}
         labelMode={labelMode}
         targets={targets}
@@ -2213,21 +2295,6 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                 onClick={() => setOverlay(null)}
               />
             </div>
-            {overlay === "shortcuts" && (
-              <div className="shortcuts-content">
-                {shortcutGroups.map(([name, rows]) => (
-                  <section key={name}>
-                    <h3>{name}</h3>
-                    {rows.map(([label, key]) => (
-                      <div key={label}>
-                        <span>{label}</span>
-                        <Key>{key}</Key>
-                      </div>
-                    ))}
-                  </section>
-                ))}
-              </div>
-            )}
             {overlay === "help" && (
               <div className="help-options">
                 <button onClick={() => openOverlay("shortcuts")}>

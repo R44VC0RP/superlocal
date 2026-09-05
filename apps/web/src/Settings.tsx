@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Icon, IconButton, Toggle, Modal } from "./components";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { Icon, IconButton, Key, Toggle } from "./components";
+import { shortcutGroups } from "./shortcuts";
 import type { Preferences } from "./data";
 import type { InboxStore } from "./inbox";
 import type { HostConfiguration } from "./host";
@@ -15,81 +16,47 @@ export type SettingsProps = {
   preferences: Preferences;
   onChange: (patch: Partial<Preferences>) => void;
   onClose: () => void;
-  onOpenShortcuts: () => void;
   initialPage?: string;
+  jumpRequest?: number;
+  onExitGuardChange?: (guard: (() => boolean) | null) => void;
   account?: string;
   accounts: string[];
   host: HostConfiguration | null;
   store: InboxStore;
   /** Set when the page reloaded after an OAuth redirect; Add Accounts resumes onboarding for this connection. */
   onboardingReturn?: { providerId: string; connectionId: string | null } | null;
-  /** Called when onboarding finished and the user should land back in the inbox. */
+  /** Clears the completed onboarding return without leaving the settings page. */
   onOnboardingDone?: () => void;
   aiActions?: AiTriageActions;
   aiMailboxes?: Array<{ id: string; name: string; email?: string }>;
 };
 
 const sections = [
-  { title: "", items: ["Mailboxes", "Reminders", "Split Inbox", "Split Inbox Library"] },
-  {
-    title: "My Account",
-    items: ["Add Accounts", "Edit Profile", "Theme", "Shortcuts"],
-  },
-  {
-    title: "Calendar",
-    items: [
-      "Calendar Accounts",
-      "Meeting Links",
-      "Timezones",
-      "Scheduling",
-      "Notifications",
-    ],
-  },
-  {
-    title: "Triage",
-    items: ["AI triage", "Get Me To Zero", "Bulk Actions", "Hide Empty Split Inboxes"],
-  },
-  {
-    title: "Writing",
-    items: ["Emoji", "Signatures"],
-  },
-  {
-    title: "Workflow",
-    items: [
-      "Auto Advance",
-      "Auto Bcc",
-      "Blocked Senders",
-      "Downloads",
-      "Images",
-      "Instant Intro",
-      "Out of Office Reply",
-      "Read Statuses",
-      "Recent Opens",
-    ],
-  },
-  {
-    title: "Advanced",
-    items: [
-      "Backtick as Escape",
-      "Send + Mark Done",
-      "RSVP + Mark Done",
-      "Hide Comment Bar",
-      "Show Sender Full Names",
-    ],
-  },
+  "AI triage", "Mailboxes", "Add Accounts", "Edit Profile",
+  "Theme", "Font", "Density", "Images",
+  "Split Inbox", "Split Inbox Library", "Hide Empty Split Inboxes", "Get Me To Zero", "Bulk Actions",
+  "Reminders", "Auto Advance", "Mark as Read", "Recent Opens", "Read Statuses",
+  "Signatures", "Default Reply", "Send Delay", "Auto Bcc", "Emoji", "Spellcheck", "Instant Intro",
+  "Blocked Senders", "Downloads", "Out of Office Reply",
+  "Calendar Settings", "Meeting Links", "Timezones", "Scheduling", "Notifications", "Notification Options",
+  "Backtick as Escape", "Send + Mark Done", "RSVP + Mark Done", "Hide Comment Bar", "Show Sender Full Names",
+  "Shortcuts",
 ];
-
-const morePreferences = [
-  "Default Reply",
-  "Send Delay",
-  "Font",
-  "Density",
-  "Show Snippets",
-  "Spellcheck",
-  "Mark as Read",
-  "Notification Options",
-  "Calendar Settings",
-];
+const sectionAliases: Record<string, string> = {
+  "Calendar Accounts": "Calendar Settings",
+  Availability: "Scheduling",
+  "Show Snippets": "Density",
+};
+const sectionId = (name: string) => `settings-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+const sectionTitle = (name: string) => name === "AI triage" ? name
+  : name === "Auto Bcc" ? "Auto Bcc"
+  : name === "RSVP + Mark Done" ? "RSVP + mark done"
+  : name[0] + name.slice(1).toLowerCase();
+const findSection = (value = "") => {
+  const match = [...sections, ...Object.keys(sectionAliases)].find(name =>
+    name.toLowerCase().replace(/[^a-z]/g, "") === value.toLowerCase().replace(/[^a-z]/g, ""));
+  return match ? sectionAliases[match] || match : "";
+};
 const defaultSplitRules: Record<string, string> = Object.assign(Object.create(null), {
   Important: "Correspondence, actionable mail, and uncertain messages",
   Other: "Promotions and newsletters with subscription evidence",
@@ -111,8 +78,9 @@ export function Settings({
   preferences,
   onChange,
   onClose,
-  onOpenShortcuts,
   initialPage,
+  jumpRequest = 0,
+  onExitGuardChange,
   account = "",
   accounts,
   host,
@@ -122,66 +90,67 @@ export function Settings({
   aiActions,
   aiMailboxes = [],
 }: SettingsProps) {
-  const findPage = (value = "") =>
-    [
-      ...sections.flatMap((section) => section.items),
-      ...morePreferences,
-      "Availability",
-    ].find(
-      (item) =>
-        item !== "Read Statuses" &&
-        item.toLowerCase().replace(/[^a-z]/g, "") ===
-          value.toLowerCase().replace(/[^a-z]/g, ""),
-    ) || "";
-  const [page, setPage] = useState(() => findPage(initialPage));
   const [entry, setEntry] = useState("");
   const [error, setError] = useState("");
+  const [listEntries, setListEntries] = useState<Record<string, string>>({});
+  const [listErrors, setListErrors] = useState<Record<string, string>>({});
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
-  const [splitTab, setSplitTab] = useState<"Active" | "Inactive">("Active");
   const [splitEditor, setSplitEditor] = useState<string | null>(null);
   const [splitRule, setSplitRule] = useState("");
-  const [splitHelp, setSplitHelp] = useState(false);
   const [mailboxEditState, setMailboxEditState] = useState({ dirty: false, saving: false });
-  const [confirmMailboxClose, setConfirmMailboxClose] = useState(false);
+  const [aiEditState, setAiEditState] = useState({ dirty: false, saving: false });
+  const [exitNotice, setExitNotice] = useState("");
   const [onboarding, setOnboarding] = useState<{ title: string; back: (() => void) | null; busy: boolean }>({ title: "Add account", back: null, busy: false });
-  const sidebar = useRef<HTMLDivElement>(null);
-  const openShortcuts = useRef(onOpenShortcuts);
-  openShortcuts.current = onOpenShortcuts;
-
-  const closeDetail = () => {
-    if (page === "Mailboxes") {
-      if (mailboxEditState.saving) return;
-      if (mailboxEditState.dirty) { setConfirmMailboxClose(true); return; }
-    }
-    if (page === "Add Accounts" && onboarding.busy) return;
-    setPage("");
+  const root = useRef<HTMLElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const exitState = useRef({ dirty: false, busy: false });
+  const authorizing = useRef(false);
+  exitState.current = {
+    dirty: mailboxEditState.dirty || aiEditState.dirty || Object.values(listEntries).some(value => value.trim()) ||
+      splitEditor !== null && (entry !== splitEditor || splitRule !== ((preferences.splitRules as Record<string, string> | undefined)?.[splitEditor] || "")),
+    busy: mailboxEditState.saving || aiEditState.saving || onboarding.busy,
   };
-
-  useEffect(() => {
-    const next = findPage(initialPage);
-    if (next === "Shortcuts") {
-      openShortcuts.current();
-      setPage("");
-    } else setPage(next);
-  }, [initialPage]);
-
-  useEffect(() => {
-    setEntry("");
-    setError("");
-    setPendingDelete(null);
-    setSplitEditor(null);
-    setSplitHelp(false);
-    setMailboxEditState({ dirty: false, saving: false });
-    setConfirmMailboxClose(false);
-  }, [page]);
-
-  useEffect(() => {
-    if (!page) sidebar.current?.focus({ preventScroll: true });
+  const canExit = useCallback(() => {
+    if (exitState.current.busy) {
+      setExitNotice("Wait for the current save or account connection to finish before leaving settings.");
+      heading.current?.focus({ preventScroll: true });
+      return false;
+    }
+    return !exitState.current.dirty || window.confirm("Discard unsaved settings changes?");
   }, []);
-
+  useLayoutEffect(() => {
+    onExitGuardChange?.(canExit);
+    return () => onExitGuardChange?.(null);
+  }, [canExit, onExitGuardChange]);
   useEffect(() => {
-    if (!mailboxEditState.dirty) setConfirmMailboxClose(false);
-  }, [mailboxEditState.dirty]);
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (authorizing.current || !exitState.current.dirty && !exitState.current.busy) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    addEventListener("beforeunload", beforeUnload);
+    return () => removeEventListener("beforeunload", beforeUnload);
+  }, []);
+  useEffect(() => {
+    if (!exitState.current.busy) setExitNotice("");
+    if (!onboarding.busy) authorizing.current = false;
+  }, [mailboxEditState.saving, aiEditState.saving, onboarding.busy]);
+  const authorizeRedirect = () => {
+    if (exitState.current.dirty && !window.confirm("Signing in will leave this page. Discard unsaved settings changes?")) return false;
+    authorizing.current = true;
+    return true;
+  };
+  const jumpTo = useCallback((name: string) => {
+    const section = findSection(name);
+    if (!section) root.current?.querySelector<HTMLElement>(".settings-scroll")?.scrollTo({ top: 0 });
+    const target = section ? root.current?.querySelector<HTMLElement>(`#${sectionId(section)}`) : heading.current;
+    target?.scrollIntoView({ block: "start" });
+    target?.focus({ preventScroll: true });
+  }, []);
+  useEffect(() => {
+    // Run after a command dialog restores focus during its cleanup.
+    jumpTo(initialPage || "");
+  }, [initialPage, jumpRequest, jumpTo]);
 
   const text = (key: string, fallback = "") =>
     typeof preferences[key] === "string"
@@ -258,13 +227,6 @@ export function Settings({
       </select>
     </span>
   );
-  const openPage = (next: string) => {
-    if (next === "Shortcuts") {
-      onOpenShortcuts();
-      return;
-    }
-    setPage(next);
-  };
   const toggle = (
     key: string,
     label: string,
@@ -362,6 +324,10 @@ export function Settings({
     email = false,
   ) => {
     const values = list(key, fallback);
+    const entry = listEntries[key] || "";
+    const error = listErrors[key] || "";
+    const setEntry = (value: string) => setListEntries(previous => ({ ...previous, [key]: value }));
+    const setError = (value: string) => setListErrors(previous => ({ ...previous, [key]: value }));
     return (
       <div className="settings-list-editor">
         {values.length > 0 ? (
@@ -405,7 +371,7 @@ export function Settings({
           <input
             type={email ? "email" : "text"}
             aria-label={label}
-            aria-describedby={error ? "settings-entry-error" : undefined}
+            aria-describedby={error ? `settings-${key}-error` : undefined}
             value={entry}
             placeholder={placeholder}
             required
@@ -423,7 +389,7 @@ export function Settings({
           </button>
         </form>
         {error && (
-          <p className="settings-error" id="settings-entry-error" role="alert">
+          <p className="settings-error" id={`settings-${key}-error`} role="alert">
             {error}
           </p>
         )}
@@ -431,10 +397,24 @@ export function Settings({
     );
   };
 
+  const sectionHref = (name: string) => {
+    const params = new URLSearchParams(location.hash.replace(/^#\/?/, ""));
+    params.set("settings", name);
+    return `#/${params}`;
+  };
+  const renderSection = (page: string) => {
   let content: ReactNode;
   switch (page) {
+    case "Shortcuts":
+      content = <div className="settings-shortcuts">{shortcutGroups.map(([name, rows]) => (
+        <section key={name} aria-label={name}>
+          <h3>{name}</h3>
+          <dl>{rows.map(([label, key]) => <div key={label}><dt>{label}</dt><dd><Key>{key}</Key></dd></div>)}</dl>
+        </section>
+      ))}</div>;
+      break;
     case "AI triage":
-      content = <AiTriageSettings actions={aiActions} mailboxes={aiMailboxes} />;
+      content = <AiTriageSettings actions={aiActions} mailboxes={aiMailboxes} onEditStateChange={setAiEditState} />;
       break;
     case "Theme":
       content = (
@@ -626,7 +606,7 @@ export function Settings({
     case "Split Inbox":
       content = (
         <div className="settings-split-inbox">
-          {splitEditor !== null ? (
+          {splitEditor !== null && (
             <form
               className="settings-split-editor"
               onSubmit={(event) => {
@@ -721,8 +701,7 @@ export function Settings({
                 </button>
               </div>
             </form>
-          ) : (
-            <>
+          )}
               <div className="settings-split-intro">
                 <p>
                   Important and Other divide your inbox. Custom filters can overlap either view.
@@ -740,64 +719,9 @@ export function Settings({
                   Add Split Inbox
                 </button>
               </div>
-              <div className="settings-split-navigation">
-                <div
-                  className="settings-split-tabs"
-                  role="tablist"
-                  aria-label="Split inboxes"
-                >
-                  {(["Active", "Inactive"] as const).map((tab) => (
-                    <button
-                      type="button"
-                      role="tab"
-                      id={`settings-splits-${tab}`}
-                      aria-controls="settings-split-list"
-                      aria-selected={splitTab === tab}
-                      tabIndex={splitTab === tab ? 0 : -1}
-                      key={tab}
-                      onClick={() => {
-                        setSplitTab(tab);
-                        setPendingDelete(null);
-                      }}
-                      onKeyDown={(event) => {
-                        if (
-                          ["ArrowLeft", "ArrowRight", "Home", "End"].includes(
-                            event.key,
-                          )
-                        ) {
-                          event.preventDefault();
-                          const next =
-                            event.key === "Home"
-                              ? "Active"
-                              : event.key === "End"
-                                ? "Inactive"
-                                : tab === "Active"
-                                  ? "Inactive"
-                                  : "Active";
-                          setSplitTab(next);
-                          document
-                            .getElementById(`settings-splits-${next}`)
-                            ?.focus();
-                        }
-                      }}
-                    >
-                      {tab}
-                    </button>
-                  ))}
-                </div>
-                <button
-                  type="button"
-                  className="settings-link-button"
-                  onClick={() => setPage("Hide Empty Split Inboxes")}
-                >
-                  Hide Empty Split Inboxes
-                </button>
-              </div>
-              <div
-                role="tabpanel"
-                id="settings-split-list"
-                aria-labelledby={`settings-splits-${splitTab}`}
-              >
+              {(["Active", "Inactive"] as const).map(splitTab => (
+              <section key={splitTab} className="settings-split-group" aria-label={`${splitTab} split inboxes`}>
+                <h3>{splitTab}</h3>
                 <ol className="settings-splits">
                   {(splitTab === "Active"
                     ? preferences.splits
@@ -944,35 +868,12 @@ export function Settings({
                     No inactive Split Inboxes.
                   </p>
                 )}
-              </div>
-              <footer className="settings-split-footer">
-                <button
-                  type="button"
-                  className="settings-link-button"
-                  aria-expanded={splitHelp}
-                  onClick={() => setSplitHelp(!splitHelp)}
-                >
-                  Learn more
-                </button>{" "}
-                about Split Inboxes to help you stay in flow and eliminate
-                context switching.
-                {splitHelp && (
-                  <p className="settings-note">
-                    Select a split to edit its name and search rule. Move splits
-                    with the arrow controls, or deactivate a split to keep it in
-                    the Inactive tab. Your messages stay in All Mail.{" "}
-                    <button
-                      type="button"
-                      className="settings-link-button"
-                      onClick={() => setPage("Split Inbox Library")}
-                    >
-                      Explore the library
-                    </button>
-                  </p>
-                )}
-              </footer>
-            </>
-          )}
+              </section>
+              ))}
+              <p className="settings-note">
+                Select a split to edit its name and search rule. Move splits with the arrow controls,
+                or deactivate a split to keep it in the inactive list. Your messages stay in All Mail.
+              </p>
         </div>
       );
       break;
@@ -1342,7 +1243,7 @@ export function Settings({
       content = <MailboxSettings host={host} store={store} onEditStateChange={setMailboxEditState} />;
       break;
     case "Add Accounts":
-      content = <ProviderConnections host={host} store={store} resume={onboardingReturn} onStepChange={setOnboarding} onDone={onOnboardingDone ?? onClose} />;
+      content = <ProviderConnections host={host} store={store} resume={onboardingReturn} onStepChange={setOnboarding} onDone={onOnboardingDone} onBeforeRedirect={authorizeRedirect} />;
       break;
     case "Calendar Settings":
     case "Calendar Accounts":
@@ -1353,11 +1254,8 @@ export function Settings({
             "Monday",
             "Saturday",
           ])}
-          {select("timeFormat", "Time format", ["12 hour", "24 hour"])}
-          {field("timezone", "Time zone", "America/New_York")}
           {toggle("showWeekends", "Show weekends", true)}
           {toggle("declinedEvents", "Show declined events")}
-          {toggle("calendarNotifications", "Event notifications", true)}
         </>
       );
       break;
@@ -1405,140 +1303,42 @@ export function Settings({
     }
   }
 
-  const dialogTitle =
-    page === "Split Inbox"
-      ? splitEditor === null
-        ? "Split Inbox Settings"
-        : splitEditor
-          ? "Edit Split Inbox"
-          : "Add Split Inbox"
-      : page === "Add Accounts" ? onboarding.title : page;
+  return content;
+  };
 
   return (
-    <div
-      className="settings-main"
-      ref={sidebar}
-      tabIndex={-1}
-      onKeyDown={(event) => {
-        if (
-          !page &&
-          (event.metaKey || event.ctrlKey) &&
-          !event.altKey &&
-          !event.shiftKey &&
-          event.key.toLowerCase() === "k"
-        )
-          return;
-        if (event.key === "Escape" && !page) {
-          event.stopPropagation();
-          onClose();
-        }
-        // Do not let letter shortcuts in the mailbox act on a focused settings control.
+    <main className="settings-main" ref={root} aria-labelledby="settings-title"
+      onKeyDown={event => {
+        if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") return;
+        if (event.key === "Escape") { event.preventDefault(); onClose(); }
+        // Settings owns its controls; shortcuts must not act on the preserved mail view.
         event.stopPropagation();
-      }}
-    >
+      }}>
       <header className="settings-heading">
-        <h2>Settings</h2>
-        <IconButton
-          className="settings-close"
-          name="Close"
-          title="Close settings"
-          onClick={onClose}
-        />
+        <IconButton name="Back" title="Back from settings" onClick={onClose} />
+        <h1 id="settings-title" ref={heading} tabIndex={-1}>Settings</h1>
+        {exitNotice && <p className="settings-exit-notice" role="alert">{exitNotice}</p>}
       </header>
       <div className="settings-scroll">
-        {sections.map((section) => (
-          <section
-            className="settings-section"
-            key={section.title}
-            aria-label={section.title || "Inbox preferences"}
-          >
-            {section.title && <h3>{section.title}</h3>}
-            {section.items.map((item) => {
-              const setting = inlineToggles[item];
-              return setting ? (
-                <div className="settings-menu-row" key={item}>
-                  <button
-                    type="button"
-                    className="settings-menu-label"
-                    onClick={() =>
-                      onChange({
-                        [setting[0]]: !enabled(setting[0], setting[1]),
-                      })
-                    }
-                  >
-                    {item}
-                  </button>
-                  <Toggle
-                    label={item}
-                    checked={enabled(setting[0], setting[1])}
-                    onChange={(value) => onChange({ [setting[0]]: value })}
-                  />
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  className="settings-menu-row"
-                  key={item}
-                  onClick={() => openPage(item)}
-                >
-                  {item}
-                </button>
-              );
-            })}
-          </section>
-        ))}
-        <details className="settings-more-preferences">
-          <summary>More Preferences</summary>
-          {morePreferences.map((item) => (
-            <button
-              type="button"
-              className="settings-menu-row"
-              key={item}
-              onClick={() => openPage(item)}
-            >
-              {item}
-            </button>
+        <div className="settings-content">
+          <nav className="settings-jumps" aria-label="Jump to settings">
+            {[["AI triage", "AI triage"], ["Mailboxes", "Mailboxes"], ["Accounts", "Add Accounts"], ["Appearance", "Theme"], ["Inbox", "Split Inbox"], ["Writing", "Signatures"], ["Workflow", "Blocked Senders"], ["Calendar", "Calendar Settings"], ["Advanced", "Backtick as Escape"], ["Shortcuts", "Shortcuts"]].map(([label, name]) => (
+              <a key={name} href={sectionHref(name)} onClick={event => { if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; event.preventDefault(); jumpTo(name); }}>{label}</a>
+            ))}
+          </nav>
+          {sections.map(name => (
+            <section key={name} className={`settings-section ${sectionId(name)}-section`} aria-labelledby={sectionId(name)}>
+              <h2 id={sectionId(name)} tabIndex={-1}>{sectionTitle(name)}</h2>
+              {name === "Add Accounts" && onboarding.back && <div className="settings-provider-heading">
+                <button type="button" className="settings-text-button" disabled={onboarding.busy} onClick={onboarding.back}>Back to providers</button>
+                <span>{onboarding.title}</span>
+              </div>}
+              <div className="settings-section-body">{renderSection(name)}</div>
+            </section>
           ))}
-        </details>
+        </div>
       </div>
-      {page && content && (
-        <Modal
-          label={dialogTitle}
-          onClose={closeDetail}
-          initialFocus={page === "Mailboxes" || page === "Add Accounts" || page === "AI triage" ? "dialog" : "input"}
-          className={`settings-dialog settings-${page.toLowerCase().replaceAll(" ", "-")}-dialog ${page === "Split Inbox" ? "settings-split-dialog" : ""}`}
-        >
-          <header className="settings-dialog-header">
-            {page === "Add Accounts" && onboarding.back && (
-              <IconButton name="Back" title="Back" className="settings-dialog-back" disabled={onboarding.busy} onClick={onboarding.back} />
-            )}
-            <h2>{dialogTitle}</h2>
-            <IconButton
-              name="Close"
-              title={`Close ${page}`}
-              disabled={page === "Mailboxes" && mailboxEditState.saving || page === "Add Accounts" && onboarding.busy}
-              onClick={closeDetail}
-            />
-          </header>
-          {page === "Mailboxes" && confirmMailboxClose && (
-            <div className="mailbox-close-confirm" role="alert">
-              <p>Discard unsaved mailbox changes?</p>
-              <div className="mailbox-bulk-actions">
-                <button type="button" className="settings-text-button" onClick={() => setConfirmMailboxClose(false)}>Keep editing</button>
-                <button type="button" className="settings-text-button" disabled={mailboxEditState.saving} onClick={() => setPage("")}>Discard changes</button>
-              </div>
-            </div>
-          )}
-          <div
-            className={
-              page === "Theme" ? "settings-theme-body" : "settings-dialog-body"
-            }
-          >
-            {content}
-          </div>
-        </Modal>
-      )}
-    </div>
+    </main>
   );
 }
 

@@ -6,9 +6,22 @@ import "./ai-triage.css";
 export type AiTriageSettingsProps = {
   actions?: AiTriageActions;
   mailboxes: Array<{ id: string; name: string; email?: string }>;
+  onEditStateChange?: (state: { dirty: boolean; saving: boolean }) => void;
 };
 
 type Diagnostics = Awaited<ReturnType<AiTriageActions["diagnostics"]>>;
+const problemLabels: Record<string, string> = {
+  AI_EVIDENCE_INVALID: "Source quotation could not be verified",
+  AI_EVIDENCE_REQUIRED: "Required supporting evidence was missing",
+  AI_RESPONSE_REFUSED: "Provider declined the assessment",
+  AI_RESPONSE_INCOMPLETE: "Provider returned an incomplete assessment",
+  AI_RESPONSE_INVALID: "Provider response could not be validated",
+  AI_TIMEOUT: "Provider response timed out",
+  AI_RATE_LIMITED: "Provider rate limit reached",
+  AI_AUTH_FAILED: "Provider credentials were rejected",
+  AI_PROVIDER_UNAVAILABLE: "Provider is temporarily unavailable",
+  AI_INSUFFICIENT_CONTEXT: "Not enough usable email context",
+};
 const number = (value: number) => value.toLocaleString();
 const dollars = (value: number) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 4, maximumFractionDigits: 6 }).format(value);
 
@@ -28,7 +41,7 @@ function Usage({ usage }: { usage: AiUsageSummary }) {
   </>;
 }
 
-export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) {
+export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTriageSettingsProps) {
   const [state, setState] = useState<AiTriageState | null>(null);
   const [draft, setDraft] = useState<AiSettings | null>(null);
   const [interests, setInterests] = useState("");
@@ -41,6 +54,7 @@ export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) 
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
+  const progressEpoch = useRef(0);
   const [reload, setReload] = useState(0);
   const [scope, setScope] = useState<"inbox" | "all">("inbox");
   const [limit, setLimit] = useState(100);
@@ -48,6 +62,13 @@ export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) 
   const [resultCursor, setResultCursor] = useState<number>();
   const [hasMore, setHasMore] = useState(false);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
+  const editListener = useRef(onEditStateChange);
+  editListener.current = onEditStateChange;
+
+  useEffect(() => {
+    onEditStateChange?.({ dirty, saving: busy });
+  }, [dirty, busy, onEditStateChange]);
+  useEffect(() => () => editListener.current?.({ dirty: false, saving: false }), []);
 
   function accept(next: AiTriageState, replaceDraft = false) {
     if (stateRef.current && next.settings.revision < stateRef.current.settings.revision) return;
@@ -77,17 +98,18 @@ export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) 
   }, [actions, reload]);
 
   useEffect(() => {
-    if (!actions || !state?.settings.enabled) return;
+    if (!actions) return;
     let ignore = false, pending = false;
     const timer = window.setInterval(() => {
-      if (pending || busyRef.current) return;
+      if (pending || busyRef.current || document.visibilityState !== "visible") return;
       pending = true;
+      const epoch = progressEpoch.current;
       void actions.state().then(next => {
-        if (!ignore) { accept(next); setLoadError(false); }
-      }).catch(() => { if (!ignore) setLoadError(true); }).finally(() => { pending = false; });
-    }, 2000);
+        if (!ignore && epoch === progressEpoch.current) { accept(next); setLoadError(false); }
+      }).catch(() => { if (!ignore && epoch === progressEpoch.current) setLoadError(true); }).finally(() => { pending = false; });
+    }, 5000);
     return () => { ignore = true; window.clearInterval(timer); };
-  }, [actions, state?.settings.enabled, reload]);
+  }, [actions, reload]);
 
   function change(patch: Partial<AiSettings>) {
     dirtyRef.current = true;
@@ -99,6 +121,7 @@ export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) 
     if (!actions || busyRef.current) return;
     const token = lifetime.current;
     const alive = () => token !== null && lifetime.current === token;
+    progressEpoch.current++;
     busyRef.current = true; setBusy(true); setError(""); setNotice("");
     try { await work(actions, alive); }
     catch { if (alive()) setError(failure); }
@@ -131,10 +154,41 @@ export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) 
   const terms = interests.split(",").map(term => term.trim()).filter(Boolean);
   const invalidInterests = terms.length > 20 || terms.some(term => term.length > 60);
   const selectedModel = state.provider?.models.find(model => model.id === draft.model);
+  const savedModel = state.provider?.models.find(model => model.id === state.settings.model);
   const stale = dirty && state.settings.revision !== draft.revision;
+  const saved = state.settings;
+  const paused = state.jobs.some(job => job.status === "paused");
+  const running = state.jobs.some(job => job.status === "running");
+  const status = loadError ? "Progress unavailable"
+    : !state.configured ? "Not configured"
+    : !saved.enabled ? "Off"
+    : saved.mailboxIds?.length === 0 ? "No mailboxes selected"
+    : state.queue.processing > 0 ? "Processing mail"
+    : paused && !running ? "Historical processing paused"
+    : state.queue.pending > 0 || running ? "Waiting to process mail"
+    : "Idle — watching for new mail";
   return <div className="ai-triage-settings" aria-busy={busy}>
-    {!state.configured && <p className="settings-note">AI triage requires a provider, model, and credentials in the host’s private configuration. No credentials are entered here. Your mail remains usable.</p>}
-    {loadError && <p className="settings-error" role="alert">Could not refresh progress. <button type="button" className="settings-link-button" onClick={reset}>Retry</button></p>}
+    <div className="ai-status" role="status" aria-live="polite" aria-atomic="true">
+      <strong>{status}</strong>
+      <span className="settings-note">{!state.configured ? "AI is unavailable; your normal inbox rules are in use." : !saved.enabled ? "AI sorting is off; your normal inbox rules are in use." : saved.mode === "apply" ? "Applying saved assessments to Important and Other." : "Preview only — AI suggestions do not change your inbox."}</span>
+      <span className="settings-note">{loadError ? "Last reported queue: " : "Queue: "}{number(state.queue.processing)} processing · {number(state.queue.pending)} waiting · {number(state.queue.failed)} failed</span>
+    </div>
+    {state.queue.failed > 0 && <p className="settings-error">{number(state.queue.failed)} conversations could not be assessed. They use normal inbox rules, not a successful AI classification. Details are under Recent attempts below.</p>}
+    {!state.configured && <p className="settings-note">Set up a provider, model and credentials in this host’s private configuration to use AI. Credentials never go in this page.</p>}
+    {loadError && <p className="settings-error" role="alert">Could not refresh AI status. The last reported counts may be out of date.</p>}
+    <button type="button" className="settings-text-button ai-refresh" disabled={busy} onClick={() => void run(async (api, alive) => {
+      try {
+        const next = await api.state(); if (alive()) { accept(next); setLoadError(false); }
+      } catch (cause) {
+        if (alive()) setLoadError(true);
+        throw cause;
+      }
+    }, "Could not refresh AI status. Your unsaved settings have been kept.")}>Refresh status</button>
+    <div className="ai-explanation">
+      <p><strong>Important</strong> is for mail that needs your attention: personal requests, replies, real deadlines and important account issues. <strong>Other</strong> is for routine marketing, product updates and other non-actionable mail, unless your preferences make it important.</p>
+      <p className="settings-note">AI reads selected text and recent conversation context. Superlocal combines that assessment with your explicit preferences and confirmed correspondence. Genuinely unclear mail stays Important for review; suspicious mail stays reviewable in Other. Manual category choices win.</p>
+      <p className="settings-note">AI does not send replies, delete mail or move it to your provider’s Spam folder. Done (W) handles a message; it does not teach AI that you dislike the sender. Mail without a current assessment uses normal inbox rules.</p>
+    </div>
     <form className="ai-settings-form" onSubmit={event => {
       event.preventDefault();
       if (invalidInterests || stale) return;
@@ -152,14 +206,7 @@ export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) 
           {!selectedModel && <option value={draft.model}>{draft.model || "Not configured"}</option>}
           {state.provider?.models.map(model => <option key={model.id} value={model.id}>{model.label}</option>)}
         </select></label>
-        <details className="ai-details"><summary>Model details</summary>
-          {selectedModel && <p>{selectedModel.id}</p>}
-          {selectedModel?.pricing ? <dl className="ai-key-values">
-            <dt>Input / output per million tokens</dt><dd>{dollars(selectedModel.pricing.inputPerMillion)} / {dollars(selectedModel.pricing.outputPerMillion)}</dd>
-            <dt>Cached input / cache write</dt><dd>{selectedModel.pricing.cachedInputPerMillion === null ? "Unknown" : dollars(selectedModel.pricing.cachedInputPerMillion)} / {selectedModel.pricing.cacheWriteInputPerMillion === null ? "Unknown" : dollars(selectedModel.pricing.cacheWriteInputPerMillion)}</dd>
-            <dt>Rate source</dt><dd>{selectedModel.pricing.source}</dd><dt>Rate version</dt><dd>{selectedModel.pricing.version}</dd>
-          </dl> : <p className="settings-note">Pricing is not configured. Costs will not be shown as zero.</p>}
-        </details>
+        <p className="settings-note">Changing the model does not automatically pay to reprocess older mail. Process historical mail below when you want new assessments.</p>
         <label className="settings-control-row"><span>Mailboxes</span><select value={draft.mailboxIds === null ? "all" : "selected"} onChange={event => change({ mailboxIds: event.target.value === "all" ? null : [] })}><option value="all">All active mailboxes</option><option value="selected">Selected mailboxes</option></select></label>
         {draft.mailboxIds !== null && <div className="ai-mailbox-options">
           {mailboxes.map(mailbox => <label className="settings-checkbox-row" key={mailbox.id}><span>{mailbox.name}{mailbox.email && <span className="settings-checkbox-note">{mailbox.email}</span>}</span><input type="checkbox" checked={draft.mailboxIds!.includes(mailbox.id)} onChange={event => change({ mailboxIds: event.target.checked ? [...draft.mailboxIds!, mailbox.id] : draft.mailboxIds!.filter(id => id !== mailbox.id) })} /></label>)}
@@ -171,7 +218,8 @@ export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) 
         <label className="settings-checkbox-row"><span>Use estimated reading activity<span className="settings-checkbox-note">Opt-in active reading time for local personalization; no text, typing, or screenshots are collected.</span></span><input type="checkbox" checked={draft.readingSignals} onChange={event => change({ readingSignals: event.target.checked })} /></label>
       </fieldset>
       {stale && <p className="settings-error" role="alert">Settings changed elsewhere. Reload before saving.</p>}
-      <div className="ai-actions"><button type="submit" className="settings-button" disabled={busy || !dirty || invalidInterests || stale || draft.enabled && !state.configured}>Save</button><button type="button" className="settings-text-button" disabled={busy} onClick={reset}>Reload saved settings</button></div>
+      {dirty && <p className="settings-note" role="status">Unsaved AI changes. Status and processing still use your saved settings.</p>}
+      <div className="ai-actions"><button type="submit" className="settings-button" disabled={busy || !dirty || invalidInterests || stale || draft.enabled && !state.configured}>Save AI settings</button><button type="button" className="settings-text-button" disabled={busy} onClick={reset}>{dirty ? "Discard AI changes" : "Reload saved settings"}</button></div>
     </form>
     {error && <p className="settings-error" role="alert">{error}</p>}
     {notice && <p className="settings-note" role="status">{notice}</p>}
@@ -184,13 +232,14 @@ export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) 
           await api.process({ id: crypto.randomUUID(), scope, limit });
           if (!alive()) return;
           const next = await api.state(); if (alive()) accept(next);
-        }, "Could not start processing. Refresh progress before retrying.")}>Process</button>
+        }, "Could not start processing. Refresh progress before retrying.")}>Process historical mail</button>
       </div>
-      <p className="settings-note">Uses saved settings. Cancelling stops work, never deletes emails.</p>
-      <p className="settings-note">Queue: {number(state.queue.pending)} pending · {number(state.queue.processing)} processing · {number(state.queue.failed)} failed</p>
-      {state.jobs.length === 0 ? <p className="settings-note">No historical jobs started.</p> : state.jobs.map(job => <div className="ai-job" key={job.id}>
-        <div>{job.scope === "inbox" ? "Inbox" : "All mail"} · {aiLabel(job.status)} · up to {number(job.limit)}</div>
-        <p className="settings-note">{number(job.scanned)} scanned · {number(job.queued)} queued · {number(job.completed)} completed · {number(job.failed)} failed</p>
+      <p className="settings-note">Uses saved settings and only already-synced mail, within the scope and limit above. This can incur provider charges. Current assessments are reused; missing or failed assessments and older uncertain marketing assessments are processed. Cancelling stops work, never deletes emails.</p>
+      {state.jobs.length === 0 ? <p className="settings-note">No historical jobs started. Turning AI on does not mean all older mail has been processed.</p> : state.jobs.map(job => <div className="ai-job" key={job.id}>
+        <div>{job.scope === "inbox" ? "Inbox" : "All mail"} · {job.status === "completed" && job.failed > 0 ? "Finished with failures" : aiLabel(job.status)} · up to {number(job.limit)}</div>
+        <p className="settings-note">{number(job.completed)} assessed · {number(job.failed)} failed · {number(job.queued)} queued from {number(job.scanned)} scanned</p>
+        {job.queued > 0 && <progress className="ai-job-progress" value={Math.min(job.queued, job.completed + job.failed)} max={job.queued} aria-label={`${job.scope === "inbox" ? "Inbox" : "All mail"} historical job, ${job.completed} assessed and ${job.failed} failed out of ${job.queued} queued`} />}
+        {job.problemCode && <p className="settings-error">{job.problemCode}</p>}
         <div className="ai-actions">{(job.status === "running" ? ["pause", "cancel"] as const : job.status === "paused" ? ["resume", "cancel"] as const : []).map(action => <button type="button" className="settings-text-button" disabled={busy || action === "resume" && !state.settings.enabled} key={action} onClick={() => void run(async (api, alive) => {
           const next = await api.control(job.id, action);
           if (!alive()) return;
@@ -198,16 +247,27 @@ export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) 
         }, "Could not change this job. Refresh progress and try again.")}>{aiLabel(action)}</button>)}</div>
       </div>)}
     </section>
-    <details className="ai-details">
-      <summary>{state.settings.mode === "preview" ? "Preview results" : "Assessment results"}</summary>
+    <section className="ai-section">
+      <h3>{state.settings.mode === "preview" ? "Preview results" : "Assessment results"}</h3>
       <p className="settings-note">{state.settings.mode === "preview" ? "Proposed categories are not applied. " : "Saved assessments. "}Loads only on request, up to 100 results.</p>
       <div className="ai-actions"><button type="button" className="settings-text-button" disabled={busy} onClick={() => void loadResults()}>{results ? "Refresh results" : "Load results"}</button>{hasMore && (results?.length ?? 0) < 100 && <button type="button" className="settings-text-button" disabled={busy} onClick={() => void loadResults(true)}>Load more</button>}</div>
       {results?.length === 0 && <p className="settings-note">No saved results returned. Pending work appears in the queue above.</p>}
       {!!results?.length && <div className="ai-table-scroll"><table className="ai-table"><thead><tr><th>{state.settings.mode === "preview" ? "Proposed category" : "Category"}</th><th>Assessment</th></tr></thead><tbody>{results.map(item => <tr key={JSON.stringify([item.sourceId, item.threadId])}><td>{item.override?.category || item.score?.category || "Not assessed"}<span className="ai-secondary">{aiLabel(item.state)}</span></td><td>{item.assessment ? <>{item.assessment.reason}<span className="ai-secondary">{aiLabel(item.assessment.type)} · {aiLabel(item.assessment.response)} · {aiLabel(item.assessment.risk)}</span></> : "Assessment not available"}</td></tr>)}</tbody></table></div>}
-    </details>
-    <details className="ai-details">
-      <summary>Diagnostics and estimated costs</summary>
-      <Usage usage={diagnostics?.usage ?? state.usage} />
+    </section>
+    <section className="ai-section">
+      <h3>Usage and estimated costs</h3>
+      <Usage usage={state.usage} />
+      {savedModel?.pricing ? <>
+        <p className="settings-note">Reference rates for the saved model. Estimates above use the rates recorded with each attempt.</p>
+        <dl className="ai-key-values">
+          <dt>Input / output per million tokens</dt><dd>{dollars(savedModel.pricing.inputPerMillion)} / {dollars(savedModel.pricing.outputPerMillion)}</dd>
+          <dt>Cached input / cache write</dt><dd>{savedModel.pricing.cachedInputPerMillion === null ? "Unknown" : dollars(savedModel.pricing.cachedInputPerMillion)} / {savedModel.pricing.cacheWriteInputPerMillion === null ? "Unknown" : dollars(savedModel.pricing.cacheWriteInputPerMillion)}</dd>
+          <dt>Rate source</dt><dd>{savedModel.pricing.source}</dd><dt>Rate version</dt><dd>{savedModel.pricing.version}</dd>
+        </dl>
+      </> : <p className="settings-note">Pricing is not configured. Unknown costs are not counted as zero.</p>}
+    </section>
+    <section className="ai-section">
+      <h3>Recent attempts</h3>
       <div className="ai-actions"><button type="button" className="settings-text-button" disabled={busy} onClick={() => void run(async (api, alive) => { const next = await api.diagnostics(); if (alive()) setDiagnostics(next); }, "Could not load diagnostics. Try again.")}>{diagnostics ? "Refresh diagnostics" : "Load recent attempts"}</button>
         <button type="button" className="settings-text-button" disabled={busy} onClick={() => void run(async (api, alive) => {
           const next = await api.diagnostics(); if (!alive()) return;
@@ -218,8 +278,8 @@ export function AiTriageSettings({ actions, mailboxes }: AiTriageSettingsProps) 
         }, "Could not download diagnostics. Try again.")}>Download diagnostics</button>
       </div>
       {diagnostics?.attempts.length === 0 && <p className="settings-note">No diagnostic attempts recorded.</p>}
-      {!!diagnostics?.attempts.length && <div className="ai-table-scroll"><table className="ai-table"><thead><tr><th>Attempt</th><th>Duration / queue</th></tr></thead><tbody>{diagnostics.attempts.slice(0, 50).map(attempt => <tr key={attempt.id}><td>{aiLabel(attempt.outcome)}{attempt.code && <span className="ai-secondary">{attempt.code}</span>}<span className="ai-secondary">{attempt.model}</span>{attempt.requestId && <span className="ai-secondary">Request: {attempt.requestId}</span>}</td><td>{attempt.durationMs === null ? "Pending" : `${number(attempt.durationMs)} ms`} / {number(attempt.queueMs)} ms</td></tr>)}</tbody></table></div>}
-    </details>
+      {!!diagnostics?.attempts.length && <div className="ai-table-scroll"><table className="ai-table"><thead><tr><th>Attempt</th><th>Duration / queue</th></tr></thead><tbody>{diagnostics.attempts.slice(0, 50).map(attempt => <tr key={attempt.id}><td>{aiLabel(attempt.outcome)}{attempt.code && <span className="ai-secondary" title={attempt.code}>{problemLabels[attempt.code] || aiLabel(attempt.code)}</span>}<span className="ai-secondary">{attempt.model}</span>{attempt.requestId && <span className="ai-secondary">Request: {attempt.requestId}</span>}</td><td>{attempt.durationMs === null ? "Pending" : `${number(attempt.durationMs)} ms`} / {number(attempt.queueMs)} ms</td></tr>)}</tbody></table></div>}
+    </section>
     <button type="button" className="settings-text-button ai-clear-reading" disabled={busy} onClick={() => {
       if (!window.confirm("Clear estimated reading history for this account? Emails, manual categories, interests, and other settings are kept.")) return;
       void run(async (api, alive) => { await api.clearReading(); if (alive()) setNotice("Estimated reading history cleared."); }, "Could not clear estimated reading history. Try again.");

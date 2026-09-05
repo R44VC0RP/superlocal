@@ -1,5 +1,6 @@
 /** Application-owned triage. These are not provider flags or permission grants. */
 export const AI_TRIAGE_VERSION = "triage-1";
+export const AI_INPUT_POLICY_VERSION = "input-2";
 export const AI_PREFERENCE_VERSION = "preference-1";
 export const aiKinds = ["conversation", "request", "notification", "invoice", "receipt", "newsletter", "promotion", "cold_outreach", "invitation", "other", "unknown"] as const;
 export const aiResponses = ["needed", "optional", "not_needed", "waiting", "unknown"] as const;
@@ -112,6 +113,8 @@ export type AiDecision = AiThreadKey & {
   inputHash: string | null;
   model: string;
   schemaVersion: string;
+  /** Policy used for the saved inference; absent on legacy or uninferred decisions. */
+  inputPolicyVersion?: string;
   updatedAt: string;
   /** Only new-arrival presentation may wait until this deadline, never startup. */
   holdUntil: string | null;

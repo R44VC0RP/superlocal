@@ -85,6 +85,7 @@ export function resolveMailShortcut(
     !event.metaKey &&
     !event.altKey &&
     /^[0-9]$/.test(event.key) &&
+    !context.settings &&
     (!context.modal || context.accountDialog)
   )
     return event.key === "0" ? { type: "unified" } : { type: "account", index: Number(event.key) - 1 };
@@ -100,12 +101,12 @@ export function resolveMailShortcut(
     return { type: "command" };
   if (context.modal) return null;
   if (event.key === "Escape") return { type: "escape" };
+  if (context.settings) return null;
   if (mod && key === "d" && !event.altKey && !shift && context.floatingDraft)
     return { type: "toggleFocus" };
   if (
     context.editing ||
     event.altKey ||
-    context.settings ||
     context.mode === "composer"
   )
     return null;

@@ -188,6 +188,25 @@ export interface MailboxQuery extends Omit<Query, 'accountId'> {
   snoozed?: boolean
 }
 
+export const MAILBOX_SYNC_PROBLEM_CODES = ['AUTHENTICATION', 'AUTHORIZATION', 'CREDENTIALS_REVOKED', 'CREDENTIALS_UNAVAILABLE',
+  'RECONNECT_REQUIRED', 'NOT_FOUND', 'RATE_LIMITED', 'INVALID_CURSOR', 'UNSUPPORTED_OPERATION', 'VALIDATION',
+  'NETWORK', 'UPSTREAM', 'INVALID_PROVIDER', 'INTERNAL'] as const
+export type MailboxSyncProblemCode = typeof MAILBOX_SYNC_PROBLEM_CODES[number]
+export interface MailboxSyncStatus {
+  sourceId: string
+  /** Opaque binding to the current effective source selection, not an individual mailbox view. */
+  scopeKey: string
+  state: 'syncing' | 'waiting' | 'error' | 'paused' | 'idle'
+  activeLanes: Array<'latest' | 'backfill'>
+  /** Earliest permitted retry, not a promise that a worker will run then. */
+  retryAt: string | null
+  problemCode: MailboxSyncProblemCode | null
+  /** Records in the last successfully committed batch; not unique arrivals or cumulative progress. */
+  lastBatch: { lane: 'latest' | 'backfill'; processed: number; completedAt: string; hasMore: boolean } | null
+  /** Persisted source timestamp, including native folders; not proof this selection or inbox completed. */
+  lastSyncAt: string | null
+}
+
 export interface MailboxSnapshotInput { mailboxIds: string[]; cursor?: string; limit?: number }
 /** Stable ID inventory, live rows: finish paging, then catch up from the fixed state baseline. */
 export interface MailboxSnapshotPage {
@@ -430,6 +449,8 @@ export interface Inbox {
   createMailbox(owner: string, input: MailboxInput): Promise<Mailbox>
   updateMailbox(owner: string, id: string, input: { name?: string; status?: Mailbox['status']; defaultSender?: string | null }, revision: number): Promise<Mailbox>
   mailboxMessages(owner: string, query: MailboxQuery): Promise<Page<MailboxMessageSummary>>
+  /** Read-only primary-inbox activity, grouped by source; excludes detached mailbox selections. */
+  mailboxSyncStatus(owner: string, input: { mailboxIds: string[] }): Promise<MailboxSyncStatus[]>
   mailboxSnapshot(owner: string, input: MailboxSnapshotInput): Promise<MailboxSnapshotPage>
   mailboxChanges(owner: string, input: MailboxChangesInput): Promise<MailboxChangesPage>
   /** Cached metadata only; never reads a body, including legacy fact enrichment. */
