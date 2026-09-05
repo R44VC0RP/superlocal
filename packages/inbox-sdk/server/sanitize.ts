@@ -555,6 +555,93 @@ function emailImageKey(source: string, attributes: Record<string, string>): stri
   return JSON.stringify([source, attributes.class ?? '', attributes.width ?? '', attributes.height ?? ''])
 }
 
+function markTrailingQuotedHistory(html: string): string {
+  if (html.length > 1_048_576 || !html.includes('<blockquote')
+    || !(html.includes('type="cite"') || html.includes('yahoo-quoted-begin') || html.includes('gmail_attr'))) return html
+  type Node = {
+    name: string; attributes: Record<string, string>; children: Node[]; parent?: Node; index: number
+    start: number; openEnd: number; end: number; content: boolean; meaningful: boolean; current: boolean
+    beforeCurrent?: boolean; afterMeaningful?: boolean
+  }
+  const root: Node = { name: '', attributes: {}, children: [], index: 0, start: 0, openEnd: 0, end: html.length, content: false, meaningful: false, current: false }
+  const stack = [root], nodes = [root], quotes: Node[] = []
+  const hasClass = (node: Node, value: string) => (node.attributes.class ?? '').split(/\s+/).includes(value)
+  const attribution = (node: Node) => hasClass(node, 'gmail_attr') || hasClass(node, 'yahoo-quoted-begin')
+  let events = 0, exceeded = false
+  // Annotation is optional: oversized or ambiguous documents stay fully visible.
+  const bounded = () => {
+    if (++events <= 20_000 && stack.length <= 64) return true
+    exceeded = true; parser.pause(); return false
+  }
+  const parser = new Parser({
+    onopentag(name, attributes) {
+      if (!bounded()) return
+      const parent = stack.at(-1)!
+      const content = /^(?:img|picture|source|table|hr)$/.test(name) || !!attributes.background
+        || /(?:^|;)\s*background(?:-image)?\s*:/i.test(attributes.style ?? '')
+      const node: Node = {
+        name, attributes, children: [], parent, index: parent.children.length, start: parser.startIndex, openEnd: parser.endIndex + 1, end: parser.endIndex + 1,
+        content, current: content,
+        // An empty styled/classed sibling can still contain CSS artwork; never step over it.
+        meaningful: content || !!attributes.style || !!attributes.class || !!attributes.width || !!attributes.height,
+      }
+      parent.children.push(node); stack.push(node); nodes.push(node)
+      if (name === 'blockquote') quotes.push(node)
+    },
+    ontext(text) {
+      if (!bounded() || !text.replace(/[\s\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '')) return
+      const parent = stack.at(-1)!
+      parent.children.push({ name: '', attributes: {}, children: [], parent, index: parent.children.length, start: parser.startIndex, openEnd: parser.startIndex, end: parser.endIndex + 1, content: true, meaningful: true, current: true })
+    },
+    onclosetag(name) {
+      if (!bounded()) return
+      const node = stack.pop()
+      if (!node || node === root || node.name !== name) { exceeded = true; parser.pause(); return }
+      node.end = parser.endIndex + 1
+      node.content ||= node.children.some(child => child.content)
+      node.meaningful ||= node.children.some(child => child.meaningful)
+      node.current = name !== 'blockquote' && !attribution(node)
+        && !hasClass(node, 'yahoo-signature') && !hasClass(node, 'gmail_signature')
+        && (node.current || node.children.some(child => child.current))
+    },
+  })
+  try { parser.end(html) } catch { return html }
+  if (exceeded || stack.length !== 1) return html
+  // Prefix/suffix flags keep many sibling quotes linear rather than rescanning their bodies.
+  for (const node of nodes) {
+    let before = false, after = false
+    for (const child of node.children) { child.beforeCurrent = before; before ||= child.current }
+    for (let index = node.children.length - 1; index >= 0; index--) {
+      const child = node.children[index]!
+      child.afterMeaningful = after; after ||= child.meaningful
+    }
+  }
+
+  for (const quote of quotes.reverse()) {
+    if (!quote.content) continue
+    const previous = quote.parent!.children[quote.index - 1]
+    const adjacent = previous && !html.slice(previous.end, quote.start).trim()
+    const yahoo = adjacent && previous.name === 'p' && hasClass(previous, 'yahoo-quoted-begin') && hasClass(quote, 'iosymail')
+    const gmail = adjacent && hasClass(previous, 'gmail_attr') && hasClass(quote, 'gmail_quote')
+    if (quote.attributes.type !== 'cite' && !yahoo && !gmail) continue
+    const group = yahoo || gmail ? [previous!, quote] : [quote]
+    let first = group[0]!, last = quote, current = false, trailing = true
+    for (let parent = quote.parent; parent; parent = parent.parent) {
+      // Historical text or a signature must not masquerade as a current reply.
+      if (parent.name === 'blockquote' || attribution(parent)
+        || hasClass(parent, 'yahoo-signature') || hasClass(parent, 'gmail_signature')) { trailing = false; break }
+      if (last.afterMeaningful) { trailing = false; break }
+      current ||= first.beforeCurrent ?? false
+      first = last = parent
+    }
+    if (!trailing || !current) continue
+    // Only one or two adjacent existing nodes are marked; content and sender layout stay intact.
+    for (const node of group.reverse()) html = `${html.slice(0, node.openEnd - 1)} data-inbox-quoted-history="true"${html.slice(node.openEnd - 1)}`
+    return html
+  }
+  return html
+}
+
 function sanitizeEmailMarkup(
   html: string,
   remoteImages: boolean,
@@ -577,7 +664,7 @@ function sanitizeEmailMarkup(
     return options.contentIds.get(cid) ?? options.contentIds.get(decoded) ?? value
   }
 
-  return sanitizeHtml(html, {
+  const clean = sanitizeHtml(html, {
     allowedTags: [...SAFE_EMAIL_TAGS, ...(options.document ? ['html', 'body'] : [])],
     allowedAttributes: {
       '*': ['class', 'dir', 'lang', 'title', 'aria-label', 'align', 'bgcolor', 'valign', 'role', 'style'],
@@ -587,6 +674,7 @@ function sanitizeEmailMarkup(
       td: ['width', 'height', 'colspan', 'rowspan', 'align', 'valign', 'background'],
       th: ['width', 'height', 'colspan', 'rowspan', 'align', 'valign', 'background'],
       font: ['color', 'face', 'size'],
+      blockquote: ['type'],
       ol: ['start', 'type'],
       li: ['value'],
       source: ['media', 'type'],
@@ -611,6 +699,12 @@ function sanitizeEmailMarkup(
             && options.backgroundContent ? () => { options.backgroundContent!.value = true } : undefined,
         }
         const sanitized = { ...attributes }
+        // Only the structural pass over sanitized output may confer collapse eligibility.
+        delete sanitized['data-inbox-quoted-history']
+        if (tagName === 'blockquote') {
+          if (attributes.type?.trim().toLowerCase() === 'cite') sanitized.type = 'cite'
+          else delete sanitized.type
+        }
         // Every emitted style uses the shared whitelist; URL values get AST/URI validation.
         if (attributes.style) sanitized.style = sanitizeInlineEmailStyles(attributes.style, context, attributes)
         if (attributes.background) {
@@ -654,24 +748,6 @@ function sanitizeEmailMarkup(
         bodyWrappers.add(attribs)
         return { tagName: 'div', attribs }
       },
-      div: (_tagName, attributes) => ({
-        tagName: 'div',
-        attribs: attributes.id === 'divRplyFwdMsg'
-          ? {
-              ...attributes,
-              class: [attributes.class, 'openmail-quoted-history'].filter(Boolean).join(' '),
-            }
-          : attributes,
-      }),
-      blockquote: (_tagName, attributes) => ({
-        tagName: 'blockquote',
-        attribs: attributes.type?.toLowerCase() === 'cite'
-          ? {
-              ...attributes,
-              class: [attributes.class, 'openmail-quoted-history'].filter(Boolean).join(' '),
-            }
-          : attributes,
-      }),
       a: (_tagName, attributes) => ({
         tagName: 'a',
         attribs: { ...attributes, ...(attributes.href ? { href: resolveCid(attributes.href) } : {}), rel: 'noopener noreferrer', target: '_blank' },
@@ -721,6 +797,7 @@ function sanitizeEmailMarkup(
       },
     },
   })
+  return markTrailingQuotedHistory(clean)
 }
 
 export function sanitizeEmailHtml(

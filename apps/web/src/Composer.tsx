@@ -1156,10 +1156,12 @@ export default function Composer({
               {status}
             </div>
           )}
-          <footer className="compose-footer">
+          {draft.dirty && !draft.saving && !draft.saveError && (
             <div className="compose-status" role="status">
-              {draft.saveError ? "Draft not saved" : draft.saving ? "Saving draft…" : draft.dirty ? "Unsaved recipient changes" : "Draft saved"}
+              Unsaved recipient changes
             </div>
+          )}
+          <footer className="compose-footer">
             <div className="compose-send-actions">
               <button
                 type="button"
