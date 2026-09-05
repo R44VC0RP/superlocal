@@ -12,6 +12,10 @@ Settings now replaces the email workspace with one continuous page. AI status an
 
 This remains a **draft** pending the review decision on the disclosed action-latency finding. No merge, deployment or paid historical refresh is approved by this review record.
 
+## Combined review in PR #12
+
+At the user's request, PR #13's [mailbox sync progress](../mailbox-sync-progress/review.md) is now included in this same PR. The branch was fast-forwarded to the already-qualified combined application tree `1881b6c481f747f1ed1e50b333089a2822435c34`; consolidation changes review documentation and screenshot presentation only. PR #13 is superseded, not merged into main. The original Settings/AI evidence below is retained alongside the sync-progress review, including its final 249 API tests, 68 web tests and 10k/50k qualification. Passing later samples do not waive the previously disclosed 205.7 ms W finding. Separate unfinished/deferred work is not included.
+
 ## Before and after
 
 | Scenario | Before | After |

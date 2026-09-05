@@ -4,11 +4,17 @@
 
 Show compact, honest mail-sync activity in the right sidebar immediately above its footer. Identify the working source/mailboxes, report actual stages/counts when available, distinguish provider backoff from failure, and stay quiet when idle. No fabricated completion percentage, automatic retry button, provider reconfiguration, or AI processing change.
 
-This is a stacked draft based on PR #12 (`dabfede15fba37bb08c0f55b0359a78d16011d58`), preserving the pending unified Settings/triage work. Production remains PR #11/main `18c78f673e1cc8ca7112f851f3ed6cf797c59c62`, verified healthy before work. PR #12 and its W-latency release decision remain unapproved. This PR grants no approval or deployment of either change.
+This work was developed as PR #13 on PR #12 (`dabfede15fba37bb08c0f55b0359a78d16011d58`). At the user's request, both now share **one review in PR #12**; PR #13 is superseded without a main merge. Consolidation preserves the exact tested application tree from `1881b6c481f747f1ed1e50b333089a2822435c34`; only review documentation and derived screenshot crops changed. Production remains PR #11/main `18c78f673e1cc8ca7112f851f3ed6cf797c59c62`. The combined PR #12 and its W-latency release decision remain unapproved.
 
 The original Mac private README edit and two unpublished classifier commits are excluded and preserved. Baseline-only commit `67f23af` and draft PR #13 preceded application edits. Feature commit: `f97ffda`.
 
 ## Before and after
+
+| Before — sidebar | After — syncing |
+| --- | --- |
+| ![Sidebar before sync progress](before-sidebar.png) | ![Sidebar showing active mailbox sync](after-sidebar.png) |
+
+These are matching crops of the full 1440×1000 fictional captures, highlighting the requested area above the footer. The full screenshots and recordings remain available below.
 
 | Scenario | Before | After |
 | --- | --- | --- |
@@ -84,4 +90,4 @@ Setup correction retained: the initial 45-second mock hold exceeded the SDK's ex
 
 ## Review gate
 
-Implementation, stated qualification and inspected evidence are complete. Remain draft pending user/designated-reviewer approval. PR12's previously disclosed concurrent W maximum **205.7 ms** against the **150 ms** budget is not erased or waived by these passing samples. Neither PR12 nor PR13 is approved for merge/deployment. No live mail/configuration mutation, paid inference or forced live provider sync was performed.
+Implementation, stated qualification and inspected evidence are complete. Remain draft pending user/designated-reviewer approval. PR12's previously disclosed concurrent W maximum **205.7 ms** against the **150 ms** budget is not erased or waived by these passing samples. The combined PR #12 is not approved for merge/deployment; PR #13 is superseded. No live mail/configuration mutation, paid inference or forced live provider sync was performed.
