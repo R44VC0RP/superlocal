@@ -19,7 +19,7 @@ const clock = new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit", 
 
 function statusText(row: MailboxSyncStatus): string {
   if (row.state === "paused") return "Sync paused";
-  if (row.state === "syncing") return row.activeLanes.includes("backfill") ? "Syncing older mail…" : "Checking for mail…";
+  if (row.state === "syncing") return row.activeLanes.includes("backfill") ? "Syncing older mail…" : "Syncing mail…";
   if (reconnect.has(row.problemCode ?? "")) return "Reconnect to resume syncing";
   if (row.state === "waiting") {
     const reason = row.problemCode === "RATE_LIMITED" ? "Rate limited" : "Waiting to retry";
@@ -30,7 +30,7 @@ function statusText(row: MailboxSyncStatus): string {
     if (row.problemCode === "NETWORK") return "Couldn’t reach the mail provider";
     return "Couldn’t sync mail";
   }
-  return row.lastSyncAt ? "Waiting for the next batch" : "Waiting for first sync";
+  return row.lastSyncAt ? "Syncing mail · between batches" : "Preparing mail sync…";
 }
 
 /** Status is sampled separately from the mail model: a poll must never refresh mail or start a sync. */
@@ -118,14 +118,17 @@ export function MailSyncStatus({ client, mailboxes, sources, enabled, onMailboxe
           const label = mailboxNames.slice(0, 2).join(", ") || source?.name || source?.email || "Mail account";
           const names = mailboxNames.join(", ");
           const active = !checking && !current?.error && visible && row.state === "syncing";
+          const unfinished = row.state === "syncing" || row.state === "idle" && Boolean(row.lastBatch?.hasMore);
+          const showProgress = unfinished && !checking && !current?.error;
           const problem = row.state === "error" || row.state === "waiting";
           return <li key={row.sourceId} className="mail-sync-row" data-sync-state={current?.error ? "unavailable" : row.state}>
-            <span className={`mail-sync-glyph${active ? " is-active" : ""}`} aria-hidden="true">
-              {active ? <i /> : problem || current?.error ? <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4"><circle cx="10" cy="10" r="7.5" /><path d="M10 5.5v5m0 2v1" /></svg> : row.state === "paused" ? <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M7 4v12M13 4v12" /></svg> : <Icon name="Clock" size={14} />}
+            <span className="mail-sync-glyph" aria-hidden="true">
+              {problem || current?.error ? <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4"><circle cx="10" cy="10" r="7.5" /><path d="M10 5.5v5m0 2v1" /></svg> : row.state === "paused" ? <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M7 4v12M13 4v12" /></svg> : <Icon name={unfinished ? "Refresh" : "Clock"} size={14} />}
             </span>
             <div className="mail-sync-copy">
               <div className="mail-sync-name" title={names}>{label}{boxes.length > 2 && <span> +{boxes.length - 2}</span>}</div>
               <p>{statusText(row)}</p>
+              {showProgress && <div className={`mail-sync-progress${active ? " is-active" : ""}`} role="progressbar" aria-label={`${label}: mail sync`} aria-valuetext={statusText(row)}><span /></div>}
               {row.lastBatch && <p className="mail-sync-count">Last batch: {numbers.format(row.lastBatch.processed)} {row.lastBatch.processed === 1 ? "record" : "records"} saved</p>}
             </div>
           </li>;

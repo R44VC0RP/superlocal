@@ -5,6 +5,7 @@
 .mail-sync-status {
   padding: 12px var(--sidebar-gutter) 0;
   color: var(--muted);
+  font-family: "Helvetica Neue", sans-serif;
   font-size: var(--ui-small);
   line-height: 1.4;
 }
@@ -31,14 +32,25 @@
   color: var(--muted);
 }
 .mail-sync-glyph > svg { width: 14px; height: 14px; }
-.mail-sync-glyph > i {
-  width: 12px;
-  height: 12px;
-  border: 1.5px solid var(--border);
-  border-top-color: var(--muted);
-  border-right-color: var(--muted);
-  border-radius: 50%;
-  animation: mail-sync-turn 1s linear infinite;
+.mail-sync-progress {
+  height: 3px;
+  margin-block: 7px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--border);
+}
+.mail-sync-progress > span {
+  display: block;
+  width: 30%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--muted);
+  transform: translateX(115%);
+  opacity: .5;
+}
+.mail-sync-progress.is-active > span {
+  opacity: 1;
+  animation: mail-sync-slide 1.5s ease-in-out infinite alternate;
 }
 .mail-sync-copy { min-width: 0; flex: 1; }
 .mail-sync-name {
@@ -66,9 +78,12 @@
   height: auto;
   background: var(--sidebar);
 }
-@keyframes mail-sync-turn { to { transform: rotate(360deg); } }
+@keyframes mail-sync-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(333%); }
+}
 @media (prefers-reduced-motion: reduce) {
-  .mail-sync-glyph > i { animation: none; }
+  .mail-sync-progress.is-active > span { animation: none; }
 }
 @media (max-width: 700px) {
   .mail-sync-settings { min-height: 44px; }
