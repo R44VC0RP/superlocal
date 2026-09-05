@@ -3033,6 +3033,87 @@ describe('finite mailbox snapshot streams', () => {
 })
 
 describe('mailbox action HTTP receipts', () => {
+  test('atomic reminder receipts survive lost acknowledgements, restart and elapsed time with exact conditional Undo', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account, box } = await h.seed('alice', 'durable-reminder', [native('remind-one', { threadId: 'reminder-thread' }), native('remind-two', { threadId: 'reminder-thread' })])
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!, scope = { mailboxIds: [mailbox.id] }
+    const original = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    const before: MailboxMembership[] = []
+    for (const [index, message] of original.entries()) before.push(await h.inbox.setMailboxState('alice', mailbox.id, message.id, {
+      done: index === 0, snoozedUntil: new Date(EPOCH + (index + 1) * 86400000).toISOString(),
+    }, message.memberships[0]!.revision))
+    const targets = before.map(({ mailboxId, messageId, revision }) => ({ mailboxId, messageId, revision }))
+    const when = EPOCH + 3 * 86400000
+    const input = { id: 'durable-reminder-command', targets, snoozedUntil: new Date(when).toUTCString() }
+    await expect(h.inbox.setMailboxStates('alice', { ...input, id: 'stale-reminder-target', targets: targets.map((target, index) => index ? { ...target, revision: 999 } : target) })).rejects.toMatchObject({ status: 412 })
+    expect((await h.inbox.mailboxMessagePage('alice', scope)).items.map(message => message.memberships[0])).toEqual(before)
+    await expect(h.inbox.mailboxStateReceipt('alice', 'stale-reminder-target')).rejects.toMatchObject({ status: 404 })
+    const wire = transport(h)
+    let loseAcknowledgement = true
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', headers: { authorization: 'Bearer alice' }, fetch: (async (url, init) => {
+      const response = await wire.fetch(url, init)
+      if (loseAcknowledgement && new URL(String(url)).pathname === '/v1/mailbox-actions' && init?.method === 'POST') { loseAcknowledgement = false; throw new TypeError('Synthetic lost reminder acknowledgement') }
+      return response
+    }) as typeof fetch })
+    await expect(client.setMailboxStates(input)).rejects.toThrow('Synthetic lost reminder acknowledgement')
+    const accepted = await client.mailboxStateReceipt(input.id)
+    expect(accepted).toEqual({ id: input.id, retracted: false, states: before.map(state => ({ ...state, snoozedUntil: new Date(when).toISOString(), revision: state.revision + 1 })) })
+    const acceptedState = (await h.inbox.changes('alice')).state
+    expect(await client.setMailboxStates(input)).toEqual(accepted)
+    expect((await h.inbox.changes('alice')).state).toBe(acceptedState)
+    await h.restart()
+    h.clock.value = when + 1
+    expect(await client.mailboxStateReceipt(input.id)).toEqual(accepted)
+    expect(await client.setMailboxStates(input)).toEqual(accepted)
+    expect((await h.inbox.changes('alice')).state).toBe(acceptedState)
+    await expect(client.setMailboxStates({ ...input, snoozedUntil: new Date(when + 86400000).toISOString() })).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT', status: 409 })
+    await expect(client.setMailboxStates({ ...input, done: false })).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT', status: 409 })
+    box.put(native('later-reminder-reply', { threadId: 'reminder-thread', receivedAt: new Date(h.clock.value).toISOString() }))
+    await h.sync('alice', account.id)
+    const providerCalls = structuredClone(box.calls)
+    const undone = await client.undoMailboxStates(input.id)
+    expect(undone).toEqual({ id: input.id, retracted: true, states: before.map(state => ({ ...state, revision: state.revision + 2 })) })
+    expect(await client.mailboxStateReceipt(input.id)).toEqual(undone)
+    expect(await client.undoMailboxStates(input.id)).toEqual(undone)
+    expect(await client.setMailboxStates(input)).toEqual(undone)
+    const current = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    for (const state of undone.states) expect(current.find(message => message.id === state.messageId)!.memberships[0]).toEqual(state)
+    expect(current.find(message => message.subject === 'Subject later-reminder-reply')!.memberships[0]).toMatchObject({ revision: 1, done: false, snoozedUntil: null })
+    expect(box.calls).toEqual(providerCalls)
+  })
+
+  test('reminder actions validate changes and byte limits, preserve Done on clear, and refuse stale atomic Undo', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { box } = await h.seed('alice', 'reminder-guards', [native('one'), native('two')])
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!, scope = { mailboxIds: [mailbox.id] }
+    const messages = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    const targets = messages.map(message => ({ mailboxId: mailbox.id, messageId: message.id, revision: 1 }))
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    const post = (body: unknown) => h.request('alice', '/mailbox-actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    for (const changes of [{}, { done: null }, { snoozedUntil: false }, { snoozedUntil: '' }, { snoozedUntil: 'invalid' }, { snoozedUntil: new Date(EPOCH).toISOString() }, { snoozedUntil: new Date(EPOCH - 1).toISOString() }, { snoozedUntil: null, force: true }]) {
+      await invalid(await post({ id: 'invalid-reminder', targets, ...changes }), 400)
+      await expect(h.inbox.setMailboxStates('alice', { id: 'invalid-reminder', targets, ...changes } as never)).rejects.toMatchObject({ code: 'VALIDATION' })
+    }
+    const body = JSON.stringify({ id: 'oversized-reminder', targets, snoozedUntil: null }) + ' '.repeat(1024 * 1024)
+    await invalid(await h.request('alice', '/mailbox-actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body }), 413)
+    await expect(client.mailboxStateReceipt('oversized-reminder')).rejects.toMatchObject({ status: 404 })
+    const providerCalls = structuredClone(box.calls), snoozedUntil = new Date(EPOCH + 86400000).toISOString()
+    const input = { id: 'mixed-reminder-command', targets, done: true, snoozedUntil }
+    const accepted = await client.setMailboxStates(input)
+    expect(accepted.states.every(state => state.done && state.snoozedUntil === snoozedUntil && state.revision === 2)).toBe(true)
+    await h.inbox.setMailboxState('alice', mailbox.id, targets[1]!.messageId, { done: false }, 2)
+    const beforeUndo = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    await expect(client.undoMailboxStates(input.id)).rejects.toMatchObject({ code: 'PRECONDITION_FAILED', status: 412 })
+    expect((await h.inbox.mailboxMessagePage('alice', scope)).items).toEqual(beforeUndo)
+    expect(await client.mailboxStateReceipt(input.id)).toEqual(accepted)
+    expect(await client.setMailboxStates(input)).toEqual(accepted)
+    const cleared = await client.setMailboxStates({ id: 'clear-reminder-only', targets: [{ ...targets[0]!, revision: 2 }], snoozedUntil: null })
+    expect(cleared.states[0]).toMatchObject({ done: true, snoozedUntil: null, revision: 3 })
+    const legacy = await client.setMailboxStates({ id: 'legacy-done-clears-reminder', targets: [{ ...targets[1]!, revision: 3 }], done: false })
+    expect(legacy.states[0]).toMatchObject({ done: false, snoozedUntil: null, revision: 4 })
+    expect(box.calls).toEqual(providerCalls)
+  })
+
   test('receipt GET is uncached, owner-exact and historical without replay, retraction, events, count changes or provider work', async () => {
     const h = await fixture({ allowProviderWrites: false })
     const alice = await h.seed('alice', 'receipt-reader-alice'), bob = await h.seed('bob', 'receipt-reader-bob')
@@ -3105,6 +3186,11 @@ describe('mailbox action HTTP receipts', () => {
     const accepted = await client.setMailboxStates(input)
     expect(accepted).toEqual({ id: input.id, retracted: false, states: targets.map(target => ({ mailboxId: target.mailboxId, messageId: target.messageId, revision: target.revision + 1, done: true, snoozedUntil: null })) })
     expect(wire.requests.map(request => [request.method, request.path])).toEqual([['POST', '/v1/mailbox-actions']])
+    const legacyHash = createHash('sha256').update(JSON.stringify({ done: true, id: input.id, targets: targets.map(({ mailboxId, messageId, messageRevision, revision }) => ({ mailboxId, messageId, messageRevision, revision })) })).digest('hex')
+    const persisted = new Database(h.database, { readonly: true })
+    try { expect(persisted.query<{ fingerprint: string }, [string, string]>('SELECT fingerprint FROM sdk_mailbox_actions WHERE owner=? AND id=?').get('alice', input.id)?.fingerprint).toBe(legacyHash) }
+    finally { persisted.close() }
+    expect(await h.inbox.setMailboxStates('alice', { ...input, snoozedUntil: undefined })).toEqual(accepted)
     expect(await client.mailboxStateReceipt(input.id)).toEqual(accepted)
     expect(await client.setMailboxStates(input)).toEqual(accepted)
     const undone = await client.undoMailboxStates(input.id)
@@ -3154,24 +3240,37 @@ describe('mailbox action HTTP receipts', () => {
     const h = await fixture({ allowProviderWrites: false })
     const { account } = await h.seed('alice', 'http-local-bound', Array.from({ length: 500 }, (_, index) => native(`bound-${index}`)))
     const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
-    const targets: Array<{ mailboxId: string; messageId: string; revision: number }> = []
+    const targets: Array<{ mailboxId: string; messageId: string; revision: number; messageRevision: number }> = []
     let cursor: string | undefined
     do {
       const page = await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id], limit: 100, ...(cursor ? { cursor } : {}) })
-      targets.push(...page.items.map(message => ({ mailboxId: mailbox.id, messageId: message.id, revision: message.memberships[0]!.revision })))
+      targets.push(...page.items.map(message => ({ mailboxId: mailbox.id, messageId: message.id, revision: message.memberships[0]!.revision, messageRevision: message.revision })))
       cursor = page.nextCursor ?? undefined
     } while (cursor)
     const wire = transport(h)
     const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' } })
     await expect(client.setMailboxStates({ id: 'too-many', targets: [...targets, targets[0]!], done: true })).rejects.toMatchObject({ status: 400 })
     await invalid(await h.request('alice', '/mailbox-actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'extra-field', targets: [targets[0]], done: true, force: true }) }), 400)
-    const result = await client.setMailboxStates({ id: 'maximum-targets', targets, done: true })
+    const input = { id: 'maximum-targets', targets, done: true }
+    expect(Buffer.byteLength(JSON.stringify(input))).toBeGreaterThan(64 * 1024)
+    expect(Buffer.byteLength(JSON.stringify(input))).toBeLessThan(1024 * 1024)
+    const result = await client.setMailboxStates(input)
     expect(result.states).toHaveLength(500)
     expect(result.states.every(state => state.done && state.revision === 2)).toBe(true)
+    const acceptedState = (await h.inbox.changes('alice')).state
+    expect(await client.setMailboxStates(input)).toEqual(result)
+    expect((await h.inbox.changes('alice')).state).toBe(acceptedState)
     expect(await client.mailboxStateReceipt(result.id)).toEqual(result)
     const undone = await client.undoMailboxStates(result.id)
     expect(undone.states).toHaveLength(500)
     expect(undone.states.every(state => !state.done && state.revision === 3)).toBe(true)
+    const reminder = { id: 'maximum-reminder-targets', targets: targets.map(target => ({ ...target, revision: 3 })), snoozedUntil: new Date(EPOCH + 86400000).toISOString() }
+    expect(Buffer.byteLength(JSON.stringify(reminder))).toBeGreaterThan(64 * 1024)
+    const reminded = await client.setMailboxStates(reminder)
+    expect(reminded.states).toHaveLength(500)
+    expect(reminded.states.every(state => !state.done && state.revision === 4 && state.snoozedUntil === reminder.snoozedUntil)).toBe(true)
+    expect(await client.setMailboxStates(reminder)).toEqual(reminded)
+    expect(await client.mailboxStateReceipt(reminder.id)).toEqual(reminded)
   })
 })
 

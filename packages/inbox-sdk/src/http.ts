@@ -175,9 +175,9 @@ const schemas = {
     defaultSender: z.string().min(1).max(1024).nullable().optional(),
   }).refine((value) => Object.keys(value).length > 0),
   MailboxState: z.strictObject({ done: z.boolean().optional(), snoozedUntil: date.nullable().optional() }).refine((value) => Object.keys(value).length > 0),
-  MailboxAction: z.strictObject({ id: id.max(128), done: z.boolean(), targets: z.array(z.strictObject({
+  MailboxAction: z.strictObject({ id: id.max(128), done: z.boolean().optional(), snoozedUntil: date.nullable().optional(), targets: z.array(z.strictObject({
     mailboxId: id, messageId: id, revision: revision.min(1), messageRevision: revision.min(1).optional(),
-  })).min(1).max(500) }),
+  })).min(1).max(500) }).refine(value => value.done !== undefined || value.snoozedUntil !== undefined),
   MailboxStateReceipt: z.object({ id: id.max(128), retracted: z.boolean(), states: z.array(membership).max(500) }),
   Membership: membership,
   MailboxMessageSummary: mailboxMessageSummary,
@@ -520,8 +520,8 @@ export function createInboxApi(options: InboxApiOptions) {
     return json(c, validate(schemas.Mailbox, await inbox.updateMailbox(c.get('owner'), current.id, input, current.revision)))
   })
   route('post', '/v1/mailboxes/:id/sync', { summary: 'Synchronize an owned mailbox', input: 'SyncRequest', output: 'SyncResult' }, async (c) => json(c, await inbox.syncMailbox(c.get('owner'), pathId(c), body(c, schemas.SyncRequest, true))))
-  route('post', '/v1/mailbox-actions', { summary: 'Apply an atomic mailbox-local Done action', input: 'MailboxAction', output: 'MailboxStateReceipt',
-    description: 'Body-free local state only. Targets carry membership revisions and optional message revisions. id is an owner-scoped idempotency key: the same input returns its stored receipt, not current state; conflicting reuse is rejected.' }, async (c) => json(c, validate(schemas.MailboxStateReceipt, await inbox.setMailboxStates(c.get('owner'), body(c, schemas.MailboxAction)))))
+  route('post', '/v1/mailbox-actions', { summary: 'Apply an atomic mailbox-local Done or snooze action', input: 'MailboxAction', output: 'MailboxStateReceipt',
+    description: 'Body-free local state only, with the existing 1 MiB HTTP request limit and 1–500 explicit targets. Provide done, snoozedUntil, or both. Snooze-only preserves Done; Done-only clears snooze as before. New non-null snoozes must be future instants and are stored as ISO timestamps. Targets carry membership revisions and optional message revisions. id is an owner-scoped idempotency key: identical retries return the stored receipt even after the reminder time passes, not current state; conflicting reuse is rejected.' }, async (c) => json(c, validate(schemas.MailboxStateReceipt, await inbox.setMailboxStates(c.get('owner'), body(c, schemas.MailboxAction)))))
   route('get', '/v1/mailbox-actions/:id', { summary: 'Read an owned historical mailbox action receipt', output: 'MailboxStateReceipt', noStore: true,
     description: 'Read-only, owner-bound persisted receipt with at most 500 states. Does not retract, replay or mutate the action. Historical receipts remain readable after source disconnect or mailbox detach; they describe the accepted action, not current membership state.' }, async c => {
     c.header('Referrer-Policy', 'no-referrer')

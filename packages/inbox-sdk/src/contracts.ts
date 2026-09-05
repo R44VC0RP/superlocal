@@ -507,8 +507,9 @@ export interface Inbox {
   mailboxMessageSummary(owner: string, mailboxId: string, messageId: string): Promise<MailboxMessageSummary>
   mailboxMessage(owner: string, mailboxId: string, messageId: string): Promise<Message & { sourceId: string; memberships: MailboxMembership[] }>
   setMailboxState(owner: string, mailboxId: string, messageId: string, input: { done?: boolean; snoozedUntil?: string | null }, revision: number): Promise<MailboxMembership>
-  /** Atomic local-only state change with a durable idempotency receipt; no provider mutation. */
-  setMailboxStates(owner: string, input: { id: string; targets: MailboxStateTarget[]; done: boolean }): Promise<MailboxStateReceipt>
+  /** Atomic local-only state change with a durable idempotency receipt; no provider mutation.
+   * At least one change is required. Snooze-only preserves Done; Done-only clears snooze as before. */
+  setMailboxStates(owner: string, input: { id: string; targets: MailboxStateTarget[]; done?: boolean; snoozedUntil?: string | null }): Promise<MailboxStateReceipt>
   /** Read the owned historical receipt, even after its source is detached; never changes mailbox state. */
   mailboxStateReceipt(owner: string, id: string): Promise<MailboxStateReceipt>
   undoMailboxStates(owner: string, id: string): Promise<MailboxStateReceipt>

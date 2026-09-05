@@ -2324,9 +2324,11 @@ export function createInbox(options: InboxOptions): Inbox {
     })),
     setMailboxStates: (owner, input) => run(() => transaction(() => {
       ownerId(owner)
-      if (!input || Object.keys(input).some(key => !['id', 'targets', 'done'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox action.')
+      if (!input || Object.keys(input).some(key => !['id', 'targets', 'done', 'snoozedUntil'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox action.')
       text(input.id, 'Action ID', 128)
-      if (typeof input.done !== 'boolean' || !Array.isArray(input.targets) || !input.targets.length || input.targets.length > 500) throw new InboxError('VALIDATION', 'Use 1–500 mailbox message targets.')
+      if (input.done === undefined && input.snoozedUntil === undefined || input.done !== undefined && typeof input.done !== 'boolean') throw new InboxError('VALIDATION', 'Provide Done or snooze state for the mailbox action.')
+      if (input.snoozedUntil !== undefined && input.snoozedUntil !== null && (typeof input.snoozedUntil !== 'string' || input.snoozedUntil.length > 100 || !Number.isFinite(Date.parse(input.snoozedUntil)))) throw new InboxError('VALIDATION', 'Invalid snooze instant.')
+      if (!Array.isArray(input.targets) || !input.targets.length || input.targets.length > 500) throw new InboxError('VALIDATION', 'Use 1–500 mailbox message targets.')
       for (const target of input.targets) {
         if (!target || Object.keys(target).some(key => !['mailboxId', 'messageId', 'revision', 'messageRevision'].includes(key)) || !Number.isSafeInteger(target.revision) || target.revision < 1 || target.messageRevision !== undefined && (!Number.isSafeInteger(target.messageRevision) || target.messageRevision < 1)) throw new InboxError('VALIDATION', 'Invalid mailbox message target.')
         text(target.mailboxId, 'Mailbox ID', 512); text(target.messageId, 'Message ID', 512)
@@ -2337,6 +2339,8 @@ export function createInbox(options: InboxOptions): Inbox {
         if (prior.fingerprint !== hash) throw new InboxError('IDEMPOTENCY_CONFLICT', 'This action ID already describes different targets.', 409)
         return JSON.parse(prior.data) as MailboxStateReceipt
       }
+      // Durable retries remain valid after their reminder instant has passed.
+      if (input.snoozedUntil && Date.parse(input.snoozedUntil) <= now()) throw new InboxError('VALIDATION', 'Snooze requires a future instant.')
       const keys = new Set<string>()
       const before = input.targets.map(target => {
         const key = `${target.mailboxId}\0${target.messageId}`
@@ -2347,7 +2351,8 @@ export function createInbox(options: InboxOptions): Inbox {
         if (target.messageRevision !== undefined && summary(messageRow(owner, target.messageId)).revision !== target.messageRevision) throw new InboxError('PRECONDITION_FAILED', 'Message changed.', 412)
         return state
       })
-      const states = before.map(state => ({ ...state, done: input.done, snoozedUntil: null, revision: state.revision + 1 }))
+      const states = before.map(state => ({ ...state, ...(input.done === undefined ? {} : { done: input.done }),
+        snoozedUntil: input.snoozedUntil ? new Date(input.snoozedUntil).toISOString() : null, revision: state.revision + 1 }))
       for (const state of states) {
         db.query('UPDATE sdk_memberships SET data=? WHERE owner=? AND mailbox=? AND message=?').run(JSON.stringify(state), owner, state.mailboxId, state.messageId)
         event(owner, 'membership.updated', mailboxRow(owner, state.mailboxId).source, state.messageId, 'updated', 'mutation', state.mailboxId)
