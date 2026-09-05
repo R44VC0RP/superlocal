@@ -2123,6 +2123,239 @@ function sse(response: Response) {
   }
 }
 
+describe('live bounded mailbox reads', () => {
+  test('cached keyset messages survive ordinary events and reconcile arrivals, backfill and deletion from the first state', async () => {
+    const h = await fixture()
+    const { account, box } = await h.seed('alice', 'live-keyset', Array.from({ length: 6 }, (_, index) => native(`live-${index}`, { bodyText: BODY_SECRET })))
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 2 }
+    const wire = transport(h), client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' }, cacheScope: 'live-keyset' })
+    const first = await client.mailboxMessagePage(scope)
+    expect(first.items).toHaveLength(2)
+    expect(first).not.toHaveProperty('total')
+    const original = (await client.mailboxMessages({ mailboxIds: scope.mailboxIds })).items
+    const deleted = original.find(item => !first.items.some(loaded => loaded.id === item.id))!
+    await client.message(first.items[0]!.id)
+    await client.mailboxCounts({ mailboxIds: scope.mailboxIds })
+    await client.mailboxConversations({ mailboxIds: scope.mailboxIds, limit: 1 })
+    await client.mailboxMessagePage(scope)
+    await client.message(first.items[0]!.id)
+    expect(wire.requests.at(-1)!.status).toBe(304)
+    await client.createDraft({ accountId: account.id, subject: 'Unrelated metadata' })
+    await client.mutate({ messageIds: [first.items[0]!.id], changes: { isRead: true }, idempotencyKey: 'live-flags' })
+    await h.inbox.runDue()
+    box.remove(deleted.subject.replace('Subject ', ''))
+    box.put(native('live-arrival', { receivedAt: new Date(EPOCH + 1000).toISOString() }))
+    box.put(native('live-backfill', { receivedAt: new Date(EPOCH - 86400000).toISOString() }))
+    await h.sync('alice', account.id)
+    const reads = structuredClone(box.calls)
+    const collected = [...first.items]
+    let cursor = first.nextCursor
+    while (cursor) {
+      const page = await client.mailboxMessagePage({ ...scope, cursor })
+      expect(page.state).toBe(first.state); expect(page.scopeState).toBe(first.scopeState)
+      expect(page.items).toHaveLength(Math.min(2, page.items.length))
+      collected.push(...page.items); cursor = page.nextCursor
+    }
+    expect(new Set(collected.map(item => item.id)).size).toBe(collected.length)
+    expect(collected.some(item => item.subject === 'Subject live-arrival')).toBe(false)
+    expect(collected.some(item => item.subject === 'Subject live-backfill')).toBe(true)
+    const current = new Map(collected.map(item => [item.id, item])), affected = new Set<string>()
+    let state = first.state, more = true
+    while (more) {
+      const delta = await client.mailboxChanges({ mailboxIds: scope.mailboxIds, since: state, scopeState: first.scopeState, limit: 2 })
+      expect(delta.resetRequired).toBe(false)
+      for (const item of delta.upserts) current.set(item.id, item)
+      for (const item of delta.removed) current.delete(item.messageId)
+      for (const key of delta.affectedThreads) affected.add(key.threadId)
+      state = delta.state; more = delta.hasMore
+    }
+    expect(affected.has(deleted.threadId)).toBe(true)
+    const latest = await client.mailboxMessagePage({ mailboxIds: scope.mailboxIds })
+    expect([...current.values()].sort((a, b) => a.id.localeCompare(b.id))).toEqual([...latest.items].sort((a, b) => a.id.localeCompare(b.id)))
+    expect(await client.mailboxCounts({ mailboxIds: scope.mailboxIds })).toMatchObject({ messages: 7, conversations: 7, asOfState: latest.state, scopeState: first.scopeState })
+    expect(box.calls).toEqual(reads)
+    expect(JSON.stringify(first)).not.toContain(BODY_SECRET)
+  })
+
+  test('complete conversation aggregates include nonmatching history, bounded previews/targets, native states and exact source/thread identity', async () => {
+    const h = await fixture({ eventRetention: 10000 })
+    const giant = Array.from({ length: 620 }, (_, index) => native(`giant-${index}`, { threadId: 'giant', subject: index ? 'Same subject' : 'Rare matching needle',
+      receivedAt: new Date(EPOCH - index * 1000).toISOString(), isRead: index !== 619, isStarred: index === 619,
+      folder: index === 619 ? 'archive' : 'inbox', ...(index === 619 ? { attachments: [{ id: 'attachment', filename: 'file.txt', contentType: 'text/plain', size: 3, url: 'https://example.test/attachment' }] } : {}) }))
+    const { account, box } = await h.seed('alice', 'live-conversations', [...giant, native('small-a', { threadId: 'small', subject: 'Same subject' }), native('small-b', { threadId: 'small', subject: 'Same subject' })])
+    const sibling = await h.seed('alice', 'live-conversations-sibling', [native('giant-0', { threadId: 'giant', subject: 'Same subject' })])
+    const scope = { mailboxIds: (await h.inbox.mailboxes('alice')).map(box => box.id) }
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    const first = await client.mailboxConversations({ ...scope, limit: 1 })
+    const rows = [...first.items]
+    let cursor = first.nextCursor
+    while (cursor) { const page = await client.mailboxConversations({ ...scope, limit: 1, cursor }); rows.push(...page.items); cursor = page.nextCursor }
+    expect(rows).toHaveLength(3)
+    const aggregate = rows.find(row => row.messageCount === 620)!
+    expect(aggregate).toMatchObject({ sourceId: account.id, isRead: false, isStarred: true, hasAttachments: true, nativeFolders: { inbox: true, archive: true }, messagesComplete: false, targetsComplete: false })
+    expect(aggregate.messages).toHaveLength(50); expect(aggregate.targets).toHaveLength(500)
+    expect(aggregate.messages.every(message => message.isRead && !message.isStarred && !message.hasAttachments)).toBe(true)
+    expect(aggregate.mailboxStates).toEqual([{ mailboxId: scope.mailboxIds.find(id => aggregate.messages[0]!.memberships.some(member => member.mailboxId === id))!, messageCount: 620, doneCount: 0, snoozedCount: 0 }])
+    const key = { sourceId: aggregate.sourceId, threadId: aggregate.threadId }
+    expect((await client.mailboxConversations({ ...scope, keys: [key], query: { search: 'subject:needle' } })).items[0]!.messageCount).toBe(620)
+    expect(await client.mailboxCounts({ ...scope, query: { search: 'subject:needle' } })).toMatchObject({ messages: 1, conversations: 1 })
+    expect(await client.mailboxCounts(scope)).toMatchObject({ messages: 623, conversations: 3 })
+    expect((await client.mailboxConversations({ ...scope, keys: [{ ...key, sourceId: sibling.account.id }] })).items).toEqual([])
+    const history = await client.mailboxMessagePage({ ...scope, ...key, limit: 500 })
+    const tail = await client.mailboxMessagePage({ ...scope, ...key, limit: 500, cursor: history.nextCursor! })
+    expect(history.items).toHaveLength(500); expect(tail.items).toHaveLength(120); expect(tail.nextCursor).toBeNull()
+    const small = rows.find(row => row.messageCount === 2)!
+    expect(small.messagesComplete && small.targetsComplete).toBe(true)
+    box.put(native('small-later', { threadId: 'small', receivedAt: new Date(EPOCH + 1000).toISOString() }))
+    await h.sync('alice', account.id)
+    await client.setMailboxStates({ id: 'captured-small-only', targets: small.targets, done: true })
+    const changed = (await client.mailboxConversations({ ...scope, keys: [{ sourceId: small.sourceId, threadId: small.threadId }] })).items[0]!
+    expect(changed).toMatchObject({ messageCount: 3, mailboxStates: [{ messageCount: 3, doneCount: 2 }] })
+    expect(changed.messages.find(message => message.subject === 'Subject small-later')!.memberships[0]!.done).toBe(false)
+    const database = new Database(h.database)
+    await h.restart(database)
+    const providerCalls = structuredClone(box.calls)
+    database.exec('PRAGMA query_only=ON')
+    expect((await h.inbox.mailboxConversations('alice', { ...scope, keys: [key] })).items[0]!.messageCount).toBe(620)
+    expect((await h.inbox.mailboxMessagePage('alice', { ...scope, ...key })).items).toHaveLength(500)
+    expect(await h.inbox.mailboxCounts('alice', scope)).toMatchObject({ messages: 624, conversations: 3 })
+    expect(box.calls).toEqual(providerCalls)
+  })
+
+  test('factual conversation aggregates include oldest subjects and awake inbox history beyond previews with scoped snooze deduplication', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const domains = ['alpha.example.test', 'beta.example.test', 'gamma.example.test']
+    h.discoveries.set('factual-aggregates', { sources: domains.map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const oldestTime = new Date(EPOCH - 100000).toISOString()
+    const giant = [
+      native('old-a', { threadId: 'awake-history', subject: 'Original oldest A', receivedAt: oldestTime, sourceDomains: [domains[0]!] }),
+      native('old-b', { threadId: 'awake-history', subject: 'Original oldest B', receivedAt: oldestTime, sourceDomains: [domains[0]!] }),
+      ...Array.from({ length: 50 }, (_, index) => native(`sent-${index}`, { threadId: 'awake-history', folder: 'sent', receivedAt: new Date(EPOCH - index * 1000).toISOString(), sourceDomains: [domains[0]!] })),
+    ]
+    const phantom = [native('done-inbox', { threadId: 'done-inbox-awake-archive', subject: 'Original done inbox', receivedAt: oldestTime, sourceDomains: [domains[0]!] }),
+      ...Array.from({ length: 50 }, (_, index) => native(`archive-${index}`, { threadId: 'done-inbox-awake-archive', subject: `New archive ${index}`, folder: 'archive', receivedAt: new Date(EPOCH - index * 1000).toISOString(), sourceDomains: [domains[1]!] })),
+    ]
+    const mixed = [native('mixed-a', { threadId: 'mixed-snooze', receivedAt: new Date(EPOCH - 5000).toISOString(), sourceDomains: domains.slice(0, 2) }),
+      native('mixed-b', { threadId: 'mixed-snooze', receivedAt: new Date(EPOCH - 4000).toISOString(), sourceDomains: domains.slice(0, 2) }),
+      native('mixed-c', { threadId: 'mixed-snooze', receivedAt: new Date(EPOCH - 3000).toISOString(), sourceDomains: domains.slice(0, 2) }),
+      native('unselected-oldest', { threadId: 'mixed-snooze', receivedAt: new Date(EPOCH - 1000000).toISOString(), sourceDomains: [domains[2]!] }),
+    ]
+    const { account, box } = await h.connect('alice', 'factual-aggregates', [...giant, ...phantom, ...mixed], SCOPED)
+    const boxes = [] as Mailbox[]
+    for (const domain of domains) boxes.push(await h.inbox.createMailbox('alice', { sourceId: account.id, name: domain, selector: { kind: 'domain', value: domain } }))
+    const [alpha, beta] = boxes as [Mailbox, Mailbox, Mailbox]
+    const scope = { mailboxIds: [alpha.id, beta.id, alpha.id] }
+    await h.sync('alice', account.id)
+    const all = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    const find = (subject: string) => all.find(message => message.subject === subject)!
+    const oldest = all.filter(message => message.subject.startsWith('Original oldest')).sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.id.localeCompare(b.id))[0]!
+    const done = find('Original done inbox'), a = find('Subject mixed-a'), b = find('Subject mixed-b'), c = find('Subject mixed-c')
+    const firstSnooze = new Date(EPOCH + 1000).toISOString(), secondSnooze = new Date(EPOCH + 2000).toISOString(), lastSnooze = new Date(EPOCH + 3000).toISOString()
+    const excluded = (await h.inbox.mailboxMessagePage('alice', { mailboxIds: [boxes[2]!.id] })).items[0]!
+    await h.inbox.setMailboxState('alice', boxes[2]!.id, excluded.id, { done: true, snoozedUntil: new Date(EPOCH + 500).toISOString() }, 1)
+    await h.inbox.setMailboxState('alice', alpha.id, done.id, { done: true }, 1)
+    await h.inbox.setMailboxState('alice', alpha.id, a.id, { snoozedUntil: firstSnooze }, 1)
+    await h.inbox.setMailboxState('alice', alpha.id, b.id, { done: true, snoozedUntil: lastSnooze }, 1)
+    await h.inbox.setMailboxState('alice', beta.id, b.id, { done: true }, 1)
+    await h.inbox.setMailboxState('alice', alpha.id, c.id, { snoozedUntil: secondSnooze }, 1)
+    await h.inbox.setMailboxState('alice', beta.id, c.id, { snoozedUntil: lastSnooze }, 1)
+    const database = new Database(h.database)
+    await h.restart(database)
+    const calls = structuredClone(box.calls), before = await h.inbox.changes('alice')
+    database.exec('PRAGMA query_only=ON')
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    const page = await client.mailboxConversations(scope)
+    const awake = page.items.find(row => row.threadId === oldest.threadId)!
+    expect(awake).toMatchObject({ firstMessageId: oldest.id, subject: oldest.subject, messageCount: 52, membershipCount: 52, doneMembershipCount: 0, awakeInboxMessageCount: 2, earliestSnoozedUntil: null, messagesComplete: false })
+    expect(awake.messages).toHaveLength(50)
+    expect(awake.messages.every(message => message.folder === 'sent')).toBe(true)
+    const noPhantom = page.items.find(row => row.threadId === done.threadId)!
+    expect(noPhantom).toMatchObject({ firstMessageId: done.id, subject: done.subject, messageCount: 51, membershipCount: 51, doneMembershipCount: 1, awakeInboxMessageCount: 0, earliestSnoozedUntil: null, messagesComplete: false })
+    expect(noPhantom.messages).toHaveLength(50)
+    expect(noPhantom.messages.every(message => message.folder === 'archive' && message.memberships.every(member => !member.done))).toBe(true)
+    const filtered = await client.mailboxConversations({ ...scope, query: { search: 'subject:"New archive"' } })
+    expect(filtered.items).toHaveLength(1)
+    expect(filtered.items[0]).toMatchObject({ firstMessageId: done.id, subject: done.subject, messageCount: 51, doneMembershipCount: 1, awakeInboxMessageCount: 0 })
+    const keys = [{ sourceId: account.id, threadId: a.threadId }]
+    const readMixed = async (mailboxIds = scope.mailboxIds) => (await client.mailboxConversations({ mailboxIds, keys })).items[0]!
+    expect(await readMixed()).toMatchObject({ firstMessageId: a.id, subject: a.subject, messageCount: 3, membershipCount: 6, doneMembershipCount: 2, awakeInboxMessageCount: 1, earliestSnoozedUntil: firstSnooze })
+    expect(await readMixed([alpha.id])).toMatchObject({ messageCount: 3, membershipCount: 3, doneMembershipCount: 1, awakeInboxMessageCount: 0, earliestSnoozedUntil: firstSnooze })
+    expect(await readMixed([beta.id])).toMatchObject({ messageCount: 3, membershipCount: 3, doneMembershipCount: 1, awakeInboxMessageCount: 1, earliestSnoozedUntil: lastSnooze })
+    h.clock.value = EPOCH + 1000
+    expect(await readMixed()).toMatchObject({ awakeInboxMessageCount: 1, earliestSnoozedUntil: secondSnooze })
+    expect(await readMixed([alpha.id])).toMatchObject({ awakeInboxMessageCount: 1, earliestSnoozedUntil: secondSnooze })
+    h.clock.value = EPOCH + 2000
+    expect(await readMixed()).toMatchObject({ awakeInboxMessageCount: 2, earliestSnoozedUntil: lastSnooze })
+    expect(await readMixed([beta.id])).toMatchObject({ awakeInboxMessageCount: 1, earliestSnoozedUntil: lastSnooze })
+    h.clock.value = EPOCH + 3000
+    expect(await readMixed()).toMatchObject({ firstMessageId: a.id, messageCount: 3, membershipCount: 6, doneMembershipCount: 2, awakeInboxMessageCount: 2, earliestSnoozedUntil: null })
+    expect(await readMixed([beta.id])).toMatchObject({ awakeInboxMessageCount: 2, earliestSnoozedUntil: null })
+    expect(await h.inbox.changes('alice', { since: before.state })).toMatchObject({ state: before.state, events: [] })
+    expect(box.calls).toEqual(calls)
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(4 * 1024 * 1024)
+    expect(page.items.reduce((sum, row) => sum + row.targets.length + row.messages.reduce((count, message) => count + message.memberships.length, 0), 0)).toBeLessThanOrEqual(5000)
+  })
+
+  test('more than 100000 SDK-ingested messages page and count without relaxing the legacy inventory cap', async () => {
+    const h = await fixture()
+    for (const source of ['one', 'two']) await h.seed('alice', `over-cap-${source}`, Array.from({ length: 50001 }, (_, index) => native(`scale-${index}`, {
+      threadId: `scale-thread-${Math.floor(index / 2)}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(), bodyText: '', bodyHtml: '',
+    })))
+    const scope = { mailboxIds: (await h.inbox.mailboxes('alice')).map(box => box.id) }
+    const calls = [...h.boxes.values()].map(box => structuredClone(box.calls))
+    const first = await h.inbox.mailboxMessagePage('alice', scope)
+    const ids = new Set(first.items.map(item => item.id))
+    let cursor = first.nextCursor, pages = 1
+    while (cursor) {
+      const page = await h.inbox.mailboxMessagePage('alice', { ...scope, cursor })
+      expect(page.items.length).toBeLessThanOrEqual(500)
+      expect(page.state).toBe(first.state)
+      for (const item of page.items) { expect(ids.has(item.id)).toBe(false); ids.add(item.id) }
+      cursor = page.nextCursor; pages++
+    }
+    expect(ids.size).toBe(100002); expect(pages).toBe(201)
+    expect(await h.inbox.mailboxCounts('alice', scope)).toMatchObject({ messages: 100002, conversations: 50002 })
+    const conversations = await h.inbox.mailboxConversations('alice', { ...scope, limit: 100 })
+    expect(conversations.items).toHaveLength(100)
+    expect(conversations.items.every(row => row.messageCount === 2 && row.messagesComplete && row.targetsComplete)).toBe(true)
+    await expect(h.inbox.mailboxSnapshot('alice', scope)).rejects.toMatchObject({ code: 'SNAPSHOT_LIMIT', status: 413 })
+    expect([...h.boxes.values()].map(box => box.calls)).toEqual(calls)
+  }, 120000)
+
+  test('strict owner/query/limit/kind, retention, restart and source-generation fences apply to live keysets', async () => {
+    const h = await fixture({ eventRetention: 5 })
+    const a = await h.seed('alice', 'live-fences', [native('a'), native('b'), native('c')])
+    await h.seed('bob', 'live-fences-foreign')
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const first = await h.inbox.mailboxMessagePage('alice', scope)
+    const conversations = await h.inbox.mailboxConversations('alice', scope)
+    for (const endpoint of ['/mailbox-message-page', '/mailbox-conversations', '/mailbox-counts']) {
+      const post = (body: unknown) => ({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      await invalid(await h.request(null, endpoint, post({ mailboxIds: scope.mailboxIds })), 401)
+      await invalid(await h.request('bob', endpoint, post({ mailboxIds: scope.mailboxIds })), 404)
+      await invalid(await h.request('alice', endpoint, post({ mailboxIds: scope.mailboxIds, unexpected: true })), 400)
+    }
+    for (const limit of [0, 501, 1.5, NaN]) await expect(h.inbox.mailboxMessagePage('alice', { ...scope, limit })).rejects.toMatchObject({ code: 'VALIDATION' })
+    await expect(h.inbox.mailboxConversations('alice', { ...scope, limit: 101 })).rejects.toMatchObject({ code: 'VALIDATION' })
+    await expect(h.inbox.mailboxCounts('alice', { mailboxIds: scope.mailboxIds, query: { unreadOnly: 'true' } as never })).rejects.toMatchObject({ code: 'VALIDATION' })
+    await expect(h.inbox.mailboxMessagePage('bob', { mailboxIds: [(await h.inbox.mailboxes('bob'))[0]!.id], cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    for (const input of [{ ...scope, limit: 2 }, { ...scope, threadId: first.items[0]!.threadId }]) await expect(h.inbox.mailboxMessagePage('alice', { ...input, cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    await expect(h.inbox.mailboxConversations('alice', { ...scope, cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    await expect(h.inbox.mailboxConversations('alice', { ...scope, keys: [{ sourceId: 'foreign', threadId: 'foreign' }] })).rejects.toMatchObject({ status: 404 })
+    await h.inbox.createLabel('alice', a.account.id, 'Unrelated')
+    await h.restart()
+    expect((await h.inbox.mailboxMessagePage('alice', { ...scope, cursor: first.nextCursor! })).items).toHaveLength(1)
+    expect((await h.inbox.mailboxConversations('alice', { ...scope, cursor: conversations.nextCursor! })).items).toHaveLength(1)
+    for (let i = 0; i < 6; i++) await h.inbox.createLabel('alice', a.account.id, `Retained ${i}`)
+    await expect(h.inbox.mailboxMessagePage('alice', { ...scope, cursor: first.nextCursor! })).rejects.toMatchObject({ code: 'MAILBOX_HISTORY_EXPIRED', status: 410 })
+    expect(await h.inbox.mailboxChanges('alice', { mailboxIds: scope.mailboxIds, since: first.state, scopeState: first.scopeState })).toMatchObject({ resetRequired: true, affectedThreads: [], upserts: [], removed: [] })
+    const fresh = await h.inbox.mailboxMessagePage('alice', scope)
+    await h.inbox.disconnect('alice', a.account.id)
+    await expect(h.inbox.mailboxMessagePage('alice', { ...scope, cursor: fresh.nextCursor! })).rejects.toMatchObject({ code: 'MAILBOX_SCOPE_CHANGED' })
+    expect(await h.inbox.mailboxChanges('alice', { mailboxIds: scope.mailboxIds, since: fresh.state, scopeState: fresh.scopeState })).toMatchObject({ resetRequired: true, resetReason: 'scope', affectedThreads: [] })
+  })
+})
+
 describe('bounded mailbox snapshot and changes', () => {
   test('single mailbox summaries use cached metadata only, including legacy rows, and enforce live owner/source/membership fences', async () => {
     const h = await fixture()
@@ -2185,6 +2418,14 @@ describe('bounded mailbox snapshot and changes', () => {
       expect(box.calls).toEqual(before)
       expect(metadataRows).toBe(2)
       expect(bodyReads).toBe(0)
+      const live = await client.mailboxMessagePage({ mailboxIds: [alpha.id] })
+      expect(live.items[0]!.facts).toBeUndefined()
+      const conversations = await client.mailboxConversations({ mailboxIds: [alpha.id] })
+      expect(conversations.items[0]!.messages[0]!.facts).toBeUndefined()
+      expect(conversations.items[0]!.mailboxStates[0]).toMatchObject({ messageCount: 1, doneCount: 1, snoozedCount: 1 })
+      expect(await client.mailboxCounts({ mailboxIds: [alpha.id], query: { done: true, snoozed: true } })).toMatchObject({ messages: 1, conversations: 1 })
+      expect(bodyReads).toBe(0); expect(box.calls).toEqual(before)
+      expect((await h.inbox.changes('alice')).state).toBe(state.state)
       database.query('UPDATE sdk_messages SET generation=generation-1 WHERE id=?').run(own.id)
       await expect(client.mailboxMessageSummary(alpha.id, own.id)).rejects.toMatchObject({ status: 404 })
       database.query('UPDATE sdk_messages SET generation=generation+1,deleted=1 WHERE id=?').run(own.id)
@@ -2335,6 +2576,17 @@ describe('bounded mailbox snapshot and changes', () => {
       expect(streamed.map(page => page.items.length)).toEqual([5, 2])
       expect(streamed.flatMap(page => page.items)).toEqual([...first.items, ...second.items])
       for (const page of streamed) expect(page.items.reduce((count, item) => count + item.memberships.length, 0)).toBeLessThanOrEqual(5000)
+      const live = await client.mailboxMessagePage({ mailboxIds: ids })
+      expect(live.items).toHaveLength(5)
+      expect(live.items.every(item => item.memberships.length === 1000)).toBe(true)
+      const liveTail = await client.mailboxMessagePage({ mailboxIds: ids, cursor: live.nextCursor! })
+      expect(liveTail.items).toHaveLength(2); expect(liveTail.nextCursor).toBeNull()
+      const conversations = await client.mailboxConversations({ mailboxIds: ids })
+      expect(conversations.items.length).toBeGreaterThan(0)
+      expect(conversations.items.reduce((sum, row) => sum + row.targets.length + row.messages.reduce((count, message) => count + message.memberships.length, 0), 0)).toBeLessThanOrEqual(5000)
+      expect(Buffer.byteLength(JSON.stringify(conversations))).toBeLessThanOrEqual(4 * 1024 * 1024)
+      expect(conversations.items.every(row => row.messageCount === 1 && row.mailboxStates.length === 1000 && !row.targetsComplete)).toBe(true)
+      expect(await client.mailboxCounts({ mailboxIds: ids })).toMatchObject({ messages: 7, conversations: 7 })
       const changed = first.items[0]!
       await h.inbox.setMailboxState('alice', ids[0]!, changed.id, { done: true }, 1)
       const delta = await h.inbox.mailboxChanges('alice', { mailboxIds: ids, since: first.state, scopeState: first.scopeState })
@@ -2357,6 +2609,7 @@ describe('bounded mailbox snapshot and changes', () => {
       const nativeState = await h.inbox.mutate('alice', { messageIds: [changed.id], changes: { isRead: true }, idempotencyKey: 'scope-absence-event' })
       const absent = await h.inbox.mailboxChanges('alice', { mailboxIds: ids, since: state, scopeState: first.scopeState })
       expect(absent.removed).toEqual([{ sourceId: account.id, messageId: changed.id, reason: 'unselected', revision: null }])
+      expect(absent.affectedThreads).toEqual([{ sourceId: account.id, threadId: changed.threadId }])
       expect((await h.inbox.operation('alice', nativeState.id)).status).toBe('pending')
     } finally { database.close() }
   })
@@ -2413,6 +2666,14 @@ describe('bounded mailbox snapshot and changes', () => {
       expect(streamed.map(page => page.items.length)).toEqual([1, 1])
       expect(streamed.flatMap(page => page.items)).toEqual([...first.items, ...second.items])
       for (const page of streamed) expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(4 * 1024 * 1024)
+      const live = await client.mailboxMessagePage(scope)
+      expect(live.items).toHaveLength(1)
+      expect((await client.mailboxMessagePage({ ...scope, cursor: live.nextCursor! })).items).toHaveLength(1)
+      const conversations = await client.mailboxConversations(scope)
+      expect(conversations.items).toHaveLength(2)
+      expect(conversations.items.every(row => row.messageCount === 1)).toBe(true)
+      expect(Buffer.byteLength(JSON.stringify(conversations))).toBeLessThanOrEqual(4 * 1024 * 1024)
+      expect(conversations.items.some(row => !row.messagesComplete)).toBe(true)
       await h.inbox.mutate('alice', { messageIds: messages.map(message => message.id), changes: { isRead: true }, idempotencyKey: 'large-read-events' })
       const one = await h.inbox.mailboxChanges('alice', { ...scope, since: first.state, scopeState: first.scopeState })
       expect(one.upserts).toHaveLength(1)
@@ -2424,6 +2685,10 @@ describe('bounded mailbox snapshot and changes', () => {
       for (const page of [one, two]) expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(4 * 1024 * 1024)
       database.query("UPDATE sdk_messages SET visible=json_set(visible,'$.preview',?) WHERE account=?").run('x'.repeat(4 * 1024 * 1024), account.id)
       await expect(h.inbox.mailboxSnapshot('alice', scope)).rejects.toMatchObject({ code: 'MAILBOX_READ_TOO_LARGE', status: 413 })
+      await expect(h.inbox.mailboxMessagePage('alice', scope)).rejects.toMatchObject({ code: 'MAILBOX_READ_TOO_LARGE', status: 413 })
+      const oversized = await client.mailboxConversations(scope)
+      expect(oversized.items).toHaveLength(2)
+      expect(oversized.items.every(row => row.messageCount === 1 && row.messages.length === 0 && !row.messagesComplete && row.targetsComplete)).toBe(true)
     } finally { database.close() }
   })
 
@@ -2768,6 +3033,63 @@ describe('finite mailbox snapshot streams', () => {
 })
 
 describe('mailbox action HTTP receipts', () => {
+  test('receipt GET is uncached, owner-exact and historical without replay, retraction, events, count changes or provider work', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const alice = await h.seed('alice', 'receipt-reader-alice'), bob = await h.seed('bob', 'receipt-reader-bob')
+    const aliceMailbox = (await h.inbox.mailboxes('alice'))[0]!, bobMailbox = (await h.inbox.mailboxes('bob'))[0]!
+    const aliceMessage = (await h.inbox.mailboxMessagePage('alice', { mailboxIds: [aliceMailbox.id] })).items[0]!
+    const bobMessage = (await h.inbox.mailboxMessagePage('bob', { mailboxIds: [bobMailbox.id] })).items[0]!
+    const id = 'r'.repeat(128)
+    const accepted = await h.inbox.setMailboxStates('alice', { id, done: true, targets: [{ mailboxId: aliceMailbox.id, messageId: aliceMessage.id, revision: 1 }] })
+    const foreign = await h.inbox.setMailboxStates('bob', { id, done: true, targets: [{ mailboxId: bobMailbox.id, messageId: bobMessage.id, revision: 1 }] })
+    await h.inbox.setMailboxStates('alice', { id: 'alice-only', done: false, targets: [{ mailboxId: aliceMailbox.id, messageId: aliceMessage.id, revision: 2 }] })
+    const database = new Database(h.database)
+    await h.restart(database)
+    const scope = { mailboxIds: [aliceMailbox.id] }, before = await h.inbox.changes('alice'), counts = await h.inbox.mailboxCounts('alice', scope)
+    const calls = [alice.box, bob.box].map(box => structuredClone(box.calls))
+    const wire = transport(h), client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' }, cacheScope: 'receipt-reader' })
+    const query = database.query.bind(database), statements: string[] = []
+    const guard = spyOn(database, 'query').mockImplementation(((sql: string) => { statements.push(sql); return query(sql) }) as typeof database.query)
+    const undo = spyOn(h.inbox, 'undoMailboxStates').mockImplementation(async () => { throw new Error('Reading must not retract a receipt') })
+    const replay = spyOn(h.inbox, 'setMailboxStates').mockImplementation(async () => { throw new Error('Reading must not replay a receipt') })
+    database.exec('PRAGMA query_only=ON')
+    try {
+      for (let index = 0; index < 10; index++) {
+        const receipt = await client.mailboxStateReceipt(id)
+        expect(receipt).toEqual(accepted)
+        receipt.states[0]!.done = false
+      }
+      expect(undo).not.toHaveBeenCalled(); expect(replay).not.toHaveBeenCalled()
+      expect(statements).toHaveLength(10)
+      expect(statements.every(sql => sql === 'SELECT data FROM sdk_mailbox_actions WHERE owner=? AND id=?')).toBe(true)
+    } finally { guard.mockRestore(); undo.mockRestore(); replay.mockRestore(); database.exec('PRAGMA query_only=OFF') }
+    expect(wire.requests.every(request => request.method === 'GET' && request.status === 200 && request.etag === null && !request.headers.has('if-none-match') && request.body === null)).toBe(true)
+    expect(await h.inbox.changes('alice', { since: before.state })).toMatchObject({ state: before.state, events: [] })
+    expect(await h.inbox.mailboxCounts('alice', scope)).toEqual(counts)
+    expect((await h.inbox.mailboxMessagePage('alice', scope)).items[0]!.memberships[0]!.done).toBe(false)
+    expect([alice.box, bob.box].map(box => box.calls)).toEqual(calls)
+    expect(await h.inbox.mailboxStateReceipt('bob', id)).toEqual(foreign)
+    await expect(h.inbox.mailboxStateReceipt('bob', 'alice-only')).rejects.toMatchObject({ status: 404 })
+    await expect(h.inbox.mailboxStateReceipt('Alice', id)).rejects.toMatchObject({ status: 404 })
+    await expect(h.inbox.mailboxStateReceipt('', id)).rejects.toMatchObject({ status: 401 })
+    for (const invalidId of ['', 'r'.repeat(129), 'bad\nreceipt']) await expect(h.inbox.mailboxStateReceipt('alice', invalidId)).rejects.toMatchObject({ code: 'VALIDATION' })
+    await invalid(await h.request(null, `/mailbox-actions/${id}`), 401)
+    await invalid(await h.request('bob', '/mailbox-actions/alice-only'), 404)
+    await invalid(await h.request('alice', '/mailbox-actions/missing'), 404)
+    await invalid(await h.request('alice', `/mailbox-actions/${'r'.repeat(129)}`), 400)
+    await invalid(await h.request('alice', `/mailbox-actions/${id}?undo=true`), 400)
+    const response = await h.request('alice', `/mailbox-actions/${id}`, { headers: { 'if-none-match': '*' } })
+    expect(response.status).toBe(200); expect(response.headers.get('cache-control')).toBe('no-store')
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer'); expect(response.headers.get('etag')).toBeNull()
+    expect(await response.json()).toEqual(accepted)
+    for (let index = 0; index < 6; index++) await h.inbox.mailboxSnapshot('alice', scope)
+    h.clock.value += 300001
+    await h.inbox.updateMailbox('alice', aliceMailbox.id, { status: 'detached' }, aliceMailbox.revision)
+    await h.inbox.disconnect('alice', alice.account.id)
+    expect(await client.mailboxStateReceipt(id)).toEqual(accepted)
+    expect(await client.mailboxStateReceipt('alice-only')).toMatchObject({ retracted: false, states: [{ done: false, revision: 3 }] })
+  })
+
   test('client Done and Undo return exact body-free memberships without hydration, scans or provider writes', async () => {
     const h = await fixture({ allowProviderWrites: false })
     const { account, box } = await h.seed('alice', 'http-local-done', [native('one'), native('two')])
@@ -2783,11 +3105,13 @@ describe('mailbox action HTTP receipts', () => {
     const accepted = await client.setMailboxStates(input)
     expect(accepted).toEqual({ id: input.id, retracted: false, states: targets.map(target => ({ mailboxId: target.mailboxId, messageId: target.messageId, revision: target.revision + 1, done: true, snoozedUntil: null })) })
     expect(wire.requests.map(request => [request.method, request.path])).toEqual([['POST', '/v1/mailbox-actions']])
+    expect(await client.mailboxStateReceipt(input.id)).toEqual(accepted)
     expect(await client.setMailboxStates(input)).toEqual(accepted)
     const undone = await client.undoMailboxStates(input.id)
     expect(undone.retracted).toBe(true)
     expect(undone.states).toEqual(accepted.states.map(state => ({ ...state, done: false, revision: state.revision + 1 })))
     const newer = await h.inbox.setMailboxState('alice', mailbox.id, messages[0]!.id, { done: true }, undone.states[0]!.revision)
+    expect(await client.mailboxStateReceipt(input.id)).toEqual(undone)
     expect(await client.undoMailboxStates(input.id)).toEqual(undone)
     expect(await client.setMailboxStates(input)).toEqual(undone)
     const current = (await h.inbox.mailboxMessages('alice', { mailboxIds: [mailbox.id] })).items.find(message => message.id === newer.messageId)!
@@ -2799,6 +3123,9 @@ describe('mailbox action HTTP receipts', () => {
     const schema = await client.request<any>('/openapi.json')
     expect(schema.components.schemas.MailboxAction.properties.targets.maxItems).toBe(500)
     expect(schema.components.schemas.MailboxStateReceipt.properties.states.maxItems).toBe(500)
+    const read = schema.paths['/v1/mailbox-actions/{id}'].get
+    expect(read.responses['200'].headers['Cache-Control'].schema.const).toBe('no-store')
+    expect(read.responses['304']).toBeUndefined()
   })
 
   test('HTTP local actions retain owner, membership/message fences, atomicity and idempotency conflicts', async () => {
@@ -2841,6 +3168,7 @@ describe('mailbox action HTTP receipts', () => {
     const result = await client.setMailboxStates({ id: 'maximum-targets', targets, done: true })
     expect(result.states).toHaveLength(500)
     expect(result.states.every(state => state.done && state.revision === 2)).toBe(true)
+    expect(await client.mailboxStateReceipt(result.id)).toEqual(result)
     const undone = await client.undoMailboxStates(result.id)
     expect(undone.states).toHaveLength(500)
     expect(undone.states.every(state => !state.done && state.revision === 3)).toBe(true)

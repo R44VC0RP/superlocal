@@ -214,6 +214,43 @@ export interface MailboxSyncStatus {
   lastSyncAt: string | null
 }
 
+export interface MailboxThreadKey { sourceId: string; threadId: string }
+export interface MailboxMessagePageInput { mailboxIds: string[]; limit?: number; cursor?: string; sourceId?: string; threadId?: string }
+/** Live descending receivedAt/id keyset. Reconcile from the first state after paging; not a frozen inventory. */
+export interface MailboxMessagePage { items: MailboxMessageSummary[]; nextCursor: string | null; state: string; scopeState: string }
+export type MailboxConversationQuery = Omit<MailboxQuery, 'mailboxIds' | 'cursor' | 'limit' | 'sort'>
+export interface MailboxConversationsInput { mailboxIds: string[]; limit?: number; cursor?: string; keys?: MailboxThreadKey[]; query?: MailboxConversationQuery }
+export interface MailboxConversation extends MailboxThreadKey {
+  /** Oldest selected message's subject/identity, ordered by receivedAt ASC then id ASC. */
+  subject: string
+  firstMessageId: string
+  /** Aggregates cover every selected message, not only the query's matching messages or previews. */
+  messageCount: number
+  membershipCount: number
+  doneMembershipCount: number
+  /** Unique primary-inbox messages with any selected !done membership whose snooze is absent or <= read time. */
+  awakeInboxMessageCount: number
+  /** Minimum future snooze among all selected memberships, including Done memberships; otherwise null. */
+  earliestSnoozedUntil: string | null
+  lastMessageAt: string
+  isRead: boolean
+  isStarred: boolean
+  hasAttachments: boolean
+  /** Native primary folder or native folder-role presence, across the complete selected conversation. */
+  nativeFolders: { inbox: boolean; archive: boolean; sent: boolean; drafts: boolean; spam: boolean; trash: boolean }
+  mailboxStates: Array<{ mailboxId: string; messageCount: number; doneCount: number; snoozedCount: number }>
+  /** Newest up to 50 cached summaries; fetch deeper messages using mailboxMessagePage. */
+  messages: MailboxMessageSummary[]
+  messagesComplete: boolean
+  /** Captured conditional-action references, up to 500. Never infer targets for later replies. */
+  targets: MailboxStateTarget[]
+  targetsComplete: boolean
+}
+export interface MailboxConversationsPage { items: MailboxConversation[]; nextCursor: string | null; state: string; scopeState: string }
+export interface MailboxCountsInput { mailboxIds: string[]; query?: MailboxConversationQuery }
+/** Exact cached matching messages and distinct matching source/thread keys; overlapping mailboxes are deduplicated. */
+export interface MailboxCounts { messages: number; conversations: number; asOfState: string; scopeState: string }
+
 export interface MailboxSnapshotInput { mailboxIds: string[]; cursor?: string; limit?: number }
 /** Stable ID inventory, live rows: finish paging, then catch up from the fixed state baseline. */
 export interface MailboxSnapshotPage {
@@ -226,6 +263,8 @@ export interface MailboxSnapshotPage {
 }
 export interface MailboxChangesInput { mailboxIds: string[]; since: string; scopeState: string; limit?: number }
 export interface MailboxChangesPage extends ChangePage {
+  /** Includes retained identities of deleted/unselected messages. Empty on scope/history reset. */
+  affectedThreads: MailboxThreadKey[]
   upserts: MailboxMessageSummary[]
   /** unselected removes only this scope's membership, not the canonical message. */
   removed: Array<{ sourceId: string; messageId: string; reason: 'deleted' | 'unselected'; revision: number | null }>
@@ -457,6 +496,9 @@ export interface Inbox {
   createMailbox(owner: string, input: MailboxInput): Promise<Mailbox>
   updateMailbox(owner: string, id: string, input: { name?: string; status?: Mailbox['status']; defaultSender?: string | null }, revision: number): Promise<Mailbox>
   mailboxMessages(owner: string, query: MailboxQuery): Promise<Page<MailboxMessageSummary>>
+  mailboxMessagePage(owner: string, input: MailboxMessagePageInput): Promise<MailboxMessagePage>
+  mailboxConversations(owner: string, input: MailboxConversationsInput): Promise<MailboxConversationsPage>
+  mailboxCounts(owner: string, input: MailboxCountsInput): Promise<MailboxCounts>
   /** Read-only primary-inbox activity, grouped by source; excludes detached mailbox selections. */
   mailboxSyncStatus(owner: string, input: { mailboxIds: string[] }): Promise<MailboxSyncStatus[]>
   mailboxSnapshot(owner: string, input: MailboxSnapshotInput): Promise<MailboxSnapshotPage>
@@ -467,6 +509,8 @@ export interface Inbox {
   setMailboxState(owner: string, mailboxId: string, messageId: string, input: { done?: boolean; snoozedUntil?: string | null }, revision: number): Promise<MailboxMembership>
   /** Atomic local-only state change with a durable idempotency receipt; no provider mutation. */
   setMailboxStates(owner: string, input: { id: string; targets: MailboxStateTarget[]; done: boolean }): Promise<MailboxStateReceipt>
+  /** Read the owned historical receipt, even after its source is detached; never changes mailbox state. */
+  mailboxStateReceipt(owner: string, id: string): Promise<MailboxStateReceipt>
   undoMailboxStates(owner: string, id: string): Promise<MailboxStateReceipt>
   syncMailbox(owner: string, mailboxId: string, options?: SyncRequest): Promise<{ synchronized: number; hasMore: boolean; state: string }>
   sync(owner: string, id: string, options?: SyncRequest): Promise<{ synchronized: number; hasMore: boolean; state: string }>
