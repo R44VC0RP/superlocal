@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { AiDecision, AiSettings, AiTriageActions, AiTriageState, AiUsageSummary } from "../../shared/ai-triage";
-import { aiLabel } from "./ConversationTriage";
+import { aiLabel, aiTaskLabel } from "./ConversationTriage";
 import "./ai-triage.css";
 
 export type AiTriageSettingsProps = {
@@ -21,6 +21,12 @@ const problemLabels: Record<string, string> = {
   AI_AUTH_FAILED: "Provider credentials were rejected",
   AI_PROVIDER_UNAVAILABLE: "Provider is temporarily unavailable",
   AI_INSUFFICIENT_CONTEXT: "Not enough usable email context",
+};
+const activityLabels: Record<string, string> = {
+  queued: "Queued", processing: "Assessing", ready: "Assessment saved", failed: "Assessment failed", stale: "Assessment outdated",
+  removed: "Context removed", cache_reused: "Saved assessment reused", feedback: "Category feedback", rescored: "Preferences rescored",
+  historical_no_prior: "Not admitted as new mail", inactive_membership: "No active selected membership", outgoing_no_prior: "No assessed incoming context",
+  unavailable: "Message unavailable", recovery_historical: "Older mail left unchanged",
 };
 const number = (value: number) => value.toLocaleString();
 const dollars = (value: number) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 4, maximumFractionDigits: 6 }).format(value);
@@ -252,7 +258,7 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
       <p className="settings-note">{state.settings.mode === "preview" ? "Proposed categories are not applied. " : "Saved assessments. "}Loads only on request, up to 100 results.</p>
       <div className="ai-actions"><button type="button" className="settings-text-button" disabled={busy} onClick={() => void loadResults()}>{results ? "Refresh results" : "Load results"}</button>{hasMore && (results?.length ?? 0) < 100 && <button type="button" className="settings-text-button" disabled={busy} onClick={() => void loadResults(true)}>Load more</button>}</div>
       {results?.length === 0 && <p className="settings-note">No saved results returned. Pending work appears in the queue above.</p>}
-      {!!results?.length && <div className="ai-table-scroll"><table className="ai-table"><thead><tr><th>{state.settings.mode === "preview" ? "Proposed category" : "Category"}</th><th>Assessment</th></tr></thead><tbody>{results.map(item => <tr key={JSON.stringify([item.sourceId, item.threadId])}><td>{item.override?.category || item.score?.category || "Not assessed"}<span className="ai-secondary">{aiLabel(item.state)}</span></td><td>{item.assessment ? <>{item.assessment.reason}<span className="ai-secondary">{aiLabel(item.assessment.type)} · {aiLabel(item.assessment.response)} · {aiLabel(item.assessment.risk)}</span></> : "Assessment not available"}</td></tr>)}</tbody></table></div>}
+      {!!results?.length && <div className="ai-table-scroll"><table className="ai-table"><thead><tr><th>{state.settings.mode === "preview" ? "Proposed category" : "Category"}</th><th>Assessment</th></tr></thead><tbody>{results.map(item => <tr key={JSON.stringify([item.sourceId, item.threadId])}><td>{item.override?.category || item.score?.category || "Not assessed"}<span className="ai-secondary">{aiLabel(item.state)}</span></td><td>{item.assessment ? <>{item.assessment.reason}<span className="ai-secondary">{aiLabel(item.assessment.type)} · {aiLabel(item.assessment.response)} · {aiTaskLabel(item.assessment.task)} · {aiLabel(item.assessment.risk)}</span></> : "Assessment not available"}</td></tr>)}</tbody></table></div>}
     </section>
     <section className="ai-section">
       <h3>Usage and estimated costs</h3>
@@ -267,8 +273,9 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
       </> : <p className="settings-note">Pricing is not configured. Unknown costs are not counted as zero.</p>}
     </section>
     <section className="ai-section">
-      <h3>Recent attempts</h3>
-      <div className="ai-actions"><button type="button" className="settings-text-button" disabled={busy} onClick={() => void run(async (api, alive) => { const next = await api.diagnostics(); if (alive()) setDiagnostics(next); }, "Could not load diagnostics. Try again.")}>{diagnostics ? "Refresh diagnostics" : "Load recent attempts"}</button>
+      <h3>Processing diagnostics</h3>
+      <p className="settings-note">Decision grades, scoring factors and processing history. Mail excerpts stay in the private conversation assessment, not in diagnostic exports.</p>
+      <div className="ai-actions"><button type="button" className="settings-text-button" disabled={busy} onClick={() => void run(async (api, alive) => { const next = await api.diagnostics(); if (alive()) setDiagnostics(next); }, "Could not load diagnostics. Try again.")}>{diagnostics ? "Refresh diagnostics" : "Load diagnostics"}</button>
         <button type="button" className="settings-text-button" disabled={busy} onClick={() => void run(async (api, alive) => {
           const next = await api.diagnostics(); if (!alive()) return;
           setDiagnostics(next);
@@ -277,6 +284,40 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
           window.setTimeout(() => URL.revokeObjectURL(url), 1000);
         }, "Could not download diagnostics. Try again.")}>Download diagnostics</button>
       </div>
+      {diagnostics?.coverage && <>
+        <dl className="ai-key-values">
+          <dt>New-mail processing boundary</dt><dd>{diagnostics.coverage.admissionSince ? new Date(diagnostics.coverage.admissionSince).toLocaleString() : "Not established"}</dd>
+          <dt>Last change check</dt><dd>{diagnostics.coverage.lastDrainAt ? new Date(diagnostics.coverage.lastDrainAt).toLocaleString() : "Not recorded"}</dd>
+        </dl>
+        {diagnostics.coverage.problemCode && <p className="settings-error" role="alert">Change processing needs attention: {diagnostics.coverage.problemCode}</p>}
+        <details className="ai-details"><summary tabIndex={0}>Recorded event counts</summary>
+          <p className="settings-note">Events can repeat for a conversation. These are not unique-message totals or a measure of classification accuracy.</p>
+          <dl className="ai-key-values">{Object.entries(diagnostics.coverage.counts).map(([reason, count]) => <div className="ai-key-pair" key={reason}><dt>{activityLabels[reason] ?? aiLabel(reason)}</dt><dd>{number(count ?? 0)}</dd></div>)}</dl>
+        </details>
+      </>}
+      {diagnostics?.activity && <>
+        <h3>Recent decision activity</h3>
+        <p className="settings-note">Latest {diagnostics.activity.length} events. Saved grades describe that event, not necessarily the current conversation.</p>
+        {diagnostics.activity.length === 0 ? <p className="settings-note">No decision activity recorded yet.</p> : <div className="ai-table-scroll"><table className="ai-table"><thead><tr><th>Event</th><th>Decision record</th></tr></thead><tbody>{diagnostics.activity.slice(0, 50).map(item => <tr key={item.id}>
+          <td>{activityLabels[item.reason] ?? aiLabel(item.reason)}<span className="ai-secondary">{new Date(item.at).toLocaleString()}</span>{item.eventReason && <span className="ai-secondary">Source event: {aiLabel(item.eventReason)}</span>}</td>
+          <td>{item.category ? `${item.category}${item.manual ? " (manual)" : ""}` : "No category saved"}
+            {item.assessment && <span className="ai-secondary">{aiLabel(item.assessment.type)} · {aiLabel(item.assessment.response)} · {aiTaskLabel(item.assessment.task)}</span>}
+            <details className="ai-details"><summary tabIndex={0}>Inspect record</summary>
+              <dl className="ai-key-values">
+                <dt>Source / thread</dt><dd>{item.sourceId}<br />{item.threadId}</dd>
+                <dt>State / revision</dt><dd>{item.state ? aiLabel(item.state) : "Not assessed"} / {item.revision ?? "Not recorded"}</dd>
+                <dt>Model</dt><dd>{item.model ?? "No inference"}</dd>
+                <dt>Assessment / score policy</dt><dd>{item.inputPolicyVersion ?? "Not recorded"} / {item.scorePolicyVersion ?? "Not scored"}</dd>
+                <dt>Settings revision</dt><dd>{item.settingsRevision ?? "Not recorded"}</dd>
+                {item.assessment && <><dt>Risk / certainty</dt><dd>{aiLabel(item.assessment.risk)} / {aiLabel(item.assessment.certainty)}</dd><dt>Actions</dt><dd>{item.assessment.actions.length ? item.assessment.actions.map(aiLabel).join(", ") : "None"}</dd><dt>Evidence references</dt><dd>{item.assessment.evidence.map((e, index) => <span className="ai-secondary" key={index}>{e.messageRef} · {aiLabel(e.field)}</span>)}</dd></>}
+                {item.score !== undefined && <><dt>Score</dt><dd>{Number(item.score.toFixed(2))}</dd></>}
+                {item.contributions?.map((part, index) => <div className="ai-key-pair" key={index}><dt>{aiLabel(part.name)}</dt><dd>{part.value > 0 ? "+" : ""}{Number(part.value.toFixed(2))}</dd></div>)}
+              </dl>
+            </details>
+          </td>
+        </tr>)}</tbody></table></div>}
+      </>}
+      {diagnostics && <h3>Inference attempts</h3>}
       {diagnostics?.attempts.length === 0 && <p className="settings-note">No diagnostic attempts recorded.</p>}
       {!!diagnostics?.attempts.length && <div className="ai-table-scroll"><table className="ai-table"><thead><tr><th>Attempt</th><th>Duration / queue</th></tr></thead><tbody>{diagnostics.attempts.slice(0, 50).map(attempt => <tr key={attempt.id}><td>{aiLabel(attempt.outcome)}{attempt.code && <span className="ai-secondary" title={attempt.code}>{problemLabels[attempt.code] || aiLabel(attempt.code)}</span>}<span className="ai-secondary">{attempt.model}</span>{attempt.requestId && <span className="ai-secondary">Request: {attempt.requestId}</span>}</td><td>{attempt.durationMs === null ? "Pending" : `${number(attempt.durationMs)} ms`} / {number(attempt.queueMs)} ms</td></tr>)}</tbody></table></div>}
     </section>

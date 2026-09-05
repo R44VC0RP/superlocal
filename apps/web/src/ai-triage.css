@@ -46,8 +46,12 @@
 }
 .ai-settings-form fieldset {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   margin: 0;
+}
+.ai-settings-form fieldset > * {
+  min-width: 0;
 }
 .ai-triage-settings p,
 .conversation-triage-dialog p {
@@ -184,7 +188,70 @@
   outline: none;
 }
 .conversation-triage-dialog {
+  width: 640px;
+  display: flex;
+  flex-direction: column;
   text-align: left;
+  overflow: hidden;
+}
+.conversation-triage-dialog .settings-dialog-header {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.conversation-triage-dialog h2 {
+  margin: 0;
+  font: inherit;
+  font-weight: 600;
+}
+.conversation-triage-dialog .settings-dialog-body {
+  display: grid;
+  gap: 16px;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px;
+}
+.conversation-triage-dialog .ai-feedback {
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+.conversation-triage-dialog .settings-field {
+  display: grid;
+  gap: 8px;
+}
+.conversation-triage-dialog .ai-actions button,
+.conversation-triage-dialog .settings-dialog-header button {
+  min-height: 40px;
+  min-width: 40px;
+}
+.conversation-triage-dialog .ai-details > summary,
+.ai-triage-settings .ai-details > summary {
+  min-height: 40px;
+  align-content: center;
+}
+.conversation-triage-dialog .ai-details > summary:focus-visible,
+.ai-triage-settings .ai-details > summary:focus-visible {
+  outline: 2px solid var(--muted);
+  outline-offset: 3px;
+}
+.ai-evidence {
+  display: grid;
+  gap: 12px;
+}
+@media (max-width: 700px) {
+  .conversation-triage-dialog .ai-details > summary,
+  .ai-triage-settings .ai-details > summary {
+    min-height: 44px;
+  }
+  .conversation-triage-dialog .ai-actions button,
+  .conversation-triage-dialog .settings-dialog-header button {
+    min-height: 44px;
+    min-width: 44px;
+  }
 }
 .conversation-triage-dialog .ai-feedback textarea {
   min-height: 64px;

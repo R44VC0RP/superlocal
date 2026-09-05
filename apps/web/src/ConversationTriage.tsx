@@ -12,6 +12,10 @@ export function aiLabel(value: string): string {
   return labels[value] ?? value.replaceAll("_", " ").replace(/^./, character => character.toUpperCase());
 }
 
+export function aiTaskLabel(value?: "required" | "optional" | "none" | "unknown"): string {
+  return value === "required" ? "Task required" : value === "optional" ? "Optional task" : value === "none" ? "No outstanding task" : value === "unknown" ? "Task unclear" : "Not recorded in this assessment";
+}
+
 export type ConversationTriageProps = {
   decision?: AiDecision;
   mode?: "preview" | "apply";
@@ -92,7 +96,8 @@ export function ConversationTriage({ decision, mode = "preview", onFeedback }: C
           <p>{assessment.reason}</p>
           <dl className="ai-key-values">
             <dt>Type</dt><dd>{aiLabel(assessment.type)}</dd>
-            <dt>Response</dt><dd>{aiLabel(assessment.response)}</dd>
+            <dt>Email reply</dt><dd>{aiLabel(assessment.response)}</dd>
+            <dt>Task</dt><dd>{aiTaskLabel(assessment.task)}</dd>
             <dt>Actions</dt><dd>{assessment.actions.length ? assessment.actions.map(aiLabel).join(", ") : "None identified"}</dd>
             <dt>Timing</dt><dd>{aiLabel(assessment.urgency)}{assessment.deadline ? ` · ${assessment.deadline}` : ""}</dd>
             <dt>Topics</dt><dd>{assessment.topics.length ? assessment.topics.join(", ") : "None identified"}</dd>
@@ -100,7 +105,23 @@ export function ConversationTriage({ decision, mode = "preview", onFeedback }: C
             <dt>Certainty</dt><dd>{aiLabel(assessment.certainty)}</dd>
           </dl>
         </section>}
-        {score && <details className="ai-details"><summary>Score contributors · {Number(score.score.toFixed(2))}</summary>
+        {assessment && assessment.evidence.length > 0 && <details className="ai-details"><summary tabIndex={0}>Supporting excerpts · {assessment.evidence.length}</summary>
+          <div className="ai-evidence">{assessment.evidence.map((item, index) => <div key={index}>
+            <span className="ai-secondary">{aiLabel(item.field)} · {item.messageRef}</span>
+            <p>{item.quote}</p>
+          </div>)}</div>
+        </details>}
+        {current && <details className="ai-details"><summary tabIndex={0}>Decision record</summary>
+          <dl className="ai-key-values">
+            <dt>Assessment policy</dt><dd>{current.inputPolicyVersion ?? "Not recorded"}</dd>
+            <dt>Schema / scoring policy</dt><dd>{current.schemaVersion} / {score?.version ?? "Not scored"}</dd>
+            <dt>Settings revision</dt><dd>{current.settingsRevision}</dd>
+            <dt>Decision revision</dt><dd>{current.revision}</dd>
+            <dt>Last updated</dt><dd>{new Date(current.updatedAt).toLocaleString()}</dd>
+            {current.problemCode && <><dt>Problem</dt><dd>{current.problemCode}</dd></>}
+          </dl>
+        </details>}
+        {score && <details className="ai-details"><summary tabIndex={0}>Score contributors · {Number(score.score.toFixed(2))}</summary>
           <dl className="ai-key-values">{score.contributions.map((part, index) => <div className="ai-key-pair" key={`${part.name}:${index}`}><dt>{aiLabel(part.name)}</dt><dd>{part.value > 0 ? "+" : ""}{Number(part.value.toFixed(2))}</dd></div>)}</dl>
           {score.reasons.length > 0 && <ul className="ai-score-reasons">{score.reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>}
         </details>}

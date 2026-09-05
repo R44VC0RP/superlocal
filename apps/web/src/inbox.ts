@@ -320,7 +320,9 @@ export class InboxStore {
       for (const key of releasedHolds) { threads.delete(key); this.aiRebuildThreads.delete(key); }
       this.rebuild(releasedHolds);
     }
-    if (this.state.loaded && threads.size) {
+    // The initial SDK model exists before catch-up marks it loaded. Retain
+    // these invalidations: an unchanged catch-up will not rebuild it for us.
+    if (threads.size) {
       if (background) {
         for (const key of threads) {
           if (!this.aiRebuildThreads.has(key) && this.aiRebuildThreads.size >= 100_000) throw new Error("AI triage reconciliation capacity reached.");

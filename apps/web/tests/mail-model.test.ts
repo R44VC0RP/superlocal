@@ -5,7 +5,7 @@ import { accounts, seedMail, defaultPreferences, type Draft, type Mail } from ".
 import { matchesSearch, splitRuleError } from "../src/mail-search.ts";
 import { selectMailView } from "../src/mail-view.ts";
 import { classifyAttention, conversationAttention } from "../../shared/mail-attention.ts";
-import { AI_TRIAGE_VERSION, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
+import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
 import {
@@ -1154,6 +1154,8 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
   let host: Awaited<ReturnType<typeof createMockHost>> | undefined, stop: (() => void) | undefined, releaseState: (() => void) | undefined;
   let stateGate: Promise<void> | undefined, gatedStates = 0, bodyReads = 0, inventories = 0, aiRequests = 0, changeRequests = 0;
   let releaseAction: (() => void) | undefined;
+  let aiCapability = false, resultRequests = 0, catchupRequests = 0;
+  let catchupGate: Promise<void> | undefined, releaseCatchup: (() => void) | undefined;
   let decision: AiDecision | undefined, queuedChange: AiDecision | undefined;
   let aiState: AiTriageState = { configured: false, provider: null, problemCode: null,
     settings: { revision: 1, enabled: false, mode: "preview", model: "fixture-model", mailboxIds: null, personalization: false, readingSignals: false, interests: [] },
@@ -1176,7 +1178,7 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
     const binding = bindApplicationScope("a".repeat(64));
     globalThis.fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
-      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], preferenceScope: "fictional-ai-client" });
+      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], preferenceScope: "fictional-ai-client", aiTriage: aiCapability });
       if (url.pathname === "/host/inbox-preferences") return Response.json({ revision: 1, unifiedMode: "all", includedMailboxIds: [], pinnedMailboxIds: [] });
       if (url.pathname === "/host/split-preferences") return Response.json({ ...normalizeSplits({}), revision: 1 });
       if (url.pathname === "/host/attention-feedback") return Response.json([]);
@@ -1199,6 +1201,7 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
         }
         if (url.pathname.endsWith("/lookup") || url.pathname.endsWith("/results")) {
           if (url.pathname.endsWith("/lookup")) assert.deepEqual(JSON.parse(String(init?.body)).keys, [{ sourceId: decision!.sourceId, threadId: decision!.threadId }]);
+          else resultRequests++;
           return Response.json({ decisions: decision ? [decision] : [], removed: [], cursor: aiState.cursor, hasMore: false, resetRequired: false });
         }
         throw new Error(`Unexpected AI endpoint ${url.pathname}`);
@@ -1206,9 +1209,11 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
       if (/\/mailboxes\/[^/]+\/messages\/[^/]+$/.test(url.pathname)) bodyReads++;
       if (url.pathname === "/v1/mailbox-snapshot") inventories++;
       const headers = new Headers(init?.headers); headers.set("Authorization", "Bearer fictional-ai-triage-client-token-for-tests");
-      return host!.fetch(new Request(url, { ...init, headers }));
+      const response = await host!.fetch(new Request(url, { ...init, headers }));
+      if (url.pathname === "/v1/mailbox-changes" && catchupGate) { catchupRequests++; await catchupGate; }
+      return response;
     }) as typeof fetch;
-    const store = new InboxStore(); stop = store.start();
+    let store = new InboxStore(); stop = store.start();
     for (let attempt = 0; attempt < 800 && !store.getSnapshot().loaded; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(store.getSnapshot().loaded, true, "real SDK fixture loaded");
     await store.retry();
@@ -1339,6 +1344,46 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
     assert.equal(ready.aiHoldUntil, undefined, "resolved arrival holds never wait behind a pending mail action");
     releaseAction!(); await pendingArrivalAction; releaseAction = undefined;
 
+    // Reproduce the reload ordering: saved AI results arrive after the SDK
+    // snapshot was projected, but before its unchanged catch-up marks it loaded.
+    // This is the current host's ready/task-required shape, bound to the two real
+    // canonical SDK messages, not a separate mail or AI-client facade.
+    stop(); aiCapability = true;
+    decision = { ...decision, revision: 4, settingsRevision: aiState.settings.revision,
+      messageIds: replied.messages.map(message => message.id), latestMessageId: replied.messages.at(-1)!.id,
+      contextVersions: replied.messages.map(message => ({ messageId: message.id, bodyRevision: message.bodyRevision! })),
+      inputPolicyVersion: AI_INPUT_POLICY_VERSION,
+      assessment: { ...decision.assessment!, type: "notification", response: "not_needed", task: "required", actions: ["review", "confirm"] } };
+    aiState = { ...aiState, cursor: 4 };
+    const reloadBodies = bodyReads, reloadInventories = inventories, reloadResults = resultRequests, reloadChanges = changeRequests;
+    catchupGate = new Promise(resolve => { releaseCatchup = resolve; });
+    store = new InboxStore(); stop = store.start();
+    for (let attempt = 0; attempt < 800 && (!catchupRequests || changeRequests === reloadChanges); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(catchupRequests && changeRequests > reloadChanges, "saved results and their delta loaded while SDK catch-up was pending");
+    assert.equal(store.getSnapshot().loaded, false);
+    assert.equal(resultRequests, reloadResults + 1);
+    const reloadedViews = () => store.getSnapshot().mail.filter(mail => mail.sourceId === selected.sourceId && mail.sdkThreadId === selected.sdkThreadId);
+    assert.ok(reloadedViews().some(mail => mail.account === UNIFIED_ACCOUNT));
+    assert.ok(reloadedViews().every(mail => mail.messages.length === 2));
+    const unrelatedReload = new Map(store.getSnapshot().mail.filter(mail => mail.sdkThreadId !== selected.sdkThreadId).map(mail => [mail.id, mail]));
+    releaseCatchup!(); catchupGate = undefined;
+    for (let attempt = 0; attempt < 200 && (!store.getSnapshot().loaded || reloadedViews().some(mail => mail.triage?.revision !== 4)); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(store.getSnapshot().loaded, true);
+    for (const mail of reloadedViews()) {
+      assert.equal(mail.triage?.state, "ready", "reload must project the saved assessment after an unchanged SDK catch-up");
+      assert.equal(mail.triage?.revision, 4);
+      assert.equal(mail.triage?.assessment?.task, "required");
+      assert.equal(mail.attentionCategory, "Important");
+    }
+    for (const [id, mail] of unrelatedReload) assert.strictEqual(store.getSnapshot().mail.find(value => value.id === id), mail);
+    assert.equal(bodyReads, reloadBodies, "restoring saved AI results reads no bodies");
+    assert.equal(inventories, reloadInventories + 1, "restoring saved AI results needs only the initial SDK snapshot");
+    assert.equal(resultRequests, reloadResults + 1, "restoring saved AI results does not retry the result inventory");
+    const restoredMail = store.getSnapshot().mail;
+    const savedResults = await store.ai.results();
+    assert.equal(savedResults.decisions[0].revision, 4);
+    assert.strictEqual(store.getSnapshot().mail, restoredMail, "Settings loading the same saved result does not replace an already-restored mail model");
+
     const currentAi = store.getSnapshot().ai;
     aiState = { ...aiState, settings: { ...aiState.settings, revision: 999, model: "obsolete-owner-model" } };
     stateGate = new Promise(resolve => { releaseState = resolve; });
@@ -1367,7 +1412,7 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
     await assert.rejects(ownerBoundStore.ai.lookup(keys), error => error instanceof DOMException && error.name === "AbortError");
     assert.equal(aiRequests, requestsAtLock, "a locked owner cannot dispatch AI requests");
   } finally {
-    releaseAction?.(); releaseState?.(); stop?.(); await host?.close(); await fs.rm(root, { recursive: true, force: true });
+    releaseAction?.(); releaseState?.(); releaseCatchup?.(); stop?.(); await host?.close(); await fs.rm(root, { recursive: true, force: true });
     globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
     for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
   }
