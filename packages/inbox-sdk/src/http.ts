@@ -1,7 +1,7 @@
 import { Hono, type Context } from 'hono'
 import busboy from 'busboy'
 import { z } from 'zod'
-import { InboxError, MAILBOX_SYNC_PROBLEM_CODES, type ChangeEvent, type ChangePage, type Inbox } from './contracts'
+import { InboxError, MAILBOX_SYNC_PROBLEM_CODES, type ChangeEvent, type ChangePage, type Inbox, type MailboxSnapshotPage } from './contracts'
 
 export interface InboxApiOptions {
   inbox: Inbox
@@ -25,6 +25,7 @@ type RouteDoc = {
   idempotent?: boolean
   description?: string
   mediaType?: string
+  streamOutput?: string
   noStore?: boolean
 }
 
@@ -32,6 +33,7 @@ const JSON_LIMIT = 1024 * 1024
 const FILE_LIMIT = 25 * 1024 * 1024
 const STREAM_PAGE_SIZE = 100
 const STREAM_LIFETIME_MS = 5 * 60 * 1000
+const SNAPSHOT_PAGE_BYTES = 4 * 1024 * 1024
 const encoder = new TextEncoder()
 const id = z.string().min(1).max(512).regex(/^[^\u0000-\u001f\u007f/\\]+$/)
 const opaque = z.string().min(1).max(4096).regex(/^[^\u0000-\u001f\u007f]+$/)
@@ -114,6 +116,7 @@ const mailboxSelector = z.discriminatedUnion('kind', [
 const membership = z.object({ mailboxId: id, messageId: id, revision, done: z.boolean(), snoozedUntil: z.string().nullable() })
 const mailboxMessageSummary = messageSummary.omit({ snoozedUntil: true }).extend({ sourceId: id, memberships: z.array(membership) })
 const mailboxReadInput = z.strictObject({ mailboxIds: z.array(id).min(1).max(1000), limit: z.number().int().min(1).max(500).optional() })
+const mailboxSnapshotPage = z.object({ items: z.array(mailboxMessageSummary).max(500), nextCursor: opaque.nullable(), state: opaque, total: revision, scopeState: opaque, expiresAt: date })
 const threadSummary = z.object({
   id, accountId: id, subject: z.string(), preview: z.string(), messageCount: revision,
   matchingMessageCount: revision, isRead: z.boolean(), isStarred: z.boolean(), lastMessageAt: z.string(),
@@ -177,7 +180,11 @@ const schemas = {
     lastBatch: z.strictObject({ lane: z.enum(['latest', 'backfill']), processed: revision, completedAt: date, hasMore: z.boolean() }).nullable(),
     lastSyncAt: date.nullable() }),
   MailboxSnapshotInput: mailboxReadInput.extend({ cursor: opaque.optional() }),
-  MailboxSnapshotPage: z.object({ items: z.array(mailboxMessageSummary).max(500), nextCursor: opaque.nullable(), state: opaque, total: revision, scopeState: opaque, expiresAt: date }),
+  MailboxSnapshotPage: mailboxSnapshotPage,
+  MailboxSnapshotFrame: z.discriminatedUnion('type', [
+    z.object({ type: z.literal('page'), page: mailboxSnapshotPage }),
+    z.object({ type: z.literal('error'), status: z.number().int().min(400).max(599), code: z.string(), error: z.string(), retryable: z.boolean() }),
+  ]),
   MailboxChangesInput: mailboxReadInput.extend({ since: opaque, scopeState: opaque }),
   MailboxChangesPage: z.object({ events: z.array(changeEvent).max(500), upserts: z.array(mailboxMessageSummary).max(500),
     removed: z.array(z.object({ sourceId: id, messageId: id, reason: z.enum(['deleted', 'unselected']), revision: revision.nullable() })).max(500),
@@ -356,6 +363,9 @@ export function createInboxApi(options: InboxApiOptions) {
     if (!Number.isSafeInteger(value) || value < 1 || value > 2147483647) throw new RangeError('Stream limits must be positive integers')
   }
   const streams = new Map<string, number>()
+  // Finite inventory transfers do not consume the long-lived event-stream slots.
+  const snapshotStreams = new Map<string, number>()
+  let snapshotStreamCount = 0
   const paths: Record<string, Record<string, unknown>> = {}
   const ref = (schema: string) => schema.endsWith('[]')
     ? { type: 'array', items: { $ref: `#/components/schemas/${schema.slice(0, -2)}` } }
@@ -437,9 +447,13 @@ export function createInboxApi(options: InboxApiOptions) {
     if (doc.idempotent) parameters.push({ name: 'Idempotency-Key', in: 'header', required: true, schema: { type: 'string', minLength: 1, maxLength: 200 } })
     if (path === '/v1/events') parameters.push({ name: 'Last-Event-ID', in: 'header', description: 'Opaque resume state; takes precedence over since.', schema: { type: 'string' } })
     if (path === '/v1/blobs/:id') parameters.push(...['Range', 'If-Range'].map((key) => ({ name: key, in: 'header', schema: { type: 'string' } })))
+    if (doc.streamOutput) parameters.push({ name: 'Accept', in: 'header', description: 'Use application/x-ndjson for a finite sequence of page/error frames. JSON returns one page as before.', schema: { type: 'string', enum: ['application/json', 'application/x-ndjson'] } })
     const status = doc.status ?? 200
     const success = { description: doc.mediaType === 'text/event-stream' ? 'Durable, metadata-only SSE stream.' : 'Success',
-      ...(status === 204 ? {} : { content: { [doc.mediaType ?? 'application/json']: { schema: doc.output ? ref(doc.output) : { type: 'string' } } } }),
+      ...(status === 204 ? {} : { content: {
+        [doc.mediaType ?? 'application/json']: { schema: doc.output ? ref(doc.output) : { type: 'string' } },
+        ...(doc.streamOutput ? { 'application/x-ndjson': { schema: ref(doc.streamOutput) } } : {}),
+      } }),
       ...(doc.noStore ? { headers: { 'Cache-Control': { schema: { const: 'no-store' } }, 'Referrer-Policy': { schema: { const: 'no-referrer' } } } }
         : doc.mediaType === 'text/event-stream' || status === 204 ? {} : { headers: { ETag: { description: 'Opaque, owner-scoped representation validator.', schema: { type: 'string' } } } }),
     }
@@ -510,8 +524,100 @@ export function createInboxApi(options: InboxApiOptions) {
     c.header('Referrer-Policy', 'no-referrer')
     return c.newResponse(JSON.stringify(result), 200, { 'Content-Type': 'application/json; charset=utf-8' })
   })
-  route('post', '/v1/mailbox-snapshot', { summary: 'Page a stable mailbox ID inventory with live body-free rows', input: 'MailboxSnapshotInput', output: 'MailboxSnapshotPage',
-    description: 'Read-only POST; no Idempotency-Key. Select 1–1000 owned attached mailboxes, up to 500 rows/page. IDs/order and state baseline are fixed for five minutes; row and membership values are current when each page is read. Finish the inventory then apply mailbox-changes from that baseline, merging canonical and membership revisions independently. A 100,000-ID and bounded shared-memory budget applies; expired/evicted/restarted inventories return SNAPSHOT_EXPIRED (410). Scope revocation returns no rows. No query filters; legacy filtered queries remain unchanged.' }, async c => json(c, validate(schemas.MailboxSnapshotPage, await inbox.mailboxSnapshot(c.get('owner'), body(c, schemas.MailboxSnapshotInput)))))
+  route('post', '/v1/mailbox-snapshot', { summary: 'Page a stable mailbox ID inventory with live body-free rows', input: 'MailboxSnapshotInput', output: 'MailboxSnapshotPage', streamOutput: 'MailboxSnapshotFrame',
+    description: 'Read-only POST; no Idempotency-Key. Select 1–1000 owned attached mailboxes, up to 500 rows/page. IDs/order and state baseline are fixed for five minutes; row and membership values are current when each page is read. Finish the inventory then apply mailbox-changes from that baseline, merging canonical and membership revisions independently. A 100,000-ID and bounded shared-memory budget applies; expired/evicted/restarted inventories return SNAPSHOT_EXPIRED (410). Scope revocation returns no further rows. No query filters; legacy filtered queries remain unchanged. Accept: application/x-ndjson streams the same SDK pages in one response, reauthenticating before every page. Each newline-terminated frame is a page or a safe terminal error with its HTTP status. Success requires the terminal page (nextCursor: null) and clean EOF; discard incomplete transfers. Page payloads remain limited to 4 MiB and 5,000 memberships. Streams last at most five minutes, with four per owner and eight total; they are uncompressed and never cached.' }, async c => {
+    const input = body(c, schemas.MailboxSnapshotInput)
+    c.header('Vary', 'Origin, Authorization, Cookie, Accept')
+    const streaming = (c.req.header('accept') ?? '').split(',').some(part => {
+      const [media, ...parameters] = part.trim().toLowerCase().split(';').map(value => value.trim())
+      const quality = parameters.find(value => value.startsWith('q='))?.slice(2)
+      return media === 'application/x-ndjson' && (quality === undefined || /^(?:0(?:\.\d{1,3})?|1(?:\.0{1,3})?)$/.test(quality) && Number(quality) > 0)
+    })
+    const owner = c.get('owner')
+    if (!streaming) return json(c, validate(schemas.MailboxSnapshotPage, await inbox.mailboxSnapshot(owner, input)))
+    const active = snapshotStreams.get(owner) ?? 0
+    if (active >= 4 || snapshotStreamCount >= 8) {
+      c.header('Retry-After', '1')
+      throw new InboxError('STREAM_LIMIT', 'Too many active inventory streams', 429, true)
+    }
+    snapshotStreams.set(owner, active + 1); snapshotStreamCount++
+    let closed = false, terminal = false, pages = 0
+    let cursor = input.cursor
+    let baseline: Pick<MailboxSnapshotPage, 'state' | 'scopeState' | 'total' | 'expiresAt'> | undefined
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let stopped: unknown
+    let interrupt: ((error: unknown) => void) | undefined
+    const read = async <T,>(work: () => T | Promise<T>): Promise<T> => {
+      if (closed) throw stopped
+      let rejectRead!: (error: unknown) => void
+      const interrupted = new Promise<never>((_resolve, reject) => { rejectRead = reject })
+      interrupt = rejectRead
+      try { return await Promise.race([Promise.resolve().then(() => { if (closed) throw stopped; return work() }), interrupted]) }
+      finally { if (interrupt === rejectRead) interrupt = undefined }
+    }
+    const stop = (error?: unknown, report = false) => {
+      if (closed) return
+      closed = true
+      clearTimeout(timer)
+      c.req.raw.signal.removeEventListener('abort', abort)
+      const remaining = (snapshotStreams.get(owner) ?? 1) - 1
+      if (remaining > 0) snapshotStreams.set(owner, remaining)
+      else snapshotStreams.delete(owner)
+      snapshotStreamCount--
+      stopped = error ?? new DOMException('Inventory stream closed', 'AbortError')
+      interrupt?.(stopped)
+      try {
+        if (report) controller?.enqueue(encoder.encode(`${JSON.stringify({ type: 'error', ...safeError(error) })}\n`))
+        if (error !== undefined && !report) controller?.error(error)
+        else controller?.close()
+      } catch { /* Cancellation may already have closed the response. */ }
+    }
+    const abort = () => stop(c.req.raw.signal.reason ?? new DOMException('Inventory stream aborted', 'AbortError'))
+    // The deadline and slot cleanup cover setup as well as a stalled consumer/read.
+    timer = setTimeout(() => stop(new InboxError('SNAPSHOT_STREAM_TIMEOUT', 'Inventory transfer timed out', 504, true), true), STREAM_LIFETIME_MS)
+    c.req.raw.signal.addEventListener('abort', abort, { once: true })
+    if (c.req.raw.signal.aborted) abort()
+    const readPage = async () => {
+      if (closed) throw stopped
+      let identity: { id: string } | null
+      try { identity = await read(() => options.authenticate(c.req.raw)) }
+      catch (error) { if (closed) throw error; throw new InboxError('AUTHENTICATION_UNAVAILABLE', 'Authentication unavailable', 503, true) }
+      if (closed) throw stopped
+      if (identity?.id !== owner) throw new InboxError('UNAUTHENTICATED', 'Authentication required', 401)
+      const page = validate(schemas.MailboxSnapshotPage, await read(() => inbox.mailboxSnapshot(owner, { ...input, ...(cursor === undefined ? {} : { cursor }) })))
+      if (closed) throw stopped
+      if (page.total > 100000 || ++pages > Math.max(1, page.total) || page.items.length > (input.limit ?? 500)
+        || page.items.reduce((count, item) => count + item.memberships.length, 0) > 5000
+        || page.nextCursor !== null && (page.nextCursor === cursor || pages >= Math.max(1, page.total))
+        || baseline && (page.state !== baseline.state || page.scopeState !== baseline.scopeState || page.total !== baseline.total || page.expiresAt !== baseline.expiresAt)) {
+        throw new InboxError('INVALID_SNAPSHOT_PAGE', 'Invalid inventory page', 500, true)
+      }
+      const text = JSON.stringify(page)
+      if (encoder.encode(text).byteLength > SNAPSHOT_PAGE_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The mailbox page exceeds its encoded budget', 413)
+      baseline ??= { state: page.state, scopeState: page.scopeState, total: page.total, expiresAt: page.expiresAt }
+      terminal = page.nextCursor === null
+      cursor = page.nextCursor ?? undefined
+      return encoder.encode(`{"type":"page","page":${text}}\n`)
+    }
+    let first: Uint8Array | undefined
+    try { first = await readPage() }
+    catch (error) { stop(error); throw error }
+    const stream = new ReadableStream<Uint8Array>({
+      start(value) { controller = value; if (closed) value.error(new DOMException('Inventory stream aborted', 'AbortError')) },
+      async pull(value) {
+        try {
+          const bytes = first ?? await readPage()
+          first = undefined
+          if (closed) return
+          value.enqueue(bytes)
+          if (terminal) stop()
+        } catch (error) { stop(error, true) }
+      },
+      cancel() { first = undefined; stop(new DOMException('Inventory stream cancelled', 'AbortError')) },
+    }, { highWaterMark: 0 })
+    return c.newResponse(stream, 200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' })
+  })
   route('post', '/v1/mailbox-changes', { summary: 'Reconcile a scoped body-free mailbox view from owner change history', input: 'MailboxChangesInput', output: 'MailboxChangesPage',
     description: 'Read-only POST; scopeState comes from mailbox-snapshot. At most 500 event-prefix entries are consumed, with current upserts and scoped removals; state advances only through that prefix when hasMore. Current rows may be newer than their events: merge canonical and membership revisions independently and apply deltas in order after initial inventory paging. Metadata events permit targeted metadata refresh. Scope/history resets contain no rows; start a new authorized inventory. Each response has encoded-byte and membership-row budgets.' }, async c => json(c, validate(schemas.MailboxChangesPage, await inbox.mailboxChanges(c.get('owner'), body(c, schemas.MailboxChangesInput)))))
   route('get', '/v1/mailboxes/:id/messages/:messageId/summary', { summary: 'Read cached metadata in an owned mailbox without accessing its body', output: 'MailboxMessageSummary',

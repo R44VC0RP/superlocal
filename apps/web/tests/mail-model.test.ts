@@ -757,9 +757,14 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
         membershipRequests.push(JSON.parse(String(init.body)));
         if (response.ok && loseMembershipResponses > 0) { loseMembershipResponses--; throw new TypeError("Controlled lost Done response"); }
       }
-      if (url.pathname === "/v1/mailbox-snapshot" && response.ok && finalPageGate && !(await response.clone().json()).nextCursor) {
-        // Freeze a COMPLETE authoritative snapshot before any local command,
-        // avoiding a later page's legitimate STALE_CURSOR restart masking it.
+      if (url.pathname === "/v1/mailbox-snapshot" && response.ok && finalPageGate) {
+        // Drain through EOF before freezing the COMPLETE authoritative snapshot.
+        // Holding an earlier page would let a later page's legitimate cursor
+        // restart mask whether newer E/W/Undo receipts survive this old snapshot.
+        assert.match(response.headers.get("Content-Type") ?? "", /^application\/x-ndjson\b/);
+        const frames = (await response.clone().text()).trim().split("\n").map(line => JSON.parse(line));
+        assert.ok(frames.length > 0 && frames.every(frame => frame.type === "page"));
+        assert.equal(frames.at(-1).page.nextCursor, null);
         finalPageHeld = true; await finalPageGate; init?.signal?.throwIfAborted();
       }
       if (url.pathname === "/v1/operations" && init?.method === "POST" && response.ok) {
@@ -1309,10 +1314,11 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
   }
 });
 test("SDK-backed startup catches signed changes before first display without repeating fresh metadata", async () => {
-  if (!process.versions.bun) {
+  // Keep the irreversible document-owner abort isolated from other SDK cases.
+  if (process.env.INBOX_STARTUP_TEST_CHILD !== "1") {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
       const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "SDK-backed startup", "--timeout", "30000"], {
-        env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_STARTUP_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
       });
       let output = "";
       child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
@@ -1321,8 +1327,8 @@ test("SDK-backed startup catches signed changes before first display without rep
     assert.equal(result.code, 0, result.output);
     return;
   }
-  const [{ createMockHost }, { InboxStore }, fs, { tmpdir }, { join }, { Database }] = await Promise.all([
-    import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("node:fs/promises"), import("node:os"), import("node:path"), import("bun:sqlite"),
+  const [{ createMockHost }, { InboxStore }, fs, { tmpdir }, { join }, { Database }, { bindApplicationScope }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("node:fs/promises"), import("node:os"), import("node:path"), import("bun:sqlite"), import("../src/application-scope.ts"),
   ]);
   const root = await fs.mkdtemp(join(tmpdir(), "startup-catchup-"));
   const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 31).toString("base64"), token: "fictional-startup-catchup-client-token", allowProviderWrites: true });
@@ -1341,10 +1347,12 @@ test("SDK-backed startup catches signed changes before first display without rep
     const value = { promise: new Promise<void>(resolve => { release = resolve; }), release: () => release(), seen: false };
     gates.push(value); return value;
   };
-  let beforeSnapshot: ReturnType<typeof gate> | undefined, snapshot: ReturnType<typeof gate> | undefined;
+  let beforeSnapshot: ReturnType<typeof gate> | undefined, snapshot: ReturnType<typeof gate> | undefined, firstPage: ReturnType<typeof gate> | undefined;
   let delta: ReturnType<typeof gate> | undefined, redundantMetadata: ReturnType<typeof gate> | undefined;
   let stop: (() => void) | undefined, liveEvents = false, deltaFailures = 0, foreignState: string | undefined;
-  let inventories = 0, deltas = 0, scopeResets = 0, streams = 0, hostReads = 0;
+  let inventories = 0, deltas = 0, scopeResets = 0, streams = 0, hostReads = 0, snapshotPages = 0;
+  let smallSnapshot = true, snapshotSignal: AbortSignal | null | undefined;
+  let snapshotFailure: "interrupted" | "truncated" | "after-final" | "expired" | "scope" | "forbidden" | undefined, snapshotFailures = 0;
   let preferences = { revision: 1, unifiedMode: "all", includedMailboxIds: [] as string[], pinnedMailboxIds: [] as string[] };
   let splits = { ...normalizeSplits({}), revision: 1 };
   try {
@@ -1366,6 +1374,7 @@ test("SDK-backed startup catches signed changes before first display without rep
       document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
       localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
     });
+    const binding = bindApplicationScope("c".repeat(64));
     globalThis.fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
       if (url.pathname === "/host/config") {
@@ -1379,7 +1388,15 @@ test("SDK-backed startup catches signed changes before first display without rep
         const abort = () => reject(new DOMException("Request cancelled", "AbortError"));
         if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
       });
-      if (url.pathname === "/v1/mailbox-snapshot" && beforeSnapshot) { beforeSnapshot.seen = true; await beforeSnapshot.promise; }
+      if (url.pathname === "/v1/mailbox-snapshot") {
+        assert.equal(init?.method, "POST");
+        assert.equal(new Headers(init?.headers).get("Accept"), "application/x-ndjson");
+        snapshotSignal = init?.signal;
+        if (beforeSnapshot) { beforeSnapshot.seen = true; await beforeSnapshot.promise; }
+        // Exercise real multi-page inventory without adding a large fixture.
+        // Only this request is changed; later bootstraps retain the app's limit.
+        if (smallSnapshot) { smallSnapshot = false; init = { ...init, body: JSON.stringify({ ...JSON.parse(String(init?.body)), limit: 1 }) }; }
+      }
       if (url.pathname === "/v1/mailbox-changes" && deltaFailures > 0) {
         deltaFailures--;
         return Response.json({ code: "CONTROLLED_FAILURE", error: "Controlled catch-up failure." }, { status: 503 });
@@ -1390,8 +1407,45 @@ test("SDK-backed startup catches signed changes before first display without rep
       if (url.pathname === "/v1/events" && response.ok) streams++;
       if (url.pathname === "/v1/mailbox-snapshot") {
         inventories++;
-        const held = snapshot;
-        if (held && response.ok && !(await response.clone().json()).nextCursor) { held.seen = true; await held.promise; }
+        if (response.ok) {
+          assert.match(response.headers.get("Content-Type") ?? "", /^application\/x-ndjson\b/);
+          const held = snapshot, first = firstPage, failure = snapshotFailures > 0 ? snapshotFailure : undefined;
+          if (snapshotFailures > 0) snapshotFailures--;
+          const decoder = new TextDecoder(), encoder = new TextEncoder();
+          let pending = "", pageCount = 0, lastPage: import("inbox-sdk/types").MailboxSnapshotPage | undefined;
+          return new Response(response.body!.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+            async transform(chunk, controller) {
+              pending += decoder.decode(chunk, { stream: true });
+              let end: number;
+              while ((end = pending.indexOf("\n")) !== -1) {
+                const frame = JSON.parse(pending.slice(0, end)); pending = pending.slice(end + 1);
+                assert.equal(frame.type, "page", "the controlled stream starts with real SDK summary pages");
+                lastPage = frame.page; pageCount++; snapshotPages++;
+              }
+              controller.enqueue(chunk);
+              if (pageCount === 1) {
+                if (first) { first.seen = true; await first.promise; }
+                if (failure === "interrupted") throw new TypeError("Controlled snapshot stream interruption");
+                if (failure === "truncated") { controller.terminate(); return; }
+                if (failure && failure !== "after-final") {
+                  const code = failure === "expired" ? "SNAPSHOT_EXPIRED" : failure === "scope" ? "SNAPSHOT_SCOPE_CHANGED" : "FORBIDDEN";
+                  controller.enqueue(encoder.encode(`${JSON.stringify({ type: "error", status: failure === "forbidden" ? 403 : 409, code, error: "Controlled terminal snapshot failure", retryable: failure !== "forbidden" })}\n`));
+                  controller.terminate();
+                }
+              }
+            },
+            async flush(controller) {
+              pending += decoder.decode();
+              assert.equal(pending, "", "snapshot EOF follows complete NDJSON frames");
+              assert.ok(pageCount > 0);
+              assert.equal(lastPage!.nextCursor, null, "freeze the complete authoritative inventory, not an earlier page");
+              if (failure === "after-final") controller.enqueue(encoder.encode(`${JSON.stringify({ type: "error", status: 503, code: "UPSTREAM", error: "Controlled failure after the final page", retryable: true })}\n`));
+              // All pages have reached the client, but successful EOF has not.
+              // Ignore abort here so the SDK/owner fence must reject late work.
+              if (held) { held.seen = true; await held.promise; }
+            },
+          })), { status: response.status, headers: response.headers });
+        }
       }
       if (url.pathname === "/v1/mailbox-changes") {
         deltas++;
@@ -1407,13 +1461,28 @@ test("SDK-backed startup catches signed changes before first display without rep
       return response;
     }) as typeof fetch;
 
-    redundantMetadata = gate(); snapshot = gate();
-    let store = new InboxStore(); stop = store.start();
-    await until(() => snapshot!.seen, "complete initial SDK snapshot held");
-    assert.equal(store.getSnapshot().loaded, false, "a snapshot alone cannot expose rows or a false empty state");
+    redundantMetadata = gate(); firstPage = gate(); snapshot = gate();
+    let store = new InboxStore(), publishedBeforeEof = false;
+    const unsubscribePages = store.subscribe(() => { publishedBeforeEof ||= store.getSnapshot().loaded || store.getSnapshot().mail.length > 0; });
+    stop = store.start();
+    await until(() => firstPage!.seen, "first real snapshot page reached the client");
+    assert.equal(snapshotPages, 1);
+    assert.equal(store.getSnapshot().loaded, false);
+    assert.deepEqual(store.getSnapshot().mail, [], "a streamed partial inventory remains private");
+    assert.equal(deltas, 0, "catch-up cannot begin before snapshot completion");
+    firstPage.release(); firstPage = undefined;
+    await until(() => snapshot!.seen, "complete initial SDK snapshot held before EOF");
+    assert.ok(snapshotPages > 1, "the real SDK supplied multiple bounded pages");
+    assert.equal(inventories, 1, "one snapshot POST carries every page, without cursor fetches");
+    assert.equal(store.getSnapshot().loaded, false, "even the final page is not success before EOF");
+    assert.deepEqual(store.getSnapshot().mail, []);
+    assert.equal(publishedBeforeEof, false, "no subscriber ever saw a partial inventory");
+    assert.equal(deltas, 0); unsubscribePages();
     snapshot.release(); snapshot = undefined;
     await until(() => store.getSnapshot().loaded, "first ready does not wait for redundant host metadata");
     assert.equal(hostReads, 1, "fresh host metadata is not unconditionally read again during catch-up");
+    assert.equal(inventories, 1, "catch-up does not restart the completed inventory");
+    assert.ok(deltas > 0, "successful EOF still requires signed catch-up");
     assert.equal(redundantMetadata.seen, false);
     assert.ok(store.getSnapshot().mail.length > 0);
     redundantMetadata.release(); redundantMetadata = undefined; stop();
@@ -1508,6 +1577,63 @@ test("SDK-backed startup catches signed changes before first display without rep
     stop(); stop = undefined; delta.release(); delta = undefined;
     await sleep(50);
     assert.equal(store.getSnapshot().loaded, false, "a late catch-up response cannot publish after stop");
+
+    for (const failure of ["interrupted", "truncated", "after-final", "forbidden"] as const) {
+      snapshotFailure = failure; snapshotFailures = 1; smallSnapshot = true; firstPage = gate();
+      const beforeInventories = inventories, beforeDelta = deltas;
+      store = new InboxStore(); let exposed = false;
+      const unsubscribe = store.subscribe(() => { exposed ||= store.getSnapshot().loaded || store.getSnapshot().mail.length > 0; });
+      stop = store.start();
+      await until(() => firstPage!.seen, `${failure} receives a real page before failure`);
+      assert.equal(store.getSnapshot().loaded, false); assert.deepEqual(store.getSnapshot().mail, []);
+      firstPage.release(); firstPage = undefined;
+      await until(() => !!store.getSnapshot().error, `${failure} stream is reported as a failed bootstrap`);
+      assert.equal(store.getSnapshot().loaded, false);
+      assert.deepEqual(store.getSnapshot().mail, []);
+      assert.equal(exposed, false, `${failure} never publishes its accumulated summaries`);
+      assert.equal(inventories, beforeInventories + 1, "stream retryable flags and transport failures do not broaden the existing automatic retry policy");
+      assert.equal(deltas, beforeDelta, "a failed stream never reaches signed catch-up");
+      unsubscribe(); snapshotFailure = undefined;
+      await store.retry();
+      assert.equal(store.getSnapshot().loaded, true, "explicit Retry starts a fresh complete inventory and catch-up");
+      assert.equal(inventories, beforeInventories + 2); stop();
+    }
+
+    for (const failure of ["expired", "scope"] as const) for (const failures of [1, 2]) {
+      snapshotFailure = failure; snapshotFailures = failures; smallSnapshot = true;
+      const beforeInventories = inventories, beforeMetadata = hostReads;
+      store = new InboxStore(); let partial = false;
+      const unsubscribe = store.subscribe(() => { partial ||= !store.getSnapshot().loaded && store.getSnapshot().mail.length > 0; });
+      stop = store.start();
+      await until(() => store.getSnapshot().loaded || !!store.getSnapshot().error, `${failure} recovery finishes`);
+      assert.equal(inventories, beforeInventories + 2, "recognized snapshot failures restart once, never indefinitely");
+      assert.equal(hostReads, beforeMetadata + 2, "restart rereads authorized metadata instead of resuming the old selection");
+      assert.equal(store.getSnapshot().loaded, failures === 1);
+      if (failures === 2) {
+        assert.equal(partial, false, "two failed attempts cannot publish either partial inventory");
+        assert.deepEqual(store.getSnapshot().mail, []);
+      } else assert.ok(store.getSnapshot().mail.length > 0);
+      unsubscribe(); stop(); snapshotFailure = undefined;
+    }
+
+    firstPage = gate(); smallSnapshot = true; store = new InboxStore(); stop = store.start();
+    await until(() => firstPage!.seen, "partial stream held before stopping its generation");
+    stop(); stop = undefined;
+    const stoppedSnapshot = store.getSnapshot();
+    assert.equal(snapshotSignal?.aborted, true, "stop aborts the in-flight snapshot request");
+    firstPage.release(); firstPage = undefined; await sleep(50);
+    assert.strictEqual(store.getSnapshot(), stoppedSnapshot, "late pages cannot publish after stop");
+    assert.equal(store.getSnapshot().loaded, false); assert.deepEqual(store.getSnapshot().mail, []);
+
+    snapshot = gate(); store = new InboxStore(); stop = store.start();
+    await until(() => snapshot!.seen, "complete stream held before owner access is revoked");
+    const lockedSnapshot = store.getSnapshot(), beforeOwnerDeltas = deltas;
+    binding.lock();
+    assert.equal(snapshotSignal?.aborted, true, "document-owner revocation aborts the snapshot transport");
+    snapshot.release(); snapshot = undefined; await sleep(50);
+    assert.strictEqual(store.getSnapshot(), lockedSnapshot, "EOF after owner abort cannot publish or report a new mail state");
+    assert.equal(store.getSnapshot().loaded, false); assert.deepEqual(store.getSnapshot().mail, []);
+    assert.equal(deltas, beforeOwnerDeltas, "owner-aborted inventory never proceeds to catch-up");
   } finally {
     stop?.(); for (const held of gates) held.release();
     database.close(); await host.close(); await fs.rm(root, { recursive: true, force: true });

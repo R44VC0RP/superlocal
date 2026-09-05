@@ -1,4 +1,4 @@
-import type { BlobInfo, ChangeEvent, Draft, DraftInput, Inbox, Label, MailboxInput, MailboxQuery, MutationInput, Policy, Query, SyncRequest } from './contracts'
+import type { BlobInfo, ChangeEvent, Draft, DraftInput, Inbox, Label, MailboxInput, MailboxQuery, MailboxSnapshotInput, MailboxSnapshotPage, MutationInput, Policy, Query, SyncRequest } from './contracts'
 
 export interface InboxClientOptions {
   /** API origin or same-origin mount path, without /v1. */
@@ -34,6 +34,8 @@ type Result<K extends keyof Inbox> = Awaited<ReturnType<Inbox[K]>>
 type CacheEntry = { etag: string; text: string; headers: Headers }
 const MAX_CACHE_BODY = 1024 * 1024
 const MAX_EVENT_BUFFER = 64 * 1024
+const MAX_SNAPSHOT_PAGE = 4 * 1024 * 1024
+const SNAPSHOT_LIFETIME_MS = 5 * 60 * 1000
 const changeTypes = new Set(['mail.changed', 'account.updated', 'draft.updated', 'operation.updated', 'label.updated', 'policy.updated', 'connection.updated', 'mailbox.updated', 'membership.updated'])
 
 function apiProblem(value: unknown, status: number, headers?: Headers): ApiError {
@@ -201,6 +203,151 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     const tag = current.headers.get('etag')
     if (!tag || !/^"[^"\r\n]+"$/.test(tag)) throw new ApiError('The API did not provide an entity ETag', 502, 'INVALID_RESPONSE')
     return write<T>(path, method, input, { signal }, { 'If-Match': tag })
+  }
+
+  /** Finite transfer of real SDK pages. Completion requires the terminal page and clean EOF. */
+  function mailboxSnapshotPages(input: MailboxSnapshotInput, requestOptions: InboxRequestOptions = {}): AsyncIterableIterator<MailboxSnapshotPage> {
+    const controller = new AbortController()
+    const version = credentialsVersion
+    const signal = AbortSignal.any([controller.signal, credentialsController.signal, ...(requestOptions.signal ? [requestOptions.signal] : [])])
+    const requestHeaders = new Headers(headers)
+    requestHeaders.set('Accept', 'application/x-ndjson')
+    requestHeaders.set('Content-Type', 'application/json')
+    const payload = JSON.stringify(input)
+    const selected = new Set(input.mailboxIds)
+    const limit = input.limit ?? 500
+    const initialCursor = input.cursor
+    const ensureCurrent = () => {
+      signal.throwIfAborted()
+      if (version !== credentialsVersion) throw new DOMException('Credentials changed', 'AbortError')
+    }
+    const invalid = () => new ApiError('The API returned an invalid or incomplete inventory stream', 502, 'INVALID_SNAPSHOT_STREAM')
+    const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
+    const token = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 4096 && !/[\u0000-\u001f\u007f]/.test(value)
+    const id = (value: unknown): value is string => token(value) && value.length <= 512 && !/[/\\]/.test(value)
+    const revision = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0
+    const participant = (value: unknown) => record(value) && typeof value.name === 'string' && value.name.length <= 1024
+      && typeof value.email === 'string' && value.email.length > 0 && value.email.length <= 1024
+      && (value.avatar === undefined || value.avatar === null || typeof value.avatar === 'string')
+    const pageValue = (value: unknown): MailboxSnapshotPage => {
+      if (!record(value) || !Array.isArray(value.items) || value.items.length > limit || value.items.length > 500
+        || !revision(value.total) || (value.total as number) > 100000 || value.items.length > (value.total as number)
+        || !token(value.state) || !token(value.scopeState) || value.nextCursor !== null && !token(value.nextCursor)
+        || typeof value.expiresAt !== 'string' || value.expiresAt.length > 100 || !Number.isFinite(Date.parse(value.expiresAt))) throw invalid()
+      let memberships = 0
+      for (const item of value.items) {
+        if (!record(item) || !id(item.id) || !id(item.sourceId) || item.accountId !== item.sourceId || !id(item.threadId) || !revision(item.revision)
+          || !participant(item.from) || !Array.isArray(item.to) || !item.to.every(participant) || !Array.isArray(item.cc) || !item.cc.every(participant)
+          || !['subject', 'preview', 'receivedAt', 'folder'].every(key => typeof item[key] === 'string')
+          || !['isRead', 'isStarred', 'hasAttachments'].every(key => typeof item[key] === 'boolean')
+          || !Array.isArray(item.folderIds) || !item.folderIds.every(id) || !Array.isArray(item.labelIds) || !item.labelIds.every(id)
+          || item.bodyRevision !== undefined && !token(item.bodyRevision) || !Array.isArray(item.memberships)
+          || ['bodyText', 'bodyHtml', 'bodyDocument', 'bcc', 'attachments'].some(key => Object.hasOwn(item, key))) throw invalid()
+        memberships += item.memberships.length
+        if (memberships > 5000) throw invalid()
+        for (const state of item.memberships) {
+          if (!record(state) || !id(state.mailboxId) || !selected.has(state.mailboxId) || state.messageId !== item.id || !revision(state.revision)
+            || typeof state.done !== 'boolean' || state.snoozedUntil !== null && typeof state.snoozedUntil !== 'string') throw invalid()
+        }
+      }
+      return value as unknown as MailboxSnapshotPage
+    }
+    async function* stream(): AsyncGenerator<MailboxSnapshotPage, void, unknown> {
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+      let responseBody: ReadableStream<Uint8Array> | null | undefined
+      const cancelReader = () => { void reader?.cancel().catch(() => {}) }
+      const timer = setTimeout(() => controller.abort(new DOMException('Inventory transfer timed out', 'TimeoutError')), SNAPSHOT_LIFETIME_MS)
+      try {
+        ensureCurrent()
+        const response = await fetcher(url('/mailbox-snapshot'), { method: 'POST', headers: requestHeaders, body: payload, credentials: 'include', cache: 'no-store', signal })
+        responseBody = response.body
+        ensureCurrent()
+        if (!response.body) throw invalid()
+        reader = response.body.getReader()
+        signal.addEventListener('abort', cancelReader, { once: true })
+        ensureCurrent()
+        if (!response.ok) {
+          const bytes = new Uint8Array(MAX_EVENT_BUFFER)
+          let length = 0
+          while (true) {
+            const chunk = await reader.read()
+            ensureCurrent()
+            if (chunk.done) break
+            if (length + chunk.value.byteLength > bytes.byteLength) throw invalid()
+            bytes.set(chunk.value, length); length += chunk.value.byteLength
+          }
+          let problem: unknown
+          try { problem = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, length))) } catch { problem = null }
+          throw apiProblem(problem, response.status, response.headers)
+        }
+        if (!/^application\/x-ndjson(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')) throw invalid()
+        // A fixed byte buffer bounds partial lines even when UTF-8 or newlines span chunks.
+        // The small allowance is framing, not an increase to the 4 MiB page budget.
+        const bytes = new Uint8Array(MAX_SNAPSHOT_PAGE + 64)
+        const decoder = new TextDecoder('utf-8', { fatal: true })
+        const encoder = new TextEncoder()
+        let length = 0, terminal = false, pages = 0, messages = 0
+        let cursor = initialCursor
+        let baseline: Pick<MailboxSnapshotPage, 'state' | 'scopeState' | 'total' | 'expiresAt'> | undefined
+        while (true) {
+          ensureCurrent()
+          const chunk = await reader.read()
+          ensureCurrent()
+          if (chunk.done) {
+            if (!terminal || length) throw invalid()
+            return
+          }
+          let offset = 0
+          while (offset < chunk.value.byteLength) {
+            ensureCurrent()
+            if (terminal) throw invalid()
+            const newline = chunk.value.indexOf(10, offset)
+            const end = newline < 0 ? chunk.value.byteLength : newline
+            if (length + end - offset > bytes.byteLength) throw invalid()
+            bytes.set(chunk.value.subarray(offset, end), length); length += end - offset
+            offset = newline < 0 ? end : end + 1
+            if (newline < 0) continue
+            let frame: unknown
+            try { frame = JSON.parse(decoder.decode(bytes.subarray(0, length))) } catch { throw invalid() }
+            length = 0
+            if (!record(frame)) throw invalid()
+            if (frame.type === 'error') {
+              if (!Number.isInteger(frame.status) || (frame.status as number) < 400 || (frame.status as number) > 599
+                || typeof frame.code !== 'string' || !/^[A-Z][A-Z0-9_]{0,79}$/.test(frame.code)
+                || typeof frame.error !== 'string' || frame.error.length > 1024 || typeof frame.retryable !== 'boolean') throw invalid()
+              throw apiProblem(frame, frame.status as number)
+            }
+            if (frame.type !== 'page') throw invalid()
+            const page = pageValue(frame.page)
+            messages += page.items.length
+            if (++pages > Math.max(1, page.total) || messages > page.total
+              || page.nextCursor !== null && (page.nextCursor === cursor || pages >= Math.max(1, page.total))
+              || baseline && (page.state !== baseline.state || page.scopeState !== baseline.scopeState || page.total !== baseline.total || page.expiresAt !== baseline.expiresAt)
+              || encoder.encode(JSON.stringify(page)).byteLength > MAX_SNAPSHOT_PAGE) throw invalid()
+            baseline ??= { state: page.state, scopeState: page.scopeState, total: page.total, expiresAt: page.expiresAt }
+            terminal = page.nextCursor === null
+            cursor = page.nextCursor ?? undefined
+            ensureCurrent()
+            yield page
+          }
+        }
+      } catch (error) { ensureCurrent(); throw error }
+      finally {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', cancelReader)
+        if (reader) await reader.cancel().catch(() => {})
+        else await responseBody?.cancel().catch(() => {})
+        reader?.releaseLock()
+        controller.abort()
+      }
+    }
+    const iterator = stream()
+    return {
+      [Symbol.asyncIterator]() { return this },
+      next: () => iterator.next(),
+      return: async () => { controller.abort(); return iterator.return(undefined) },
+      throw: async (error?: unknown) => { controller.abort(); return iterator.throw(error) },
+    }
   }
 
   function events(eventOptions: InboxEventsOptions = {}): AsyncIterableIterator<InboxEvent> {
@@ -384,6 +531,7 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     mailboxMessage: (mailboxId: string, messageId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'mailboxMessage'>>(`/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}`, requestOptions),
     mailboxSyncStatus: (input: Parameters<Inbox['mailboxSyncStatus']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxSyncStatus'>>('/mailbox-sync/status', 'POST', input, requestOptions),
     mailboxSnapshot: (input: Parameters<Inbox['mailboxSnapshot']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxSnapshot'>>('/mailbox-snapshot', 'POST', input, requestOptions),
+    mailboxSnapshotPages,
     mailboxChanges: (input: Parameters<Inbox['mailboxChanges']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxChanges'>>('/mailbox-changes', 'POST', input, requestOptions),
     setMailboxStates: (input: Parameters<Inbox['setMailboxStates']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'setMailboxStates'>>('/mailbox-actions', 'POST', input, requestOptions),
     undoMailboxStates: (id: string, requestOptions: InboxRequestOptions = {}) => write<Result<'undoMailboxStates'>>(`/mailbox-actions/${resourceId(id)}/undo`, 'POST', undefined, requestOptions),

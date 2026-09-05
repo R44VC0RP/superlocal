@@ -37,7 +37,7 @@ import { MockMailStore } from '../../../apps/mock-api/src/store'
 import { seedMockMail } from '../../../apps/mock-api/src/seed'
 import type {
   Account, BlobInfo, ChangeEvent, ChangePage, Connection, Draft, Folder, Inbox, InboxOptions,
-  Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, MailboxSyncStatus, Message,
+  Label, Mailbox, MailboxCandidate, MailboxMembership, MailboxMessageSummary, MailboxSnapshotPage, MailboxSyncStatus, Message,
   MessageSummary, Operation, Page, Policy, ProviderDefinition, Query,
   ThreadSummary, MediaNetwork, SendingIdentity, SendingIdentities,
 } from '../src/contracts'
@@ -2330,6 +2330,11 @@ describe('bounded mailbox snapshot and changes', () => {
       expect(second.items).toHaveLength(2)
       expect(second.nextCursor).toBeNull()
       expect(new Set([...first.items, ...second.items].map(item => item.id)).size).toBe(7)
+      const streamed: MailboxSnapshotPage[] = []
+      for await (const page of client.mailboxSnapshotPages({ mailboxIds: ids })) streamed.push(page)
+      expect(streamed.map(page => page.items.length)).toEqual([5, 2])
+      expect(streamed.flatMap(page => page.items)).toEqual([...first.items, ...second.items])
+      for (const page of streamed) expect(page.items.reduce((count, item) => count + item.memberships.length, 0)).toBeLessThanOrEqual(5000)
       const changed = first.items[0]!
       await h.inbox.setMailboxState('alice', ids[0]!, changed.id, { done: true }, 1)
       const delta = await h.inbox.mailboxChanges('alice', { mailboxIds: ids, since: first.state, scopeState: first.scopeState })
@@ -2402,6 +2407,12 @@ describe('bounded mailbox snapshot and changes', () => {
       const second = await h.inbox.mailboxSnapshot('alice', { ...scope, cursor: first.nextCursor! })
       expect(second.items).toHaveLength(1)
       expect(second.nextCursor).toBeNull()
+      const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+      const streamed: MailboxSnapshotPage[] = []
+      for await (const page of client.mailboxSnapshotPages(scope)) streamed.push(page)
+      expect(streamed.map(page => page.items.length)).toEqual([1, 1])
+      expect(streamed.flatMap(page => page.items)).toEqual([...first.items, ...second.items])
+      for (const page of streamed) expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(4 * 1024 * 1024)
       await h.inbox.mutate('alice', { messageIds: messages.map(message => message.id), changes: { isRead: true }, idempotencyKey: 'large-read-events' })
       const one = await h.inbox.mailboxChanges('alice', { ...scope, since: first.state, scopeState: first.scopeState })
       expect(one.upserts).toHaveLength(1)
@@ -2457,6 +2468,302 @@ describe('bounded mailbox snapshot and changes', () => {
       expect(legacy.items[0]!.bodyRevision).toMatch(/^[a-zA-Z0-9_-]{43}$/)
       expect(database.query<{ revision: number }, [string]>('SELECT revision FROM sdk_messages WHERE id=?').get(previous.id)!.revision).toBe(before)
     } finally { database.close() }
+  })
+})
+
+describe('finite mailbox snapshot streams', () => {
+  test('one real socket POST transports 500-row SDK pages and catches up concurrent changes without publishing an incomplete inventory', async () => {
+    const h = await fixture()
+    const { account, box } = await h.seed('alice', 'snapshot-socket', Array.from({ length: 1001 }, (_, index) => native(`socket-${index}`)))
+    await h.seed('bob', 'snapshot-socket-foreign')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const scope = { mailboxIds: [mailbox.id], limit: 500 }
+    const original = h.inbox.mailboxSnapshot.bind(h.inbox)
+    const barrier = h.gate(undefined)
+    let reads = 0, requests = 0
+    const guard = spyOn(h.inbox, 'mailboxSnapshot').mockImplementation(async (...args) => {
+      if (++reads === 2) await barrier.wait()
+      return original(...args)
+    })
+    const base = h.socket()
+    const client = createInboxClient({ baseUrl: base, headers: { authorization: 'Bearer alice' }, fetch: (async (input, init) => {
+      if (new URL(String(input)).pathname === '/v1/mailbox-snapshot') {
+        requests++
+        expect(init?.method).toBe('POST')
+        expect(new Headers(init?.headers).get('accept')).toBe('application/x-ndjson')
+      }
+      const response = await fetch(input, init)
+      if (new URL(String(input)).pathname === '/v1/mailbox-snapshot') {
+        expect(response.headers.get('content-type')).toContain('application/x-ndjson')
+        expect(response.headers.get('cache-control')).toBe('no-store')
+        expect(response.headers.get('content-encoding')).toBeNull()
+        expect(response.headers.get('etag')).toBeNull()
+      }
+      return response
+    }) as typeof fetch })
+    const iterator = client.mailboxSnapshotPages(scope)
+    try {
+      const first: MailboxSnapshotPage = (await bounded(iterator.next(), 'first socket inventory page')).value!
+      expect(first.items).toHaveLength(500)
+      await bounded(barrier.entered, 'next real SDK page')
+      const target = first.items[0]!
+      await h.inbox.mutate('alice', { messageIds: [target.id], changes: { isRead: true, isStarred: true }, idempotencyKey: 'stream-flags' })
+      await h.inbox.setMailboxStates('alice', { id: 'stream-done', targets: [{ mailboxId: mailbox.id, messageId: target.id, revision: target.memberships[0]!.revision }], done: true })
+      box.put(native('stream-arrival'))
+      await h.sync('alice', account.id)
+      const beforeReads = structuredClone(box.calls)
+      barrier.release()
+      const pages = [first]
+      while (true) {
+        const next = await bounded(iterator.next(), 'remaining socket inventory')
+        if (next.done) break
+        pages.push(next.value)
+      }
+      expect(requests).toBe(1); expect(reads).toBe(3)
+      expect(pages.map(page => page.items.length)).toEqual([500, 500, 1])
+      for (const page of pages) {
+        expect(page).toMatchObject({ state: first.state, scopeState: first.scopeState, expiresAt: first.expiresAt, total: 1001 })
+        expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(4 * 1024 * 1024)
+        expect(page.items.every(item => item.sourceId === account.id)).toBe(true)
+        expect(JSON.stringify(page)).not.toContain(BODY_SECRET)
+      }
+      expect(pages.at(-1)!.nextCursor).toBeNull()
+      const current = new Map(pages.flatMap(page => page.items).map(item => [item.id, item]))
+      expect(current.size).toBe(1001)
+      expect([...current.values()].some(item => item.subject === 'Subject stream-arrival')).toBe(false)
+      let since = first.state
+      while (true) {
+        const delta = await client.mailboxChanges({ ...scope, since, scopeState: first.scopeState })
+        expect(delta.resetRequired).toBe(false)
+        for (const row of delta.upserts) current.set(row.id, row)
+        for (const row of delta.removed) current.delete(row.messageId)
+        since = delta.state
+        if (!delta.hasMore) break
+      }
+      expect(current.size).toBe(1002)
+      expect(current.get(target.id)).toMatchObject({ isRead: true, isStarred: true, memberships: [{ done: true }] })
+      expect([...current.values()].some(item => item.subject === 'Subject stream-arrival')).toBe(true)
+      expect(box.calls).toEqual(beforeReads)
+    } finally { barrier.release(); await iterator.return?.(); guard.mockRestore() }
+  })
+
+  test('breaking a real socket iterator disconnects a pending page and does not request further SDK pages', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-socket-cancel', [native('one'), native('two'), native('three')])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const barrier = h.gate(undefined), disconnected = deferred<void>(), settled = deferred<void>()
+    let reads = 0
+    const api = createInboxApi({ inbox: { ...h.inbox, mailboxSnapshot: async (...args) => {
+      const page = await h.inbox.mailboxSnapshot(...args)
+      if (++reads === 2) { await barrier.wait(); settled.resolve() }
+      return page
+    } }, authenticate: () => ({ id: 'alice' }) })
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+      request.signal.addEventListener('abort', () => disconnected.resolve(), { once: true })
+      return api.fetch(request)
+    } })
+    const client = createInboxClient({ baseUrl: `http://127.0.0.1:${server.port}` })
+    const iterator = client.mailboxSnapshotPages(scope)
+    try {
+      for await (const page of iterator) {
+        expect(page.items).toHaveLength(1)
+        await bounded(barrier.entered, 'in-flight socket page')
+        break
+      }
+      await bounded(disconnected.promise, 'socket cancellation')
+      barrier.release()
+      await bounded(settled.promise, 'cancelled SDK page settlement')
+      expect(reads).toBe(2)
+      expect(await iterator.next()).toEqual({ done: true, value: undefined })
+    } finally { barrier.release(); await iterator.return?.(); await server.stop(true) }
+  })
+
+  test('JSON stays single-page, NDJSON does not invalidate body validators, and the route documents both representations', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-negotiation', [native('one'), native('two')])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const wire = transport(h)
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' }, cacheScope: 'snapshot-stream' })
+    const json = await client.mailboxSnapshot(scope)
+    expect(json.items).toHaveLength(1); expect(json.nextCursor).not.toBeNull()
+    await client.message(json.items[0]!.id)
+    const pages: MailboxSnapshotPage[] = []
+    for await (const page of client.mailboxSnapshotPages(scope)) pages.push(page)
+    expect(pages.map(page => page.items.length)).toEqual([1, 1])
+    await client.message(json.items[0]!.id)
+    expect(wire.requests.at(-1)!.status).toBe(304)
+    const disabled = await h.request('alice', '/mailbox-snapshot', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/x-ndjson;q=0, application/json' }, body: JSON.stringify(scope) })
+    expect(disabled.headers.get('content-type')).toContain('application/json')
+    expect((await disabled.json() as MailboxSnapshotPage).items).toHaveLength(1)
+    const schema = await client.request<any>('/openapi.json')
+    const content = schema.paths['/v1/mailbox-snapshot'].post.responses['200'].content
+    expect(Object.keys(content).sort()).toEqual(['application/json', 'application/x-ndjson'])
+    expect(content['application/x-ndjson'].schema.$ref).toEndWith('/MailboxSnapshotFrame')
+  })
+
+  test('per-page authentication and core scope/expiry fences stop further rows with sanitized typed errors', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-fences', [native('one'), native('two')])
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const scope = { mailboxIds: [mailbox.id], limit: 1 }
+    for (const failure of ['revoked', 'owner', 'authentication', 'expired', 'scope'] as const) {
+      let identity: string | null = 'alice', unavailable = false, reads = 0
+      const api = createInboxApi({ inbox: { ...h.inbox, mailboxSnapshot: (...args) => { reads++; return h.inbox.mailboxSnapshot(...args) } }, authenticate: () => {
+        if (unavailable) throw new Error(SECRET)
+        return identity ? { id: identity } : null
+      } })
+      const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: ((input, init) => api.request(new Request(input, init))) as typeof fetch })
+      const iterator = client.mailboxSnapshotPages(scope)
+      expect((await iterator.next()).value!.items).toHaveLength(1)
+      expect(reads).toBe(1) // No eager read while the consumer is suspended.
+      if (failure === 'revoked') identity = null
+      if (failure === 'owner') identity = 'bob'
+      if (failure === 'authentication') unavailable = true
+      if (failure === 'expired') h.clock.value += 300001
+      if (failure === 'scope') await h.inbox.updateMailbox('alice', mailbox.id, { status: 'detached' }, mailbox.revision)
+      const error = await iterator.next().catch(error => error)
+      expect(error).toMatchObject({ name: 'ApiError', code: failure === 'expired' ? 'SNAPSHOT_EXPIRED' : failure === 'scope' ? 'SNAPSHOT_SCOPE_CHANGED' : failure === 'authentication' ? 'AUTHENTICATION_UNAVAILABLE' : 'UNAUTHENTICATED',
+        status: failure === 'expired' ? 410 : failure === 'scope' ? 409 : failure === 'authentication' ? 503 : 401 })
+      expect(error.message).not.toContain(SECRET)
+      expect(reads).toBe(['expired', 'scope'].includes(failure) ? 2 : 1)
+      await iterator.return?.()
+    }
+  })
+
+  test('snapshot slots are four per owner/eight total, independent of SSE, and cancellation releases them', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-slots', [native('one'), native('two')])
+    await h.seed('bob', 'snapshot-slots-bob', [native('one'), native('two')])
+    await h.inbox.connect('charlie', { providerId: FULL, credentials: { mailbox: 'snapshot-slots', accessToken: SECRET } })
+    const boxes = new Map(await Promise.all(['alice', 'bob', 'charlie'].map(async owner => [owner, (await h.inbox.mailboxes(owner))[0]!.id] as const)))
+    const api = createInboxApi({ inbox: h.inbox, authenticate: request => ({ id: request.headers.get('authorization')! }), maxStreamsPerOwner: 1 })
+    const responses: Response[] = []
+    const request = (owner: string) => api.request('/v1/mailbox-snapshot', { method: 'POST', headers: { authorization: owner, 'content-type': 'application/json', accept: 'application/x-ndjson' }, body: JSON.stringify({ mailboxIds: [boxes.get(owner)], limit: 1 }) })
+    try {
+      for (let index = 0; index < 4; index++) { const response = await request('alice'); expect(response.status).toBe(200); responses.push(response) }
+      const limited = await request('alice')
+      expect(limited.headers.get('retry-after')).toBe('1'); await invalid(limited, 429)
+      for (let index = 0; index < 4; index++) { const response = await request('bob'); expect(response.status).toBe(200); responses.push(response) }
+      await invalid(await request('charlie'), 429)
+      const events = await api.request('/v1/events', { headers: { authorization: 'alice' } })
+      expect(events.status).toBe(200); await events.body!.cancel()
+      await responses[0]!.body!.cancel()
+      const replacement = await request('charlie')
+      expect(replacement.status).toBe(200); responses.push(replacement)
+      await invalid(await request('alice'), 429)
+    } finally { await Promise.all(responses.map(response => response.body!.cancel().catch(() => {}))) }
+    const replacement = await request('alice')
+    expect(replacement.status).toBe(200); await replacement.body!.cancel()
+  })
+
+  test('abort and the five-minute deadline release slots even while initial SDK reads are pending', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-pending', [native('one'), native('two')])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const sample = await h.inbox.mailboxSnapshot('alice', scope)
+    const barrier = h.gate(sample)
+    const deadlines: Array<() => void> = []
+    const schedule = globalThis.setTimeout
+    const timers = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+      if (ms === 300000) deadlines.push(() => callback(...args))
+      return schedule(callback, ms, ...args)
+    }) as typeof setTimeout)
+    const api = createInboxApi({ inbox: { ...h.inbox, mailboxSnapshot: () => barrier.wait() }, authenticate: () => ({ id: 'alice' }) })
+    const controllers = Array.from({ length: 4 }, () => h.controller())
+    const requests = controllers.map(controller => Promise.resolve(api.request('/v1/mailbox-snapshot', { method: 'POST', signal: controller.signal,
+      headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' }, body: JSON.stringify(scope) })))
+    try {
+      await bounded(barrier.entered, 'pending snapshot setup')
+      // Let all four setup requests enter before checking the real admission limit.
+      while (deadlines.length < 4) await Bun.sleep(0)
+      controllers[0]!.abort()
+      await bounded(requests[0]!, 'cancelled setup')
+      deadlines[1]!()
+      const expired = await bounded(requests[1]!, 'deadline during setup')
+      expect(expired.status).toBe(504)
+      expect(await expired.json()).toMatchObject({ code: 'SNAPSHOT_STREAM_TIMEOUT', retryable: true })
+      const other = h.controller()
+      const replacement = Promise.resolve(api.request('/v1/mailbox-snapshot', { method: 'POST', signal: other.signal,
+        headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' }, body: JSON.stringify(scope) }))
+      barrier.release()
+      const resumed = await bounded(replacement, 'released snapshot capacity')
+      expect(resumed.status).toBe(200); await resumed.body!.cancel()
+      for (const response of await Promise.all(requests.slice(2))) await response.body!.cancel()
+    } finally { controllers.forEach(controller => controller.abort()); barrier.release(); await Promise.all(requests); timers.mockRestore() }
+  })
+
+  test('client parses split UTF-8 frames and rejects truncation, trailing data, inconsistent metadata and byte/membership overflows', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-parser', [native('one', { subject: 'Résumé 🦉' }), native('two')])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const first = await h.inbox.mailboxSnapshot('alice', scope)
+    const last = await h.inbox.mailboxSnapshot('alice', { ...scope, cursor: first.nextCursor! })
+    const encode = (page: MailboxSnapshotPage) => `${JSON.stringify({ type: 'page', page })}\n`
+    const consume = async (bytes: Uint8Array, split = false) => {
+      let offset = 0
+      const client = createInboxClient({ fetch: (async (_input, _init) => new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (offset === bytes.length) { controller.close(); return }
+          const end = split ? Math.min(bytes.length, offset + 1 + offset % 7) : bytes.length
+          controller.enqueue(bytes.subarray(offset, end)); offset = end
+        },
+      }), { headers: { 'content-type': 'application/x-ndjson' } })) as typeof fetch })
+      const pages: MailboxSnapshotPage[] = []
+      for await (const page of client.mailboxSnapshotPages(scope)) pages.push(page)
+      return pages
+    }
+    const text = encode(first) + encode(last)
+    expect(await consume(Buffer.from(text), true)).toEqual([first, last])
+    const empty = { ...first, items: [] }
+    expect(await consume(Buffer.from(encode(empty) + encode(last)))).toEqual([empty, last])
+    for (const malformed of [encode(first), text.slice(0, -1), text + encode(last), text + 'x', text + '\n',
+      ...['state', 'scopeState', 'expiresAt'].map(key => encode(first) + encode({ ...last, [key]: key === 'expiresAt' ? new Date(EPOCH + 600000).toISOString() : 'different' })),
+      encode(first) + encode({ ...last, total: 3 }), encode(first) + encode({ ...last, nextCursor: first.nextCursor }),
+      encode({ ...first, total: 100001 }), encode({ ...first, items: Array.from({ length: 501 }, () => first.items[0]!) }),
+      encode({ ...first, items: [{ ...first.items[0]!, memberships: Array.from({ length: 5001 }, () => first.items[0]!.memberships[0]!) }] }),
+      encode({ ...empty, total: 0 }), '{"type":"page","page":' + ' '.repeat(4 * 1024 * 1024 + 65),
+    ]) await expect(consume(Buffer.from(malformed))).rejects.toMatchObject({ code: 'INVALID_SNAPSHOT_STREAM' })
+    await expect(consume(new Uint8Array([0xff, 10]))).rejects.toMatchObject({ code: 'INVALID_SNAPSHOT_STREAM' })
+    const oversized = { ...last, extra: '' }
+    oversized.extra = 'x'.repeat(4 * 1024 * 1024 + 1 - Buffer.byteLength(JSON.stringify(oversized)))
+    expect(Buffer.byteLength(JSON.stringify(oversized))).toBe(4 * 1024 * 1024 + 1)
+    await expect(consume(Buffer.from(encode(first) + encode(oversized)))).rejects.toMatchObject({ code: 'INVALID_SNAPSHOT_STREAM' })
+    const client = createInboxClient({ fetch: (async (_input, _init) => Response.json(first)) as typeof fetch })
+    await expect(client.mailboxSnapshotPages(scope).next()).rejects.toMatchObject({ code: 'INVALID_SNAPSHOT_STREAM' })
+  })
+
+  test('client break, pending-read abort, credentials and deadline cancel the body without partial successful EOF', async () => {
+    const h = await fixture()
+    await h.seed('alice', 'snapshot-client-abort', [native('one'), native('two')])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], limit: 1 }
+    const page = await h.inbox.mailboxSnapshot('alice', scope)
+    for (const action of ['break', 'abort', 'terminal-abort', 'credentials', 'deadline'] as const) {
+      let cancelled = 0, sent = false, deadline: (() => void) | undefined
+      const schedule = globalThis.setTimeout
+      const timers = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+        if (ms === 300000) deadline = () => callback(...args)
+        return schedule(callback, ms, ...args)
+      }) as typeof setTimeout)
+      const controller = h.controller()
+      const sentPage = action === 'terminal-abort' ? { ...page, nextCursor: null } : page
+      const client = createInboxClient({ fetch: (async (_input, _init) => new Response(new ReadableStream<Uint8Array>({
+        pull(output) { if (!sent) { sent = true; output.enqueue(Buffer.from(`${JSON.stringify({ type: 'page', page: sentPage })}\n`)) } },
+        cancel() { cancelled++ },
+      }, { highWaterMark: 0 }), { headers: { 'content-type': 'application/x-ndjson' } })) as typeof fetch })
+      const iterator = client.mailboxSnapshotPages(scope, { signal: controller.signal })
+      try {
+        if (action === 'break') { for await (const _page of iterator) break }
+        else {
+          expect((await iterator.next()).value).toEqual(sentPage)
+          const pending = iterator.next().catch(error => error)
+          if (action === 'abort' || action === 'terminal-abort') controller.abort()
+          if (action === 'credentials') client.setCredentials({ headers: { authorization: 'Bearer bob' } })
+          if (action === 'deadline') deadline!()
+          expect(await bounded(pending, 'cancelled inventory read')).toMatchObject({ name: action === 'deadline' ? 'TimeoutError' : 'AbortError' })
+        }
+        expect(cancelled).toBe(1)
+      } finally { await iterator.return?.(); timers.mockRestore() }
+    }
   })
 })
 

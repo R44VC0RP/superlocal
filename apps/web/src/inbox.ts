@@ -1090,14 +1090,19 @@ export class InboxStore {
       // and the earlier metadata baseline, covering both reads after the last
       // page, never a newly sampled global ready token.
       if (mailboxIds.length && mailboxIds.length <= 1000) {
-          const items: MailboxMessageSummary[] = []; let cursor: string | undefined;
-          do {
-            const started = performance.now();
-            const page = await this.client.mailboxSnapshot({ mailboxIds, limit: 500, ...(cursor ? { cursor } : {}) }, options);
-            networkMs += performance.now() - started; pages++; messages += page.items.length;
-            baseline = { state: metadataBaseline.state, scopeState: page.scopeState, mailboxIds };
-            items.push(...page.items); cursor = page.nextCursor ?? undefined;
-          } while (cursor);
+          const items: MailboxMessageSummary[] = [];
+          const snapshot = this.client.mailboxSnapshotPages({ mailboxIds, limit: 500 }, options);
+          try {
+            for (;;) {
+              const started = performance.now();
+              const result = await snapshot.next();
+              networkMs += performance.now() - started;
+              if (result.done) break;
+              const page = result.value; pages++; messages += page.items.length;
+              baseline = { state: metadataBaseline.state, scopeState: page.scopeState, mailboxIds };
+              items.push(...page.items);
+            }
+          } finally { await snapshot.return?.(); }
           for (const item of items) for (const membership of item.memberships) summaries.get(membership.mailboxId)?.push(item);
       } else if (mailboxIds.length) {
         // Preserve the older >1000-view capability. This exceptional scope

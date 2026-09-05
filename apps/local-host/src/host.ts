@@ -357,9 +357,10 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       request.method === 'PUT' && /^\/v1\/connections\/[^/]+\/credentials$/.test(path)) return problem(403, 'HOST_CONNECT_REQUIRED', 'Use the host provider connection flow, not raw SDK credential input.')
     if (extension) return extension.fetch(request)
     if (url.pathname.startsWith('/v1/')) {
-      // SDK events reauthenticate on every page and the one-second poll, against the
-      // same uncached application session lookup. Revocation also terminates open SSE.
-      const forwarded = url.pathname === '/v1/events' ? new Request(request, { signal: AbortSignal.any([request.signal, streamShutdown.signal]) }) : request
+      // SDK streams reauthenticate each page; events also recheck on idle polls.
+      // Host shutdown must abort snapshot streams as well as open SSE.
+      const streaming = url.pathname === '/v1/events' || url.pathname === '/v1/mailbox-snapshot'
+      const forwarded = streaming ? new Request(request, { signal: AbortSignal.any([request.signal, streamShutdown.signal]) }) : request
       return api.fetch(forwarded)
     }
     return problem(404, 'NOT_FOUND', 'Route not found.')
