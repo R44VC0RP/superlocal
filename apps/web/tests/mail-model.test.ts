@@ -85,6 +85,9 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
   let liveEvents = false, readyEvents = 0, mailEvents = 0, inventoryRequests = 0, deltaRequests = 0;
   let gate: Promise<void> | undefined, loseResponses = 0, replayAuthFailures = 0, snapshotFailures = 0, bodyReads = 0, operationReads = 0;
   let unrelatedOperationReads = 0;
+  let draftSaveCalls = 0, loseDraftResponse = false, draftReadHeld = false, gatedDraftRead: string | undefined;
+  let draftSaveGate: Promise<void> | undefined, releaseDraftSave: (() => void) | undefined;
+  let draftReadGate: Promise<void> | undefined, releaseDraftRead: (() => void) | undefined;
   const posted: Array<{ input: import("inbox-sdk/types").MutationInput; operation: import("inbox-sdk/types").Operation }> = [];
   const flagRequests: import("inbox-sdk/types").MutationInput[] = [];
   const membershipRequests: Array<Parameters<import("inbox-sdk/types").Inbox["setMailboxStates"]>[1]> = [];
@@ -147,7 +150,14 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
           return Response.json({ code: "UNAUTHENTICATED", error: "The controlled session needs to reconnect." }, { status: 401 });
         }
       }
+      const savingDraft = /^\/v1\/drafts\/[^/]+$/.test(url.pathname) && init?.method === "PATCH";
+      if (savingDraft) draftSaveCalls++;
       const response = await host.fetch(new Request(url, { ...init, headers }));
+      if (savingDraft && response.ok) {
+        if (draftSaveGate) await draftSaveGate;
+        if (loseDraftResponse) { loseDraftResponse = false; throw new TypeError("Controlled lost draft acknowledgement"); }
+      }
+      if (draftReadGate && url.pathname === `/v1/drafts/${gatedDraftRead}` && init?.method !== "PATCH") { draftReadHeld = true; await draftReadGate; }
       if (url.pathname === "/v1/mailbox-snapshot") inventoryRequests++;
       if (url.pathname === "/v1/mailbox-changes") {
         deltaRequests++;
@@ -436,6 +446,80 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     await store.undoSend(send.id);
     assert.ok(store.getSnapshot().drafts.some(saved => saved.id === draft.id));
 
+    // Correcting a local recipient error can save again; conflicts and lost
+    // acknowledgements still require reload, and recovery owns one incident.
+    const editable = await store.newDraft(primary.id, { to: "qa-other@example.test", subject: "Recipient recovery" });
+    const otherDraft = await store.newDraft(primary.id, { to: "other@example.test", subject: "Independent error" });
+    store.editDraft({ ...editable, to: "qa-other@example.test, other@" });
+    await assert.rejects(store.flushDraft(editable.id), /Complete the recipient/);
+    await assert.rejects(store.flushDraft(editable.id), /Complete the recipient/);
+    store.editDraft({ ...otherDraft, to: "other@" });
+    await assert.rejects(store.flushDraft(otherDraft.id), /Complete the recipient/);
+    const otherIssue = store.getSnapshot().issues.find(issue => issue.key === `draft:${otherDraft.id}`)!;
+    const recipientIssue = store.getSnapshot().issues.find(issue => issue.key === `draft:${editable.id}`)!;
+    assert.equal(recipientIssue.count, 2, "repeat validation errors coalesce without losing their local origin");
+    const beforeCorrection = draftSaveCalls;
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, body: "<p>Still incomplete</p>" });
+    await sleep(550);
+    assert.equal(draftSaveCalls, beforeCorrection, "incomplete recipients never autosave");
+    assert.ok(store.getSnapshot().drafts.find(value => value.id === editable.id)!.saveError);
+    draftSaveGate = new Promise(resolve => { releaseDraftSave = resolve; });
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, to: "qa-other@example.test", cc: "", bcc: "", body: "<p>Corrected body</p>" });
+    await until(() => draftSaveCalls > beforeCorrection, "corrected recipient triggers an actual automatic save");
+    assert.equal(store.getSnapshot().drafts.find(value => value.id === editable.id)!.saveError, undefined);
+    assert.equal(store.getSnapshot().drafts.find(value => value.id === editable.id)!.dirty, true);
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === recipientIssue.key), recipientIssue, "editing or a pending acknowledgement cannot retire the failure");
+    releaseDraftSave!(); draftSaveGate = undefined;
+    await until(() => !store.getSnapshot().drafts.find(value => value.id === editable.id)!.dirty, "successful save acknowledges corrected recipients");
+    assert.equal((await host.inbox.draft(host.owner, editable.id)).bodyHtml, "<p>Corrected body</p>");
+    assert.equal(store.getSnapshot().issues.some(issue => issue.key === recipientIssue.key), false);
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === otherIssue.key), otherIssue);
+    const savedCalls = draftSaveCalls;
+    await store.flushDraft(editable.id);
+    assert.equal(draftSaveCalls, savedCalls, "a clean flush is a no-op");
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === otherIssue.key), otherIssue);
+
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, body: "<p>Local conflict</p>" });
+    const serverDraft = await host.inbox.draft(host.owner, editable.id);
+    await host.inbox.updateDraft(host.owner, editable.id, { subject: "Newer server writing" }, serverDraft.revision);
+    await assert.rejects(store.flushDraft(editable.id));
+    assert.match(store.getSnapshot().drafts.find(value => value.id === editable.id)!.saveError!, /changed elsewhere/);
+    const conflictCalls = draftSaveCalls;
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, to: "corrected@example.test", body: "<p>Keep conflicting writing</p>" });
+    await sleep(550);
+    await assert.rejects(store.flushDraft(editable.id), /changed elsewhere/);
+    assert.equal(draftSaveCalls, conflictCalls, "complete recipients cannot retry an HTTP 412 conflict");
+    await store.reloadDraft(editable.id);
+    assert.equal(store.getSnapshot().drafts.find(value => value.id === editable.id)!.subject, "Newer server writing");
+    assert.equal(store.getSnapshot().issues.some(issue => issue.key === recipientIssue.key), false);
+
+    loseDraftResponse = true;
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, body: "<p>Lost acknowledgement</p>" });
+    await assert.rejects(store.flushDraft(editable.id), TypeError);
+    const ambiguousCalls = draftSaveCalls;
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, to: "complete@example.test", body: "<p>Keep ambiguous writing</p>" });
+    await sleep(550);
+    await assert.rejects(store.flushDraft(editable.id), /lost draft acknowledgement/);
+    assert.equal(draftSaveCalls, ambiguousCalls, "complete recipients cannot retry an ambiguous network save");
+    await store.reloadDraft(editable.id);
+    assert.equal((await host.inbox.draft(host.owner, editable.id)).bodyHtml, "<p>Lost acknowledgement</p>");
+
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, to: "newer@" });
+    await assert.rejects(store.flushDraft(editable.id), /Complete the recipient/);
+    gatedDraftRead = editable.id; draftReadGate = new Promise(resolve => { releaseDraftRead = resolve; });
+    const lateReload = store.reloadDraft(editable.id);
+    await until(() => draftReadHeld, "reload response is held before a newer validation incident");
+    await assert.rejects(store.flushDraft(editable.id), /Complete the recipient/);
+    const newerIssue = store.getSnapshot().issues.find(issue => issue.key === recipientIssue.key)!;
+    releaseDraftRead!(); draftReadGate = undefined; await lateReload;
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === newerIssue.key), newerIssue, "late recovery cannot retire a newer incident");
+    await store.flushDraft(editable.id);
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === newerIssue.key), newerIssue, "cached no-op is not authoritative recovery");
+    await store.reloadDraft(editable.id);
+    assert.equal(store.getSnapshot().issues.some(issue => issue.key === newerIssue.key), false);
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === otherIssue.key), otherIssue);
+    await store.reloadDraft(otherDraft.id);
+
     // Release a second acknowledgement exactly as the previous operation's
     // terminal snapshot publishes. The reconciler may be finishing its last
     // loop; the newly accepted operation must still be polled to its outcome.
@@ -640,7 +724,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     assert.ok(inventoryRequests > beforeScope);
     assert.ok(large().messages.length > 0, "another receiving view of the same source remains available");
   } finally {
-    releaseResponse?.(); releaseSnapshot?.(); releaseFinalPage?.(); releaseDelta?.(); releaseProvider?.(); stopReloaded?.(); stop?.(); await providerWork;
+    releaseResponse?.(); releaseSnapshot?.(); releaseFinalPage?.(); releaseDelta?.(); releaseProvider?.(); releaseDraftSave?.(); releaseDraftRead?.(); stopReloaded?.(); stop?.(); await providerWork;
     MockInboxProvider.prototype.mutate = originalMutate;
     MockInboxProvider.prototype.send = originalSend;
     feedbackDatabase.close(); await host.close(); await fs.rm(root, { recursive: true, force: true });
