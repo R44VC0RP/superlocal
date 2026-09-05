@@ -1764,6 +1764,11 @@ kbd {
     position: absolute;
   }
 }
+@media (min-width: 701px) and (max-width: 819px) {
+  /* Keep the 40px rail and 260px sidebar visible below the desktop 820px minimum. */
+  .mail-workspace { min-width: 0; }
+  .selection-toolbar { flex-wrap: wrap; }
+}
 @media (max-width: 700px) {
   .app { overflow: hidden; }
   .mail-workspace { min-width: 0; }
