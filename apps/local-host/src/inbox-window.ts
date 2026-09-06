@@ -852,7 +852,13 @@ export function createInboxWindowService(deps: Dependencies) {
     if (closed || timer || working || !captureWorkPending()) return
     timer = setTimeout(() => { timer = undefined; working = work().catch(() => {}).finally(() => {
       working = undefined
-      if (captureWorkPending()) schedule([...scopes.values()].some(scope => preparations.has(scope.row.id) && !current(scope) || captureLocked(scope)) || pruning.size ? 25 : 1000)
+      // An explicit selection still has bounded work after the source inventory is current.
+      // Do not add a one-second idle pause between each 50-row query scan.
+      const scanning = [...preparations].some(([scopeId, preparation]) => {
+        const scope = scopes.get(scopeId)
+        return scope && [...preparation.queries].some(id => { const query = getQuery(id); return query && query.preference === scope.preference && query.generation === scope.row.generation && query.scanned < scope.row.revision })
+      })
+      if (captureWorkPending()) schedule(scanning || [...scopes.values()].some(scope => preparations.has(scope.row.id) && !current(scope) || captureLocked(scope)) || pruning.size ? 25 : 1000)
     }) }, delay)
     timer.unref?.()
   }
