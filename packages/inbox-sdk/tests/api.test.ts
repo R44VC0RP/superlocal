@@ -2579,6 +2579,182 @@ describe('bounded host inbox window', () => {
   }, 30000)
 })
 
+describe('cached mailbox contacts and correspondence', () => {
+  test('selected cached contacts and all-time correspondence deduplicate overlapping views, sources, recipients and exact domain boundaries', async () => {
+    const h = await fixture(), day = 86400000, at = (days: number) => new Date(EPOCH + days * day).toISOString()
+    const domains = ['alpha.example.test', 'beta.example.test', 'hidden.example.test']
+    h.discoveries.set('correspondents', { sources: domains.map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
+    const shared = { sourceDomains: domains.slice(0, 2), bodyText: BODY_SECRET, bodyHtml: '' }
+    const rows = [
+      native('old', { ...shared, threadId: 'exchange', from: participant('SAM@example.test', 'Zed old name'), receivedAt: at(-20) }),
+      native('since', { ...shared, threadId: 'exchange', from: participant('sam@example.test', 'Earlier name'), receivedAt: at(-4) }),
+      native('sent', { ...shared, threadId: 'exchange', folder: 'sent', from: participant('me@elsewhere.test'), receivedAt: at(-3),
+        to: [participant('sam@example.test', 'Reply name'), participant('child@dept.example.test', 'Old child')], cc: [participant('SAM@EXAMPLE.TEST', 'Reply name')] }),
+      native('child', { ...shared, from: participant('child@dept.example.test', 'Current child'), receivedAt: at(-2) }),
+      native('native-sent', { ...shared, threadId: 'exchange', folder: 'archive', folderIds: ['archive', 'sent'], from: participant('me@elsewhere.test'),
+        to: [], cc: [participant('sam@example.test', 'Recent reply name')], receivedAt: at(-1) }),
+      native('now', { ...shared, from: participant('Sam@Example.Test', 'Current Sam'), receivedAt: at(0) }),
+      native('wrong-domain', { ...shared, from: participant('sam@notexample.test', 'Wrong domain'), receivedAt: at(-1) }),
+      native('wrong-direction', { ...shared, from: participant('noreply@elsewhere.test'), to: [participant('sam@example.test')], receivedAt: at(-1) }),
+      native('escaped-name', { ...shared, from: participant('escaped@literal.test', '50%_\\off'), receivedAt: at(-5) }),
+      native('future', { ...shared, from: participant('sam@example.test', 'Future name'), receivedAt: at(1) }),
+      native('invalid-time', { ...shared, from: participant('sam@example.test'), receivedAt: 'not-a-timestamp' }),
+      native('invalid-day', { ...shared, from: participant('sam@example.test'), receivedAt: '2026-02-30T12:00:00.000Z' }),
+      native('hidden', { ...shared, sourceDomains: [domains[2]!], from: participant('sam@example.test', 'Hidden name'), receivedAt: at(0) }),
+      ...['trash', 'spam', 'draft', 'drafts', 'scheduled', 'outbox', 'unsent', 'queued'].map(folder => native(`excluded-${folder}`, {
+        ...shared, folder, from: participant('sam@example.test', 'Excluded name'), to: [participant('sam@example.test')], receivedAt: at(0),
+      })),
+      native('native-trash', { ...shared, folder: 'inbox', folderIds: ['inbox', 'trash'], from: participant('sam@example.test'), receivedAt: at(0) }),
+      native('native-draft', { ...shared, folder: 'inbox', folderIds: ['inbox', 'drafts'], from: participant('sam@example.test'), receivedAt: at(0) }),
+    ]
+    const first = await h.connect('alice', 'correspondents', rows, SCOPED), boxes: Mailbox[] = []
+    for (const domain of domains) boxes.push(await h.inbox.createMailbox('alice', { sourceId: first.account.id, name: domain, selector: { kind: 'domain', value: domain } }))
+    await h.sync('alice', first.account.id)
+    const sibling = await h.seed('alice', 'correspondents-sibling', [native('sent', { threadId: 'exchange', folder: 'sent', from: participant('me@elsewhere.test'),
+      to: [participant('sam@example.test', 'Sibling name')], receivedAt: at(-2.5) })])
+    const siblingBox = (await h.inbox.mailboxes('alice')).find(box => box.sourceId === sibling.account.id)!
+    await h.seed('alice', 'correspondents-unselected', [native('same', { from: participant('sam@example.test', 'Unselected source'), receivedAt: at(0) })])
+    await h.seed('bob', 'correspondents-foreign', [native('same', { from: participant('sam@example.test', 'Foreign owner'), receivedAt: at(0) })])
+    const pending = await h.draft('alice', sibling.account.id, { to: [participant('sam@example.test')], subject: 'Queued is not sent' })
+    expect((await h.submit('alice', pending, 'correspondence-queued', at(1))).status).toBe('pending')
+    const scope = { mailboxIds: [boxes[0]!.id, boxes[1]!.id, boxes[0]!.id, siblingBox.id] }
+    const draftSummary = (await h.inbox.mailboxMessagePage('alice', scope)).items.find(message => message.subject === 'Subject excluded-drafts')!
+    expect((await h.mutate('alice', [draftSummary.id], { folder: 'sent' }, 'optimistic-sent-is-not-confirmed')).status).toBe('pending')
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    const before = [...h.boxes.values()].map(box => structuredClone(box.calls)), state = await h.inbox.changes('alice')
+    expect((await client.mailboxContacts({ ...scope, query: 'sAm@ExAmPlE' })).items).toEqual([{ name: 'Current Sam', email: 'sam@example.test' }])
+    expect((await client.mailboxContacts({ ...scope, query: 'cUrReNt SaM' })).items).toEqual([{ name: 'Current Sam', email: 'sam@example.test' }])
+    expect((await client.mailboxContacts({ ...scope, query: 'Zed old name' })).items).toEqual([])
+    for (const query of ['%', '_', '\\', '50%_\\OFF']) expect((await client.mailboxContacts({ ...scope, query })).items).toEqual([{ name: '50%_\\off', email: 'escaped@literal.test' }])
+    expect((await client.mailboxContacts({ ...scope, query: "%' OR 1=1 --" })).items).toEqual([])
+    expect((await client.mailboxContacts({ ...scope, query: '', limit: 1 })).items).toEqual([{ name: 'Current Sam', email: 'sam@example.test' }])
+    expect((await client.mailboxContacts({ ...scope, query: '' })).items.map(item => item.email)).toEqual([
+      'sam@example.test', 'noreply@elsewhere.test', 'sam@notexample.test', 'child@dept.example.test', 'escaped@literal.test',
+    ])
+    const input = { ...scope, email: ' SAM@EXAMPLE.TEST ', since: at(-4), bucketMs: day, bucketCount: 4 }
+    const all = await client.mailboxCorrespondence({ ...input, domain: 'EXAMPLE.TEST' })
+    expect(all).toMatchObject({ received: 4, sent: 3, conversations: 4, twoWay: 1, firstMessageAt: at(-20), lastMessageAt: at(0), lastSentAt: at(-1),
+      periods: [{ start: at(-4), received: 1, sent: 0 }, { start: at(-3), received: 0, sent: 2 }, { start: at(-2), received: 1, sent: 0 }, { start: at(-1), received: 0, sent: 1 }] })
+    const canonical = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    const key = (sourceId: string, subject: string) => ({ sourceId, threadId: canonical.find(message => message.sourceId === sourceId && message.subject === `Subject ${subject}`)!.threadId })
+    expect(all.recent).toEqual([key(first.account.id, 'now'), key(first.account.id, 'sent'), key(first.account.id, 'child'), key(sibling.account.id, 'sent')])
+    const exact = await client.mailboxCorrespondence({ ...input, recentLimit: 2 })
+    expect(exact).toMatchObject({ received: 3, sent: 3, conversations: 3, twoWay: 1, recent: all.recent.slice(0, 2) })
+    expect((await client.mailboxCorrespondence({ ...input, email: 'child@dept.example.test', domain: 'example.test' })).received).toBe(4)
+    expect(await client.mailboxCorrespondence({ ...input, email: 'missing@elsewhere.test' })).toMatchObject({ received: 0, sent: 0, conversations: 0, twoWay: 0,
+      firstMessageAt: null, lastMessageAt: null, lastSentAt: null, recent: [], periods: [0, 1, 2, 3].map(index => ({ start: at(-4 + index), received: 0, sent: 0 })) })
+    expect((await h.inbox.changes('alice')).state).toBe(state.state)
+    expect([...h.boxes.values()].map(box => box.calls)).toEqual(before)
+    expect(JSON.stringify(all)).not.toContain(BODY_SECRET)
+  })
+
+  test('contact reads are bounded query-only metadata reads, preserve body validators and do no provider or body work after restart', async () => {
+    const h = await fixture(), hour = 3600000
+    const { box } = await h.seed('alice', 'contact-bounds', Array.from({ length: 120 }, (_, index) => native(`bounded-contact-${index}`, {
+      from: participant(index < 8 ? 'repeat@sender.test' : `person-${index}@sender.test`, `Name ${index}`), receivedAt: new Date(EPOCH - index * 1000).toISOString(), bodyText: BODY_SECRET,
+    })))
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id] }
+    const input = { ...scope, email: 'repeat@sender.test', since: new Date(EPOCH - hour).toISOString(), bucketMs: hour, bucketCount: 2 }
+    const wire = transport(h), client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: wire.fetch, headers: { authorization: 'Bearer alice' }, cacheScope: 'contact-read-cache' })
+    const message = (await client.mailboxMessagePage({ ...scope, limit: 1 })).items[0]!
+    await client.message(message.id)
+    expect((await client.mailboxContacts({ ...scope, query: '' })).items).toHaveLength(20)
+    expect((await client.mailboxCorrespondence(input)).recent).toHaveLength(5)
+    await client.message(message.id)
+    expect(wire.requests.at(-1)!.status).toBe(304)
+    const database = new Database(h.database)
+    database.query("UPDATE sdk_messages SET body=?,visible=json_remove(visible,'$.facts')").run('invalid JSON: body access is forbidden')
+    await h.restart(database)
+    const calls = structuredClone(box.calls), before = database.query<{ total: number }, []>('SELECT total_changes() total').get()!
+    const query = database.query.bind(database)
+    let bodyReads = 0, returnedRows = 0
+    const guard = spyOn(database, 'query').mockImplementation(((sql: string) => {
+      if (/\b(?:body|search_text)\b/i.test(sql)) { bodyReads++; throw new Error('Contact reads must not access bodies or body-derived search text') }
+      const statement = query(sql)
+      return new Proxy(statement, { get(statement, key) {
+        const value = Reflect.get(statement, key, statement)
+        if (key !== 'get' && key !== 'all') return typeof value === 'function' ? value.bind(statement) : value
+        return (...params: Parameters<typeof statement.all>) => {
+          const result = value.apply(statement, params), rows = key === 'all' ? result : result ? [result] : []
+          returnedRows = Math.max(returnedRows, rows.length)
+          for (const row of rows) if (['body', 'visible', 'confirmed', 'search_text'].some(field => Object.hasOwn(row, field))) { bodyReads++; throw new Error('Contact reads must project metadata, not whole messages') }
+          return result
+        }
+      } })
+    }) as typeof database.query)
+    database.exec('PRAGMA query_only=ON')
+    try {
+      const contacts = await client.mailboxContacts({ ...scope, query: '', limit: 100 })
+      expect(contacts.items).toHaveLength(100)
+      expect(contacts.items[0]).toEqual({ name: 'Name 0', email: 'repeat@sender.test' })
+      const correspondence = await client.mailboxCorrespondence({ ...input, recentLimit: 50 })
+      expect(correspondence).toMatchObject({ received: 8, sent: 0, conversations: 8, twoWay: 0, firstMessageAt: new Date(EPOCH - 7000).toISOString(), lastMessageAt: new Date(EPOCH).toISOString(), lastSentAt: null,
+        periods: [{ start: input.since, received: 7, sent: 0 }, { start: new Date(EPOCH).toISOString(), received: 1, sent: 0 }] })
+      expect(correspondence.recent).toHaveLength(8)
+      expect(correspondence.state).toBe(contacts.state); expect(correspondence.scopeState).toBe(contacts.scopeState)
+      expect(await client.mailboxContacts({ ...scope, query: '', limit: 100 })).toEqual(contacts)
+      expect(database.query<{ total: number }, []>('SELECT total_changes() total').get()).toEqual(before)
+      expect(returnedRows).toBeLessThanOrEqual(100); expect(bodyReads).toBe(0); expect(box.calls).toEqual(calls)
+    } finally { guard.mockRestore(); database.exec('PRAGMA query_only=OFF') }
+    database.query("UPDATE sdk_messages SET visible=json_set(visible,'$.from.name',?) WHERE native_id='bounded-contact-0'").run('x'.repeat(4 * 1024 * 1024))
+    await expect(h.inbox.mailboxContacts('alice', { ...scope, query: '', limit: 1 })).rejects.toMatchObject({ code: 'MAILBOX_READ_TOO_LARGE', status: 413 })
+  })
+
+  test('contact HTTP inputs and owner, generation, membership, attached-scope and privacy fences remain strict', async () => {
+    const h = await fixture()
+    const own = await h.seed('alice', 'contact-fences', [native('same', { from: participant('sam@example.test') })])
+    await h.seed('bob', 'contact-fences-foreign')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!, foreign = (await h.inbox.mailboxes('bob'))[0]!
+    const scope = { mailboxIds: [mailbox.id] }, contact = { ...scope, query: '' }
+    const correspondence = { ...scope, email: 'sam@example.test', since: '2026-08-31T13:00:00+01:00', bucketMs: 3600000, bucketCount: 24 }
+    const post = (input: unknown, headers: HeadersInit = {}) => ({ method: 'POST', headers: { 'content-type': 'application/json', ...Object.fromEntries(new Headers(headers)) }, body: JSON.stringify(input) })
+    for (const [path, input] of [['/mailbox-contacts', contact], ['/mailbox-correspondence', correspondence]] as const) {
+      const response = await h.request('alice', path, post(input))
+      expect(response.status).toBe(200); expect(response.headers.get('cache-control')).toBe('no-store'); expect(response.headers.get('referrer-policy')).toBe('no-referrer'); expect(response.headers.get('etag')).toBeNull()
+      const unauthenticated = await h.request(null, path, post(input))
+      expect(unauthenticated.headers.get('referrer-policy')).toBe('no-referrer'); await invalid(unauthenticated, 401)
+      await invalid(await h.request('bob', path, post(input)), 404)
+      await invalid(await h.request('alice', path, post({ ...input, mailboxIds: [mailbox.id, foreign.id] })), 404)
+      await invalid(await h.request('alice', path, post({ ...input, owner: 'bob' })), 400)
+      await invalid(await h.request('alice', `${path}?owner=bob`, post(input)), 400)
+      await invalid(await h.request('alice', path, post(input, { cookie: 'session=fictional' })), 403)
+      await invalid(await h.request('alice', path, { ...post(input), body: `${JSON.stringify(input)}${' '.repeat(64 * 1024)}` }), 413)
+    }
+    for (const limit of [0, 101, 1.5, NaN, null]) await expect(h.inbox.mailboxContacts('alice', { ...contact, limit } as never)).rejects.toMatchObject({ code: 'VALIDATION' })
+    for (const query of ['x'.repeat(257), '\0', null]) await expect(h.inbox.mailboxContacts('alice', { ...contact, query } as never)).rejects.toMatchObject({ code: 'VALIDATION' })
+    expect((await h.inbox.mailboxContacts('alice', { ...contact, query: 'x'.repeat(256) })).items).toEqual([])
+    for (const patch of [
+      { email: 'invalid' }, { email: 'sam@notexample.test', domain: 'example.test' }, { email: 'sam@example.test.evil', domain: 'example.test' },
+      { domain: '*.example.test' }, { domain: '%example.test' }, { domain: `${'x'.repeat(64)}.example.test` },
+      { since: '2026-02-30T00:00:00Z' }, { since: '2026-08-31' }, { since: '2026-08-31T12:00:00' },
+      { bucketMs: 3599999 }, { bucketMs: 365 * 86400000 + 1 }, { bucketMs: NaN }, { bucketCount: 0 }, { bucketCount: 65 }, { bucketCount: 1.5 },
+      { recentLimit: 0 }, { recentLimit: 51 }, { recentLimit: null },
+    ]) {
+      await expect(h.inbox.mailboxCorrespondence('alice', { ...correspondence, ...patch } as never)).rejects.toMatchObject({ code: 'VALIDATION' })
+      await invalid(await h.request('alice', '/mailbox-correspondence', post({ ...correspondence, ...patch })), 400)
+    }
+    const maximum = await h.inbox.mailboxCorrespondence('alice', { ...correspondence, bucketMs: 365 * 86400000, bucketCount: 64 })
+    expect(maximum.periods).toHaveLength(64); expect(maximum.periods[0]!.start).toBe('2026-08-31T12:00:00.000Z')
+    await h.inbox.updateMailbox('alice', mailbox.id, { status: 'paused' }, mailbox.revision)
+    expect((await h.inbox.mailboxContacts('alice', contact)).items).toHaveLength(1)
+    const database = new Database(h.database); cleanup.push(async () => database.close())
+    database.query('UPDATE sdk_messages SET generation=generation-1 WHERE account=?').run(own.account.id)
+    expect((await h.inbox.mailboxContacts('alice', contact)).items).toEqual([])
+    expect((await h.inbox.mailboxCorrespondence('alice', correspondence)).received).toBe(0)
+    database.query('UPDATE sdk_messages SET generation=generation+1,deleted=1 WHERE account=?').run(own.account.id)
+    expect((await h.inbox.mailboxContacts('alice', contact)).items).toEqual([])
+    database.query('UPDATE sdk_messages SET deleted=0 WHERE account=?').run(own.account.id)
+    database.query('DELETE FROM sdk_memberships WHERE mailbox=?').run(mailbox.id)
+    expect((await h.inbox.mailboxCorrespondence('alice', correspondence)).received).toBe(0)
+    await h.inbox.updateMailbox('alice', mailbox.id, { status: 'detached' }, mailbox.revision + 1)
+    await expect(h.inbox.mailboxContacts('alice', contact)).rejects.toMatchObject({ status: 404 })
+    await expect(h.inbox.mailboxCorrespondence('alice', correspondence)).rejects.toMatchObject({ status: 404 })
+    const docs = await h.json<{ paths: Record<string, { post: { description: string } }> }>('alice', '/openapi.json')
+    expect(docs.paths['/v1/mailbox-contacts']!.post.description).toContain('provider-complete')
+    expect(docs.paths['/v1/mailbox-correspondence']!.post.description).toContain('cached history only')
+  })
+})
+
 describe('live bounded mailbox reads', () => {
   test('cached keyset messages survive ordinary events and reconcile arrivals, backfill and deletion from the first state', async () => {
     const h = await fixture()

@@ -30,6 +30,8 @@ type RouteDoc = {
 }
 
 const JSON_LIMIT = 1024 * 1024
+const CONTACT_READ_JSON_LIMIT = 64 * 1024
+const CONTACT_READ_PATHS = ['/v1/mailbox-contacts', '/v1/mailbox-correspondence']
 const FILE_LIMIT = 25 * 1024 * 1024
 const STREAM_PAGE_SIZE = 100
 const STREAM_LIFETIME_MS = 5 * 60 * 1000
@@ -189,6 +191,14 @@ const schemas = {
   MailboxConversationsPage: z.object({ items: z.array(mailboxConversation).max(100), nextCursor: opaque.nullable(), state: opaque, scopeState: opaque }),
   MailboxCountsInput: mailboxReadInput.pick({ mailboxIds: true }).extend({ query: mailboxConversationQuery.optional() }),
   MailboxCounts: z.object({ messages: revision, conversations: revision, asOfState: opaque, scopeState: opaque }),
+  MailboxContactsInput: mailboxReadInput.pick({ mailboxIds: true }).extend({ query: z.string().max(256).regex(/^[^\u0000-\u001f\u007f]*$/), limit: limit.optional() }),
+  MailboxContacts: z.strictObject({ items: z.array(z.strictObject({ name: z.string(), email: z.string().min(1) })).max(100), state: opaque, scopeState: opaque }),
+  MailboxCorrespondenceInput: mailboxReadInput.pick({ mailboxIds: true }).extend({ email: z.string().min(1).max(320), domain: z.string().min(1).max(253).optional(),
+    since: date.describe('ISO timestamp with seconds, up to millisecond precision, and an explicit timezone. Anchors bins only, not all-time totals.'),
+    bucketMs: z.number().int().min(3600000).max(365 * 86400000), bucketCount: z.number().int().min(1).max(64), recentLimit: z.number().int().min(1).max(50).optional() }),
+  MailboxCorrespondence: z.strictObject({ state: opaque, scopeState: opaque, received: revision, sent: revision, conversations: revision, twoWay: revision,
+    firstMessageAt: date.nullable(), lastMessageAt: date.nullable(), lastSentAt: date.nullable(),
+    periods: z.array(z.strictObject({ start: date, received: revision, sent: revision })).min(1).max(64), recent: z.array(mailboxThreadKey).max(50) }),
   MailboxSyncStatusInput: mailboxReadInput.pick({ mailboxIds: true }),
   MailboxSyncStatus: z.strictObject({ sourceId: id, scopeKey: opaque,
     state: z.enum(['syncing', 'waiting', 'error', 'paused', 'idle']), activeLanes: z.array(z.enum(['latest', 'backfill'])).max(2),
@@ -391,6 +401,7 @@ export function createInboxApi(options: InboxApiOptions) {
 
   app.use('*', async (c, next) => {
     c.header('Cache-Control', 'no-store')
+    if (CONTACT_READ_PATHS.some(path => c.req.path.endsWith(path))) c.header('Referrer-Policy', 'no-referrer')
     c.header('X-Content-Type-Options', 'nosniff')
     c.header('Vary', 'Origin, Authorization, Cookie')
     const origin = c.req.header('origin')
@@ -425,7 +436,8 @@ export function createInboxApi(options: InboxApiOptions) {
       if (c.req.header('cookie') && (!origin || origin !== new URL(c.req.url).origin && !origins.has(origin))) {
         throw new InboxError('ORIGIN_FORBIDDEN', 'A trusted Origin is required for cookie-authenticated mutations', 403)
       }
-      const maximum = c.req.path.endsWith('/v1/blobs') && c.req.method === 'POST' ? FILE_LIMIT + JSON_LIMIT : JSON_LIMIT
+      const maximum = c.req.path.endsWith('/v1/blobs') && c.req.method === 'POST' ? FILE_LIMIT + JSON_LIMIT
+        : CONTACT_READ_PATHS.some(path => c.req.path.endsWith(path)) ? CONTACT_READ_JSON_LIMIT : JSON_LIMIT
       c.set('body', await boundedBody(c.req.raw, maximum))
     }
     await next()
@@ -645,6 +657,20 @@ export function createInboxApi(options: InboxApiOptions) {
     description: 'Read-only POST. Live chronological keyset over exact source/thread identities. Generic filters qualify a conversation if any selected member matches; aggregates still span all selected members. Previews and conditional-action targets are bounded independently and explicitly report completeness. Direct keys remain mailbox-scoped. Reconcile from the starting state using mailbox-changes; this is not a frozen snapshot.' }, async c => json(c, validate(schemas.MailboxConversationsPage, await inbox.mailboxConversations(c.get('owner'), body(c, schemas.MailboxConversationsInput)))))
   route('post', '/v1/mailbox-counts', { summary: 'Count exact cached matching messages and conversations', input: 'MailboxCountsInput', output: 'MailboxCounts',
     description: 'Read-only POST. Deduplicates overlapping mailboxes; conversations are distinct source/thread identities with at least one matching selected message. May scan cached metadata; returns its asOfState separately from startup pages.' }, async c => json(c, validate(schemas.MailboxCounts, await inbox.mailboxCounts(c.get('owner'), body(c, schemas.MailboxCountsInput)))))
+  route('post', '/v1/mailbox-contacts', { summary: 'Find bounded contacts in selected cached mail', input: 'MailboxContactsInput', output: 'MailboxContacts', noStore: true,
+    description: 'Read-only POST with at most 64 KiB JSON and 1–1000 attached owned mailbox IDs. Literal case-insensitive address/name substring, at most 256 characters; default 20 results, maximum 100. Deduplicates addresses and returns their most recent cached display name, ordered by recency then address. Excludes trash, spam, unsent and invalid/future mail. Native confirmed Sent mail contributes To/CC; other eligible mail contributes From. Cached history is not a provider-complete address book. No body/provider access, persistent contact index or cursor. Response budget: 4 MiB.' }, async c => {
+    const result = validate(schemas.MailboxContacts, await inbox.mailboxContacts(c.get('owner'), body(c, schemas.MailboxContactsInput)))
+    const text = JSON.stringify(result)
+    if (encoder.encode(text).byteLength > SNAPSHOT_PAGE_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The contact read exceeds its encoded budget', 413)
+    return c.newResponse(text, 200, { 'Content-Type': 'application/json; charset=utf-8' })
+  })
+  route('post', '/v1/mailbox-correspondence', { summary: 'Aggregate selected cached correspondence without loading mail bodies', input: 'MailboxCorrespondenceInput', output: 'MailboxCorrespondence', noStore: true,
+    description: 'Read-only POST with at most 64 KiB JSON. Same owned attached selection and 4 MiB response budget as contacts. All-time metrics cover selected cached history only, never provider completeness. Exact case-insensitive email, or its validated domain including exact-boundary child domains. Received is From; sent is To/CC on confirmed Sent mail, not queued work. Deduplicates selected memberships and matching recipients per source/message/direction; conversations and recent keys use source/thread identity. Excludes trash, spam, unsent and invalid/future timestamps. since is an ISO timestamp anchoring 1–64 half-open bins; bucketMs is an integer from one hour through 365 days. Future bins remain empty; recentLimit defaults to 5 and is at most 50. Does not fetch providers, bodies or inference, write state, or create a contact inventory.' }, async c => {
+    const result = validate(schemas.MailboxCorrespondence, await inbox.mailboxCorrespondence(c.get('owner'), body(c, schemas.MailboxCorrespondenceInput)))
+    const text = JSON.stringify(result)
+    if (encoder.encode(text).byteLength > SNAPSHOT_PAGE_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The correspondence read exceeds its encoded budget', 413)
+    return c.newResponse(text, 200, { 'Content-Type': 'application/json; charset=utf-8' })
+  })
   route('post', '/v1/mailbox-changes', { summary: 'Reconcile a scoped body-free mailbox view from owner change history', input: 'MailboxChangesInput', output: 'MailboxChangesPage',
     description: 'Read-only POST; scopeState comes from mailbox-snapshot, mailbox-message-page, mailbox-conversations or mailbox-counts. At most 500 event-prefix entries are consumed, with current upserts and scoped removals; state advances only through that prefix when hasMore. Current rows may be newer than their events: merge canonical and membership revisions independently and apply deltas in order after initial inventory paging. Metadata events permit targeted metadata refresh. Scope/history resets contain no rows; start a new authorized inventory. Each response has encoded-byte and membership-row budgets.' }, async c => json(c, validate(schemas.MailboxChangesPage, await inbox.mailboxChanges(c.get('owner'), body(c, schemas.MailboxChangesInput)))))
   route('get', '/v1/mailboxes/:id/messages/:messageId/summary', { summary: 'Read cached metadata in an owned mailbox without accessing its body', output: 'MailboxMessageSummary',

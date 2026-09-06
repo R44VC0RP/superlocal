@@ -622,6 +622,32 @@ export function createInbox(options: InboxOptions): Inbox {
     return { sql: clauses.join(' AND ').replace(/\bm\./g, `${alias}.`), params }
   }
 
+  /** One explicit cached metadata scan, shared by the bounded contact and correspondence reads.
+   * EXISTS membership checks deduplicate overlapping views before recipient expansion. Native Sent
+   * evidence must be confirmed: an optimistic move or queued local draft is not correspondence. */
+  function cachedCorrespondents(owner: string, scope: ReturnType<typeof mailboxReadScope>, readAt: number) {
+    const selection = scopedReadWhere(owner, scope)
+    const unsent = "'draft','drafts','scheduled','outbox','unsent','queued'", excluded = `'trash','spam',${unsent}`
+    const nativeRole = (column: 'visible' | 'confirmed', roles: string) => `EXISTS(SELECT 1 FROM json_each(m.${column},'$.folderIds') j
+      CROSS JOIN sdk_folders f ON f.id=j.value AND f.owner=m.owner AND f.account=m.account AND f.generation=m.generation
+      WHERE json_extract(f.data,'$.role') IN (${roles}))`
+    return { sql: `WITH cached AS (
+      SELECT m.account source,m.id message,m.thread_id thread,CAST(round(unixepoch(m.received_at,'subsec')*1000) AS INTEGER) at,
+        CASE WHEN json_extract(m.confirmed,'$.folder')='sent' OR ${nativeRole('confirmed', "'sent'")} THEN 1 ELSE 0 END sent,
+        json_extract(m.visible,'$.from') sender,json_extract(m.visible,'$.to') recipients,json_extract(m.visible,'$.cc') copies
+      FROM sdk_messages m WHERE ${selection.sql} AND m.folder NOT IN (${excluded})
+        AND date(substr(m.received_at,1,10),'+0 days')=substr(m.received_at,1,10)
+        AND coalesce(json_extract(m.confirmed,'$.folder'),'') NOT IN (${unsent})
+        AND NOT ${nativeRole('visible', excluded)} AND NOT ${nativeRole('confirmed', unsent)}
+    ), correspondents AS (
+      SELECT c.source,c.message,c.thread,c.at,c.sent,lower(trim(json_extract(p.value,'$.email'))) email,
+        CASE WHEN json_type(p.value,'$.name')='text' THEN json_extract(p.value,'$.name') ELSE '' END name
+      FROM cached c CROSS JOIN json_each(CASE WHEN c.sent=1 THEN json_array(json(c.recipients),json(c.copies))
+        ELSE json_array(json_array(json(c.sender))) END) addresses CROSS JOIN json_each(addresses.value) p
+      WHERE c.at<=? AND json_type(p.value,'$.email')='text' AND trim(json_extract(p.value,'$.email'))<>''
+    )`, params: [...selection.params, readAt] }
+  }
+
   function liveMailboxPage(owner: string, scope: ReturnType<typeof mailboxReadScope>, cursor: string | undefined, kind: string, context: unknown) {
     const hash = fingerprint(context), head = sequence(owner)
     let seq = head, position: [string, string] | null = null
@@ -2163,6 +2189,68 @@ export function createInbox(options: InboxOptions): Inbox {
       const selection = scopedReadWhere(owner, scope, conversationQuery(input.query))
       const counts = db.query<{ messages: number; conversations: number }, (string | number)[]>(`SELECT COALESCE(SUM(messageCount),0) messages,COUNT(*) conversations FROM (SELECT COUNT(*) messageCount FROM sdk_messages m WHERE ${selection.sql} GROUP BY m.account,m.thread_id)`).get(...selection.params)!
       return { ...counts, asOfState: token(owner, sequence(owner)), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`) }
+    }).deferred()),
+    mailboxContacts: (owner, input) => run(() => db.transaction(() => {
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['mailboxIds', 'query', 'limit'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox contacts input.')
+      const scope = mailboxReadScope(owner, input.mailboxIds), limit = input.limit === undefined ? 20 : input.limit
+      if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+      if (typeof input.query !== 'string' || input.query.length > 256 || /[\u0000-\u001f\u007f]/.test(input.query)) throw new InboxError('VALIDATION', 'Contact queries contain at most 256 characters.')
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new InboxError('VALIDATION', 'Contact reads contain between 1 and 100 entries.')
+      const selection = cachedCorrespondents(owner, scope, now())
+      const pattern = `%${input.query.toLowerCase().replace(/[\\%_]/g, '\\$&')}%`
+      const items = db.query<{ name: string; email: string }, (string | number)[]>(`${selection.sql}, ranked AS (
+        SELECT email,name,at,ROW_NUMBER() OVER (PARTITION BY email ORDER BY at DESC,source,message DESC,name) ordinal FROM correspondents
+      ) SELECT name,email FROM ranked WHERE ordinal=1 AND (email LIKE ? ESCAPE '\\' OR lower(name) LIKE ? ESCAPE '\\') ORDER BY at DESC,email LIMIT ?`).all(...selection.params, pattern, pattern, limit)
+      const result = { items, state: token(owner, sequence(owner)), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`) }
+      if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The contact read exceeds its encoded budget.', 413)
+      return result
+    }).deferred()),
+    mailboxCorrespondence: (owner, input) => run(() => db.transaction(() => {
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['mailboxIds', 'email', 'domain', 'since', 'bucketMs', 'bucketCount', 'recentLimit'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox correspondence input.')
+      const scope = mailboxReadScope(owner, input.mailboxIds), recentLimit = input.recentLimit === undefined ? 5 : input.recentLimit
+      if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+      const address = selector({ kind: 'address', value: input.email })
+      if (address.kind !== 'address') throw new InboxError('VALIDATION', 'Invalid correspondence address.')
+      const email = address.value.toLowerCase(), hostname = email.slice(email.lastIndexOf('@') + 1)
+      let domain: string | undefined
+      if (input.domain !== undefined) {
+        const selected = selector({ kind: 'domain', value: text(input.domain, 'Correspondence domain', 253) })
+        if (selected.kind !== 'domain' || selected.value.split('.').some(label => label.length > 63) || !(hostname === selected.value || hostname.endsWith(`.${selected.value}`))) throw new InboxError('VALIDATION', 'The correspondence domain must contain the address.')
+        domain = selected.value
+      }
+      const since = text(input.since, 'Correspondence start', 100), start = Date.parse(since)
+      if (!/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(since)
+        || !Number.isFinite(start) || new Date(`${since.slice(0, 10)}T00:00:00Z`).toISOString().slice(0, 10) !== since.slice(0, 10)) throw new InboxError('VALIDATION', 'Correspondence start must be a valid ISO timestamp.')
+      if (!Number.isSafeInteger(input.bucketMs) || input.bucketMs < 3600000 || input.bucketMs > 365 * 86400000
+        || !Number.isSafeInteger(input.bucketCount) || input.bucketCount < 1 || input.bucketCount > 64
+        || !Number.isSafeInteger(recentLimit) || recentLimit < 1 || recentLimit > 50) throw new InboxError('VALIDATION', 'Invalid correspondence period or recent limit.')
+      const selection = cachedCorrespondents(owner, scope, now())
+      const predicate = domain ? "(substr(email,instr(email,'@')+1)=? OR substr(email,instr(email,'@')+1) LIKE ? ESCAPE '\\')" : 'email=?'
+      const params = domain ? [domain, `%.${domain.replace(/[\\%_]/g, '\\$&')}`] : [email]
+      const aggregate = db.query<{ received: number; sent: number; conversations: number; twoWay: number; firstMessageAt: number | null; lastMessageAt: number | null; lastSentAt: number | null; bins: string; recent: string }, (string | number)[]>(`${selection.sql}, matched AS (
+        SELECT source,message,thread,at,sent FROM correspondents WHERE ${predicate} GROUP BY source,message,sent
+      ), threads AS (
+        SELECT source,thread,MAX(sent=0) received,MAX(sent=1) sent,MAX(at) latest FROM matched GROUP BY source,thread
+      ) SELECT COALESCE(SUM(sent=0),0) received,COALESCE(SUM(sent=1),0) sent,
+        MIN(at) firstMessageAt,MAX(at) lastMessageAt,MAX(CASE WHEN sent=1 THEN at END) lastSentAt,
+        (SELECT COUNT(*) FROM threads) conversations,(SELECT COALESCE(SUM(received AND sent),0) FROM threads) twoWay,
+        (SELECT json_group_array(json_object('bucket',bucket,'received',received,'sent',sent)) FROM (
+          SELECT CAST((at-?)/? AS INTEGER) bucket,SUM(sent=0) received,SUM(sent=1) sent FROM matched WHERE at>=? AND at<? GROUP BY bucket
+        )) bins,
+        (SELECT json_group_array(json_object('sourceId',source,'threadId',thread)) FROM (
+          SELECT source,thread FROM threads ORDER BY latest DESC,source,thread LIMIT ?
+        )) recent FROM matched`).get(...selection.params, ...params, start, input.bucketMs, start, start + input.bucketMs * input.bucketCount, recentLimit)!
+      const periods = Array.from({ length: input.bucketCount }, (_, index) => ({ start: new Date(start + index * input.bucketMs).toISOString(), received: 0, sent: 0 }))
+      for (const bin of JSON.parse(aggregate.bins) as Array<{ bucket: number; received: number; sent: number }>) {
+        periods[bin.bucket]!.received = bin.received; periods[bin.bucket]!.sent = bin.sent
+      }
+      const iso = (value: number | null) => value === null ? null : new Date(value).toISOString()
+      const result = { state: token(owner, sequence(owner)), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`),
+        received: aggregate.received, sent: aggregate.sent, conversations: aggregate.conversations, twoWay: aggregate.twoWay,
+        firstMessageAt: iso(aggregate.firstMessageAt), lastMessageAt: iso(aggregate.lastMessageAt), lastSentAt: iso(aggregate.lastSentAt), periods,
+        recent: JSON.parse(aggregate.recent) as MailboxThreadKey[] }
+      if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The correspondence read exceeds its encoded budget.', 413)
+      return result
     }).deferred()),
     mailboxSyncStatus: (owner, input) => run(() => db.transaction(() => {
       if (!input || Object.keys(input).some(key => key !== 'mailboxIds')) throw new InboxError('VALIDATION', 'Invalid mailbox sync status input.')

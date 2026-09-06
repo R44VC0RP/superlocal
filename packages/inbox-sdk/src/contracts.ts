@@ -251,6 +251,41 @@ export interface MailboxCountsInput { mailboxIds: string[]; query?: MailboxConve
 /** Exact cached matching messages and distinct matching source/thread keys; overlapping mailboxes are deduplicated. */
 export interface MailboxCounts { messages: number; conversations: number; asOfState: string; scopeState: string }
 
+export interface MailboxContactsInput { mailboxIds: string[]; query: string; limit?: number }
+/** Top cached correspondents, not a provider-complete address book. Literal address/name substring;
+ * default 20, maximum 100. Addresses are case-insensitive and use their most recent cached name. */
+export interface MailboxContacts { items: Array<{ name: string; email: string }>; state: string; scopeState: string }
+export interface MailboxCorrespondenceInput {
+  mailboxIds: string[]
+  email: string
+  /** Optional exact domain or parent of the email's hostname; includes that domain's children. */
+  domain?: string
+  /** ISO timestamp anchoring the period bins, not a filter on all-time cached metrics. */
+  since: string
+  /** Integer milliseconds, between one hour and 365 days. */
+  bucketMs: number
+  /** Between 1 and 64 bins. */
+  bucketCount: number
+  /** Default 5, maximum 50 distinct source/thread keys. */
+  recentLimit?: number
+}
+/** Selected cached history only, never provider-complete. Excludes trash, spam, unsent, invalid
+ * and future messages. Received means From; sent means To/CC on confirmed Sent mail, not queued work.
+ * Overlapping mailboxes and multiple matching recipients contribute once per message/direction. */
+export interface MailboxCorrespondence {
+  state: string
+  scopeState: string
+  received: number
+  sent: number
+  conversations: number
+  twoWay: number
+  firstMessageAt: string | null
+  lastMessageAt: string | null
+  lastSentAt: string | null
+  periods: Array<{ start: string; received: number; sent: number }>
+  recent: MailboxThreadKey[]
+}
+
 export interface MailboxSnapshotInput { mailboxIds: string[]; cursor?: string; limit?: number }
 /** Stable ID inventory, live rows: finish paging, then catch up from the fixed state baseline. */
 export interface MailboxSnapshotPage {
@@ -499,6 +534,10 @@ export interface Inbox {
   mailboxMessagePage(owner: string, input: MailboxMessagePageInput): Promise<MailboxMessagePage>
   mailboxConversations(owner: string, input: MailboxConversationsInput): Promise<MailboxConversationsPage>
   mailboxCounts(owner: string, input: MailboxCountsInput): Promise<MailboxCounts>
+  /** Read-only top-N contacts from selected cached metadata; never loads bodies or calls a provider. */
+  mailboxContacts(owner: string, input: MailboxContactsInput): Promise<MailboxContacts>
+  /** Read-only correspondence aggregates over selected cached metadata, independent of app labels/settings. */
+  mailboxCorrespondence(owner: string, input: MailboxCorrespondenceInput): Promise<MailboxCorrespondence>
   /** Read-only primary-inbox activity, grouped by source; excludes detached mailbox selections. */
   mailboxSyncStatus(owner: string, input: { mailboxIds: string[] }): Promise<MailboxSyncStatus[]>
   mailboxSnapshot(owner: string, input: MailboxSnapshotInput): Promise<MailboxSnapshotPage>
