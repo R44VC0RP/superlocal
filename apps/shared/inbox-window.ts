@@ -69,6 +69,8 @@ export type InboxWindowState = {
   preferenceRevision: string
   sources: Array<{ sourceId: string; generation: number }>
   sdkState: string | null
+  /** Attested reconciliation checkpoint; remains usable while underlying scoped histories are retained. */
+  readCursor?: string
   indexing: boolean
   catchup: 'pending' | 'catching-up' | 'current' | 'blocked'
 }
@@ -153,6 +155,8 @@ export type InboxLookupResult = {
 export type InboxChangesInput = {
   queryId: string
   sinceRevision: number
+  /** Matching state.readCursor. Older clients may still use the bounded numeric checkpoint cache. */
+  sinceCursor?: string
   residentKeys: string[]
   pinnedKeys: string[]
   cursor?: string

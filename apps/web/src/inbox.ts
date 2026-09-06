@@ -26,6 +26,7 @@ import type { AiTriageActions, AiTriageState, AiDecision, AiDecisionPage } from 
 import { CATEGORY_BATCH_LIMIT, CATEGORY_MEMBERSHIP_LIMIT, CATEGORY_BODY_LIMIT, categoryKey, categoryErrorMessages, isCategoryContext, isCategoryCommand, type AttentionCategory, type CategoryContext, type CategoryEntry, type CategoryCommand, type CategoryReceipt, type CategoryErrorCode } from "../../shared/attention-overrides";
 
 type Edit = { draft: Draft; revision: number; version: number; error?: string; errorKind?: "recipients" };
+type WindowCheckpoint = Readonly<Pick<InboxWindowState, "indexRevision" | "readCursor">>;
 class DraftRecipientError extends Error {}
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
 type Sending = { ref: SendReference; operation: Operation; draft: SdkDraft };
@@ -314,7 +315,7 @@ export class InboxStore {
   private windowAutoDone = false;
   private windowSenderEpoch = 0;
   private windowChanges?: Promise<void>;
-  private windowReplayRevision?: number;
+  private windowReplayCheckpoint?: WindowCheckpoint;
   private windowMetadataEvents: ChangeEvent[] = [];
   private windowDetails = new Map<string, { contextVersion: string; summaries: MailboxMessageSummary[]; cursor: string | null; exhausted: boolean }>();
   private initialThread = new URLSearchParams(location.hash.replace(/^#\/?/, "")).get("thread");
@@ -443,7 +444,13 @@ export class InboxStore {
     if (!append) this.windowNewerCursor = null;
     else if (headEvicted) this.windowNewerCursor = this.windowBoundaryCursors.get(keys[0]) ?? null;
     const stale = append && previous && previous.state.indexRevision > page.state.indexRevision;
-    const state = stale ? previous.state : page.state, totals = stale ? previous.totals : page.totals;
+    // Appending rows does not complete reconciliation for the rest of the resident window.
+    const state = append && previous ? previous.state : page.state, totals = stale ? previous.totals : page.totals;
+    if (stale) {
+      if (!this.windowReplayCheckpoint || page.state.indexRevision < this.windowReplayCheckpoint.indexRevision)
+        this.windowReplayCheckpoint = { indexRevision: page.state.indexRevision, readCursor: page.state.readCursor };
+      this.scheduleRefresh();
+    }
     const exhausted = stale ? false : page.exhausted;
     // A bounded response is usable even with no matches yet; its cursor is explicit demand, not a loading loop.
     this.publish({ window: { query, state, keys, totals, nextCursor: page.nextCursor ?? (stale ? previous.nextCursor : null), exhausted, paging: false, residentBytes: this.windowBytes(), hasNewer: append && (previous?.hasNewer === true || headEvicted) }, loading: false, loaded: true, refreshing: false, error: null });
@@ -452,7 +459,7 @@ export class InboxStore {
   private openWindow = (): Promise<void> => {
     const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
     this.windowController.abort(); this.windowController = new AbortController();
-    this.windowPaging = undefined; this.windowChanges = undefined; this.windowReplayRevision = undefined; this.windowBoundaryCursors.clear(); this.windowNewerCursor = null; this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
+    this.windowPaging = undefined; this.windowChanges = undefined; this.windowReplayCheckpoint = undefined; this.windowBoundaryCursors.clear(); this.windowNewerCursor = null; this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
     const signal = AbortSignal.any([this.windowController.signal, this.controller.signal]);
     const transport = createInboxWindowTransport(() => signal, (input, init) => this.fetch(input, init));
     this.publish({ window: null, loading: true, loaded: false, refreshing: true });
@@ -538,9 +545,14 @@ export class InboxStore {
       const combined = [...new Set([...latest.keys.filter(key => !previousKeys.has(key)), ...pageKeys, ...latest.keys])];
       const keys = this.trimWindow(combined, "end"), tailEvicted = combined.at(-1) !== keys.at(-1);
       const stale = latest.state.indexRevision > page.state.indexRevision;
+      if (stale) {
+        if (!this.windowReplayCheckpoint || page.state.indexRevision < this.windowReplayCheckpoint.indexRevision)
+          this.windowReplayCheckpoint = { indexRevision: page.state.indexRevision, readCursor: page.state.readCursor };
+        this.scheduleRefresh();
+      }
       // This continuation also advances through empty scans; a resident bookmark would repeat them.
       this.windowNewerCursor = page.nextCursor;
-      this.publish({ window: { ...latest, keys, state: stale ? latest.state : page.state, totals: stale ? latest.totals : page.totals,
+      this.publish({ window: { ...latest, keys, state: latest.state, totals: stale ? latest.totals : page.totals,
         hasNewer: !page.exhausted, paging: false, residentBytes: this.windowBytes(),
         nextCursor: tailEvicted ? this.windowBoundaryCursors.get(keys.at(-1)!) ?? null : latest.nextCursor,
         exhausted: !tailEvicted && latest.exhausted } });
@@ -623,6 +635,7 @@ export class InboxStore {
     if (this.windowChanges) { this.updateAgain = true; return this.windowChanges; }
     this.updateAgain = false;
     const epoch = this.windowEpoch, generation = this.generation;
+    let replayCheckpoint: WindowCheckpoint | undefined;
     const work = (async () => {
       const events = this.windowMetadataEvents.splice(0), force = metadata || this.metadataPending; this.metadataPending = false;
       if (force || events.length) {
@@ -632,8 +645,11 @@ export class InboxStore {
       const current = this.state.window;
       if (!current) { await this.openWindow(); return; }
       // Continuations bind to one immutable wanted scope, including pins that can change during an await.
-      const input = { queryId: current.state.queryId, sinceRevision: this.windowReplayRevision ?? current.state.indexRevision,
+      replayCheckpoint = this.windowReplayCheckpoint;
+      const checkpoint = replayCheckpoint ?? current.state;
+      const input = { queryId: current.state.queryId, sinceRevision: checkpoint.indexRevision, sinceCursor: checkpoint.readCursor,
         residentKeys: [...current.keys], pinnedKeys: [...this.pinnedWindowKeys()], limit: INBOX_PAGE_LIMIT };
+      this.windowReplayCheckpoint = undefined;
       const wanted = new Set([...input.residentKeys, ...input.pinnedKeys]), heads = new Set<string>();
       let cursor: string | undefined;
       do {
@@ -660,15 +676,23 @@ export class InboxStore {
         // removals, ordering changes and this pass's own head additions do not require another drain.
         const replay = !page.nextCursor && ([...this.pinnedWindowKeys()].some(key => !wanted.has(key)) ||
           keys.some(key => !wanted.has(key) && !heads.has(key)));
-        // Demand paging may publish a newer revision before the scheduled replay starts.
-        if (!page.nextCursor) this.windowReplayRevision = replay ? input.sinceRevision : undefined;
-        this.updateAgain ||= replay;
-        this.publish({ window: { ...latest, keys, state: page.nextCursor ? latest.state : { ...page.state, indexRevision: replay ? input.sinceRevision : page.throughRevision }, totals: page.totals },
+        // A stale page can queue an older baseline during this drain; never erase or advance that replay.
+        if (replay && (!this.windowReplayCheckpoint || input.sinceRevision < this.windowReplayCheckpoint.indexRevision))
+          this.windowReplayCheckpoint = { indexRevision: input.sinceRevision, readCursor: input.sinceCursor };
+        this.updateAgain ||= this.windowReplayCheckpoint !== undefined;
+        this.publish({ window: { ...latest, keys, state: page.nextCursor ? latest.state : { ...page.state,
+          indexRevision: replay ? input.sinceRevision : page.throughRevision, readCursor: replay ? input.sinceCursor : page.state.readCursor }, totals: page.totals },
           ...(keys.length ? { loading: false, loaded: true, error: null } : {}) });
         this.reconcileFlags(); this.rebuild();
         cursor = page.nextCursor ?? undefined;
       } while (cursor);
-    })().finally(() => {
+    })().catch(error => {
+      // Failed reads retain their consumed replay for the next explicit/event-driven attempt.
+      if (replayCheckpoint && epoch === this.windowEpoch && generation === this.generation &&
+        (!this.windowReplayCheckpoint || replayCheckpoint.indexRevision < this.windowReplayCheckpoint.indexRevision))
+        this.windowReplayCheckpoint = replayCheckpoint;
+      throw error;
+    }).finally(() => {
       if (this.windowChanges !== work) return;
       this.windowChanges = undefined;
       if (this.updateAgain && epoch === this.windowEpoch && generation === this.generation) this.scheduleRefresh();

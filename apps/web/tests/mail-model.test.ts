@@ -2732,7 +2732,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
     const { default: App } = await import("../src/App.tsx");
     const render = () => renderToStaticMarkup(createElement(App));
     for (const [name, sizes] of [["full", [100, 100, 0, 1]], ["sparse", [3, 2, 0, 1]], ["empty", [0, 0, 0, 1]], ["exhausted", [0]], ["unfinished", [0]]] as const) {
-      const pages: PageInput[] = [], changes: ChangesInput[] = [], querySignals: AbortSignal[] = [], published: number[] = [];
+      const pages: PageInput[] = [], changes: ChangesInput[] = [], querySignals: AbortSignal[] = [], published: number[] = [], mismatchedCheckpoints: number[] = [];
       const captures: Array<{ path: string; id: string; account: string; queryId?: string }> = [];
       let queries = 0, revision = 1, holdQuery = false, heldQuery = false, stream: ReadableStreamDefaultController<Uint8Array> | undefined;
       let reversePage: ((input: PageInput) => Page | Promise<Page>) | undefined;
@@ -2741,8 +2741,14 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       let detailRead: ((input: MessagesInput) => MessagesPage | Promise<MessagesPage>) | undefined;
       let lookupRead: ((ids: string[]) => Row[]) | undefined;
       let bodyRead: ((id: string) => import("inbox-sdk/types").Message) | undefined;
-      const state = (): Page["state"] => ({ queryId: `query-${queries}`, queryGeneration: 1, indexRevision: revision, scopeState: "fictional-scope",
-        preferenceRevision: "1", sources: [{ sourceId: source.id, generation: 1 }], sdkState: "fictional-state", indexing: true, catchup: "current" });
+      let signedState = name === "full";
+      const readCursors = new Map<string, string | undefined>();
+      const state = (): Page["state"] => {
+        const queryId = `query-${queries}`, readCursor = signedState ? `${queryId}:read-${revision}` : undefined;
+        readCursors.set(`${queryId}:${revision}`, readCursor);
+        return { queryId, queryGeneration: 1, indexRevision: revision, readCursor, scopeState: "fictional-scope",
+          preferenceRevision: "1", sources: [{ sourceId: source.id, generation: 1 }], sdkState: "fictional-state", indexing: true, catchup: "current" };
+      };
       const row = (index: number): Row => {
         const id = `${box.id}:thread-${index}`, messageId = `message-${index}`;
         return { key: id, sourceId: source.id, threadId: `thread-${index}`, sourceGeneration: 1, revision: 1, pageCursor: `row-${index}`,
@@ -2776,6 +2782,8 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         if (url.pathname === "/host/inbox/changes") {
           const body = JSON.parse(String(init?.body)) as ChangesInput; changes.push(body);
           assert.ok(body.residentKeys.length <= 1000); assert.equal(body.limit, 100);
+          assert.ok(readCursors.has(`${body.queryId}:${body.sinceRevision}`));
+          assert.equal(body.sinceCursor, readCursors.get(`${body.queryId}:${body.sinceRevision}`), "each request preserves one matching revision/token pair, including legacy omission");
           if (scopeChanges) return scopeChanges(body);
           const delta = reverseDelta; reverseDelta = undefined;
           if (delta) revision++;
@@ -2794,7 +2802,11 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         assert.fail(`Unexpected request in demand-only fixture: ${url.pathname}`);
       }) as typeof fetch;
       store = new InboxStore();
-      const unsubscribe = store.subscribe(() => { if (store.getSnapshot().loaded) published.push(store.getSnapshot().window!.keys.length); });
+      const unsubscribe = store.subscribe(() => {
+        const snapshot = store.getSnapshot(), current = snapshot.window?.state;
+        if (snapshot.loaded) published.push(snapshot.window!.keys.length);
+        if (current && current.readCursor !== readCursors.get(`${current.queryId}:${current.indexRevision}`)) mismatchedCheckpoints.push(current.indexRevision);
+      });
       stop = store.start();
       await until(() => !!store.getSnapshot().window && !store.getSnapshot().window!.paging && !!stream, `${name}: bounded initial response settled`);
       assert.equal(published[0], sizes[0], `${name}: the first response is usable before the buffer arrives`);
@@ -2937,6 +2949,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           await store.loadNewerWindow();
           assert.equal(pages.at(-1)!.cursor, "row-52", "head eviction uses the exact first resident row, not its page boundary");
           assert.equal(store.getSnapshot().window!.keys[0], row(52).key); assert.equal(store.getSnapshot().window!.hasNewer, true);
+          const reverseBaseline = store.getSnapshot().window!.state.indexRevision;
           const pending = store.loadNewerWindow();
           await until(() => !!releaseReverse, "sparse newer response is held");
           assert.equal(pages.at(-1)!.cursor, "newer-gap-52", "an empty newer response advances its separate continuation");
@@ -2945,11 +2958,21 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           reverseDelta = { newHead: [arrival], removed: [{ key: row(1049).key, reason: "deleted" }] }; arrived = true;
           await store.retry();
           assert.equal(store.getSnapshot().window!.keys[0], arrival.key);
+          const reverseChanges = changes.length, savedReverse = row(50);
+          const changedReverse = { ...savedReverse, revision, mail: { ...savedReverse.mail, starred: !savedReverse.mail.starred } };
+          scopeChanges = async input => {
+            assert.equal(input.sinceRevision, reverseBaseline, "a delayed newer page replays its original baseline, not the completed drain");
+            assert.ok(input.residentKeys.includes(changedReverse.key));
+            return Response.json({ state: state(), upserts: [changedReverse], newHead: [], removed: [], totals, nextCursor: null, throughRevision: revision, resetReason: null } satisfies ChangesPage);
+          };
           releaseReverse!(); releaseReverse = undefined; await pending;
           assert.equal(store.getSnapshot().window!.state.indexRevision, 2, "a late page cannot regress a concurrent delta revision");
           assert.equal(store.getSnapshot().window!.keys[0], arrival.key, "newer paging merges the latest resident head");
           assert.ok(!store.getSnapshot().window!.keys.includes(row(1049).key));
           assert.equal(store.getSnapshot().window!.nextCursor, "row-1046", "tail eviction retains a bookmark from a terminal older page");
+          await until(() => store.getSnapshot().mail.find(mail => mail.id === changedReverse.key)?.starred === changedReverse.mail.starred, "the newly resident reverse row reconciles the flag delta it missed");
+          assert.equal(changes.length, reverseChanges + 1, "reverse catch-up is one bounded changes pass");
+          scopeChanges = undefined;
           await store.loadNewerWindow();
           assert.equal(pages.at(-1)!.cursor, "newer-progress-50", "sparse continuation wins over the concurrently arrived first row");
           await store.loadMoreWindow(2);
@@ -3095,8 +3118,8 @@ test("demand-driven host windows bound automatic requests and render unknown tot
                 return response({ newHead: [head], removed: expand ? [] : [{ key: nextHead.key, reason: "deleted" }], nextCursor: "frozen-scope-next" });
               }
               if (input.cursor) {
-                if (JSON.stringify([input.queryId, input.sinceRevision, input.residentKeys, input.pinnedKeys]) !==
-                  JSON.stringify([frozen.queryId, frozen.sinceRevision, frozen.residentKeys, frozen.pinnedKeys])) {
+                if (JSON.stringify([input.queryId, input.sinceRevision, input.sinceCursor, input.residentKeys, input.pinnedKeys]) !==
+                  JSON.stringify([frozen.queryId, frozen.sinceRevision, frozen.sinceCursor, frozen.residentKeys, frozen.pinnedKeys])) {
                   conflicts++; return Response.json({ code: "HOST_INBOX_CURSOR_INVALID", error: "The inbox cursor does not match this request." }, { status: 409 });
                 }
                 assert.equal(input.cursor, "frozen-scope-next"); return response();
@@ -3123,7 +3146,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
               assert.equal(store.getSnapshot().window!.state.indexRevision, checkpoint);
               assert.equal(store.getSnapshot().mail.find(mail => mail.id === changed.key)!.starred, false, "the old wanted set did not reconcile the newly pinned row");
               await store.seekWindow("start");
-              assert.equal(store.getSnapshot().window!.state.indexRevision, revision, "a demand page can advance the published revision before the scheduled replay");
+              assert.equal(store.getSnapshot().window!.state.indexRevision, revision, "an explicit replacement seek can advance the published revision before the scheduled replay");
               await until(() => requests.length === 3 && store.getSnapshot().mail.some(mail => mail.id === changed.key && mail.starred), "one current-scope replay reconciles the missed pin");
               assert.ok(store.getSnapshot().window!.keys.includes(nextHead.key)); assert.ok(!store.getSnapshot().window!.keys.includes(head.key));
             }
@@ -3141,6 +3164,48 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           assert.equal(bodyReads.length, bodiesBefore); assert.equal(lookupReads, 1, "only the explicit fixture lookup reads off-view rows");
           assert.equal(queries, queriesBefore); assert.equal(pages.length, pagesBefore + 1, "only the explicit seek issues a demand page during reconciliation");
           store.pinWindow("reader", []);
+
+          for (const withToken of [true, false]) {
+            signedState = withToken; revision++;
+            const baseline = state(), saved = row(withToken ? 1600 : 1601);
+            const oldRow = { ...saved, revision, mail: { ...saved.mail, starred: false } };
+            reversePage = async input => {
+              if (input.seek === "start") return { state: baseline, totals, rows: [giantRow(), companionRow], nextCursor: "held-checkpoint-page", exhausted: false };
+              assert.equal(input.cursor, "held-checkpoint-page");
+              const result: Page = { state: baseline, totals, rows: [oldRow], nextCursor: null, exhausted: true };
+              await new Promise<void>(resolve => { releaseReverse = resolve; }); return result;
+            };
+            await store.seekWindow("start");
+            const delayed = store.loadMoreWindow(); void delayed.catch(() => {});
+            await until(() => !!releaseReverse, "the old signed or legacy page is held");
+            signedState = true;
+            reverseDelta = { upserts: [], newHead: [], removed: [] }; await store.retry();
+            assert.ok(store.getSnapshot().window!.state.readCursor, "the completed newer state has a token even when the queued old page does not");
+            const requests: ChangesInput[] = [];
+            let failRead = withToken;
+            scopeChanges = async input => {
+              requests.push(structuredClone(input));
+              assert.equal(input.sinceRevision, baseline.indexRevision);
+              assert.equal(input.sinceCursor, baseline.readCursor, "replay never borrows the newer state's token for an older revision");
+              if (failRead) { failRead = false; throw new TypeError("Fictional checkpoint network failure"); }
+              return Response.json({ state: state(), upserts: [{ ...oldRow, revision, mail: { ...oldRow.mail, starred: true } }], newHead: [], removed: [], totals,
+                nextCursor: null, throughRevision: revision, resetReason: null } satisfies ChangesPage);
+            };
+            releaseReverse!(); releaseReverse = undefined; await delayed;
+            if (withToken) {
+              await until(() => requests.length === 1 && store.getSnapshot().error !== null, "a network failure interrupts the signed replay");
+              await sleep(150); assert.equal(requests.length, 1, "a failed replay does not introduce an automatic retry");
+              assert.equal(store.getSnapshot().mail.find(mail => mail.id === oldRow.key)!.starred, false);
+              await store.retry();
+              assert.deepEqual(requests[1], requests[0], "explicit retry retains the entire consumed checkpoint and wanted scope");
+            }
+            await until(() => store.getSnapshot().mail.some(mail => mail.id === oldRow.key && mail.starred), "the preserved signed or legacy checkpoint reconciles its old page");
+            assert.equal(requests.length, withToken ? 2 : 1); assert.equal(store.getSnapshot().error, null);
+            assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), stableGiant);
+            assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
+            assert.equal(bodyReads.length, bodiesBefore); assert.equal(queries, queriesBefore); assert.equal(lookupReads, 1);
+            scopeChanges = undefined;
+          }
         }
         if (name === "sparse") {
           holdQuery = true;
@@ -3161,6 +3226,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           assert.equal(store.getSnapshot().window!.query.folder, "Sent"); assert.equal(store.getSnapshot().error, null);
         }
       }
+      assert.deepEqual(mismatchedCheckpoints, [], "every published checkpoint keeps its revision and token paired, including a deferred pin replay");
       unsubscribe(); stop(); stop = undefined;
       await sleep(0);
     }
@@ -3202,7 +3268,8 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     inboxPreferences: preferences, splitPreferences: splits, attentionOverrides: categories, ai });
   type ChangesInput = import("../../shared/inbox-window").InboxChangesInput;
   type ChangesPage = import("../../shared/inbox-window").InboxWindowChanges;
-  let stop: (() => void) | undefined, releaseChanges: (() => void) | undefined;
+  type Page = import("../../shared/inbox-window").InboxWindowPage;
+  let stop: (() => void) | undefined, releaseChanges: (() => void) | undefined, releasePage: (() => void) | undefined;
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
   const until = async (check: () => boolean, message: string) => {
     const deadline = Date.now() + 20000; while (!check() && Date.now() < deadline) await sleep(20); assert.ok(check(), message);
@@ -3211,9 +3278,11 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     const nativeBox = host.store.mailboxes(host.owner)[0];
     const source = { owner: host.owner, storeId: nativeBox.id, accountId: host.store.link(host.owner, nativeBox.id)!.accountId };
     let firstNative: ReturnType<typeof host.store.receive> | undefined;
+    const nativeIds = new Map<string, string>();
     for (let index = 0; index < 1200; index++) {
       const received = host.store.receive(source, { from: "window-fixture@example.test", to: nativeBox.email,
         subject: `Window fixture ${String(index).padStart(4, "0")}`, text: "Fictional bounded inbox context." });
+      nativeIds.set(received.subject, received.id);
       if (!index) firstNative = received;
     }
     let more = true;
@@ -3226,6 +3295,7 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     });
     let inventories = 0, pages = 0, bodyReads = 0, queries = 0, lookups = 0;
     let holdQuery = false, heldQuery = false, releaseQuery: (() => void) | undefined, holdChanges = false, heldChanges = false;
+    let holdPage = false, heldPage: Page | undefined, holdTerminalChanges = false;
     const changes: ChangesInput[] = [], changeFailures: Array<{ status?: number; code?: string }> = [];
     const published: number[] = [];
     globalThis.fetch = (async (input, init) => {
@@ -3241,8 +3311,15 @@ test("host-service-backed bounded startup pages, lookup and search without brows
           const body = JSON.parse(String(init?.body));
           if (url.pathname === "/host/inbox/changes") changes.push(structuredClone(body));
           const result = await service.dispatch(url.pathname, body);
+          if (holdPage && url.pathname === "/host/inbox/page") {
+            holdPage = false; heldPage = result as Page;
+            const response = Response.json(result);
+            await new Promise<void>(resolve => { releasePage = resolve; init?.signal?.addEventListener("abort", () => resolve(), { once: true }); });
+            return response;
+          }
           if (holdChanges && url.pathname === "/host/inbox/changes" && !body.cursor) {
-            assert.ok((result as ChangesPage).nextCursor, "a real SDK mutation produces a bound host changes continuation");
+            if (holdTerminalChanges) assert.equal((result as ChangesPage).nextCursor, null, "the no-change pass is held at its final publication");
+            else assert.ok((result as ChangesPage).nextCursor, "a real SDK mutation produces a bound host changes continuation");
             holdChanges = false; heldChanges = true;
             await new Promise<void>(resolve => { releaseChanges = resolve; init?.signal?.addEventListener("abort", () => resolve(), { once: true }); });
           }
@@ -3289,17 +3366,73 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     assert.equal(bodyReads, reads, "cached open performs no additional body read");
     assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), cached, "cached open preserves row identity");
 
+    for (const [duringDrain, idleDrains] of [[false, 0], [true, 0], [false, 18]] as const) {
+      await store.seekWindow("start");
+      const beforePage = store.getSnapshot().window!, beforePageMail = store.getSnapshot().mail.find(mail => mail.id === first.id);
+      const pageBodies = bodyReads, pageQueries = queries, pageLookups = lookups;
+      holdPage = true;
+      const delayedPage = store.loadMoreWindow();
+      void delayedPage.catch(() => {});
+      await until(() => !!releasePage, "the real older page is serialized before its response is released");
+      assert.equal(heldPage!.rows.length, 100);
+      assert.equal(heldPage!.state.indexRevision, beforePage.state.indexRevision, "the actual host cursor retains its immutable original baseline");
+      assert.ok(heldPage!.state.readCursor); assert.equal(heldPage!.state.readCursor, beforePage.state.readCursor);
+      const delayedRow = heldPage!.rows.find(row => row.mail.subject.startsWith("Window fixture ") && !row.mail.starred && row.mail.unread)!;
+      assert.ok(!beforePage.keys.includes(delayedRow.key)); assert.equal(delayedRow.mail.starred, false); assert.equal(delayedRow.mail.unread, true);
+      // An upstream flag event reaches the real SDK without changing the host's provider-write policy.
+      host.store.mutate(source, nativeIds.get(delayedRow.mail.subject)!, { isStarred: true, isRead: true });
+      await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+      const currentSummary = await host.inbox.mailboxMessageSummary(host.owner, box.id, delayedRow.summaries[0].id);
+      assert.equal(currentSummary.isStarred, true); assert.equal(currentSummary.isRead, true);
+      await store.retry();
+      for (let count = 0; count < idleDrains; count++) await store.retry();
+      if (idleDrains) {
+        const expiredNumeric = await store.windowTransport.changes({ queryId: beforePage.state.queryId, sinceRevision: heldPage!.state.indexRevision,
+          residentKeys: [...store.getSnapshot().window!.keys], pinnedKeys: [first.id], limit: 100 });
+        assert.equal(expiredNumeric.resetReason, "history", "18 ordinary drains retire the numeric checkpoint while its signed SDK baseline is still usable");
+      }
+      const completedCheckpoint = store.getSnapshot().window!.state, completedRevision = completedCheckpoint.indexRevision;
+      let afterDrain = changes.length, overlappingDrain: Promise<void> | undefined;
+      assert.ok(completedRevision > heldPage!.state.indexRevision);
+      assert.ok(!store.getSnapshot().mail.some(mail => mail.id === delayedRow.key), "the delta cannot upsert or prepend this still-offscreen older row");
+      if (duringDrain) {
+        holdChanges = true; heldChanges = false; holdTerminalChanges = true;
+        overlappingDrain = store.retry();
+        await until(() => !!releaseChanges, "a subsequent drain is held at its final response");
+        assert.equal(changes.at(-1)!.sinceRevision, completedRevision, "this drain started after the missed flags were already checkpointed");
+        assert.equal(changes.at(-1)!.sinceCursor, completedCheckpoint.readCursor);
+        afterDrain = changes.length;
+      }
+      releasePage!(); releasePage = undefined; await delayedPage;
+      assert.equal(store.getSnapshot().window!.state.indexRevision, completedRevision, "a delayed page must not replace the completed checkpoint");
+      assert.equal(store.getSnapshot().window!.state.readCursor, completedCheckpoint.readCursor);
+      if (overlappingDrain) { releaseChanges!(); releaseChanges = undefined; await overlappingDrain; holdTerminalChanges = false; }
+      for (let attempt = 0; attempt < 100 && (!store.getSnapshot().mail.find(mail => mail.id === delayedRow.key)?.starred || store.getSnapshot().window!.state.indexRevision <= completedRevision); attempt++) await sleep(20);
+      const reconciledRow = store.getSnapshot().mail.find(mail => mail.id === delayedRow.key)!;
+      assert.deepEqual({ starred: reconciledRow.starred, unread: reconciledRow.unread }, { starred: true, unread: false },
+        `a held R${heldPage!.state.indexRevision} page arriving ${duringDrain ? "during a later drain" : "after the drain"} at R${completedRevision} must reconcile its missed flags; catch-up requests=${changes.length - afterDrain}`);
+      const pageReplay = changes.slice(afterDrain).find(input => !input.cursor)!;
+      assert.ok(pageReplay); assert.equal(pageReplay.sinceRevision, heldPage!.state.indexRevision); assert.equal(pageReplay.sinceCursor, heldPage!.state.readCursor);
+      assert.ok(pageReplay.residentKeys.includes(delayedRow.key));
+      assert.equal(bodyReads, pageBodies); assert.equal(inventories, 0); assert.equal(queries, pageQueries); assert.equal(lookups, pageLookups);
+      assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), beforePageMail);
+      const settledPageMail = store.getSnapshot().mail;
+      await store.loadThread(first.id); assert.equal(bodyReads, pageBodies); assert.strictEqual(store.getSnapshot().mail, settledPageMail);
+      assert.deepEqual(changeFailures, []);
+    }
+
     await store.seekWindow("start"); await store.retry();
     const outside = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [box.id], search: 'subject:"Window fixture 0000"', limit: 1 })).items[0]!;
     const outsideKey = `${box.id}:${outside.threadId}`, resident = [...store.getSnapshot().window!.keys];
     assert.ok(!resident.includes(outsideKey), "the changed sender conversation starts outside the resident window");
     const [savedOutside] = await store.lookupWindow([outsideKey]);
     const unchanged = store.getSnapshot().mail.find(mail => mail.id === first.id);
-    const checkpoint = store.getSnapshot().window!.state.indexRevision, firstChange = changes.length;
+    const checkpoint = store.getSnapshot().window!.state, firstChange = changes.length;
+    assert.ok(checkpoint.readCursor);
     const queriesBefore = queries, lookupsBefore = lookups, bodiesBefore = bodyReads;
     const changedState = await host.inbox.setMailboxStates(host.owner, { id: "held-window-pin-change", done: true,
       targets: [{ mailboxId: box.id, messageId: outside.id, revision: outside.memberships.find(state => state.mailboxId === box.id)!.revision }] });
-    holdChanges = true;
+    holdChanges = true; heldChanges = false;
     const draining = store.retry();
     await until(() => heldChanges || changeFailures.length > 0, "first real changes page is held");
     assert.deepEqual(changeFailures, []);
@@ -3311,11 +3444,12 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     const firstPass = changes.slice(firstChange);
     assert.ok(firstPass.length > 1, "the strict host cursor was actually exercised");
     for (const input of firstPass.slice(1)) assert.deepEqual(input, { ...firstPass[0], cursor: input.cursor }, "all continuations use the captured resident/pinned scope");
-    assert.equal(store.getSnapshot().window!.state.indexRevision, checkpoint, "the completed old scope cannot advance past an unreconciled new pin");
+    assert.equal(store.getSnapshot().window!.state.indexRevision, checkpoint.indexRevision, "the completed old scope cannot advance past an unreconciled new pin");
+    assert.equal(store.getSnapshot().window!.state.readCursor, checkpoint.readCursor, "the deferred old revision keeps its own token, not the new response's token");
     assert.equal(store.getSnapshot().mail.find(mail => mail.id === outsideKey)!.folder, savedOutside.folder);
     await until(() => store.getSnapshot().mail.some(mail => mail.id === outsideKey && mail.folder === "Done"), "the scheduled current-scope replay reconciles the missed SDK receipt");
     const replay = changes.slice(firstChange + 1).find(input => !input.cursor)!;
-    assert.ok(replay); assert.equal(replay.sinceRevision, checkpoint);
+    assert.ok(replay); assert.equal(replay.sinceRevision, checkpoint.indexRevision); assert.equal(replay.sinceCursor, checkpoint.readCursor);
     assert.deepEqual(new Set(replay.pinnedKeys), new Set([resident[1], ...newPins]));
     await sleep(200);
     assert.equal(changes.slice(firstChange).filter(input => !input.cursor).length, 2, "one scope expansion schedules one follow-up pass, not a loop");
@@ -3367,7 +3501,7 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     assert.equal(store.getSnapshot().window?.query.folder, "All Mail", "late prior-view response cannot replace the active window");
     stop(); stop = undefined;
   } finally {
-    releaseChanges?.(); stop?.(); await service.close(); await ai.close(); await host.close(); database.close();
+    releasePage?.(); releaseChanges?.(); stop?.(); await service.close(); await ai.close(); await host.close(); database.close();
     globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
     for (const [key, descriptor] of globals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); }
     await fs.rm(root, { recursive: true, force: true });

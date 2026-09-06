@@ -2428,22 +2428,58 @@ describe('bounded host inbox window', () => {
     const cached = await call('lookup', { account: 'unified', ids: ready.rows.slice(0, 3).map(row => row.key) })
     expect(cached.entries.every(entry => entry.status === 'found')).toBe(true)
     expect(cached.entries.map(entry => entry.status === 'found' && entry.row.key)).toEqual(ready.rows.slice(0, 3).map(row => row.key))
-    // Ordinary reconciliations may retire numeric change baselines, but a signed
-    // paging boundary remains usable while its SDK scope/history is still valid.
+    // Complete 18 ordinary drains: the numeric cache may retire R1, but paging
+    // and its attested replay must remain valid while SDK history is retained.
+    const drainChanges = async (input: WindowDTO.InboxChangesInput) => {
+      let cursor: string | undefined, last: WindowDTO.InboxWindowChanges
+      do {
+        const before = conversationReads
+        last = await call('changes', { ...input, ...(cursor ? { cursor } : {}) })
+        expect(last.resetReason).toBeNull(); expect(conversationReads - before).toBeLessThanOrEqual(5)
+        cursor = last.nextCursor ?? undefined
+      } while (cursor)
+      return last
+    }
     let through = ready.state.indexRevision
     const retainedCursor = ready.nextCursor!, selectedBoxes = (await h.inbox.mailboxes('alice')).map(mailbox => mailbox.id)
     for (let sample = 0; sample < 9; sample++) {
       const current = (await h.inbox.mailboxConversations('alice', { mailboxIds: selectedBoxes, keys: [{ sourceId: ready.rows[0]!.sourceId, threadId: ready.rows[0]!.threadId }] })).items[0]!
       const receipt = await h.inbox.setMailboxStates('alice', { id: randomUUID(), targets: current.targets, done: true })
-      const doneDelta = await call('changes', { queryId: first.state.queryId, sinceRevision: through, residentKeys: ready.rows.map(row => row.key), pinnedKeys: [], limit: 100 })
-      expect(doneDelta.resetReason).toBeNull(); through = doneDelta.throughRevision
+      const doneDelta = await drainChanges({ queryId: first.state.queryId, sinceRevision: through, residentKeys: ready.rows.map(row => row.key), pinnedKeys: [], limit: 100 })
+      through = doneDelta.throughRevision
       await h.inbox.undoMailboxStates('alice', receipt.id)
-      const undoDelta = await call('changes', { queryId: first.state.queryId, sinceRevision: through, residentKeys: ready.rows.map(row => row.key), pinnedKeys: [], limit: 100 })
-      expect(undoDelta.resetReason).toBeNull(); through = undoDelta.throughRevision
+      const undoDelta = await drainChanges({ queryId: first.state.queryId, sinceRevision: through, residentKeys: ready.rows.map(row => row.key), pinnedKeys: [], limit: 100 })
+      through = undoDelta.throughRevision
     }
     const afterOrdinaryChanges = await call('page', { queryId: first.state.queryId, cursor: retainedCursor })
     expect(afterOrdinaryChanges.rows).toHaveLength(100)
     expect(afterOrdinaryChanges.rows.some(row => first.rows.some(previous => previous.key === row.key))).toBe(false)
+    expect(afterOrdinaryChanges.state.indexRevision).toBe(ready.state.indexRevision)
+    expect(afterOrdinaryChanges.state.readCursor).toBe(ready.state.readCursor)
+    expect(afterOrdinaryChanges.state.readCursor).toBeString()
+    expect(Buffer.byteLength(afterOrdinaryChanges.state.readCursor!)).toBeLessThanOrEqual(16384)
+    const replayInput: WindowDTO.InboxChangesInput = { queryId: afterOrdinaryChanges.state.queryId, sinceRevision: afterOrdinaryChanges.state.indexRevision,
+      residentKeys: [...ready.rows, ...afterOrdinaryChanges.rows].map(row => row.key), pinnedKeys: [], limit: 100 }
+    // This is the pre-fix failure, observed through the unchanged numeric-only path.
+    expect((await call('changes', replayInput)).resetReason).toBe('history')
+    replayInput.sinceCursor = afterOrdinaryChanges.state.readCursor!
+    const beforeReplay = conversationReads
+    let replay = await call('changes', replayInput)
+    expect(replay.resetReason).toBeNull(); expect(replay.nextCursor).not.toBeNull()
+    expect(conversationReads - beforeReplay).toBeLessThanOrEqual(5)
+    const replayed = [...replay.upserts]
+    // A continuation cannot silently drop the checkpoint that fixed its pass scope.
+    await expect(call('changes', { ...replayInput, sinceCursor: undefined, cursor: replay.nextCursor! })).rejects.toMatchObject({ code: 'HOST_INBOX_CURSOR_INVALID', status: 409 })
+    while (replay.nextCursor) {
+      const before = conversationReads
+      replay = await call('changes', { ...replayInput, cursor: replay.nextCursor })
+      expect(replay.resetReason).toBeNull(); expect(conversationReads - before).toBeLessThanOrEqual(5)
+      replayed.push(...replay.upserts)
+    }
+    expect(replay.throughRevision).toBeGreaterThanOrEqual(through)
+    const refreshed = replayed.find(row => row.key === ready.rows[0]!.key)!
+    expect(refreshed).toBeDefined()
+    expect(refreshed.targets.every(target => target.revision > ready.rows[0]!.targets.find(previous => previous.mailboxId === target.mailboxId && previous.messageId === target.messageId)!.revision)).toBe(true)
     const search = await call('query', { ...view, search: true, query: '(from:old-window@example.test OR is:starred) -in:trash' })
     const matches = [...search.rows]
     let found = search
@@ -2542,6 +2578,198 @@ describe('bounded host inbox window', () => {
     await preferences.write({ ...current, unifiedMode: 'selected', includedMailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id] })
     await expect(call('page', { queryId: nextView.state.queryId })).rejects.toMatchObject({ code: 'HOST_INBOX_SCOPE_CHANGED' })
   }, 30000)
+
+  test('identical public query openings reconcile independently when changes are interleaved', async () => {
+    const h = await fixture({ allowProviderWrites: false }), database = new Database(':memory:')
+    const { box } = await h.seed('alice', 'independent-query-opens', Array.from({ length: 4 }, (_, index) => native(`query-open-${index}`, {
+      threadId: `query-open-thread-${index}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(), bodyText: 'Please confirm the fictional delivery plan.',
+    })))
+    const providerCalls = structuredClone(box.calls)
+    let bodyReads = 0, unscopedReads = 0, conversationReads = 0
+    const guarded: Inbox = { ...h.inbox,
+      mailboxConversations: async (...args) => { conversationReads++; return h.inbox.mailboxConversations(...args) },
+      mailboxMessagePage: async (owner, input) => {
+        if (!input.threadId) { unscopedReads++; throw new Error('Opening independent views must not copy the mailbox') }
+        return h.inbox.mailboxMessagePage(owner, input)
+      },
+      mailboxMessage: async () => { bodyReads++; throw new Error('Reconciliation must not read bodies') },
+      message: async () => { bodyReads++; throw new Error('Reconciliation must not read bodies') },
+    }
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY })
+    const service = createInboxWindowService({ database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: false,
+      inboxPreferences: createInboxViewPreferencesStore(database, guarded, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'),
+      attentionOverrides: createAttentionOverridesStore(database, guarded, 'alice') })
+    let now = Date.now()
+    const started = now, clock = spyOn(Date, 'now').mockImplementation(() => now)
+    cleanup.push(async () => { try { await service.close(); await ai.close(); database.close() } finally { clock.mockRestore() } })
+    const view: WindowDTO.InboxViewQuery = { account: 'unified', folder: 'Inbox', split: 'Important', search: false, query: '', filter: null }
+    const open = async (split = 'Important') => {
+      now++
+      const before = conversationReads, page = await service.dispatch('/host/inbox/query', { ...view, split }) as WindowDTO.InboxWindowPage
+      expect(page.state.indexing).toBe(false); expect(conversationReads - before).toBeLessThanOrEqual(5)
+      return page
+    }
+    const a = await open(), b = await open(), opened = [a, b]
+    expect(a.rows).toHaveLength(4); expect(b.rows.map(row => row.key)).toEqual(a.rows.map(row => row.key))
+    for (let index = 2; index < 128; index++) opened.push(await open(index % 2 ? 'Other' : 'Important'))
+    expect(opened).toHaveLength(128)
+    const oldestIdle = opened[2]!
+    const activeCount = () => database.query<{ count: number }, (string | number)[]>('SELECT COUNT(*) count FROM local_window_queries WHERE owner=? AND scope=(SELECT scope FROM local_window_queries WHERE owner=? AND id=?) AND expires>?').get('alice', 'alice', a.state.queryId, now)!.count
+    expect(activeCount()).toBe(128)
+    const [first, second, third] = a.rows
+    await h.inbox.setMailboxStates('alice', { id: randomUUID(), done: true, targets: [first!, second!].flatMap(row => row.targets) })
+    const inputA: WindowDTO.InboxChangesInput = { queryId: a.state.queryId, sinceRevision: a.state.indexRevision, sinceCursor: a.state.readCursor!,
+      residentKeys: [first!.key, second!.key], pinnedKeys: [second!.key], limit: 1 }
+    const inputB: WindowDTO.InboxChangesInput = { queryId: b.state.queryId, sinceRevision: b.state.indexRevision, sinceCursor: b.state.readCursor!,
+      residentKeys: [second!.key, third!.key], pinnedKeys: [first!.key], limit: 1 }
+    const changes = async (input: WindowDTO.InboxChangesInput) => {
+      now++ // Successful A/B pages renew their existing TTL/LRU position.
+      const before = conversationReads
+      const page = await service.dispatch('/host/inbox/changes', input) as WindowDTO.InboxWindowChanges
+      expect(page.resetReason).toBeNull(); expect(page.state.queryId).toBe(input.queryId)
+      expect(conversationReads - before).toBeLessThanOrEqual(5)
+      return page
+    }
+    const pagesA = [await changes(inputA)], pagesB = [await changes(inputB)]
+    expect(pagesA[0]!.nextCursor).not.toBeNull(); expect(pagesB[0]!.nextCursor).not.toBeNull()
+    // The 129th public open must reclaim one bounded idle batch, not fail 429.
+    opened.push(await open('Important'))
+    expect(opened[128]!.rows).toHaveLength(2); expect(activeCount()).toBe(97)
+    for (let index = 129; index < 160; index++) opened.push(await open(index % 2 ? 'Other' : 'Important'))
+    expect(opened).toHaveLength(160); expect(activeCount()).toBe(128)
+    expect(now - started).toBeLessThan(30 * 60_000)
+    await expect(service.dispatch('/host/inbox/page', { queryId: oldestIdle.state.queryId })).rejects.toMatchObject({ code: 'HOST_INBOX_QUERY_EXPIRED', status: 410 })
+    await expect(service.dispatch('/host/inbox/changes', { queryId: oldestIdle.state.queryId, sinceRevision: oldestIdle.state.indexRevision,
+      sinceCursor: oldestIdle.state.readCursor!, residentKeys: [], pinnedKeys: [] })).rejects.toMatchObject({ code: 'HOST_INBOX_QUERY_EXPIRED', status: 410 })
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const otherScope = await service.dispatch('/host/inbox/query', { ...view, account: mailbox.id }) as WindowDTO.InboxWindowPage
+    await expect(service.dispatch('/host/inbox/changes', { queryId: otherScope.state.queryId, sinceRevision: oldestIdle.state.indexRevision,
+      sinceCursor: oldestIdle.state.readCursor!, residentKeys: [], pinnedKeys: [] })).rejects.toMatchObject({ code: 'HOST_INBOX_CURSOR_INVALID', status: 409 })
+    await expect(changes({ ...inputB, cursor: pagesA[0]!.nextCursor! })).rejects.toMatchObject({ code: 'HOST_INBOX_CURSOR_INVALID', status: 409 })
+    let cursorA = pagesA[0]!.nextCursor, cursorB = pagesB[0]!.nextCursor
+    while (cursorA || cursorB) {
+      if (cursorA) { const page = await changes({ ...inputA, cursor: cursorA }); pagesA.push(page); cursorA = page.nextCursor }
+      if (cursorB) { const page = await changes({ ...inputB, cursor: cursorB }); pagesB.push(page); cursorB = page.nextCursor }
+    }
+    expect(pagesA.flatMap(page => page.removed)).toEqual([{ key: first!.key, reason: 'not-matching' }])
+    expect(pagesB.flatMap(page => page.removed)).toEqual([{ key: second!.key, reason: 'not-matching' }])
+    expect(pagesA.flatMap(page => page.upserts).map(row => row.key)).toEqual([second!.key])
+    expect(pagesB.flatMap(page => page.upserts).map(row => row.key)).toEqual([first!.key])
+    expect([...pagesA, ...pagesB].flatMap(page => page.upserts).every(row => row.targets.every(target => target.revision > 1))).toBe(true)
+    expect(bodyReads).toBe(0); expect(unscopedReads).toBe(0); expect(box.calls).toEqual(providerCalls)
+    for (const table of ['messages', 'rows', 'matches', 'prefix_rows']) expect(database.query<{ count: number }, []>(`SELECT COUNT(*) count FROM local_window_${table}`).get()!.count).toBe(0)
+  })
+
+  test('query reclamation preserves explicit preparation and accepted frozen selections', async () => {
+    const h = await fixture({ allowProviderWrites: false }), database = new Database(':memory:')
+    const { box } = await h.seed('alice', 'protected-query-preparation', [native('protected-one', { bodyText: 'Please confirm the fictional delivery plan.' }), native('protected-two', { bodyText: 'Please review the fictional shipping date.' })])
+    const providerCalls = structuredClone(box.calls), scan = gate<void>(undefined)
+    let rawReads = 0, bodyReads = 0
+    const guarded: Inbox = { ...h.inbox,
+      mailboxMessagePage: async (owner, input) => {
+        if (!input.threadId && ++rawReads === 1) await scan.wait()
+        return h.inbox.mailboxMessagePage(owner, input)
+      },
+      mailboxMessage: async () => { bodyReads++; throw new Error('Query retention must not load bodies') },
+      message: async () => { bodyReads++; throw new Error('Query retention must not load bodies') },
+    }
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY })
+    const service = createInboxWindowService({ database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: false,
+      inboxPreferences: createInboxViewPreferencesStore(database, guarded, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'),
+      attentionOverrides: createAttentionOverridesStore(database, guarded, 'alice') })
+    cleanup.push(async () => { scan.release(); await service.close(); await ai.close(); database.close() })
+    const call = async <K extends keyof WindowDTO.InboxWindowTransport>(name: K, input: Parameters<WindowDTO.InboxWindowTransport[K]>[0]): Promise<Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>> =>
+      await service.dispatch(WindowDTO.inboxWindowPaths[name], input) as Awaited<ReturnType<WindowDTO.InboxWindowTransport[K]>>
+    const view: WindowDTO.InboxViewQuery = { account: 'unified', folder: 'All Mail', split: 'Important', search: false, query: '', filter: null }
+    // At the public-query plateau, a fresh internal All Mail query must also
+    // reclaim idle slots rather than make explicit cleanup fail with 429.
+    for (let index = 0; index < 128; index++) await call('query', { ...view, folder: 'Inbox', split: index % 2 ? 'Other' : 'Important' })
+    const activeQueries = () => database.query<{ count: number }, (string | number)[]>('SELECT COUNT(*) count FROM local_window_queries WHERE owner=? AND expires>?').get('alice', Date.now())!.count
+    expect(activeQueries()).toBe(128); expect(rawReads).toBe(0)
+    await expect(call('zeroCreate', { id: randomUUID(), account: 'unified' })).rejects.toMatchObject({ code: 'HOST_INBOX_PREPARING' })
+    expect(activeQueries()).toBe(97)
+    await bounded(scan.entered, 'fresh cleanup preparation at the query plateau')
+    const original = await call('query', view)
+    const input: WindowDTO.InboxSelectionInput = { id: randomUUID(), account: 'unified', queryId: original.state.queryId, allMatching: true }
+    await expect(call('selectionCreate', input)).rejects.toMatchObject({ code: 'HOST_INBOX_PREPARING' })
+    await bounded(scan.entered, 'explicit preparation starts before query reclamation')
+    // The oldest query has no materialized rows yet; its preparation lease alone
+    // must protect it while ordinary opens reclaim otherwise idle query slots.
+    for (let index = 0; index < 160; index++) await call('query', { ...view, folder: 'Inbox', split: index % 2 ? 'Other' : 'Important' })
+    expect(rawReads).toBe(1)
+    for (const table of ['messages', 'rows', 'matches', 'captures']) expect(database.query<{ count: number }, []>(`SELECT COUNT(*) count FROM local_window_${table}`).get()!.count).toBe(0)
+    expect((await call('page', { queryId: original.state.queryId })).rows.map(row => row.key)).toEqual(original.rows.map(row => row.key))
+    await expect(call('selectionCreate', input)).rejects.toMatchObject({ code: 'HOST_INBOX_PREPARING' })
+    scan.release()
+    const accepted = await acceptPrepared(() => call('selectionCreate', input), 'preserved preparation accepts its original selection')
+    expect(accepted.id).toBe(input.id); expect(accepted.captureComplete).toBe(false)
+    // Exercise the capture's query reference while its frozen work is pending.
+    for (let index = 0; index < 160; index++) await call('query', { ...view, folder: 'Inbox', split: index % 2 ? 'Other' : 'Important' })
+    const selected = await bounded((async () => {
+      for (;;) { const page = await call('selectionPage', { selectionId: accepted.id }); if (page.selection.captureComplete) return page; await Bun.sleep(10) }
+    })(), 'protected frozen selection completes after reclamation')
+    expect(selected.selection.count).toBe(2); expect(selected.entries.every(entry => entry.status === 'found')).toBe(true)
+    expect(selected.entries.map(entry => entry.id).sort()).toEqual(original.rows.map(row => row.key).sort())
+    expect(rawReads).toBe(1); expect(bodyReads).toBe(0); expect(box.calls).toEqual(providerCalls)
+    expect(database.query<{ count: number }, (string | number)[]>('SELECT COUNT(*) count FROM local_window_queries WHERE owner=? AND expires>?').get('alice', Date.now())!.count).toBeLessThanOrEqual(128)
+  })
+
+  test('attested read cursors reject mismatched checkpoints and still honor actual SDK history expiry', async () => {
+    const h = await fixture({ eventRetention: 3, allowProviderWrites: false }), database = new Database(':memory:')
+    const { box } = await h.seed('alice', 'read-checkpoint-fences', [native('checkpoint-one'), native('checkpoint-two')])
+    const providerCalls = structuredClone(box.calls), mailboxIds = (await h.inbox.mailboxes('alice')).map(mailbox => mailbox.id)
+    let deltaReads = 0
+    const guarded: Inbox = { ...h.inbox,
+      mailboxChanges: async (...args) => { deltaReads++; return h.inbox.mailboxChanges(...args) },
+      mailboxMessage: async () => { throw new Error('Read checkpoints must not load bodies') },
+      message: async () => { throw new Error('Read checkpoints must not load bodies') },
+    }
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY })
+    const services = ['alice', 'bob'].map(owner => createInboxWindowService({ database, inbox: guarded, owner, ai, sessionKey: KEY, allowProviderWrites: false,
+      inboxPreferences: createInboxViewPreferencesStore(database, guarded, owner), splitPreferences: createSplitPreferencesStore(database, owner),
+      attentionOverrides: createAttentionOverridesStore(database, guarded, owner) }))
+    const service = services[0]!, foreignService = services[1]!
+    cleanup.push(async () => { for (const current of services) await current.close(); await ai.close(); database.close() })
+    const view: WindowDTO.InboxViewQuery = { account: 'unified', folder: 'All Mail', split: 'Important', search: false, query: '', filter: null }
+    const first = await service.dispatch('/host/inbox/query', view) as WindowDTO.InboxWindowPage
+    const otherQuery = await service.dispatch('/host/inbox/query', { ...view, folder: 'Inbox' }) as WindowDTO.InboxWindowPage
+    const foreign = await foreignService.dispatch('/host/inbox/query', view) as WindowDTO.InboxWindowPage
+    const input: WindowDTO.InboxChangesInput = { queryId: first.state.queryId, sinceRevision: first.state.indexRevision,
+      sinceCursor: first.state.readCursor!, residentKeys: first.rows.map(row => row.key), pinnedKeys: [] }
+    const changes = (value: WindowDTO.InboxChangesInput) => service.dispatch('/host/inbox/changes', value) as Promise<WindowDTO.InboxWindowChanges>
+    const [payload, signature] = first.state.readCursor!.split('.')
+    for (const invalid of [
+      { ...input, sinceCursor: otherQuery.state.readCursor! },
+      { ...input, sinceCursor: foreign.state.readCursor! },
+      { ...input, sinceRevision: input.sinceRevision + 1 },
+      { ...input, sinceCursor: `${payload}.${signature![0] === 'A' ? 'B' : 'A'}${signature!.slice(1)}` },
+      { ...input, sinceCursor: first.rows[0]!.pageCursor! },
+      { ...input, sinceCursor: 'x'.repeat(16385) },
+    ]) await expect(changes(invalid)).rejects.toMatchObject({ code: 'HOST_INBOX_CURSOR_INVALID', status: 409 })
+    // Valid fixture HMACs distinguish payload validation from tamper rejection.
+    const { createHmac } = await import('node:crypto')
+    const envelope = JSON.parse(Buffer.from(payload!, 'base64url').toString())
+    for (const value of [null, [], { ...envelope.value, sdkState: 1 }, { ...envelope.value, scopeState: '' },
+      { ...envelope.value, ai: -1 }, { ...envelope.value, category: 0.5 }, { ...envelope.value, at: Number.MAX_SAFE_INTEGER + 1 }]) {
+      const data = Buffer.from(JSON.stringify({ ...envelope, value })).toString('base64url')
+      const sinceCursor = `${data}.${createHmac('sha256', KEY).update(data).digest('base64url')}`
+      await expect(changes({ ...input, sinceCursor })).rejects.toMatchObject({ code: 'HOST_INBOX_CURSOR_INVALID', status: 409 })
+    }
+    expect(deltaReads).toBe(0)
+    // Empty scopes legitimately attest a nullable SDK state without any SDK read.
+    expect(foreign.state.sdkState).toBeNull(); expect(foreign.state.readCursor).toBeString()
+    expect(await foreignService.dispatch('/host/inbox/changes', { queryId: foreign.state.queryId, sinceRevision: foreign.state.indexRevision,
+      sinceCursor: foreign.state.readCursor!, residentKeys: [], pinnedKeys: [] })).toMatchObject({ resetReason: null })
+    expect(deltaReads).toBe(0)
+    // Expire real retained events through local conditional receipts, not SQL edits.
+    for (let index = 0; index < 5; index++) {
+      const row = first.rows[0]!, current = (await h.inbox.mailboxConversations('alice', { mailboxIds, keys: [{ sourceId: row.sourceId, threadId: row.threadId }] })).items[0]!
+      await h.inbox.setMailboxStates('alice', { id: randomUUID(), targets: current.targets, done: index % 2 === 0 })
+    }
+    expect(await h.inbox.mailboxChanges('alice', { mailboxIds, since: first.state.sdkState!, scopeState: first.state.scopeState })).toMatchObject({ resetRequired: true, resetReason: 'history' })
+    expect(await changes(input)).toMatchObject({ resetReason: 'history', upserts: [], newHead: [], removed: [], nextCursor: null })
+    expect(deltaReads).toBe(1); expect(box.calls).toEqual(providerCalls)
+  })
 
   test('small selections retain missing IDs and freeze accepted targets rather than including later replies', async () => {
     const h = await fixture()
@@ -2733,6 +2961,20 @@ describe('bounded host inbox window', () => {
     expect(await call('zeroUndo', partialInverse)).toMatchObject({ status: 'accepted', session: { progress: { decidedCount: 4 } } })
     await h.inbox.undoMailboxStates('alice', redoneId)
     expect((await call('zeroUndo', { id: randomUUID(), reference: redone.undo!, receipts: [{ kind: 'mailbox-state', id: redoneId }] })).status).toBe('accepted')
+    // Completed captures no longer need their clean source query. Reclaim it
+    // while durable W/Other/Later credits still await their conditional Undo.
+    await bounded((async () => {
+      for (;;) {
+        const remaining = ['matches', 'counts', 'query_pending', 'prefix', 'prefix_rows'].some(table => database.query<{ count: number }, string[]>(`SELECT COUNT(*) count FROM local_window_${table} WHERE owner=? AND query_id=?`).get('alice', first.state.queryId)!.count > 0)
+        if (!remaining) return
+        await Bun.sleep(10)
+      }
+    })(), 'completed capture query becomes disposable')
+    const beforeReclamation = await resume()
+    for (let index = 0; index < 160; index++) await call('query', { account: 'unified', folder: 'Inbox', split: index % 2 ? 'Other' : 'Important', search: false, query: '', filter: null })
+    await expect(call('page', { queryId: first.state.queryId })).rejects.toMatchObject({ code: 'HOST_INBOX_QUERY_EXPIRED', status: 410 })
+    expect((await resume()).progress).toEqual(beforeReclamation.progress)
+    expect(database.query<{ count: number }, (string | number)[]>('SELECT COUNT(*) count FROM local_window_queries WHERE owner=? AND expires>?').get('alice', Date.now())!.count).toBeLessThanOrEqual(128)
     await feedback.undo(feedbackId)
     expect((await call('zeroUndo', { id: randomUUID(), reference: feedbackCredit.undo!, receipts: [{ kind: 'attention-feedback', id: feedbackId }] })).status).toBe('accepted')
     await categories.undo(categoryId)

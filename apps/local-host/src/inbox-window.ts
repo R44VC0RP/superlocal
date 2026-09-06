@@ -463,6 +463,7 @@ export function createInboxWindowService(deps: Dependencies) {
     return { queryId: query?.id ?? `scope:${scope.row.id}`, queryGeneration: query?.generation ?? scope.row.generation,
       indexRevision: read?.revision ?? scope.row.revision, scopeState: read?.scopeState ?? scope.row.id, preferenceRevision: scope.preference,
       sources: scope.sources.map(source => ({ sourceId: source.id, generation: source.generation })), sdkState: read?.sdkState ?? null,
+      ...(query && read ? { readCursor: token(`read:${query.id}`, scope, read) } : {}),
       // Current means this bounded cached SDK read, not upstream history completion.
       // The dormant capture index is deliberately not a source of ordinary read state.
       indexing: false, catchup: query?.problem ? 'blocked' : 'current' }
@@ -934,23 +935,36 @@ export function createInboxWindowService(deps: Dependencies) {
     if (scope.row.reset === 'pruning') { pruning.add(scope.row.id); schedule(0) }
     return { capture: capture!, meta, scope }
   }
-  async function newQuery(input: DTO.InboxQueryInput, scope: Scope): Promise<QueryRow> {
+  async function newQuery(input: DTO.InboxQueryInput, scope: Scope, reuse = true): Promise<QueryRow> {
     const { limit: _, ...query } = input
     text(query.account); text(query.folder, 128); text(query.split, 128)
     if (typeof query.search !== 'boolean' || typeof query.query !== 'string' || query.query.length > 4096 || query.filter !== null && !['Unread', 'Starred', 'Important', 'No reply', 'Needs reply', 'Action requested', 'Time-sensitive', 'Suspicious', 'Unassessed'].includes(query.filter)) fail('HOST_INBOX_INVALID')
     try { parseSearch(query.query) } catch { fail('HOST_INBOX_INVALID') }
     const serialized = JSON.stringify(query)
-    const expired = db.query<{ id: string }, (string | number)[]>(`SELECT q.id FROM local_window_queries q WHERE q.owner=? AND q.expires<?
-      AND NOT EXISTS(SELECT 1 FROM local_window_captures c WHERE c.owner=q.owner AND c.complete=0 AND json_extract(c.data,'$.queryId')=q.id)
+    const preparing = JSON.stringify([...preparations.values()].flatMap(value => [...value.queries]))
+    // Unfinished captures still consult their query. Completed queues and Undo use
+    // frozen capture items instead; never remove those items or materialized refs.
+    const disposable = `NOT EXISTS(SELECT 1 FROM local_window_captures c WHERE c.owner=q.owner AND c.complete=0 AND json_extract(c.data,'$.queryId')=q.id)
       AND NOT EXISTS(SELECT 1 FROM local_window_matches m WHERE m.owner=q.owner AND m.query_id=q.id)
       AND NOT EXISTS(SELECT 1 FROM local_window_query_pending p WHERE p.owner=q.owner AND p.query_id=q.id)
       AND NOT EXISTS(SELECT 1 FROM local_window_counts c WHERE c.owner=q.owner AND c.query_id=q.id)
       AND NOT EXISTS(SELECT 1 FROM local_window_prefix p WHERE p.owner=q.owner AND p.query_id=q.id)
-      AND NOT EXISTS(SELECT 1 FROM local_window_prefix_rows p WHERE p.owner=q.owner AND p.query_id=q.id) LIMIT 8`).all(owner, Date.now())
+      AND NOT EXISTS(SELECT 1 FROM local_window_prefix_rows p WHERE p.owner=q.owner AND p.query_id=q.id)
+      AND q.id NOT IN (SELECT value FROM json_each(?))`
+    const expired = db.query<{ id: string }, (string | number)[]>(`SELECT q.id FROM local_window_queries q WHERE q.owner=? AND q.expires<? AND ${disposable} LIMIT 8`).all(owner, Date.now(), preparing)
     for (const value of expired) db.query('DELETE FROM local_window_queries WHERE owner=? AND id=?').run(owner, value.id)
-    const prior = db.query<QueryRow, (string | number)[]>('SELECT * FROM local_window_queries WHERE owner=? AND scope=? AND preference=? AND generation=? AND data=? AND expires>? AND problem IS NULL LIMIT 1').get(owner, scope.row.id, scope.preference, scope.row.generation, serialized, Date.now())
+    const prior = reuse ? db.query<QueryRow, (string | number)[]>('SELECT * FROM local_window_queries WHERE owner=? AND scope=? AND preference=? AND generation=? AND data=? AND expires>? AND problem IS NULL LIMIT 1').get(owner, scope.row.id, scope.preference, scope.row.generation, serialized, Date.now()) : null
     if (prior) return prior
-    const count = db.query<{ count: number }, (string | number)[]>('SELECT COUNT(*) count FROM local_window_queries WHERE owner=? AND scope=? AND expires>?').get(owner, scope.row.id, Date.now())!.count
+    const active = db.query<{ count: number }, (string | number)[]>('SELECT COUNT(*) count FROM local_window_queries WHERE owner=? AND scope=? AND expires>?')
+    let count = active.get(owner, scope.row.id, Date.now())!.count
+    if (count >= 128) {
+      // TTL renewal already records recency. Reclaim one atomic bounded batch,
+      // keeping independent public IDs and every capture/preparation safety fence.
+      db.query(`DELETE FROM local_window_queries WHERE owner=? AND scope=? AND id IN (
+        SELECT q.id FROM local_window_queries q WHERE q.owner=? AND q.scope=? AND q.expires>? AND ${disposable}
+        ORDER BY q.expires,q.id LIMIT 32)`).run(owner, scope.row.id, owner, scope.row.id, Date.now(), preparing)
+      count = active.get(owner, scope.row.id, Date.now())!.count
+    }
     if (count >= 128) fail('HOST_INBOX_UNAVAILABLE', 429)
     const id = crypto.randomUUID()
     db.query('INSERT INTO local_window_queries(owner,id,scope,data,preference,generation,expires) VALUES (?,?,?,?,?,?,?)').run(owner, id, scope.row.id, serialized, scope.preference, scope.row.generation, Date.now() + QUERY_TTL)
@@ -1424,13 +1438,28 @@ export function createInboxWindowService(deps: Dependencies) {
     const resetReason = scope.row.id !== query!.scope ? 'scope' : scope.row.generation !== query!.generation ? 'history' : scope.preference !== query!.preference ? 'query' : null
     const reset = (reason: NonNullable<DTO.InboxWindowChanges['resetReason']>): DTO.InboxWindowChanges => ({ state: state(scope), upserts: [], newHead: [], removed: [], totals: unknownTotals(scope), nextCursor: null, throughRevision: scope.row.revision, resetReason: reason })
     if (resetReason) return reset(resetReason)
-    const wanted = [...new Set([...resident, ...pinned])], pinnedSet = new Set(pinned), inputHash = digest([since, resident, pinned])
+    let attested: ReadBaseline | undefined
+    if (input.sinceCursor !== undefined) {
+      try { attested = untoken<ReadBaseline>(input.sinceCursor, `read:${query!.id}`, scope) }
+      catch { fail('HOST_INBOX_CURSOR_INVALID', 409) }
+      if (!attested || typeof attested !== 'object' || Array.isArray(attested)
+        || Object.keys(attested).some(key => !['sdkState', 'scopeState', 'revision', 'ai', 'category', 'at'].includes(key))
+        || attested.sdkState !== null && (typeof attested.sdkState !== 'string' || !attested.sdkState.length)
+        || typeof attested.scopeState !== 'string' || !attested.scopeState.length
+        || ![attested.revision, attested.ai, attested.category, attested.at].every(value => Number.isSafeInteger(value) && value >= 0)
+        || attested.revision !== since) fail('HOST_INBOX_CURSOR_INVALID', 409)
+    }
+    // Preserve the legacy three-part pass identity when no attestation is supplied.
+    const wanted = [...new Set([...resident, ...pinned])], pinnedSet = new Set(pinned)
+    const inputHash = digest(input.sinceCursor === undefined ? [since, resident, pinned] : [since, resident, pinned, input.sinceCursor])
     if (wanted.length > 1000) fail('HOST_INBOX_TOO_LARGE', 413)
     const cursor = input.cursor ? untoken<{ id: string; offset: number; stage: 'rows' | 'head' | 'next' }>(input.cursor, `changes:${query!.id}`, scope) : undefined
     let saved = readMetadata(query!), pass = cursor ? saved.changes : undefined
     if (cursor && (!pass || pass.id !== cursor.id || pass.input !== inputHash)) fail('HOST_INBOX_CURSOR_INVALID', 409)
     if (!pass || cursor?.stage === 'next') {
-      const before = pass?.baseline ?? baseline(scope, query!, since)
+      // A signed old page can outlive the numeric cache, but never the underlying
+      // SDK/AI/category history and scope checks performed below.
+      const before = pass?.baseline ?? attested ?? baseline(scope, query!, since)
       if (!before) return reset('history')
       const delta = before.sdkState && scope.boxes.length ? await inbox.mailboxChanges(owner, { mailboxIds: scope.boxes.map(box => box.id), since: before.sdkState, scopeState: before.scopeState, limit: 100 }) : null
       if (delta?.resetRequired) return reset(delta.resetReason ?? 'history')
@@ -1492,7 +1521,9 @@ export function createInboxWindowService(deps: Dependencies) {
   const transport: DTO.InboxWindowTransport = {
     async query(input) {
       const maximum = limit(input.limit), scope = await resolve(input.account)
-      const query = await newQuery(input, scope)
+      // Public openings own independent reconciliation passes; internal capture
+      // preparation keeps the default reuse so explicit retries retain their work.
+      const query = await newQuery(input, scope, false)
       return scopedRead(scope, () => preparePage(scope, query, maximum))
     },
     async page(input) {
@@ -1718,7 +1749,7 @@ export function createInboxWindowService(deps: Dependencies) {
       if (!name) fail('HOST_INBOX_INVALID', 404)
       const fields: Record<keyof DTO.InboxWindowTransport, string[]> = {
         query: ['account', 'folder', 'split', 'search', 'query', 'filter', 'limit'], page: ['queryId', 'cursor', 'limit', 'direction', 'seek'], counts: ['queryId'],
-        lookup: ['account', 'ids'], changes: ['queryId', 'sinceRevision', 'residentKeys', 'pinnedKeys', 'cursor', 'limit'], messages: ['account', 'id', 'cursor', 'limit'],
+        lookup: ['account', 'ids'], changes: ['queryId', 'sinceRevision', 'sinceCursor', 'residentKeys', 'pinnedKeys', 'cursor', 'limit'], messages: ['account', 'id', 'cursor', 'limit'],
         sender: ['account', 'id', 'selectedMessageId', 'domain'], contacts: ['account', 'query', 'limit'], selectionCreate: ['id', 'account', 'queryId', 'allMatching', 'ids'], selectionPage: ['selectionId', 'cursor', 'limit'],
         zeroCreate: ['id', 'account'], zeroResume: ['sessionId', 'account'], zeroPage: ['sessionId', 'cursor', 'limit'], zeroProgress: ['sessionId', 'id', 'ifRevision', 'decisions', 'currentId', 'reviewOnlyIds', 'phase', 'paused'], zeroUndo: ['id', 'reference', 'receipts'],
       }
