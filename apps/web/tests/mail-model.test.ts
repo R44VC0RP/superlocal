@@ -3287,6 +3287,15 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           assert.deepEqual(bodyReads.slice(senderBodyBaseline), ["giant-700", "giant-699", "giant-698", "giant-697"], "only the four explicitly requested message bodies were fetched");
           assert.equal(queries, senderQueryBaseline + 1); assert.equal(pages.length, senderPageBaseline + 1, "only the explicit query switch loads another buffer");
           assert.equal(lookupReads, 1, "reader priority introduces no lookup or inventory work");
+
+          reversePage = () => ({ state: state(), totals, rows: [giantRow()], nextCursor: null, exhausted: true });
+          await store.seekWindow("start");
+          const readsBeforeDeepWindow = bodyReads.length;
+          for (let page = 0; page < 7; page++) await store.loadMoreMessages(giantKey);
+          const movedHistory = store.getSnapshot().mail.find(mail => mail.id === giantKey)!;
+          assert.equal(movedHistory.historyExhausted, true); assert.equal(movedHistory.messages.length, 500);
+          assert.ok(!movedHistory.messages.some(message => message.id === "giant-700"), "merging current preview flags never reintroduces evicted history identities");
+          assert.equal(bodyReads.length, readsBeforeDeepWindow); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
         }
         if (name === "sparse") {
           holdQuery = true;
@@ -3329,24 +3338,25 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     assert.equal(result.code, 0, result.output); return;
   }
   const [{ createMockHost }, { InboxStore }, { Database }, { createInboxWindowService }, { createInboxViewPreferencesStore },
-    { createSplitPreferencesStore }, { createAttentionOverridesStore }, { createAiTriageService }, fs, { tmpdir }, { join }] = await Promise.all([
+    { createSplitPreferencesStore }, { createAttentionOverridesStore }, { createAiTriageService }, { createAttentionFeedbackStore }, fs, { tmpdir }, { join }] = await Promise.all([
     import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("bun:sqlite"), import("../../local-host/src/inbox-window.ts"),
     import("../../local-host/src/inbox-preferences.ts"), import("../../local-host/src/split-preferences.ts"), import("../../local-host/src/attention-overrides.ts"),
-    import("../../local-host/src/ai-triage.ts"), import("node:fs/promises"), import("node:os"), import("node:path"),
+    import("../../local-host/src/ai-triage.ts"), import("../../local-host/src/attention-feedback.ts"), import("node:fs/promises"), import("node:os"), import("node:path"),
   ]);
   const root = await fs.mkdtemp(join(tmpdir(), "host-window-client-"));
   const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
   const globals = ["location", "window", "document", "localStorage"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
   console.info = () => {}; console.warn = () => {};
   const token = "fictional-window-client-token-only";
-  const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 48).toString("base64"), token, allowProviderWrites: false });
+  const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 48).toString("base64"), token, allowProviderWrites: true });
   const database = new Database(join(root, "host-window.sqlite"));
   const preferences = createInboxViewPreferencesStore(database, host.inbox, host.owner);
   const splits = createSplitPreferencesStore(database, host.owner);
   const categories = createAttentionOverridesStore(database, host.inbox, host.owner);
   const ai = createAiTriageService({ database, inbox: host.inbox, configuration: null, sessionKey: token });
-  const service = createInboxWindowService({ database, inbox: host.inbox, owner: host.owner, sessionKey: token, allowProviderWrites: false,
+  const service = createInboxWindowService({ database, inbox: host.inbox, owner: host.owner, sessionKey: token, allowProviderWrites: true,
     inboxPreferences: preferences, splitPreferences: splits, attentionOverrides: categories, ai });
+  const feedback = createAttentionFeedbackStore(database, host.inbox, host.owner);
   type ChangesInput = import("../../shared/inbox-window").InboxChangesInput;
   type ChangesPage = import("../../shared/inbox-window").InboxWindowChanges;
   type Page = import("../../shared/inbox-window").InboxWindowPage;
@@ -3374,20 +3384,37 @@ test("host-service-backed bounded startup pages, lookup and search without brows
       document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
       localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
     });
-    let inventories = 0, pages = 0, bodyReads = 0, queries = 0, lookups = 0;
+    let inventories = 0, pages = 0, bodyReads = 0, queries = 0, lookups = 0, detailPages = 0;
+    const nativeWrites: Array<{ input: import("inbox-sdk/types").MutationInput; operation: import("inbox-sdk/types").Operation }> = [];
+    const observedFlags = new Set<string>(), feedbackRequests: Array<{ id: string; targets: import("../src/host.ts").AttentionFeedbackTarget[] }> = [];
+    const feedbackReplies: Array<{ status: number; code?: string }> = [];
     let holdQuery = false, heldQuery = false, releaseQuery: (() => void) | undefined, holdChanges = false, heldChanges = false;
     let holdPage = false, heldPage: Page | undefined, holdTerminalChanges = false;
     const changes: ChangesInput[] = [], changeFailures: Array<{ status?: number; code?: string }> = [];
     const published: number[] = [];
     globalThis.fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
-      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: false, providers: [], inboxWindow: true });
+      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], inboxWindow: true, preferenceScope: "fictional-window-client" });
       if (url.pathname === "/host/inbox-preferences") return Response.json(await preferences.read());
+      if (url.pathname === "/host/split-preferences") return Response.json(splits.read());
+      if (url.pathname === "/host/attention-feedback" || /^\/host\/attention-feedback\/[^/]+\/undo$/.test(url.pathname)) {
+        try {
+          if (url.pathname.endsWith("/undo")) return Response.json(await feedback.undo(url.pathname.split("/")[3]));
+          if (init?.method !== "POST") return Response.json(await feedback.list());
+          const body = JSON.parse(String(init.body)); feedbackRequests.push(body);
+          const event = await feedback.record(body); feedbackReplies.push({ status: 200 }); return Response.json(event);
+        } catch (cause) {
+          const error = cause as { status: number; code: string; message: string };
+          feedbackReplies.push({ status: error.status, code: error.code });
+          return Response.json({ code: error.code, error: error.message, retryable: false }, { status: error.status });
+        }
+      }
       if (url.pathname.startsWith("/host/inbox/")) {
         assert.equal(init?.method, "POST"); assert.equal(init?.credentials, "include");
         if (url.pathname === "/host/inbox/page") pages++;
         if (url.pathname === "/host/inbox/query") queries++;
         if (url.pathname === "/host/inbox/lookup") lookups++;
+        if (url.pathname === "/host/inbox/messages") detailPages++;
         try {
           const body = JSON.parse(String(init?.body));
           if (url.pathname === "/host/inbox/changes") changes.push(structuredClone(body));
@@ -3422,7 +3449,13 @@ test("host-service-backed bounded startup pages, lookup and search without brows
         const abort = () => reject(new DOMException("Stopped", "AbortError")); if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
       });
       const headers = new Headers(init?.headers); headers.set("Authorization", `Bearer ${token}`);
-      return host.fetch(new Request(url, { ...init, headers }));
+      const response = await host.fetch(new Request(url, { ...init, headers }));
+      if (url.pathname === "/v1/operations" && init?.method === "POST" && response.ok)
+        nativeWrites.push({ input: JSON.parse(String(init.body)), operation: await response.clone().json() });
+      if (url.pathname.startsWith("/v1/operations/") && response.ok) {
+        const operation = await response.clone().json(); if (operation.status === "succeeded") observedFlags.add(operation.id);
+      }
+      return response;
     }) as typeof fetch;
     // Opening the app must not depend on a prewarmed global index.
     const query = { account: box.id, folder: "All Mail", split: "Important", search: false, query: "", filter: null };
@@ -3580,6 +3613,98 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     await store.setWindowQuery(query); releaseQuery?.();
     assert.equal((await stale)?.name, "AbortError");
     assert.equal(store.getSnapshot().window?.query.folder, "All Mail", "late prior-view response cannot replace the active window");
+
+    await until(() => !store.getSnapshot().window!.paging, "the preceding view is settled before the long-thread case");
+    const unaffected = store.getSnapshot().mail[0]; store.pinWindow("draft:long-guard", [unaffected.id]);
+    let longNative: ReturnType<typeof host.store.receive> | undefined;
+    const longAt = Date.now(), longSubject = "Expanded long W fixture";
+    for (let index = 0; index < 120; index++) {
+      const received = host.store.receive(source, { from: "long-fixture@example.test", to: nativeBox.email, subject: longSubject,
+        threadId: longNative?.threadId, receivedAt: new Date(longAt - (119 - index) * 1000).toISOString(), isRead: index < 119,
+        text: index === 119 ? "EXPANDED-LONG-LATEST-120" : `Expanded long history ${index + 1}.` });
+      longNative ??= received;
+    }
+    more = true; while (more) more = (await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 })).hasMore;
+    const longSummaries: import("inbox-sdk/types").MailboxMessageSummary[] = []; let longCursor: string | undefined;
+    do {
+      const page = await host.inbox.mailboxMessages(host.owner, { mailboxIds: [box.id], search: `subject:"${longSubject}"`, limit: 100, cursor: longCursor });
+      longSummaries.push(...page.items); longCursor = page.nextCursor ?? undefined;
+    } while (longCursor);
+    longSummaries.sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)); assert.equal(longSummaries.length, 120);
+    const latestLong = longSummaries[0], longKey = `${box.id}:${latestLong.threadId}`;
+    const preparation = await host.inbox.setMailboxStates(host.owner, { id: "web-long-prep-119-done", done: true,
+      targets: longSummaries.slice(1).map(message => ({ mailboxId: box.id, messageId: message.id, revision: message.memberships[0].revision })) });
+    assert.equal(preparation.states.filter(state => state.done).length, 119);
+    store.pinWindow("reader", [longKey]);
+    await store.setWindowQuery({ ...query, search: true, query: `subject:"${longSubject}"` });
+    const long = () => store.getSnapshot().mail.find(mail => mail.id === longKey)!;
+    assert.equal(long().messages.length, 50); assert.equal(long().window!.targets.length, 120);
+    const context = long().window!.contextVersion, initialDetails = detailPages;
+    await store.loadThread(longKey);
+    assert.ok(long().messages.at(-1)!.bodyText?.includes("EXPANDED-LONG-LATEST-120"));
+    const loadedBodies = bodyReads, beforeRead = nativeWrites.length, loadedLatest = long().messages.at(-1)!;
+    await store.action([long()], "read");
+    assert.equal(detailPages - initialDetails, 2); assert.equal(long().messages.length, 120);
+    assert.equal(nativeWrites.length, beforeRead + 1); assert.deepEqual(nativeWrites.at(-1)!.input.messageIds, [latestLong.id]);
+    const readOperation = nativeWrites.at(-1)!.operation;
+    await host.inbox.runDue();
+    assert.equal((await host.inbox.operation(host.owner, readOperation.id)).status, "succeeded");
+    await until(() => observedFlags.has(readOperation.id), "the client observes native read settlement before W");
+    await store.retry();
+    const freshLatest = await host.inbox.mailboxMessageSummary(host.owner, box.id, latestLong.id);
+    assert.ok(freshLatest.revision > latestLong.revision); assert.equal(freshLatest.isRead, true);
+    assert.equal(long().window!.contextVersion, context, "read settlement keeps the canonical body/context identity");
+    assert.equal(long().window!.targets.find(target => target.messageId === latestLong.id)!.messageRevision, freshLatest.revision, "a trusted host upsert has already delivered the current action fence");
+    assert.equal(long().messages.length, 120); assert.equal(long().historyExhausted, true); assert.equal(detailPages - initialDetails, 2);
+    const cachedLong = store.getSnapshot().mail;
+    await store.loadThread(longKey); assert.equal(bodyReads, loadedBodies); assert.strictEqual(store.getSnapshot().mail, cachedLong);
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === unaffected.id), unaffected);
+    const currentLong = long(); let longUndo: import("../src/inbox.ts").InboxUndo | undefined, longError: unknown;
+    try { longUndo = await store.action([currentLong], "not-important"); } catch (error) { longError = error; }
+    const postedLong = feedbackRequests.at(-1)!;
+    assert.deepEqual({ status: feedbackReplies.at(-1)?.status, messageRevision: postedLong?.targets.find(target => target.messageId === latestLong.id)?.messageRevision },
+      { status: 200, messageRevision: freshLatest.revision }, `expanded summary revision=${currentLong.messages.find(message => message.id === latestLong.id)!.revision}; host target revision=${freshLatest.revision}; W error=${longError instanceof Error ? longError.message : String(longError)}`);
+    assert.ok(longUndo); assert.equal(postedLong.targets.length, 120);
+    const projectedLatest = currentLong.messages.find(message => message.id === latestLong.id)!;
+    assert.equal(projectedLatest.revision, freshLatest.revision); assert.equal(projectedLatest.isRead, true);
+    assert.equal(projectedLatest.loaded, true); assert.equal(projectedLatest.bodyRevision, loadedLatest.bodyRevision); assert.equal(projectedLatest.body, loadedLatest.body);
+    assert.deepEqual(new Set(postedLong.targets.map(target => target.messageId)), new Set(longSummaries.map(message => message.id)));
+    for (const target of postedLong.targets) assert.equal(target.revision, target.messageId === latestLong.id ? latestLong.memberships[0].revision : preparation.states.find(state => state.messageId === target.messageId)!.revision);
+    const doneReceipt = await host.inbox.mailboxStateReceipt(host.owner, `attention:${postedLong.id}`);
+    assert.equal(doneReceipt.states.filter(state => state.done).length, 120);
+    await longUndo();
+    const restoredReceipt = await host.inbox.mailboxStateReceipt(host.owner, `attention:${postedLong.id}`);
+    assert.equal(restoredReceipt.retracted, true); assert.equal(restoredReceipt.states.filter(state => state.done).length, 119, "W Undo restores the 119 prepared Done memberships, not zero");
+    assert.equal(restoredReceipt.states.find(state => state.messageId === latestLong.id)!.done, false);
+    assert.equal((await host.inbox.mailboxStateReceipt(host.owner, preparation.id)).retracted, false);
+
+    // The 101st newest message is outside the canonical preview; only explicit targets carry its current fence.
+    const olderLong = longSummaries[100], frozenFeedback = JSON.stringify(longUndo.recovery);
+    const olderWrite = await host.inbox.mutate(host.owner, { messageIds: [olderLong.id], viaMailboxId: box.id,
+      changes: { isRead: false, isStarred: true }, ifRevisions: { [olderLong.id]: olderLong.revision }, idempotencyKey: "web-long-older-flags" });
+    await host.inbox.runDue(); assert.equal((await host.inbox.operation(host.owner, olderWrite.id)).status, "succeeded");
+    await store.retry();
+    const freshOlder = await host.inbox.mailboxMessageSummary(host.owner, box.id, olderLong.id);
+    assert.ok(freshOlder.revision > olderLong.revision); assert.equal(freshOlder.isRead, false); assert.equal(freshOlder.isStarred, true);
+    assert.ok(!long().messages.some(message => message.id === olderLong.id));
+    assert.notEqual(long().window!.contextVersion, context, "noncanonical target changes retain the host's existing context invalidation fence");
+    assert.equal(long().window!.targets.find(target => target.messageId === olderLong.id)!.messageRevision, freshOlder.revision);
+    const newerDetails = detailPages;
+    const olderUndo = await store.action([long()], "not-important");
+    const postedOlder = feedbackRequests.at(-1)!;
+    assert.equal(detailPages - newerDetails, 2, "only a new explicit action completes the changed noncanonical context");
+    assert.equal(feedbackReplies.at(-1)!.status, 200); assert.equal(postedOlder.targets.length, 120);
+    assert.equal(postedOlder.targets.find(target => target.messageId === olderLong.id)!.messageRevision, freshOlder.revision);
+    for (const target of postedOlder.targets) assert.equal(target.revision, restoredReceipt.states.find(state => state.messageId === target.messageId)!.revision);
+    const projectedOlder = long().messages.find(message => message.id === olderLong.id)!;
+    assert.equal(projectedOlder.revision, freshOlder.revision); assert.equal(projectedOlder.isRead, false); assert.equal(projectedOlder.isStarred, true);
+    assert.equal(JSON.stringify(longUndo.recovery), frozenFeedback, "fresh actions never mutate an earlier accepted capture/receipt");
+    await olderUndo();
+    const restoredOlder = await host.inbox.mailboxStateReceipt(host.owner, `attention:${postedOlder.id}`);
+    assert.equal(restoredOlder.retracted, true); assert.equal(restoredOlder.states.filter(state => state.done).length, 119);
+    assert.equal((await host.inbox.mailboxStateReceipt(host.owner, preparation.id)).retracted, false);
+    assert.equal(bodyReads, loadedBodies); assert.equal(inventories, 0);
+    store.pinWindow("reader", []); store.pinWindow("draft:long-guard", []);
     stop(); stop = undefined;
   } finally {
     releasePage?.(); releaseChanges?.(); stop?.(); await service.close(); await ai.close(); await host.close(); database.close();

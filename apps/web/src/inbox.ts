@@ -1683,10 +1683,15 @@ export class InboxStore {
     const calendar = displayTimes(); this.calendarKey = calendar.key;
     const rows = [...this.windowRows.values()];
     const summaries = new Map<string, MailboxMessageSummary>();
-    for (const row of rows) for (const summary of this.windowDetails.get(row.key)?.summaries ?? row.summaries) {
-      const key = nativeKey(summary.sourceId, summary.id), previous = summaries.get(key);
-      const memberships = new Map([...(previous?.memberships ?? []), ...summary.memberships].map(state => [state.mailboxId, state]));
-      summaries.set(key, { ...(previous && previous.revision > summary.revision ? previous : summary), memberships: [...memberships.values()] });
+    for (const row of rows) {
+      const expanded = this.windowDetails.get(row.key)?.summaries, retained = expanded && new Set(expanded.map(summary => summary.id));
+      // Refresh retained detail state without widening a giant's moving history window.
+      for (const summary of expanded ? [...expanded, ...row.summaries.filter(summary => retained!.has(summary.id))] : row.summaries) {
+        const key = nativeKey(summary.sourceId, summary.id), previous = summaries.get(key);
+        const memberships = new Map((previous?.memberships ?? []).map(state => [state.mailboxId, state]));
+        for (const state of summary.memberships) if (state.revision >= (memberships.get(state.mailboxId)?.revision ?? 0)) memberships.set(state.mailboxId, state);
+        summaries.set(key, { ...(previous && previous.revision > summary.revision ? previous : summary), memberships: [...memberships.values()] });
+      }
     }
     this.messageRows = summaries;
     const attachmentIds = new Set([...this.rawDrafts.values()].flatMap(draft => draft.attachmentIds));
@@ -2921,12 +2926,23 @@ export class InboxStore {
     if (!this.state.host?.preferenceScope) throw new Error("The local host must be updated before it can save attention feedback.");
     if (!this.canRecordFeedback(selected)) throw new Error("Select incoming inbox conversations to record not-important feedback.");
     const captured = new Map<string, AttentionFeedbackTarget>();
-    for (const mail of selected) for (const message of mail.messages) {
-      if (message.pending) continue;
-      if (!message.revision || !message.memberships?.length) throw new Error("This conversation is still loading. Try again after it refreshes.");
-      for (const state of message.memberships) {
-        const key = `${mail.sourceId}\0${state.mailboxId}\0${message.id}`;
-        captured.set(key, { sourceId: mail.sourceId!, mailboxId: state.mailboxId, messageId: message.id, messageRevision: message.revision, revision: state.revision });
+    for (const mail of selected) {
+      if (mail.window) {
+        // Use this selected snapshot's explicit fences, including targets outside its preview.
+        // Never borrow newer revisions from the live window for an older capture.
+        for (const target of mail.window.targets) {
+          if (!target.messageRevision) throw new Error("This conversation is still loading. Try again after it refreshes.");
+          captured.set(`${mail.sourceId}\0${target.mailboxId}\0${target.messageId}`, { ...target, sourceId: mail.sourceId!, messageRevision: target.messageRevision });
+        }
+        continue;
+      }
+      for (const message of mail.messages) {
+        if (message.pending) continue;
+        if (!message.revision || !message.memberships?.length) throw new Error("This conversation is still loading. Try again after it refreshes.");
+        for (const state of message.memberships) {
+          const key = `${mail.sourceId}\0${state.mailboxId}\0${message.id}`;
+          captured.set(key, { sourceId: mail.sourceId!, mailboxId: state.mailboxId, messageId: message.id, messageRevision: message.revision, revision: state.revision });
+        }
       }
     }
     // Freeze IDs and membership revisions at the W click. Only preceding flag
