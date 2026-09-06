@@ -9,6 +9,27 @@ export type SavedSplitPreferences = SplitPreferences & { revision: number };
 export type AttentionFeedback = { id: string; createdAt: string; status: "pending" | "active" | "retracting" | "retracted" | "failed"; count: number; problem?: string; states?: MailboxMembership[] };
 export type AttentionFeedbackTarget = { sourceId: string; messageId: string; mailboxId: string; messageRevision: number; revision: number };
 
+/** Mirrors the local host's `HostProvider`: SDK onboarding copy plus host readiness, presets and connections. */
+export type HostProviderCredentialHelp = { text: string; url: string; linkLabel: string };
+export type HostProviderOption = {
+  value: string;
+  label: string;
+  summary?: string;
+  /** Labels that replace a field's own label while this option is selected. */
+  fieldLabels?: Record<string, string>;
+  /** Fields that do not apply while this option is selected. */
+  hiddenFields?: string[];
+  credentialHelp?: HostProviderCredentialHelp;
+};
+export type HostProviderField = {
+  name: string;
+  label: string;
+  type: "password" | "text" | "email" | "select";
+  required: boolean;
+  advanced?: boolean;
+  defaultValue?: string;
+  options?: HostProviderOption[];
+};
 export type HostProvider = {
   id: string;
   name: string;
@@ -16,10 +37,13 @@ export type HostProvider = {
   enabled: boolean;
   ready: boolean;
   setupMessage?: string;
+  summary?: string;
   actionLabel?: string;
-  fields?: Array<{ name: string; label: string; type: "password" | "text" | "email" | "select"; required: boolean; advanced?: boolean; defaultValue?: string; options?: Array<{ value: string; label: string }> }>;
+  redirectNote?: string;
+  fields?: HostProviderField[];
   mailboxSelection?: "automatic" | "manual";
-  credentialHelp?: { text: string; url: string };
+  credentialHelp?: HostProviderCredentialHelp;
+  advancedNote?: string;
   reconnect?: boolean;
   connectionIds: string[];
 };

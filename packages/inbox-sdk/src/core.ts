@@ -147,15 +147,13 @@ export function createInbox(options: InboxOptions): Inbox {
   try { media = createMediaStore({ database: db, now, options: options.media, injectedFetch: options.fetch !== undefined, log: options.log }) }
   catch (error) { if (ownsDatabase) db.close(); throw error }
   const instances = new Map<string, Promise<InboxProvider>>()
-  const instanceVersions = new Map<string, number>()
   const controllers = new Map<string, AbortController>()
   const activeRequests = new Map<string, number>()
   const retiring = new Set<string>()
   const disconnecting = new Set<Promise<void>>()
   const refreshes = new Map<string, Promise<ConnectionRow>>()
   const credentialUpdates = new Set<Promise<CredentialState>>()
-  const identityCache = new Map<string, { value: SendingIdentities | null; expires: number; sequence: number }>()
-  const identityFlights = new Map<string, Promise<SendingIdentities>>()
+  const identityCache = new Map<string, { value: SendingIdentities | null; expires: number; sequence: number; pending?: Promise<SendingIdentities> }>()
   let identitySequence = 0
   const syncing = new Map<string, Promise<{ synchronized: number; hasMore: boolean; state: string }>>()
   type SyncActivity = { owner: string; sourceId: string; binding: string; folder: string; lane: 'latest' | 'backfill'; visible: boolean }
@@ -308,7 +306,7 @@ export function createInbox(options: InboxOptions): Inbox {
       listeners.clear()
       inventories.clear(); inventoryBytes = 0
       syncActivity.clear(); syncCompletions.clear()
-      identityCache.clear(); identityFlights.clear()
+      identityCache.clear()
       if (ownsDatabase) db.close()
     }),
   ))
@@ -393,11 +391,12 @@ export function createInbox(options: InboxOptions): Inbox {
   }
 
   function retireInstance(key: string, abort: boolean): void {
+    identityCache.delete(key)
     if (abort) controllers.get(key)?.abort()
     retiring.add(key)
     if (!abort && (activeRequests.get(key) ?? 0) > 0) return
     const instance = instances.get(key)
-    instances.delete(key); instanceVersions.delete(key); controllers.delete(key); retiring.delete(key)
+    instances.delete(key); controllers.delete(key); retiring.delete(key)
     if (instance) {
       const closing = instance.then(provider => provider.disconnect()).catch(() => {}).finally(() => disconnecting.delete(closing))
       disconnecting.add(closing)
@@ -414,7 +413,8 @@ export function createInbox(options: InboxOptions): Inbox {
     const prefix = `${owner}\0${id}\0`
     for (const key of identityCache.keys()) if (key.startsWith(prefix)) identityCache.delete(key)
     for (const key of new Set([...controllers.keys(), ...instances.keys()])) {
-      if (key.startsWith(prefix) && (abort || (instanceVersions.get(key) ?? 0) <= version)) retireInstance(key, abort)
+      // The instance key already binds owner/source/connection generations and the credential version.
+      if (key.startsWith(prefix) && (abort || Number(key.slice(key.lastIndexOf('\0') + 1)) <= version)) retireInstance(key, abort)
     }
   }
 
@@ -630,26 +630,32 @@ export function createInbox(options: InboxOptions): Inbox {
     for (const sourceId of publicConnection(grant).sourceIds) {
       const source = accountRow(owner, sourceId, true)
       const definition = definitions.get((JSON.parse(source.data) as Account).providerId)!
-      const native = JSON.parse(source.native)
-      if (!definition.discover) {
-        result.push({ sourceId, name: native.name || native.email || definition.name, selector: { kind: 'all' },
-          canReceive: true, canSend: (JSON.parse(source.data) as Account).capabilities.send, canFilter: true,
-          identities: [...new Set([native.email, ...native.aliases ?? []].filter((email: unknown) => typeof email === 'string' && email.includes('@')))] as string[] })
-        continue
-      }
-      const discovered = await io(source, provider => definition.discover!(provider))
-      if (!current(source)) throw new InboxError('RECONNECT_REQUIRED', 'Connection changed during discovery.', 409)
-      const identities = discovered.identities.map(value => selector({ kind: 'address', value: value.email }))
+      const native = JSON.parse(source.native) as MailAccount
+      const discovered = await io(source, async provider => {
+        const key = generationKey(source), controller = controllers.get(key)
+        const identities = await provider.identities?.()
+        assertIdentityBinding(source, key, controller)
+        return { sending: identities ? checkedSendingIdentities(source.id, native, identities.sending).identities : nativeSendingIdentities(native),
+          receiving: identities?.receiving, canSend: provider.capabilities.send }
+      })
+      assertIdentityBinding(source, generationKey(source))
+      const identities = discovered.sending.map(value => selector({ kind: 'address', value: value.email }))
         .filter((value): value is { kind: 'address'; value: string } => value.kind === 'address').map(value => value.value)
       const aliases = [...new Set(identities)]
+      if (discovered.receiving === undefined) {
+        result.push({ sourceId, name: native.name || native.email || definition.name, selector: { kind: 'all' },
+          canReceive: true, canSend: discovered.canSend, canFilter: true, identities: aliases })
+        continue
+      }
+      if (!Array.isArray(discovered.receiving)) throw new InboxError('INVALID_PROVIDER', 'Invalid receiving scope response.', 502)
       db.query('UPDATE sdk_accounts SET native=? WHERE id=? AND owner=? AND generation=?').run(JSON.stringify({ ...native, aliases }), source.id, owner, source.generation)
-      for (const offered of discovered.sources) {
+      for (const offered of discovered.receiving) {
         const scope = selector(offered)
         if (scope.kind === 'all') continue
-        result.push({ sourceId, name: scope.value, selector: scope, canReceive: offered.canReceive,
-          canSend: offered.canSend, canFilter: offered.canFilter === true,
-          identities: aliases.filter(email => scope.kind === 'address' ? email === scope.value : email.split('@').at(-1) === scope.value),
-          ...(offered.unavailableReason ? { unavailableReason: offered.unavailableReason } : {}) })
+        const sending = aliases.filter(email => scope.kind === 'address' ? email === scope.value : email.split('@').at(-1) === scope.value)
+        result.push({ sourceId, name: scope.value, selector: scope, canReceive: offered.canReceive ?? true,
+          canSend: offered.canSend ?? (discovered.canSend && sending.length > 0), canFilter: offered.canFilter ?? true,
+          identities: sending, ...(offered.unavailableReason ? { unavailableReason: offered.unavailableReason } : {}) })
       }
     }
     return result
@@ -979,11 +985,6 @@ export function createInbox(options: InboxOptions): Inbox {
     let controller = controllers.get(key)
     if (!controller) { controller = new AbortController(); controllers.set(key, controller) }
     let instance = instances.get(key)
-    if (instance && instanceVersions.get(key) !== grant.credential_version) {
-      const retired = instance
-      instances.delete(key); instance = undefined
-      void retired.then(provider => provider.disconnect()).catch(() => {})
-    }
     if (!instance) {
       instance = Promise.resolve(definition.create({ ...credentials, accountId: row.id, userId: row.owner, sdkMailboxScopes: undefined,
         fetch: ((input, init) => (options.fetch ?? globalThis.fetch)(input, { ...init,
@@ -992,7 +993,6 @@ export function createInbox(options: InboxOptions): Inbox {
         return provider
       })
       instances.set(key, instance)
-      instanceVersions.set(key, grant.credential_version)
       void instance.catch(() => { if (instances.get(key) === instance) instances.delete(key) })
     }
     let provider: InboxProvider
@@ -1014,67 +1014,98 @@ export function createInbox(options: InboxOptions): Inbox {
     }
   }
 
-  async function providerSendingIdentities(row: AccountRow, provider: InboxProvider, refresh = false, exclusive = false): Promise<SendingIdentities> {
+  function nativeSendingIdentities(native: MailAccount): SendingIdentity[] {
+    const seen = new Set<string>(), primary = (native.email ?? '').trim().toLowerCase()
+    return [native.email, ...native.aliases ?? []]
+      .filter(email => typeof email === 'string' && email.includes('@')).map(email => email.trim())
+      .filter(email => !seen.has(email.toLowerCase()) && !!seen.add(email.toLowerCase()))
+      .map(email => ({ email, isPrimary: email.toLowerCase() === primary, isDefault: email.toLowerCase() === primary }))
+  }
+
+  function checkedSendingIdentities(sourceId: string, native: MailAccount, offered: unknown): SendingIdentities {
+    if (!Array.isArray(offered) || offered.length > 100) throw new InboxError('INVALID_PROVIDER', 'Invalid sending identity response.', 502)
+    const seen = new Set<string>(), primary = (native.email ?? '').trim().toLowerCase()
+    const identities: SendingIdentity[] = offered.map(identity => {
+      if (!identity || typeof identity.email !== 'string' || identity.email.length > 1024 || /[\x00-\x1f\x7f]/.test(identity.email)
+        || typeof identity.isPrimary !== 'boolean' || typeof identity.isDefault !== 'boolean') throw new InboxError('INVALID_PROVIDER', 'Invalid sending identity response.', 502)
+      const email = identity.email.trim(), normalized = email.toLowerCase()
+      if (!/^[^\s<>@]+@[^\s<>@]+$/.test(email) || seen.has(normalized)) throw new InboxError('INVALID_PROVIDER', 'Invalid sending identity response.', 502)
+      seen.add(normalized)
+      return { email, isPrimary: identity.isPrimary, isDefault: identity.isDefault }
+    })
+    if (identities.filter(identity => identity.isPrimary).length > 1 || identities.filter(identity => identity.isDefault).length > 1) {
+      throw new InboxError('INVALID_PROVIDER', 'Conflicting sending identities.', 502)
+    }
+    if (primary && identities.some(identity => identity.isPrimary && identity.email.toLowerCase() !== primary)) {
+      // Provider primary identities may be aliases. Keep the warning content-free.
+      try { options.log?.({ code: 'SENDING_PRIMARY_ALIAS', operation: 'identities' }) } catch {}
+    }
+    return { sourceId, identities, checkedAt: new Date(now()).toISOString() }
+  }
+
+  async function providerSendingIdentities(row: AccountRow, provider: InboxProvider, refresh = false): Promise<SendingIdentities> {
     // providerFor resolves/rotates credentials before this callback. Never capture this key earlier.
     const key = generationKey(row), controller = controllers.get(key)
     assertIdentityBinding(row, key, controller)
     const native = JSON.parse(row.native) as MailAccount
-    if (!provider.getSendingIdentities) {
-      const seen = new Set<string>()
-      return { sourceId: row.id, checkedAt: null, identities: [native.email, ...native.aliases ?? []]
-        .filter(email => typeof email === 'string' && email.includes('@') && !seen.has(email.toLowerCase()) && !!seen.add(email.toLowerCase()))
-        .map(email => ({ email, isPrimary: email.toLowerCase() === native.email.toLowerCase(), isDefault: email.toLowerCase() === native.email.toLowerCase() })) }
+    if (!provider.identities) {
+      const identities = nativeSendingIdentities(native)
+      refreshIdentityDefault(row, identities)
+      return { sourceId: row.id, checkedAt: null, identities }
     }
-    for (const [entry, cached] of identityCache) if (cached.expires <= now()) identityCache.delete(entry)
+    for (const [entry, cached] of identityCache) if (!cached.pending && cached.expires <= now()) identityCache.delete(entry)
     const cached = identityCache.get(key)
-    if (!refresh && cached?.value) return structuredClone(cached.value)
-    const pending = exclusive ? undefined : identityFlights.get(key)
-    if (pending) {
-      const value = await pending
+    if (!refresh && cached?.value && cached.expires > now()) return structuredClone(cached.value)
+    if (cached?.pending) {
+      const value = await cached.pending
       assertIdentityBinding(row, key, controller)
       return structuredClone(value)
     }
-    if (!exclusive && identityFlights.size >= 128) throw new InboxError('RATE_LIMITED', 'Sending identity discovery is busy.', 429, true)
+    if (!cached && identityCache.size >= 128) {
+      const idle = [...identityCache].find(([, entry]) => !entry.pending)
+      if (!idle) throw new InboxError('RATE_LIMITED', 'Sending identity discovery is busy.', 429, true)
+      identityCache.delete(idle[0])
+    }
     const sequence = ++identitySequence
+    const entry: { value: SendingIdentities | null; expires: number; sequence: number; pending?: Promise<SendingIdentities> } = {
+      value: cached?.value ?? null, expires: cached?.expires ?? 0, sequence,
+    }
+    identityCache.delete(key); identityCache.set(key, entry)
     const lookup = (async () => {
       try {
-        const offered = await provider.getSendingIdentities!()
+        const profile = await provider.identities!()
         assertIdentityBinding(row, key, controller)
-        if (!Array.isArray(offered) || offered.length > 100) throw new InboxError('INVALID_PROVIDER', 'Invalid sending identity response.', 502)
-        const seen = new Set<string>()
-        const identities = offered.map(identity => {
-          if (!identity || typeof identity.email !== 'string' || identity.email.length > 1024 ||
-            !/^[^\s<>@]+@[^\s<>@]+$/.test(identity.email) || /[\x00-\x1f\x7f]/.test(identity.email) ||
-            typeof identity.isPrimary !== 'boolean' || typeof identity.isDefault !== 'boolean' ||
-            seen.has(identity.email.toLowerCase()) || identity.isPrimary && identity.email.toLowerCase() !== native.email.toLowerCase()) {
-            throw new InboxError('INVALID_PROVIDER', 'Invalid sending identity response.', 502)
-          }
-          seen.add(identity.email.toLowerCase())
-          return { email: identity.email, isPrimary: identity.isPrimary, isDefault: identity.isDefault }
-        })
-        if (identities.filter(identity => identity.isPrimary).length > 1 || identities.filter(identity => identity.isDefault).length > 1) {
-          throw new InboxError('INVALID_PROVIDER', 'Conflicting sending identities.', 502)
-        }
-        const value: SendingIdentities = { sourceId: row.id, identities, checkedAt: new Date(now()).toISOString() }
-        // An older overlapping read may not replace a newer completed snapshot.
-        if ((identityCache.get(key)?.sequence ?? 0) <= sequence) {
-          identityCache.delete(key)
-          identityCache.set(key, { value, expires: now() + 60_000, sequence })
-          while (identityCache.size > 128) identityCache.delete(identityCache.keys().next().value!)
-        }
+        const value = checkedSendingIdentities(row.id, native, profile?.sending)
+        // Reservation plus sequence equality also fences deletion/recreation of an
+        // instance; a late result cannot resurrect an evicted or retired snapshot.
+        if (identityCache.get(key)?.sequence === sequence) { entry.value = value; entry.expires = now() + 60_000 }
+        refreshIdentityDefault(row, value.identities)
         return value
       } catch (error) {
-        if ((identityCache.get(key)?.sequence ?? 0) <= sequence) {
-          identityCache.delete(key)
-          identityCache.set(key, { value: null, expires: now() + 60_000, sequence })
-          while (identityCache.size > 128) identityCache.delete(identityCache.keys().next().value!)
-        }
+        if (identityCache.get(key)?.sequence === sequence) { entry.value = null; entry.expires = now() + 60_000 }
         throw error
       }
     })()
-    if (!exclusive) identityFlights.set(key, lookup)
+    entry.pending = lookup
     try { return structuredClone(await lookup) }
-    finally { if (identityFlights.get(key) === lookup) identityFlights.delete(key) }
+    finally { if (identityCache.get(key)?.sequence === sequence) delete entry.pending }
+  }
+
+  function refreshIdentityDefault(row: AccountRow, identities: readonly SendingIdentity[]): void {
+    if (identities.length !== 1) return
+    transaction(() => {
+      if (!current(row)) return
+      // Fill only a missing default on the automatically-created all-mailbox.
+      // Explicit sender choices and separately configured mailboxes stay user-owned.
+      const stored = db.query<MailboxRow, [string, string, string]>('SELECT * FROM sdk_mailboxes WHERE owner=? AND id=? AND source=?').get(row.owner, row.id, row.id)
+      if (!stored) return
+      const box = JSON.parse(stored.data) as Mailbox
+      if (box.selector.kind !== 'all' || box.defaultSender) return
+      const revision = box.revision
+      box.defaultSender = identities[0]!.email; box.revision++
+      const saved = db.query("UPDATE sdk_mailboxes SET data=? WHERE owner=? AND id=? AND source=? AND json_extract(data,'$.revision')=?").run(JSON.stringify(box), row.owner, box.id, row.id, revision)
+      if (saved.changes) event(row.owner, 'mailbox.updated', row.id, box.id, 'updated', 'mutation', box.id)
+    })
   }
 
   function refreshCapabilities(row: AccountRow, provider: InboxProvider): void {
@@ -1502,10 +1533,10 @@ export function createInbox(options: InboxOptions): Inbox {
   function validateDraft(owner: string, input: DraftInput, submitting = false, identities?: readonly SendingIdentity[]): Required<Omit<DraftInput, 'sourceMessageId' | 'mailboxId'>> & { sourceMessageId?: string; mailboxId?: string } {
     const row = accountRow(owner, input.accountId)
     const native = JSON.parse(row.native)
-    const own = identities ? identities.map(identity => identity.email) : [native.email, ...(native.aliases ?? [])].filter((v: unknown) => typeof v === 'string') as string[]
+    const own = (identities ?? nativeSendingIdentities(native)).map(identity => identity.email)
     const box = input.mailboxId ? JSON.parse(mailboxRow(owner, input.mailboxId, true).data) as Mailbox : null
     if (box && box.sourceId !== row.id) throw new InboxError('NOT_FOUND', 'Mailbox belongs to a different source.', 404)
-    const from = input.from ?? box?.defaultSender ?? native.email
+    const from = input.from ?? box?.defaultSender ?? (native.email || (own.length === 1 ? own[0] : ''))
     if (typeof from !== 'string' || from.length > 1024 || /[\r\n\0]/.test(from)) throw new InboxError('VALIDATION', 'Invalid sender address.')
     if (submitting && !own.some(email => email.toLowerCase() === from.toLowerCase())) throw new InboxError('FORBIDDEN_SENDER', 'The selected sender is not authorized for this account.', 403)
     if (submitting && box) assertMailboxSender(box, from)
@@ -1620,7 +1651,7 @@ export function createInbox(options: InboxOptions): Inbox {
             references: payload.references, replyAll: false } : {}), headers: { 'X-Inbox-Submission-ID': op.id } }
         const receipt = await io(account, async provider => {
           const key = generationKey(account), controller = controllers.get(key)
-          const identities = await providerSendingIdentities(account, provider, true, true)
+          const identities = await providerSendingIdentities(account, provider)
           if (!ownsLease(row)) return null
           assertIdentityBinding(account, key, controller)
           validateDraft(row.owner, draft, true, identities.identities)
@@ -1872,10 +1903,12 @@ export function createInbox(options: InboxOptions): Inbox {
       try {
         const native = await provider.getAccount()
         if (provider.accountId !== id || native.id !== id) throw new InboxError('INVALID_PROVIDER', 'Provider returned a foreign account.', 502)
-        if (definition.discover) {
-          const discovered = await definition.discover(provider)
-          native.aliases = [...new Set(discovered.identities.map(value => value.email))]
-        }
+        // Normal account metadata needs no extra provider round trip. A source
+        // without an email (or with explicit mailbox selection) needs its identities.
+        const sending = provider.identities && (!native.email || definition.mailboxSelection === 'manual')
+          ? checkedSendingIdentities(id, native, (await provider.identities()).sending) : undefined
+        if (sending) native.aliases = sending.identities.map(value => value.email)
+        const identities = sending?.identities ?? nativeSendingIdentities(native)
         const account: Account = { id, providerId: definition.id, email: native.email, name: native.name, generation: 1,
           status: 'connected', capabilities: { ...provider.capabilities },
           features: { localDrafts: true, localLabels: true, snooze: true, scheduledSend: provider.capabilities.send, undoSend: provider.capabilities.send },
@@ -1888,7 +1921,8 @@ export function createInbox(options: InboxOptions): Inbox {
           db.query('INSERT INTO sdk_accounts VALUES (?,?,?,?,?,?,?)').run(id, owner, 1, 'connected', JSON.stringify(account), JSON.stringify(native), '')
           db.query('INSERT INTO sdk_source_connections(source,owner,connection) VALUES (?,?,?)').run(id, owner, connectionId)
           if (definition.mailboxSelection !== 'manual') {
-            const mailbox: Mailbox = { id, sourceId: id, connectionId, name: account.name || account.email || definition.name, selector: { kind: 'all' }, status: 'active', defaultSender: native.email || null, revision: 1, receiving: 'unverified' }
+            const mailbox: Mailbox = { id, sourceId: id, connectionId, name: account.name || account.email || definition.name, selector: { kind: 'all' }, status: 'active',
+              defaultSender: native.email || (identities.length === 1 ? identities[0]!.email : null), revision: 1, receiving: 'unverified' }
             db.query('INSERT INTO sdk_mailboxes VALUES (?,?,?,?,?,?)').run(id, owner, id, connectionId, JSON.stringify(mailbox.selector), JSON.stringify(mailbox))
             event(owner, 'mailbox.updated', id, id, 'created', 'initial', id)
           }
@@ -1897,8 +1931,8 @@ export function createInbox(options: InboxOptions): Inbox {
         })
         const row = accountRow(owner, id)
         instances.set(generationKey(row), Promise.resolve(provider))
-        instanceVersions.set(generationKey(row), 1)
         controllers.set(generationKey(row), controller)
+        if (sending && identityCache.size < 128) identityCache.set(generationKey(row), { value: sending, expires: now() + 60_000, sequence: ++identitySequence })
         return account
       } catch (error) { controller.abort(); await provider.disconnect().catch(() => {}); throw error }
   }
@@ -1925,7 +1959,9 @@ export function createInbox(options: InboxOptions): Inbox {
         const native = await provider.getAccount()
         const previous = JSON.parse(old.data) as Account
         if (native.id !== id || (!identity && native.email.toLowerCase() !== previous.email.toLowerCase())) throw new InboxError('ACCOUNT_MISMATCH', 'Reconnect must authorize the same mailbox.', 409)
-        if (definition.discover) native.aliases = (await definition.discover(provider)).identities.map(value => value.email)
+        const sending = provider.identities && (!native.email || definition.mailboxSelection === 'manual')
+          ? checkedSendingIdentities(id, native, (await provider.identities()).sending) : undefined
+        if (sending) native.aliases = sending.identities.map(value => value.email)
         const account: Account = { ...previous, email: native.email, name: native.name || previous.name, generation: old.generation + 1, status: 'connected', capabilities: { ...provider.capabilities },
           features: { ...previous.features, scheduledSend: provider.capabilities.send, undoSend: provider.capabilities.send },
           sync: { lastSyncAt: null, coverage: previous.sync.coverage === 'empty' ? 'empty' : 'partial', problem: null }, revision: previous.revision + 1 }
@@ -1957,7 +1993,8 @@ export function createInbox(options: InboxOptions): Inbox {
         retireCredentials(oldGrant)
         const row = accountRow(owner, id)
         instances.set(generationKey(row), Promise.resolve(provider)); controllers.set(generationKey(row), controller)
-        instanceVersions.set(generationKey(row), row.credential_version)
+        if (sending && identityCache.size < 128) identityCache.set(generationKey(row), { value: sending, expires: now() + 60_000, sequence: ++identitySequence })
+        refreshIdentityDefault(row, sending?.identities ?? nativeSendingIdentities(native))
         return account
       } catch (error) { controller.abort(); await provider.disconnect().catch(() => {}); throw error }
   }
@@ -2002,7 +2039,10 @@ export function createInbox(options: InboxOptions): Inbox {
         if (!verified && (!native.email || !(JSON.parse(source.data) as Account).email || native.email.toLowerCase() !== (JSON.parse(source.data) as Account).email.toLowerCase())) {
           throw new InboxError('ACCOUNT_MISMATCH', 'Replacement credentials belong to another mailbox.', 409)
         }
-        if (definition.discover) native.aliases = (await definition.discover(provider)).identities.map(identity => identity.email)
+        if (provider.identities && (!native.email || definition.mailboxSelection === 'manual')) {
+          const sending = checkedSendingIdentities(sourceId, native, (await credentialCall(signal, () => provider.identities!())).sending)
+          native.aliases = sending.identities.map(identity => identity.email)
+        }
         profiles.push({ sourceId, native, provider })
       }
       if (closed || stopping) throw new InboxError('CLOSED', 'The inbox instance is closing.', 503)
@@ -2039,84 +2079,117 @@ export function createInbox(options: InboxOptions): Inbox {
       let providerReturned = false
       try {
         const saved = db.query<{ data: string }, [string, number, string, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND scope=? AND lane=?').get(id, row.generation, checkpointScope, lane)
-        const checkpoint: SyncCheckpoint = request.reset || !saved ? { cursor: null, initialized: false } : JSON.parse(saved.data)
+        const checkpoint: SyncCheckpoint & { snapshotComplete?: boolean } = saved ? JSON.parse(saved.data)
+          : { cursor: null, initialized: (JSON.parse(row.data) as Account).sync.lastSyncAt !== null }
+        if (request.reset) {
+          checkpoint.cursor = null
+          checkpoint.snapshotComplete = false
+        }
+        const backfill = db.query<{ data: string }, [string, number, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND scope=? AND lane=\'backfill\'').get(id, row.generation, checkpointScope)
+        const backfillCheckpoint: SyncCheckpoint | undefined = backfill ? JSON.parse(backfill.data) : undefined
         let fence: number
-        const known = db.query<{ native_id: string; is_read: number; is_starred: number }, [string, number]>(
-          "SELECT native_id,json_extract(confirmed,'$.isRead') is_read,json_extract(confirmed,'$.isStarred') is_starred FROM sdk_messages WHERE account=? AND generation=? AND deleted=0").all(id, row.generation)
+        const known = db.query<{ native_id: string; is_read: number; is_starred: number; folder: string }, [string, number]>(
+          "SELECT native_id,json_extract(confirmed,'$.isRead') is_read,json_extract(confirmed,'$.isStarred') is_starred,json_extract(confirmed,'$.folder') folder FROM sdk_messages WHERE account=? AND generation=? AND deleted=0").all(id, row.generation)
         const syncOptions = { folder: scope, limit: request.limit ?? 100, ...(selection?.scopes ? { mailboxScopes: selection.scopes } : {}) }
         // Runtime hints are separate from providers' validated operation input.
         const syncContext = {
+          lane,
+          snapshotComplete: !request.reset && (backfillCheckpoint
+            ? backfillCheckpoint.initialized && backfillCheckpoint.cursor === null
+            : checkpoint.snapshotComplete ?? (Boolean(saved) && checkpoint.initialized && (JSON.parse(row.data) as Account).sync.coverage === 'complete')),
           knownMessageIds: known.map(message => message.native_id),
-          knownMessageStates: known.map(message => ({ id: message.native_id, isRead: Boolean(message.is_read), isStarred: Boolean(message.is_starred) })) }
+          knownMessageStates: known.map(message => ({ id: message.native_id, isRead: Boolean(message.is_read), isStarred: Boolean(message.is_starred), folder: message.folder })) }
         let page: SyncResult
+        let synchronized = 0
+        let inputCursor = checkpoint.cursor
         const provider = await providerFor(row)
         if (!provider.capabilities.sync) throw new InboxError('UNSUPPORTED_OPERATION', 'Synchronization is unavailable.', 409)
         fence = sequence(owner)
-        try { page = await io(row, p => p.sync(checkpoint.cursor, syncOptions, syncContext)) }
-        catch (error) {
-          if (!(error instanceof ProviderError) || error.code !== 'INVALID_CURSOR' || !checkpoint.cursor) throw error
-          checkpoint.cursor = null; checkpoint.initialized = false
-          page = await io(row, p => p.sync(null, syncOptions, syncContext))
-        }
-        providerReturned = true
-        if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed during synchronization.', 409)
-        if (!scopeCurrent()) throw new InboxError('SCOPE_CHANGED', 'Mailbox selection changed during synchronization.', 409)
-        if (!Array.isArray(page.messages) || (page.hasMore && !page.cursor)) throw new InboxError('INVALID_PROVIDER', 'Provider returned an invalid synchronization page.', 502)
-        if (page.hasMore && checkpoint.cursor && fingerprint(page.cursor) === fingerprint(checkpoint.cursor)) throw new InboxError('INVALID_CURSOR', 'Provider synchronization did not advance.', 502)
-        transaction(() => {
-          if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed.', 409)
-          if (!scopeCurrent()) throw new InboxError('SCOPE_CHANGED', 'Mailbox selection changed during synchronization.', 409)
-          const reason = lane === 'backfill' ? 'backfill' : page.fullSync || !checkpoint.initialized ? 'initial' : 'arrival'
-          for (const message of page.messages) persist(row, message, reason, undefined, fence)
-          for (const nativeId of page.retiredMessageIds ?? []) {
-            const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
-            if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
-            // A mailbox-scoped identity vanished. Hide this instance, without inventing an
-            // Archive membership or permanently tombstoning possible later authoritative evidence.
-            db.query('UPDATE sdk_messages SET deleted=2,revision=revision+1 WHERE id=?').run(removed.id)
-            event(owner, 'mail.changed', id, removed.id, 'deleted')
+        for (let batch = 0; ; batch++) {
+          try { page = await io(row, p => p.sync(inputCursor, syncOptions, syncContext)) }
+          catch (error) {
+            if (batch || !(error instanceof ProviderError) || error.code !== 'INVALID_CURSOR' || !inputCursor) throw error
+            inputCursor = null
+            page = await io(row, p => p.sync(null, syncOptions, syncContext))
           }
-          for (const nativeId of page.deletedMessageIds) {
-            const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
-            if (removed && lane !== 'backfill' && removed.last_mutation_seq <= fence) {
-              db.query('UPDATE sdk_messages SET deleted=1,revision=revision+1 WHERE id=?').run(removed.id)
+          providerReturned = true
+          if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed during synchronization.', 409)
+          if (!scopeCurrent()) throw new InboxError('SCOPE_CHANGED', 'Mailbox selection changed during synchronization.', 409)
+          if (!Array.isArray(page.messages) || (page.hasMore && !page.cursor)) throw new InboxError('INVALID_PROVIDER', 'Provider returned an invalid synchronization page.', 502)
+          if (page.hasMore && inputCursor && fingerprint(page.cursor) === fingerprint(inputCursor)) throw new InboxError('INVALID_CURSOR', 'Provider synchronization did not advance.', 502)
+          const headRefresh = lane === 'latest' && page.fullSync && !page.recentCursor
+          transaction(() => {
+            if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed.', 409)
+            if (!scopeCurrent()) throw new InboxError('SCOPE_CHANGED', 'Mailbox selection changed during synchronization.', 409)
+            // A completed page-only source polls its head without a history cursor.
+            // A delta/history reset is still an import, not evidence of a new arrival.
+            const completedHeadPoll = checkpoint.initialized && checkpoint.cursor === null && syncContext.snapshotComplete
+              && !page.recentCursor && (page.cursor === null || page.cursor.kind === 'page')
+            const reason = lane === 'backfill' ? 'backfill' : !checkpoint.initialized || page.fullSync && !completedHeadPoll ? 'initial' : 'arrival'
+            for (const message of page.messages) persist(row, message, reason, undefined, fence)
+            for (const nativeId of page.retiredMessageIds ?? []) {
+              const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
+              if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
+              // A mailbox-scoped identity vanished. Hide this instance, without inventing an
+              // Archive membership or permanently tombstoning possible later authoritative evidence.
+              db.query('UPDATE sdk_messages SET deleted=2,revision=revision+1 WHERE id=?').run(removed.id)
               event(owner, 'mail.changed', id, removed.id, 'deleted')
             }
+            for (const nativeId of page.deletedMessageIds) {
+              const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
+              if (removed && lane !== 'backfill' && removed.last_mutation_seq <= fence) {
+                db.query('UPDATE sdk_messages SET deleted=1,revision=revision+1 WHERE id=?').run(removed.id)
+                event(owner, 'mail.changed', id, removed.id, 'deleted')
+              }
+            }
+            for (const nativeId of page.removedMessageIds ?? []) {
+              const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
+              if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
+              const value: MessageSummary = JSON.parse(removed.confirmed)
+              const folderIds = db.query<{ id: string }, [string, string, string]>('SELECT id FROM sdk_folders WHERE account=? AND (native_id=? OR (json_type(data,\'$.custom\') IS NOT \'true\' AND json_extract(data,\'$.role\')=?))').all(id, scope, scope)
+              value.folderIds = value.folderIds.filter(fid => !folderIds.some(folder => folder.id === fid))
+              if (value.folder === scope) value.folder = 'archive'
+              db.query('UPDATE sdk_messages SET confirmed=? WHERE id=?').run(JSON.stringify(value), removed.id)
+              project(removed.id)
+              event(owner, 'mail.changed', id, removed.id)
+            }
+            // A page continuation is for this head refresh only. Native history boundaries
+            // (including a terminal history/delta/UID cursor) remain durable between polls.
+            const cursor = lane === 'backfill' ? (page.hasMore ? page.cursor : null)
+              : page.recentCursor ?? (headRefresh && (page.hasMore || page.cursor?.kind === 'page') ? null : page.cursor)
+            if (lane === 'backfill' && !page.hasMore && page.recentCursor) {
+              db.query('INSERT INTO sdk_checkpoints VALUES (?,?,?,?,?) ON CONFLICT(account,generation,scope,lane) DO UPDATE SET data=excluded.data').run(id, row.generation, checkpointScope, 'latest', JSON.stringify({ cursor: page.recentCursor, initialized: true, snapshotComplete: true }))
+            }
+            const account = JSON.parse(accountRow(owner, id).data) as Account
+            // Head pagination says nothing about an already completed backfill. Incremental
+            // providers keep their existing coverage semantics and separate history boundary.
+            const completedBackfill = headRefresh ? db.query<{ data: string }, [string, number, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND scope=? AND lane=\'backfill\'').get(id, row.generation, checkpointScope) : undefined
+            const completed: SyncCheckpoint | undefined = completedBackfill ? JSON.parse(completedBackfill.data) : undefined
+            const snapshotComplete = completed ? completed.initialized && completed.cursor === null
+              : syncContext.snapshotComplete || page.snapshotComplete === true
+            const coverage = scope !== 'inbox' ? account.sync.coverage
+              : headRefresh ? (snapshotComplete || (page.snapshotComplete === undefined && !page.hasMore) ? 'complete' : 'partial')
+              : page.hasMore ? 'partial' : page.snapshotComplete === false ? account.sync.coverage : 'complete'
+            db.query('INSERT INTO sdk_checkpoints VALUES (?,?,?,?,?) ON CONFLICT(account,generation,scope,lane) DO UPDATE SET data=excluded.data').run(id, row.generation, checkpointScope, lane, JSON.stringify({ cursor, initialized: true, snapshotComplete: scope === 'inbox' ? coverage === 'complete' : snapshotComplete }))
+            const changed = account.sync.coverage !== coverage || account.sync.problem !== null
+            account.sync = { lastSyncAt: new Date(now()).toISOString(), coverage, problem: null }
+            if (changed) account.revision += 1
+            db.query('UPDATE sdk_accounts SET data=? WHERE id=?').run(JSON.stringify(account), id)
+            db.query('DELETE FROM sdk_cooldowns WHERE account=?').run(id)
+            if (changed) event(owner, 'account.updated', id, id)
+          })
+          synchronized += page.messages.length
+          // Telemetry follows the current selection; it never decides whether a page may commit.
+          if (activity.visible && syncActivity.get(key) === activity && current(row) && syncScopeBinding(row, sourceSelection(owner, id)) === binding) {
+            const completionKey = `${owner}\0${id}`
+            syncCompletions.delete(completionKey)
+            syncCompletions.set(completionKey, { binding, batch: { lane, processed: page.messages.length, completedAt: new Date(now()).toISOString(), hasMore: page.hasMore } })
+            while (syncCompletions.size > SYNC_COMPLETIONS) syncCompletions.delete(syncCompletions.keys().next().value!)
           }
-          for (const nativeId of page.removedMessageIds ?? []) {
-            const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
-            if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
-            const value: MessageSummary = JSON.parse(removed.confirmed)
-            const folderIds = db.query<{ id: string }, [string, string, string]>('SELECT id FROM sdk_folders WHERE account=? AND (native_id=? OR (json_type(data,\'$.custom\') IS NOT \'true\' AND json_extract(data,\'$.role\')=?))').all(id, scope, scope)
-            value.folderIds = value.folderIds.filter(fid => !folderIds.some(folder => folder.id === fid))
-            if (value.folder === scope) value.folder = 'archive'
-            db.query('UPDATE sdk_messages SET confirmed=? WHERE id=?').run(JSON.stringify(value), removed.id)
-            project(removed.id); event(owner, 'mail.changed', id, removed.id)
-          }
-          const cursor = lane === 'backfill' ? (page.hasMore ? page.cursor : null) : page.recentCursor ?? page.cursor
-          if (lane === 'backfill' && !page.hasMore && page.recentCursor) {
-            db.query('INSERT INTO sdk_checkpoints VALUES (?,?,?,?,?) ON CONFLICT(account,generation,scope,lane) DO UPDATE SET data=excluded.data').run(id, row.generation, checkpointScope, 'latest', JSON.stringify({ cursor: page.recentCursor, initialized: true }))
-          }
-          db.query('INSERT INTO sdk_checkpoints VALUES (?,?,?,?,?) ON CONFLICT(account,generation,scope,lane) DO UPDATE SET data=excluded.data').run(id, row.generation, checkpointScope, lane, JSON.stringify({ cursor, initialized: true }))
-          const account = JSON.parse(accountRow(owner, id).data) as Account
-          // An incremental poll finishing is not proof that older history was imported.
-          const coverage = scope !== 'inbox' ? account.sync.coverage
-            : page.hasMore ? 'partial' : page.snapshotComplete === false ? account.sync.coverage : 'complete'
-          const changed = account.sync.coverage !== coverage || account.sync.problem !== null
-          account.sync = { lastSyncAt: new Date(now()).toISOString(), coverage, problem: null }
-          if (changed) account.revision += 1
-          db.query('UPDATE sdk_accounts SET data=? WHERE id=?').run(JSON.stringify(account), id)
-          db.query('DELETE FROM sdk_cooldowns WHERE account=?').run(id)
-          if (changed) event(owner, 'account.updated', id, id)
-        })
-        // Telemetry follows the current selection; it never decides whether a page may commit.
-        if (activity.visible && syncActivity.get(key) === activity && current(row) && syncScopeBinding(row, sourceSelection(owner, id)) === binding) {
-          const completionKey = `${owner}\0${id}`
-          syncCompletions.delete(completionKey)
-          syncCompletions.set(completionKey, { binding, batch: { lane, processed: page.messages.length, completedAt: new Date(now()).toISOString(), hasMore: page.hasMore } })
-          while (syncCompletions.size > SYNC_COMPLETIONS) syncCompletions.delete(syncCompletions.keys().next().value!)
+          if (!headRefresh || !page.hasMore || batch === 9) break
+          inputCursor = page.cursor
         }
-        return { synchronized: page.messages.length, hasMore: page.hasMore, state: token(owner, sequence(owner)) }
+        return { synchronized, hasMore: page.hasMore, state: token(owner, sequence(owner)) }
       } catch (error) {
         if (error instanceof CredentialError && error.reason === 'revoked') throw error
         if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed.', 409)
@@ -2505,7 +2578,8 @@ export function createInbox(options: InboxOptions): Inbox {
         const problemCode = !connected ? 'RECONNECT_REQUIRED' : paused ? null : syncProblem(account.sync.problem) ?? (retryAt && cooldown?.hard ? 'RATE_LIMITED' : null)
         const completed = syncCompletions.get(`${owner}\0${sourceId}`)
         return { sourceId, scopeKey: binding, state: !connected ? 'error' : paused ? 'paused' : activeLanes.length ? 'syncing' : retryAt ? 'waiting' : problemCode ? 'error' : 'idle',
-          activeLanes, retryAt, problemCode, lastBatch: connected && !paused && completed?.binding === binding ? { ...completed.batch } : null,
+          coverage: account.sync.coverage, activeLanes, retryAt, problemCode,
+          lastBatch: connected && !paused && completed?.binding === binding ? { ...completed.batch } : null,
           lastSyncAt: account.sync.lastSyncAt } satisfies MailboxSyncStatus
       })
     }).deferred()),
@@ -2866,7 +2940,7 @@ export function createInbox(options: InboxOptions): Inbox {
         if (source.account !== account.id) throw new InboxError('NOT_FOUND', 'Source message not found.', 404)
         const base = summary(source); const body = JSON.parse(source.body)
         const native = JSON.parse(account.native)
-        const identities: string[] = sending?.identities.map(identity => identity.email) ?? [native.email, ...native.aliases ?? []]
+        const identities = (sending?.identities ?? nativeSendingIdentities(native)).map(identity => identity.email)
         const own = new Set(identities.map(email => email.toLowerCase()))
         if (replying && input.from === undefined) {
           const box = input.mailboxId ? JSON.parse(mailboxRow(owner, input.mailboxId, true).data) as Mailbox : null
@@ -2877,6 +2951,7 @@ export function createInbox(options: InboxOptions): Inbox {
           }
           const matches = [...new Set([...base.to, ...base.cc].flatMap(recipient => eligible(recipient.email) ?? []))]
           const from = (base.folder === 'sent' ? eligible(base.from.email) : undefined) ?? (matches.length === 1 ? matches[0] : undefined) ?? eligible(box?.defaultSender) ?? eligible(native.email)
+            ?? (identities.length === 1 ? eligible(identities[0]) : undefined)
           if (!from) throw new InboxError('FORBIDDEN_SENDER', 'No authorized sender is available for this reply.', 403)
           prepared.from = from
         }
@@ -2919,7 +2994,7 @@ export function createInbox(options: InboxOptions): Inbox {
       validateDraft(owner, draft)
       if (!draft.to.length && !draft.cc.length && !draft.bcc.length) throw new InboxError('VALIDATION', 'At least one recipient is required.')
       const sending = await io(account, async provider => {
-        const identities = await providerSendingIdentities(account, provider, true, true)
+        const identities = await providerSendingIdentities(account, provider)
         assertIdentityBinding(account, generationKey(account))
         if (!provider.capabilities.send || (['reply', 'replyAll'].includes(draft.mode) && !provider.capabilities.reply)) throw new InboxError('UNSUPPORTED_OPERATION', 'This account cannot send this message.', 409)
         return identities
@@ -3116,7 +3191,11 @@ export function createInbox(options: InboxOptions): Inbox {
             await synchronizeSource(row.owner, row.id, {}, true)
             const checkpointScope = `mailboxes:${sourceSelection(row.owner, row.id).key}:inbox`
             const backfill = db.query<{ data: string }, [string, number, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND lane=\'backfill\' AND scope=?').get(row.id, row.generation, checkpointScope)
-            if (backfill ? (JSON.parse(backfill.data) as SyncCheckpoint).cursor : (JSON.parse(accountRow(row.owner, row.id).data) as Account).sync.coverage === 'partial') await synchronizeSource(row.owner, row.id, { lane: 'backfill' }, true)
+            // Only resume explicitly started history. Partial coverage (including a rejected
+            // latest cursor) is not permission to begin another whole-mailbox import.
+            if (backfill && (JSON.parse(backfill.data) as SyncCheckpoint).cursor) {
+              await synchronizeSource(row.owner, row.id, { lane: 'backfill' }, true)
+            }
           }, catch: failure,
         }).pipe(Effect.catchAll(error => Effect.sync(() => options.log?.({ code: error.code, operation: 'sync' })))), { concurrency, discard: true }))
       }).finally(() => { polling = undefined })

@@ -23,7 +23,7 @@ export function projectMailboxMail(input: MailProjectionInput): { accounts: Mail
   const accounts: MailboxOption[] = boxes.map(box => {
     const source = sources.get(box.sourceId)!;
     return { id: box.id, sourceId: source.id, sourceGeneration: source.generation, name: box.name || source.name,
-      email: box.defaultSender || source.email, selectorKind: box.selector.kind,
+      email: box.defaultSender || source.email, selectorKind: box.selector.kind, selectorValue: box.selector.kind === "all" ? undefined : box.selector.value,
       canSend: input.allowProviderWrites && source.status === "connected" && box.status === "active" && source.capabilities.send && !!box.defaultSender };
   });
   const boxSources = new Map(boxes.map(box => [box.id, box.sourceId]));

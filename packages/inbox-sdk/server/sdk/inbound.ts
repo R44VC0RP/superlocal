@@ -36,10 +36,12 @@ import {
   type SendInput,
   type SendResult,
   type SyncCursor,
+  type SyncContext,
   type SyncOptions,
   type SyncResult,
 } from './types'
 import type { ConnectionSources, MailScope, MailSource } from './mail-sources'
+import { createHash } from 'node:crypto'
 
 export interface InboundCredentials extends ProviderCredentials {
   apiKey: string
@@ -55,10 +57,23 @@ interface SnapshotSource {
   params: URLSearchParams
   domain?: string
   address?: string
-  ids: string[]
+  offset: number
   total?: number
-  seed?: InboundEmailList
+  anchor?: string
   complete: boolean
+}
+
+interface SyncPosition {
+  version: 3
+  scope: string
+  source: number
+  offset: number
+  total?: number
+  anchor?: string
+  /** False after a skipped known head or a concurrent listing change. */
+  fullWalk: boolean
+  /** Bounded retirement candidates; never an inventory or a body cache. */
+  remaining: string[]
 }
 
 interface SnapshotEntry {
@@ -69,7 +84,6 @@ interface SnapshotEntry {
 interface InboundSnapshot {
   scope: string
   folder?: MailFolder
-  expiresAt: number
   connectionMode: boolean
   sources: SnapshotSource[]
   entries: Array<SnapshotEntry | null>
@@ -80,16 +94,15 @@ interface InboundSnapshot {
   threads?: SnapshotEntry[][]
 }
 
-const SNAPSHOT_TTL_MS = 15 * 60_000
+// Preview lists may retain a small metadata merge buffer. Sync never uses it.
 const MAX_SNAPSHOTS = 4
 const MAX_SNAPSHOT_ITEMS = 20_000
 const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
-const MAX_SCAN_PAGES = 200
-const SCAN_LOOKAHEAD = 4
+const MAX_SYNC_HINTS = 500
+const MAX_PAGE_READS = 128
 const MAX_LISTING_BYTES = 4 * 1024 * 1024
 const MAX_MAILBOX_SCOPE_INPUTS = 5_000
 const MAX_RECEIVING_SOURCES = 1_000
-const SOURCE_HEAD_CONCURRENCY = 4
 
 type MessageEvidence = Pick<InboundEmail, 'is_archived' | 'envelope_recipient' | 'thread_id' | 'message_id' | 'from_name'> & { domain?: string }
 
@@ -162,7 +175,6 @@ const INBOUND_CAPABILITIES: Readonly<ProviderCapabilities> = Object.freeze({
   send: true,
   reply: true,
   threads: true,
-  nativeThreads: true,
   folders: false,
   createFolders: false,
   labels: false,
@@ -173,13 +185,7 @@ const INBOUND_CAPABILITIES: Readonly<ProviderCapabilities> = Object.freeze({
   markUnread: true,
   star: false,
   attachments: true,
-  attachmentDownload: true,
   search: true,
-  drafts: false,
-  scheduledSend: true,
-  snooze: false,
-  readReceipts: false,
-  pushNotifications: false,
 })
 
 function inboundFolder(email: InboundEmail): MailFolder {
@@ -203,7 +209,6 @@ export class InboundProvider implements InboxProvider {
   private envelopeRecipients = false
   private readonly requests = new AbortController()
   private readonly snapshots = new Map<string, InboundSnapshot>()
-  private headPin: Promise<void> | undefined
   private readonly evidence = new Map<string, MessageEvidence>()
   private evidenceBytes = 0
 
@@ -280,7 +285,19 @@ export class InboundProvider implements InboxProvider {
     if (this.credentials.domain) params.set('domain', this.credentials.domain)
   }
 
-  async getMailSources(): Promise<ConnectionSources> {
+  async identities(): Promise<Awaited<ReturnType<NonNullable<InboxProvider['identities']>>>> {
+    const discovered = await this.getMailSources()
+    const primary = (this.credentials.email ?? this.credentials.address ?? '').trim().toLowerCase()
+    return {
+      sending: discovered.identities.map(({ email }) => ({ email,
+        isPrimary: email.toLowerCase() === primary || discovered.identities.length === 1,
+        isDefault: email.toLowerCase() === primary || discovered.identities.length === 1,
+      })),
+      receiving: discovered.sources,
+    }
+  }
+
+  private async getMailSources(): Promise<ConnectionSources> {
     if (this.sources && Date.now() < this.sourcesExpireAt) return structuredClone(this.sources)
     if (!this.sourceDiscovery) {
       this.sourceDiscovery = (async () => {
@@ -596,74 +613,9 @@ export class InboundProvider implements InboxProvider {
     return selected.filter(source => source.canReceive && source.canFilter !== false)
   }
 
-  private async pinSnapshotHeads(snapshot: InboundSnapshot): Promise<void> {
-    // Limit heads across concurrent queries too; a failed batch must not poison the next one.
-    while (this.headPin) await this.headPin.catch(() => {})
-    if (this.requests.signal.aborted) throw new ProviderError('inbound', 'NETWORK', 'Inbound provider is disconnected', { retryable: true })
-    const cancel = new AbortController()
-    const signal = AbortSignal.any([cancel.signal, this.requests.signal])
-    let nextSource = 0
-    let total = 0
-    let failure: { error: unknown } | undefined
-    const worker = async () => {
-      while (!signal.aborted) {
-        const source = snapshot.sources[nextSource++]
-        if (!source) return
-        try {
-          const params = new URLSearchParams(source.params)
-          params.set('offset', '0'); params.set('limit', '1')
-          const seed = await this.emailPage(`/emails?${params}`, 0, signal)
-          if (seed.pagination.limit !== 1 || seed.data.length !== Math.min(1, seed.pagination.total) ||
-            seed.pagination.has_more !== (seed.pagination.total > 1)) {
-            throw new ProviderCursorExpiredError('inbound', 'Inbound returned inconsistent snapshot totals')
-          }
-          total += seed.pagination.total
-          if (total > MAX_SNAPSHOT_ITEMS) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeds 20000 records; select a narrower scope')
-          const pinned = { data: seed.data.map(email => this.snapshotSummary(email)), pagination: {
-            offset: 0, limit: 1, total: seed.pagination.total, has_more: seed.pagination.has_more,
-          } }
-          // Reserve head metadata for the snapshot lifetime, even after a seed is consumed.
-          const bytes = JSON.stringify(pinned).length * 2
-          if (snapshot.bytes + bytes > MAX_SNAPSHOT_BYTES) {
-            throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
-          }
-          snapshot.bytes += bytes
-          source.total = seed.pagination.total
-          source.seed = pinned
-          source.complete = source.total === 0
-        } catch (error) {
-          failure ??= { error }
-          cancel.abort()
-        }
-      }
-    }
-    // Only the fixed worker set is eager, not one promise (or paced timer) per source.
-    const pending = Promise.all(Array.from({ length: Math.min(SOURCE_HEAD_CONCURRENCY, snapshot.sources.length) }, worker)).then(() => {
-      if (failure) throw failure.error
-      if (signal.aborted) throw new ProviderError('inbound', 'NETWORK', 'Inbound provider is disconnected', { retryable: true })
-    })
-    this.headPin = pending
-    try { await pending } finally { if (this.headPin === pending) this.headPin = undefined }
-  }
-
-  private async snapshotFor(kind: 'messages' | 'threads', options: ListOptions) {
+  private async listingFor(kind: string, options: ListOptions) {
     this.assertFolder(options.folder)
     if (this.requests.signal.aborted) throw new ProviderError('inbound', 'NETWORK', 'Inbound provider is disconnected', { retryable: true })
-    for (const [key, value] of this.snapshots) if (value.expiresAt <= Date.now()) this.snapshots.delete(key)
-    let token = crypto.randomUUID() as string
-    let offset = 0
-    let snapshot: InboundSnapshot | undefined
-    if (options.cursor !== undefined && options.cursor !== null) {
-      try {
-        if (options.cursor.length > 128) throw new Error()
-        const value: unknown = JSON.parse(options.cursor)
-        if (!Array.isArray(value) || value.length !== 3 || value[0] !== 2 || typeof value[1] !== 'string' ||
-          !Number.isSafeInteger(value[2]) || value[2] < 0 || value[2] > MAX_SNAPSHOT_ITEMS) throw new Error()
-        token = value[1]; offset = value[2]
-        snapshot = this.snapshots.get(token)
-        if (!snapshot) throw new Error()
-      } catch { throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot expired or belongs to another provider instance') }
-    }
     const scopes = this.mailboxScopes(options)
     const connectionMode = Boolean(this.credentials.connectionMode || scopes !== undefined)
     const sources: SnapshotSource[] = []
@@ -677,12 +629,11 @@ export class InboundProvider implements InboxProvider {
       if (options.search) params.set('search', options.search)
       if (options.folder === 'archive') params.set('status', 'archived')
       else if (options.unreadOnly) params.set('status', 'unread')
-      descriptorBytes += JSON.stringify({ params: params.toString(), domain, address, ids: [],
-        total: MAX_SNAPSHOT_ITEMS, complete: false }).length * 2
+      descriptorBytes += JSON.stringify({ params: params.toString(), domain, address, offset: 0, complete: false }).length * 2
       if (descriptorBytes > MAX_SNAPSHOT_BYTES) {
         throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
       }
-      sources.push({ params, domain, address, ids: [], complete: false })
+      sources.push({ params, domain, address, offset: 0, complete: false })
     }
     if (connectionMode) {
       const receiving = await this.receivingSources(scopes)
@@ -710,147 +661,108 @@ export class InboundProvider implements InboxProvider {
       options.search ?? null, options.unreadOnly ?? false, sources.map(source => source.params.toString())])
     const bytes = descriptorBytes + scope.length * 2
     if (bytes > MAX_SNAPSHOT_BYTES) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
-    if (snapshot) {
-      if (snapshot.scope !== scope) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot query or receiving grants changed')
-      snapshot.expiresAt = Date.now() + SNAPSHOT_TTL_MS
+    return { scope, folder: options.folder, connectionMode, sources, bytes }
+  }
+
+  private async snapshotFor(kind: 'messages' | 'threads', options: ListOptions) {
+    const listing = await this.listingFor(kind, options)
+    let token = crypto.randomUUID() as string
+    let offset = 0
+    let snapshot: InboundSnapshot | undefined
+    if (options.cursor !== undefined && options.cursor !== null) {
+      try {
+        if (options.cursor.length > 128) throw new Error()
+        const value: unknown = JSON.parse(options.cursor)
+        if (!Array.isArray(value) || value.length !== 3 || value[0] !== 2 || typeof value[1] !== 'string' ||
+          !Number.isSafeInteger(value[2]) || value[2] < 0 || value[2] > MAX_SNAPSHOT_ITEMS) throw new Error()
+        token = value[1]
+        offset = value[2]
+        snapshot = this.snapshots.get(token)
+        if (!snapshot || snapshot.scope !== listing.scope) throw new Error()
+      } catch { throw new ProviderCursorExpiredError('inbound', 'Inbound preview cursor or receiving grants changed') }
     } else {
-      snapshot = { scope, folder: options.folder, connectionMode, sources, entries: [], seen: new Set(), bytes, nextSource: 0,
-        expiresAt: Date.now() + SNAPSHOT_TTL_MS }
-      // Pin every source head before returning the first page, without importing bodies or whole mailboxes.
-      await this.pinSnapshotHeads(snapshot)
-      if (this.requests.signal.aborted) throw new ProviderError('inbound', 'NETWORK', 'Inbound provider is disconnected', { retryable: true })
-      snapshot.expiresAt = Date.now() + SNAPSHOT_TTL_MS
+      snapshot = { ...listing, entries: [], seen: new Set(), nextSource: 0 }
       while (this.snapshots.size >= MAX_SNAPSHOTS) this.snapshots.delete(this.snapshots.keys().next().value!)
       this.snapshots.set(token, snapshot)
     }
-    return { snapshot, offset, next: (index: number) => JSON.stringify([2, token, index]) }
+    return { snapshot: snapshot!, offset, next: (index: number) => JSON.stringify([2, token, index]) }
   }
 
-  private async readSnapshotSource(snapshot: InboundSnapshot, source: SnapshotSource, size: number, budget: { requests: number }): Promise<void> {
-    const pending: InboundEmail[] = []
-    const known = new Set(source.ids)
-    let pendingBytes = 0
-    let offset = 0
-    let skippedHeads = 0
-    let matched = 0
-    let foundHead = source.ids.length === 0
-    let total: number | undefined
-    type PageRead = { page: InboundEmailList } | { error: unknown }
-    const pages = new Map<number, Promise<PageRead>>()
-    let cancel = new AbortController()
-    let failure: { error: unknown } | undefined
-    let sequential = false
-    const start = (at: number) => {
-      if (budget.requests >= MAX_SCAN_PAGES) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot verification exceeded its bounded scan')
-      budget.requests++
+  private async sourcePage(source: SnapshotSource, size: number, connectionMode: boolean, folder?: MailFolder) {
+    const read = async (offset: number) => {
       const params = new URLSearchParams(source.params)
-      params.set('offset', String(at)); params.set('limit', '100')
-      const controller = cancel
-      pages.set(at, this.emailPage(`/emails?${params}`, at, controller.signal).then(
-        page => ({ page }),
-        error => {
-          if (!controller.signal.aborted) { failure ??= { error }; controller.abort() }
-          return { error }
-        },
-      ))
-    }
-    const settle = async () => {
-      cancel.abort()
-      await Promise.all(pages.values())
-      pages.clear()
-    }
-    try {
-      for (;;) {
-        const seed = source.seed
-        let page: InboundEmailList
-        if (seed) page = seed
-        else {
-          if (!pages.has(offset)) start(offset)
-          const result = await pages.get(offset)!
-          pages.delete(offset)
-          if (failure) throw failure.error
-          if ('error' in result) throw result.error
-          page = result.page
-        }
-        source.seed = undefined
-        if (page.data.length > page.pagination.limit || (total !== undefined && total !== page.pagination.total) ||
-          page.data.length !== Math.min(page.pagination.limit, page.pagination.total - offset) ||
-          page.pagination.has_more !== (offset + page.data.length < page.pagination.total)) {
-          throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot changed during enumeration')
-        }
-        total = page.pagination.total
-        for (const email of page.data) {
-          if (!foundHead) {
-            if (email.id !== source.ids[0]) { skippedHeads++; continue }
-            foundHead = true
-            if (total - skippedHeads !== source.total) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot membership changed')
-          }
-          if (matched < source.ids.length) {
-            if (email.id !== source.ids[matched++]) throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot prefix changed')
-            continue
-          }
-          if (known.has(email.id)) {
-            throw new ProviderCursorExpiredError('inbound', 'Inbound returned duplicate snapshot records')
-          }
-          known.add(email.id)
-          const summary = this.snapshotSummary(email)
-          pendingBytes += JSON.stringify(summary).length * 2
-          if (snapshot.bytes + pendingBytes > MAX_SNAPSHOT_BYTES) throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
-          pending.push(summary)
-          if (pending.length === size) break
-        }
-        if (pending.length === size || !page.pagination.has_more) break
-        offset += page.pagination.limit
-        if (!seed && page.pagination.limit !== 100) {
-          // Guessed offsets are no longer valid; settle them before following the actual limit.
-          await settle()
-          if (failure) throw failure.error
-          cancel = new AbortController()
-          sequential = true
-        }
-        if (foundHead && !sequential) {
-          const target = skippedHeads + source.ids.length + Math.min(size, source.total! - source.ids.length)
-          let next = pages.size ? Math.max(...pages.keys()) + 100 : offset
-          // Per scan: both in-flight responses and completed, unconsumed pages occupy a slot.
-          while (next < target && pages.size < SCAN_LOOKAHEAD && budget.requests < MAX_SCAN_PAGES) {
-            start(next)
-            next += 100
-          }
-        }
+      params.set('offset', String(offset))
+      params.set('limit', '100')
+      const page = await this.emailPage(`/emails?${params}`, offset)
+      if (page.data.length !== Math.min(page.pagination.limit, Math.max(0, page.pagination.total - offset)) ||
+        page.pagination.has_more !== (offset + page.data.length < page.pagination.total) ||
+        new Set(page.data.map(email => email.id)).size !== page.data.length) {
+        throw new ProviderCursorExpiredError('inbound', 'Inbound returned inconsistent listing membership')
       }
-    } finally { await settle() }
-    if (!foundHead || matched !== source.ids.length || !pending.length || source.ids.length + pending.length > source.total!) {
-      throw new ProviderCursorExpiredError('inbound', 'Inbound snapshot ended before its pinned membership was enumerated')
+      return page
     }
-    for (const raw of pending) {
+    // One boundary record detects displacement without rescanning the whole prefix.
+    let offset = source.offset
+    let page = await read(Math.max(0, offset - Number(offset > 0)))
+    const changed = source.total !== undefined && source.total !== page.pagination.total
+    if (offset && changed) {
+      offset += page.pagination.total - source.total!
+      if (offset < 1 || offset > page.pagination.total) throw new ProviderCursorExpiredError('inbound', 'Inbound backfill boundary disappeared')
+      const total = page.pagination.total
+      page = await read(offset - 1)
+      if (page.pagination.total !== total) throw new ProviderCursorExpiredError('inbound', 'Inbound listing changed while resuming backfill')
+    }
+    if (offset && page.data[0]?.id !== source.anchor) {
+      throw new ProviderCursorExpiredError('inbound', 'Inbound backfill boundary changed')
+    }
+    let listed = offset ? page.data.slice(1) : page.data
+    if (offset && !listed.length && page.pagination.has_more) {
+      const total = page.pagination.total
+      page = await read(offset)
+      if (page.pagination.total !== total) throw new ProviderCursorExpiredError('inbound', 'Inbound listing changed while resuming backfill')
+      listed = page.data
+    }
+    const consumed = listed.slice(0, size)
+    const entries: Array<SnapshotEntry | null> = []
+    const archived: string[] = []
+    for (const raw of consumed) {
       if (source.domain && raw.type !== 'received') throw new ProviderError('inbound', 'UPSTREAM', 'Inbound returned a non-received email in a receiving listing')
       let email = raw
-      if (source.address && !this.deliveryRecipient(email)) email = { ...raw, ...await this.getRawMessage(raw.id, true) }
+      if (source.address && !this.deliveryRecipient(email)) email = { ...raw, ...await this.getRawMessage(raw.id, connectionMode) }
       if (source.address && !this.deliveryRecipient(email)) {
-        throw new ProviderError('inbound', 'UPSTREAM', 'Inbound omitted delivery evidence required to complete this address snapshot')
+        throw new ProviderError('inbound', 'UPSTREAM', 'Inbound omitted delivery evidence required to complete this address listing')
       }
       const summary = this.snapshotSummary(email)
-      const bytes = JSON.stringify(summary).length * 2
-      if (snapshot.entries.length >= MAX_SNAPSHOT_ITEMS) {
-        throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeds 20000 records; select a narrower scope')
-      }
-      if (snapshot.bytes + bytes > MAX_SNAPSHOT_BYTES) {
-        throw new ProviderError('inbound', 'UPSTREAM', 'Inbound snapshot exceeded its 16 MiB metadata cache')
-      }
       const recipient = this.deliveryRecipient(summary)
       const domainMatches = !source.domain || !recipient || recipient.split('@')[1] === source.domain
       this.remember(summary, domainMatches ? source.domain : undefined)
-      source.ids.push(summary.id)
-      snapshot.bytes += bytes
-      const matches = domainMatches && (!source.address || recipient === source.address) &&
-        !(summary.is_archived && snapshot.folder === 'inbox')
-      if (!matches || snapshot.seen.has(summary.id)) snapshot.entries.push(null)
+      const matches = domainMatches && (!source.address || recipient === source.address)
+      if (matches && summary.is_archived && folder === 'inbox') archived.push(summary.id)
+      entries.push(matches && !(summary.is_archived && folder === 'inbox') ? { summary, domain: source.domain } : null)
+    }
+    source.offset = offset + consumed.length
+    source.total = page.pagination.total
+    source.anchor = consumed.at(-1)?.id ?? source.anchor
+    source.complete = source.offset >= source.total
+    return { entries, listed, consumed, changed, archived }
+  }
+
+  private async readSnapshotSource(snapshot: InboundSnapshot, source: SnapshotSource, size: number): Promise<void> {
+    const advanced = { ...source }
+    const page = await this.sourcePage(advanced, size, snapshot.connectionMode, snapshot.folder)
+    const bytes = page.entries.reduce((total, entry) => total + JSON.stringify(entry).length * 2, 0)
+    if (snapshot.entries.length + page.entries.length > MAX_SNAPSHOT_ITEMS || snapshot.bytes + bytes > MAX_SNAPSHOT_BYTES) {
+      throw new ProviderError('inbound', 'UPSTREAM', 'Inbound preview exceeded its bounded metadata buffer')
+    }
+    snapshot.bytes += bytes
+    for (const entry of page.entries) {
+      if (!entry || snapshot.seen.has(entry.summary.id)) snapshot.entries.push(null)
       else {
-        snapshot.seen.add(summary.id)
-        snapshot.entries.push({ summary, domain: source.domain })
+        snapshot.seen.add(entry.summary.id)
+        snapshot.entries.push(entry)
       }
     }
-    source.complete = source.ids.length === source.total
+    Object.assign(source, advanced)
   }
 
   private deliveryRecipient(email: InboundEmail): string | undefined {
@@ -861,11 +773,13 @@ export class InboundProvider implements InboxProvider {
   private async fillSnapshot(snapshot: InboundSnapshot, target: number): Promise<void> {
     while (snapshot.pending) await snapshot.pending
     const pending = (async () => {
-      const budget = { requests: 0 }
       while (snapshot.entries.length < target && snapshot.sources.some(source => !source.complete)) {
-        const index = snapshot.nextSource++ % snapshot.sources.length
-        const source = snapshot.sources[index]!
-        if (!source.complete) await this.readSnapshotSource(snapshot, source, Math.min(MAX_SNAPSHOT_ITEMS, target - snapshot.entries.length), budget)
+        const source = snapshot.sources[snapshot.nextSource]!
+        if (source.complete) {
+          snapshot.nextSource++
+          continue
+        }
+        await this.readSnapshotSource(snapshot, source, Math.min(100, target - snapshot.entries.length))
       }
       if (this.requests.signal.aborted) throw new ProviderError('inbound', 'NETWORK', 'Inbound provider is disconnected', { retryable: true })
     })()
@@ -1033,8 +947,8 @@ export class InboundProvider implements InboxProvider {
     }
   }
 
-  async sync(cursor?: SyncCursor | string | null, options: SyncOptions = {}): Promise<SyncResult> {
-    // Inbound exposes pagination and webhooks, but no replayable mailbox-history or delta API.
+  async sync(cursor?: SyncCursor | string | null, options: SyncOptions = {}, context?: SyncContext): Promise<SyncResult> {
+    // Page-only sync has no instance-local tokens, pinned heads or body cache.
     const current = normalizeCursor('inbound', cursor, 'page')
     if (current && current.kind !== 'page') {
       throw new ProviderCursorExpiredError('inbound', 'Inbound supports only full-sync pagination cursors')
@@ -1045,23 +959,90 @@ export class InboundProvider implements InboxProvider {
     if (current?.folder && options.folder && current.folder !== options.folder) {
       throw new ProviderCursorExpiredError('inbound', 'Inbound pagination cursors cannot switch folders')
     }
+    const hints = context ?? options
+    const lane = hints.lane ?? 'backfill'
     const mailboxScopes = options.mailboxScopes ?? this.credentials.sdkMailboxScopes
     const folder = options.folder ?? current?.folder ?? (mailboxScopes === undefined ? undefined : 'inbox')
-    // Unscoped connection sync remains a whole-source refresh.
-    const result = await this.listMessages({
+    const listing = await this.listingFor(`sync:${lane}`, {
       folder: this.credentials.connectionMode && mailboxScopes === undefined ? undefined : folder,
-      limit: options.limit, cursor: current?.value, mailboxScopes,
+      mailboxScopes,
     })
+    const scope = createHash('sha256').update(listing.scope).digest('hex')
+    // Bare Inbound IDs do not encode their receiving source. Only a whole-source walk
+    // can retire them; a selected view must not hide mail from another cached view.
+    let position: SyncPosition = { version: 3, scope, source: 0, offset: 0, fullWalk: true,
+      remaining: !listing.folder && mailboxScopes === undefined ? (hints.knownMessageIds ?? []).slice(0, MAX_SYNC_HINTS) : [] }
+    if (current) {
+      try {
+        if (current.value.length > MAX_LISTING_BYTES) throw new Error()
+        const saved = JSON.parse(current.value) as SyncPosition
+        if (!saved || saved.version !== 3 || saved.scope !== scope ||
+          Object.keys(saved).some(key => !['version', 'scope', 'source', 'offset', 'total', 'anchor', 'fullWalk', 'remaining'].includes(key)) ||
+          !Number.isSafeInteger(saved.source) || saved.source < 0 || saved.source >= listing.sources.length ||
+          !Number.isSafeInteger(saved.offset) || saved.offset < 0 ||
+          (saved.total !== undefined && (!Number.isSafeInteger(saved.total) || saved.total < saved.offset)) ||
+          (saved.offset > 0 && (saved.total === undefined || typeof saved.anchor !== 'string' || !saved.anchor || saved.anchor.length > 2048)) ||
+          typeof saved.fullWalk !== 'boolean' || !Array.isArray(saved.remaining) || saved.remaining.length > MAX_SYNC_HINTS ||
+          saved.remaining.some(id => typeof id !== 'string' || !id || id.length > 2048)) throw new Error()
+        position = saved
+      } catch { throw new ProviderCursorExpiredError('inbound', 'Inbound backfill cursor or receiving grants changed') }
+    }
+    if (!current && lane === 'backfill' && hints.snapshotComplete) {
+      return { messages: [], threads: [], deletedMessageIds: [], cursor: null, hasMore: false, fullSync: true, snapshotComplete: true }
+    }
+    const limit = clampLimit(options.limit, 100, 100)
+    const entries: SnapshotEntry[] = []
+    const removedMessageIds: string[] = []
+    let consumed = 0
+    for (let reads = 0; position.source < listing.sources.length && reads < MAX_PAGE_READS &&
+      (lane === 'latest' ? entries.length + removedMessageIds.length : consumed) < limit; reads++) {
+      const source = listing.sources[position.source]!
+      Object.assign(source, { offset: position.offset, total: position.total, anchor: position.anchor })
+      const page = await this.sourcePage(source, limit - (lane === 'latest' ? entries.length + removedMessageIds.length : consumed), listing.connectionMode, listing.folder)
+      // Intersect with at most one 100-record page, rather than duplicating the SDK inventory.
+      const pageIds = new Set(page.listed.map(email => email.id))
+      const known = new Set((hints.knownMessageIds ?? []).filter(id => pageIds.has(id)))
+      const states = new Map((hints.knownMessageStates ?? []).filter(state => pageIds.has(state.id)).map(state => [state.id, state]))
+      const unchanged = (email: InboundEmail) => {
+        const state = states.get(email.id)
+        const outbound = email.type === 'sent' || email.type === 'outbound' || email.type === 'scheduled'
+        return known.has(email.id) && state && state.isRead === (email.is_read ?? outbound) && state.isStarred === false &&
+          (state.folder === undefined || state.folder === inboundFolder(email))
+      }
+      removedMessageIds.push(...page.archived.filter(id => known.has(id) && states.get(id)?.folder === 'inbox'))
+      for (const entry of page.entries) if (entry && !unchanged(entry.summary)) entries.push(entry)
+      consumed += page.consumed.length
+      const seen = new Set(page.consumed.map(email => email.id))
+      position.remaining = position.remaining.filter(id => !seen.has(id))
+      position.fullWalk &&= !page.changed
+      const knownHead = lane === 'latest' && page.listed.length > 0 && page.listed.every(unchanged)
+      if (source.complete || knownHead) {
+        if (!source.complete) position.fullWalk = false
+        position.source++
+        position.offset = 0
+        delete position.total
+        delete position.anchor
+      } else {
+        position.offset = source.offset
+        position.total = source.total
+        position.anchor = source.anchor
+        break
+      }
+    }
+    const hasMore = position.source < listing.sources.length
+    const messages = await this.hydrate(entries, listing.connectionMode)
+    const fullWalk = !hasMore && position.fullWalk
     return {
-      messages: result.items,
-      threads: buildThreads(result.items),
+      messages,
+      threads: buildThreads(messages),
       deletedMessageIds: [],
-      cursor: result.nextCursor
-        ? { provider: 'inbound', kind: 'page', value: result.nextCursor, metadata: { accountId: this.accountId }, ...(folder ? { folder } : {}) }
-        : null,
-      hasMore: result.hasMore,
+      retiredMessageIds: fullWalk ? position.remaining.filter(id => hints.knownMessageIds?.includes(id)) : [],
+      removedMessageIds,
+      cursor: hasMore ? { provider: 'inbound', kind: 'page', value: JSON.stringify(position),
+        metadata: { accountId: this.accountId }, ...(folder ? { folder } : {}) } : null,
+      hasMore,
       fullSync: true,
-      snapshotComplete: !result.hasMore,
+      snapshotComplete: lane === 'backfill' ? !hasMore : hints.snapshotComplete === true || fullWalk,
     }
   }
 
@@ -1204,7 +1185,6 @@ export class InboundProvider implements InboxProvider {
 
   async disconnect(): Promise<void> {
     this.requests.abort()
-    await this.headPin?.catch(() => {})
     this.snapshots.clear()
     this.evidence.clear()
     this.evidenceBytes = 0

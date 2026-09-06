@@ -282,6 +282,9 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       const account = await inbox.account(owner, source)
       if (account.status !== 'connected') return { boxes: [], addresses, sent }
       if (account.email) addresses.add(account.email.trim().toLowerCase())
+      // Replies sent from an alias or send-as identity are still the user's own mail, not incoming.
+      try { for (const identity of (await inbox.sendingIdentities(owner, source)).identities) addresses.add(identity.email.trim().toLowerCase()) }
+      catch { /* Identity lookup is advisory; the primary address and mailbox scopes still classify. */ }
       for (const box of boxes) if (box.selector.kind === 'address') addresses.add(box.selector.value.trim().toLowerCase())
       for (const folder of await inbox.cachedFolders(owner, source)) if (folder.role.toLowerCase() === 'sent') sent.add(folder.id)
     }

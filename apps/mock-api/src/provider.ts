@@ -10,10 +10,9 @@ import { compare, contextId, email, fingerprint, invalid, keys, limit, object, P
 
 export const MOCK_CAPABILITIES: Readonly<ProviderCapabilities> = Object.freeze({
   sync: true, incrementalSync: true, deltaSync: true, send: true, reply: true,
-  threads: true, nativeThreads: true, folders: true, createFolders: true, labels: true,
+  threads: true, folders: true, createFolders: true, labels: true,
   archive: true, trash: true, permanentDelete: true, markRead: true, markUnread: true,
-  star: true, attachments: true, attachmentDownload: true, search: true,
-  drafts: false, scheduledSend: false, snooze: false, readReceipts: false, pushNotifications: false,
+  star: true, attachments: true, search: true,
 })
 
 type MailScope = NonNullable<ListOptions['mailboxScopes']>[number]
@@ -55,8 +54,6 @@ export class MockInboxProvider implements InboxProvider {
     if (this.disconnected) throw new ProviderError(PROVIDER_ID, 'AUTHORIZATION', 'This mock provider instance is disconnected.', { status: 409 })
     this.store.assertScope(this.scope)
   }
-
-  belongsTo(store: MockMailStore): boolean { return store === this.store }
 
   private selection(options: Omit<ListOptions, 'cursor' | 'limit'>, defaultFolder: string): Selection {
     const profile = this.store.assertScope(this.scope)
@@ -123,6 +120,18 @@ export class MockInboxProvider implements InboxProvider {
   async getAccount() {
     this.open()
     return { ...this.store.account(this.scope), capabilities: MOCK_CAPABILITIES }
+  }
+
+  async identities() {
+    this.open()
+    const account = this.store.assertScope(this.scope)
+    const sending = [account.email, ...(account.aliases ?? [])].map(email => ({ email,
+      isPrimary: email.toLowerCase() === account.email.toLowerCase(), isDefault: email.toLowerCase() === account.email.toLowerCase() }))
+    const domains = [...new Set(sending.map(identity => identity.email.split('@')[1]!))]
+    return { sending, receiving: [
+      ...sending.map(identity => ({ kind: 'address' as const, value: identity.email, canReceive: true, canSend: true, canFilter: true })),
+      ...domains.map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: true, canFilter: true })),
+    ] }
   }
 
   async listFolders() { this.open(); return this.store.listFolders(this.scope) }
@@ -228,15 +237,5 @@ export function createMockProviderDefinition(store: MockMailStore): ProviderDefi
     id: PROVIDER_ID, name: 'Superlocal Mock (offline)', connection: 'credentials', scopes: [],
     credentialReconnect: false, mailboxSelection: 'automatic',
     create(credentials) { return new MockInboxProvider(store, mockCredentialScope(store, credentials)) },
-    async discover(provider) {
-      if (!(provider instanceof MockInboxProvider) || !provider.belongsTo(store)) invalid('Mock discovery requires an instance of this store factory.')
-      const account = await provider.getAccount()
-      const identities = [account.email, ...(account.aliases ?? [])].map(email => ({ email, name: account.name }))
-      const domains = [...new Set(identities.map(identity => identity.email.split('@')[1]!))]
-      return { identities, sources: [
-        ...identities.map(identity => ({ kind: 'address' as const, value: identity.email, canReceive: true, canSend: true, canFilter: true })),
-        ...domains.map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: true, canFilter: true })),
-      ] }
-    },
   }
 }

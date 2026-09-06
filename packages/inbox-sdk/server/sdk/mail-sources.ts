@@ -3,6 +3,11 @@ import type { InboxProvider } from './types'
 export interface MailScope {
   kind: 'domain' | 'address'
   value: string
+  /** Optional discovery facts; selectors themselves need only kind/value. */
+  canReceive?: boolean
+  canSend?: boolean
+  canFilter?: boolean
+  unavailableReason?: string
 }
 
 export interface MailSource extends MailScope {
@@ -23,8 +28,14 @@ export interface ConnectionSources {
 }
 
 export async function discoverMailSources(provider: InboxProvider): Promise<ConnectionSources> {
-  const discoverable = provider as InboxProvider & { getMailSources?: () => Promise<ConnectionSources> }
-  return typeof discoverable.getMailSources === 'function'
-    ? discoverable.getMailSources()
-    : { sources: [], identities: [] }
+  const identities = await provider.identities?.()
+  return {
+    sources: (identities?.receiving ?? []).map(scope => ({ ...scope,
+      canReceive: scope.canReceive ?? true,
+      canSend: scope.canSend ?? (provider.capabilities.send && !!identities?.sending.some(identity => scope.kind === 'address'
+        ? identity.email.toLowerCase() === scope.value.toLowerCase() : identity.email.split('@').at(-1)?.toLowerCase() === scope.value.toLowerCase())),
+      canFilter: scope.canFilter ?? true,
+    })),
+    identities: (identities?.sending ?? []).map(({ email }) => ({ email })),
+  }
 }

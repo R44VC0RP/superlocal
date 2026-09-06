@@ -10,6 +10,8 @@ export const builtInProviders: readonly ProviderDefinition[] = Object.freeze([
     id: 'gmail', name: 'Gmail', connection: 'oauth',
     nativeCategoryRoles: GMAIL_CATEGORY_ROLES,
     scopes: ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/gmail.send'],
+    onboarding: { summary: 'Sign in with your Google account', actionLabel: 'Sign in with Google',
+      redirectNote: 'You will be sent to Google to approve access, then brought back here while your mail loads.' },
     create: (credentials) => {
       if (typeof credentials.accessToken !== 'string' || !credentials.accessToken) {
         throw new ProviderError('gmail', 'VALIDATION', 'Gmail requires an explicit OAuth access token')
@@ -20,6 +22,8 @@ export const builtInProviders: readonly ProviderDefinition[] = Object.freeze([
   {
     id: 'outlook', name: 'Outlook', connection: 'oauth',
     scopes: ['offline_access', 'User.Read', 'Mail.ReadWrite', 'Mail.Send'],
+    onboarding: { summary: 'Sign in with your Microsoft account', actionLabel: 'Sign in with Microsoft',
+      redirectNote: 'You will be sent to Microsoft to approve access, then brought back here while your mail loads.' },
     create: (credentials) => {
       if (typeof credentials.accessToken !== 'string' || !credentials.accessToken) {
         throw new ProviderError('outlook', 'VALIDATION', 'Outlook requires an explicit OAuth access token')
@@ -29,6 +33,15 @@ export const builtInProviders: readonly ProviderDefinition[] = Object.freeze([
   },
   {
     id: 'imap', name: 'IMAP', connection: 'credentials', credentialReconnect: false,
+    // Server endpoints are not fields: hosts pin them (presets) so browser input cannot redirect mail.
+    onboarding: { summary: 'Email and mail password', actionLabel: 'Connect mailbox',
+      fields: [
+        { name: 'email', label: 'Email address', type: 'email', required: true },
+        { name: 'password', label: 'Mail password', type: 'password', required: true },
+        { name: 'imapUsername', label: 'IMAP username (defaults to email)', type: 'text', required: false, advanced: true },
+        { name: 'smtpUsername', label: 'SMTP username (defaults to email)', type: 'text', required: false, advanced: true },
+      ],
+      advancedNote: 'Server endpoints and required TLS are set by the selected host preset. Change presets in the local host configuration.' },
     create: (credentials, context) => new ImapProvider({ ...credentials, signal: context?.signal }),
     // Passwords have no refresh protocol. Stop background authentication retries until
     // the trusted host replaces/re-authorizes the connection's credentials.
@@ -36,6 +49,8 @@ export const builtInProviders: readonly ProviderDefinition[] = Object.freeze([
   },
   {
     id: 'inbound', name: 'Inbound', connection: 'credentials', mailboxSelection: 'manual', credentialReconnect: false,
+    onboarding: { summary: 'Paste an API key', actionLabel: 'Connect Inbound',
+      fields: [{ name: 'apiKey', label: 'API key', type: 'password', required: true }] },
     create: (credentials) => {
       if (typeof credentials.apiKey !== 'string' || !credentials.apiKey) {
         throw new ProviderError('inbound', 'VALIDATION', 'Inbound requires an explicit API key')
@@ -45,12 +60,6 @@ export const builtInProviders: readonly ProviderDefinition[] = Object.freeze([
         connectionMode: credentials.connectionMode === true ||
           ![credentials.address, credentials.email, credentials.domain].some((value) => typeof value === 'string' && value.length > 0),
       })
-    },
-    discover: (provider) => {
-      if (!(provider instanceof InboundProvider)) {
-        throw new ProviderError('inbound', 'VALIDATION', 'Inbound discovery requires an Inbound provider')
-      }
-      return provider.getMailSources()
     },
   },
 ] satisfies ProviderDefinition[])

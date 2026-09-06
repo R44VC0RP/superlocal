@@ -51,6 +51,26 @@ type ComposerProps = {
   onFocusChange?: (focused: boolean) => void;
 };
 
+/** Receiving views can overlap; expose each authorized source/address once. */
+export function sendingAddressGroups(accounts: MailboxOption[], catalog: Record<string, readonly { email: string }[] | undefined>, preferredMailbox: string) {
+  const groups = accounts.map(account => ({ account, identities: (catalog[account.id] ?? (account.email ? [{ email: account.email }] : []))
+    .filter(identity => account.selectorKind === "address" ? identity.email.toLowerCase() === (account.selectorValue ?? account.email).toLowerCase()
+      : account.selectorKind === "domain" ? identity.email.split("@").at(-1)?.toLowerCase() === account.selectorValue?.toLowerCase() : true)
+    .map(identity => ({ account: account.id, email: identity.email, value: JSON.stringify([account.id, identity.email]) })) }));
+  const owners = new Map<string, string>();
+  for (const group of groups) for (const identity of group.identities) {
+    const key = `${group.account.sourceId}\0${identity.email.toLowerCase()}`;
+    if (!owners.has(key) || group.account.id === preferredMailbox) owners.set(key, group.account.id);
+  }
+  let offset = 0;
+  return groups.flatMap(group => {
+    const identities = group.identities.filter(identity => owners.get(`${group.account.sourceId}\0${identity.email.toLowerCase()}`) === group.account.id);
+    const result = { ...group, identities, offset };
+    offset += identities.length;
+    return identities.length ? [result] : [];
+  });
+}
+
 const addresses = (value: string) =>
   value
     .split(/[,;\n]+/)
@@ -335,38 +355,76 @@ export default function Composer({
     Record<string, string> | undefined;
   const signature = signatures?.[draft.account] ?? preferences.signature;
   const mailbox = accounts.find(account => account.id === draft.account);
-  const sourceBinding = `${mailbox?.sourceId ?? ""}\0${mailbox?.sourceGeneration ?? ""}`;
-  const identityOwner = `${draft.id}\0${draft.account}\0${sourceBinding}`;
+  const sourceLocked = draft.mode !== "new" || !!draft.sourceMessageId;
+  const replyMailbox = mailbox && (!draft.sourceId || mailbox.sourceId === draft.sourceId) ? mailbox
+    : accounts.find(account => account.canSend && account.sourceId === draft.sourceId);
+  const sendingAccounts = accounts.filter(account => account.canSend && (!sourceLocked || account.id === replyMailbox?.id));
+  const sourceBinding = JSON.stringify(sendingAccounts.map(account => [account.id, account.sourceId, account.sourceGeneration, account.email, account.selectorKind, account.selectorValue]));
+  // Switching From within a new draft does not discard other accounts' pending or loaded identities.
+  const identityOwner = `${draft.id}\0${draft.mode}\0${draft.sourceMessageId ?? ""}\0${sourceBinding}`;
   const identityOwnerRef = useRef(identityOwner);
   identityOwnerRef.current = identityOwner;
   const identityRequest = useRef(0);
   const previousSource = useRef(sourceBinding);
   const identityStatusId = useId();
-  const [identityLoad, setIdentityLoad] = useState<{
-    owner: string;
-    loading: boolean;
-    value?: Awaited<ReturnType<LoadSendingIdentities>>;
-    error?: string;
-  }>({ owner: identityOwner, loading: true });
-  const identityState = identityLoad.owner === identityOwner ? identityLoad : undefined;
-  const identitiesLoading = !identityState || identityState.loading;
-  const identities = identityState?.value?.identities ?? [];
-  const from = draft.from ?? "";
-  const listedFrom = identities.find(identity => identity.email.toLowerCase() === from.toLowerCase());
-  const missingFrom = !!identityState?.value && !listedFrom;
+  type IdentityState = { loading: boolean; value?: Awaited<ReturnType<LoadSendingIdentities>>; error?: string };
+  const [identityLoad, setIdentityLoad] = useState<{ owner: string; accounts: Record<string, IdentityState> }>({ owner: identityOwner, accounts: {} });
+  const identityStates: Record<string, IdentityState> = identityLoad.owner === identityOwner ? identityLoad.accounts : {};
+  const identityState = identityStates[draft.account];
+  const identitiesLoading = sendingAccounts.some(account => !identityStates[account.id] || identityStates[account.id].loading);
+  const currentLoading = sendingAccounts.some(account => account.id === draft.account) && (!identityState || identityState.loading);
+  const senderGroups = sendingAddressGroups(sendingAccounts,
+    Object.fromEntries(sendingAccounts.map(account => [account.id, identityStates[account.id]?.value?.identities])), draft.account);
+  const identities = senderGroups.flatMap(group => group.identities);
+  const from = draft.from ?? mailbox?.email ?? "";
+  const listedFrom = identities.find(identity => identity.account === draft.account && identity.email.toLowerCase() === from.toLowerCase());
+  const missingFrom = !sendingAccounts.some(account => account.id === draft.account) || !!identityState?.value && !listedFrom;
+  const [senderOpen, setSenderOpen] = useState(false);
+  const [senderHighlight, setSenderHighlight] = useState(0);
+  const senderAnchor = useRef<HTMLDivElement>(null);
+  const senderTrigger = useRef<HTMLButtonElement>(null);
+  const senderTypeahead = useRef({ text: "", at: 0 });
+  const senderListId = useId();
+  const activeSender = identities.length ? Math.min(senderHighlight, identities.length - 1) : -1;
+  const openSenders = (last = false) => {
+    setSenderHighlight(last ? Math.max(0, identities.length - 1) : Math.max(0, identities.findIndex(identity => identity.value === listedFrom?.value)));
+    setSenderOpen(true);
+  };
+  const chooseSender = (value: string) => {
+    const identity = identities.find(identity => identity.value === value);
+    if (!identity || sending) return;
+    update({ account: identity.account, from: identity.email });
+    setSenderOpen(false);
+    senderTrigger.current?.focus();
+  };
+  useEffect(() => { setSenderOpen(false); }, [identityOwner, sending]);
+  useEffect(() => {
+    if (!senderOpen) return;
+    const close = (event: PointerEvent) => {
+      if (!senderAnchor.current?.contains(event.target as Node)) setSenderOpen(false);
+    };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [senderOpen]);
+  useEffect(() => {
+    if (senderOpen) document.getElementById(`${senderListId}-${activeSender}`)?.scrollIntoView({ block: "nearest" });
+  }, [senderOpen, activeSender, senderListId]);
   const loadIdentities = useCallback(async (refresh = false) => {
     const request = ++identityRequest.current;
-    setIdentityLoad({ owner: identityOwner, loading: true });
-    try {
-      const value = await loadSendingIdentities(draft.account, { refresh });
+    setIdentityLoad({ owner: identityOwner, accounts: Object.fromEntries(sendingAccounts.map(account => [account.id, { loading: true }])) });
+    await Promise.all(sendingAccounts.map(async account => {
+      let state: IdentityState;
+      try {
+        const value = await loadSendingIdentities(account.id, { refresh });
+        if (value.sourceId !== account.sourceId) throw new Error("The sending mailbox changed. Retry to load its senders.");
+        state = { loading: false, value };
+      } catch (cause) {
+        state = { loading: false, error: cause instanceof Error && !(cause instanceof TypeError) ? cause.message : "Could not load sending addresses." };
+      }
       if (mounted.current && identityOwnerRef.current === identityOwner && identityRequest.current === request)
-        setIdentityLoad({ owner: identityOwner, loading: false, value });
-    } catch (cause) {
-      if (mounted.current && identityOwnerRef.current === identityOwner && identityRequest.current === request)
-        setIdentityLoad({ owner: identityOwner, loading: false, error: cause instanceof Error && !(cause instanceof TypeError)
-          ? cause.message : "Could not load sending addresses." });
-    }
-  }, [identityOwner, draft.account, loadSendingIdentities]);
+        setIdentityLoad(previous => previous.owner === identityOwner ? { ...previous, accounts: { ...previous.accounts, [account.id]: state } } : previous);
+    }));
+  }, [identityOwner, loadSendingIdentities]);
 
   useEffect(() => {
     mounted.current = true;
@@ -998,45 +1056,77 @@ export default function Composer({
                     onChange={(bcc) => update({ bcc })}
                     onExpand={() => setExpanded(true)}
                   />
-                  <label className="compose-recipient-row compose-from">
-                    <span>Mailbox</span>
-                    <select
-                      aria-label="Mailbox"
-                      value={draft.account}
-                      onChange={(event) =>
-                        update({ account: event.target.value })
-                      }
-                    >
-                      {accounts.filter(account => account.canSend || account.id === draft.account).map(
-                        (account) => (
-                          <option key={account.id} value={account.id}>{account.email || account.name}</option>
-                        ),
-                      )}
-                    </select>
-                    <Icon name="ChevronDown" size={12} />
-                  </label>
                 </>
               )}
             </div>
           )}
-          <label className="compose-recipient-row compose-from">
+          <div className="compose-recipient-row compose-from">
             <span>From</span>
-            <select
+            <div className="compose-sender-picker" ref={senderAnchor} onBlur={event => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setSenderOpen(false);
+            }}>
+            <button
+              type="button"
+              ref={senderTrigger}
+              className="compose-sender-trigger"
+              role="combobox"
               aria-label="From"
+              aria-haspopup="listbox"
+              aria-expanded={senderOpen}
+              aria-controls={senderListId}
+              aria-activedescendant={senderOpen && activeSender >= 0 ? `${senderListId}-${activeSender}` : undefined}
               aria-describedby={identityStatusId}
               aria-busy={identitiesLoading}
-              value={listedFrom?.email ?? from}
-              disabled={identitiesLoading || sending}
-              onChange={(event) => update({ from: event.target.value })}
+              value={listedFrom?.value ?? JSON.stringify([draft.account, from])}
+              disabled={sending}
+              onClick={() => senderOpen ? setSenderOpen(false) : openSenders()}
+              onKeyDown={event => {
+                if (event.nativeEvent.isComposing || event.metaKey || event.ctrlKey || event.altKey) return;
+                const key = event.key;
+                if (key === "Tab") { setSenderOpen(false); return; }
+                if (key === "Escape") {
+                  if (!senderOpen) return;
+                  setSenderOpen(false);
+                } else if (key === "ArrowDown" || key === "ArrowUp") {
+                  if (!senderOpen) openSenders(key === "ArrowUp");
+                  else setSenderHighlight((activeSender + (key === "ArrowDown" ? 1 : -1) + identities.length) % Math.max(1, identities.length));
+                } else if (key === "Home" || key === "End") {
+                  setSenderOpen(true); setSenderHighlight(key === "Home" ? 0 : Math.max(0, identities.length - 1));
+                } else if (key === "Enter" || key === " ") {
+                  if (!senderOpen) openSenders();
+                  else if (activeSender >= 0) chooseSender(identities[activeSender].value);
+                } else if (key.length === 1) {
+                  const now = Date.now(), previous = senderTypeahead.current;
+                  const text = (now - previous.at < 600 ? previous.text : "") + key.toLowerCase();
+                  senderTypeahead.current = { text, at: now };
+                  const index = identities.findIndex(identity => identity.email.toLowerCase().startsWith(text));
+                  setSenderOpen(true); if (index >= 0) setSenderHighlight(index);
+                } else return;
+                event.preventDefault(); event.stopPropagation();
+              }}
             >
-              {!listedFrom && <option value={from} disabled>{from || "Choose a sending address"}{missingFrom && from ? " (Unavailable)" : ""}</option>}
-              {identities.map(identity => <option key={identity.email} value={identity.email}>{identity.email}</option>)}
-            </select>
-            <Icon name="ChevronDown" size={12} />
-          </label>
+              <span>{from || "Choose a sending address"}{missingFrom && from ? " (Unavailable)" : ""}</span>
+              <Icon name="ChevronDown" size={12} />
+            </button>
+            <div id={senderListId} role="listbox" aria-label="Sending addresses" className="compose-sender-options" hidden={!senderOpen}>
+              {senderGroups.map(({ account, identities, offset }) => {
+                return identities.length > 0 && <div key={account.id} role="group" aria-label={account.email || account.name}>
+                  {senderGroups.length > 1 && <div className="compose-sender-group">{account.email || account.name}</div>}
+                  {identities.map((identity, index) => <button key={identity.value} type="button" role="option" tabIndex={-1}
+                    id={`${senderListId}-${offset + index}`} value={identity.value} aria-label={identity.email}
+                    aria-selected={identity.value === listedFrom?.value} className={offset + index === activeSender ? "is-active" : undefined}
+                    onMouseDown={event => event.preventDefault()} onMouseEnter={() => setSenderHighlight(offset + index)} onClick={() => chooseSender(identity.value)}>
+                    <span>{identity.email}</span>{identity.value === listedFrom?.value && <Icon name="Check" size={14} />}
+                  </button>)}
+                </div>;
+              })}
+              {identities.length === 0 && <div className="compose-sender-group">{identitiesLoading ? "Loading sending addresses…" : "No sending addresses available"}</div>}
+            </div>
+            </div>
+          </div>
           <div id={identityStatusId} className={`compose-sender-status ${identityState?.error || missingFrom ? "is-error" : ""}`} aria-live="polite">
-            {identitiesLoading ? "Loading sending addresses…" : identityState?.error || (missingFrom ? "This address is not in the available senders." : "")}
-            {!identitiesLoading && (identityState?.error || missingFrom || draft.sendError) && <button type="button" onClick={() => void loadIdentities(true)}>Retry sending addresses</button>}
+            {currentLoading ? "Loading sending addresses…" : identityState?.error || (missingFrom ? "This address is not in the available senders." : "")}
+            {!currentLoading && (identityState?.error || missingFrom || draft.sendError) && <button type="button" onClick={() => void loadIdentities(true)}>Retry sending addresses</button>}
           </div>
           {(!inline || expanded) && (
             <input
@@ -1233,11 +1323,6 @@ export default function Composer({
           {status && (
             <div className="compose-status" role="status">
               {status}
-            </div>
-          )}
-          {draft.dirty && !draft.saving && !draft.saveError && (
-            <div className="compose-status" role="status">
-              Unsaved recipient changes
             </div>
           )}
           <footer className="compose-footer">

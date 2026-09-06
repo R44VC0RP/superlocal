@@ -1,11 +1,11 @@
 import { createHmac, randomBytes } from 'node:crypto'
 import { dirname, join } from 'node:path'
-import { createMockHost, type MockHost } from '@superlocal/mock-api'
+import { createMockHost, createMockProviderDefinition, type MockHost } from '@superlocal/mock-api'
 import { createInbox, InboxError, type Inbox } from 'inbox-sdk'
 import { createInboxApi } from 'inbox-sdk/http'
 import { loadLocalConfig, object, type LocalConfig } from './config'
 import { createInboxViewPreferencesStore, INBOX_PREFERENCES_BODY_LIMIT } from './inbox-preferences'
-import { createRealRegistrations, type HostProvider, type HostProviderRegistration } from './providers'
+import { connectFailure, createRealRegistrations, describeProvider, type HostExtension, type HostProviderRegistration } from './providers'
 import { openLocalRuntime } from './runtime'
 import { createSenderDomainHost } from './sender-domains'
 import { createSplitPreferencesStore } from './split-preferences'
@@ -60,16 +60,20 @@ async function jsonBody(request: Request, kind: 'connection' | 'preferences' | '
 
 function credentialsFor(provider: HostProviderRegistration, input: Record<string, unknown>): Record<string, string> {
   const invalid = () => new InboxError('HOST_INVALID_CREDENTIALS', 'Only the declared provider credential fields are accepted.', 400)
-  if (provider.onboarding.connection !== 'credentials') {
+  if (provider.descriptor.connection !== 'credentials') {
     if (Object.keys(input).length) throw invalid()
     return {}
   }
   if (Object.keys(input).join(',') !== 'credentials' || !object(input.credentials)) throw invalid()
-  const fields = provider.onboarding.fields ?? []
+  const fields = provider.descriptor.fields ?? []
   if (Object.keys(input.credentials).some(name => !fields.some(field => field.name === name))) throw invalid()
   const credentials: Record<string, string> = Object.create(null)
+  // A selected option may hide fields; they are not declared for that choice and are refused like unknown names.
+  const chosen = input.credentials
+  const hidden = new Set(fields.flatMap(field => field.type === 'select' ? field.options?.find(option => option.value === (chosen[field.name] ?? field.defaultValue))?.hiddenFields ?? [] : []))
   for (const field of fields) {
     const value = input.credentials[field.name]
+    if (hidden.has(field.name)) { if (value !== undefined) throw invalid(); continue }
     if (value === undefined && !field.required) continue
     // Mail passwords are opaque. Spaces are significant; never trim or normalize them.
     if (typeof value !== 'string' || value.length > 4096 || field.type !== 'password' && (value.trim() !== value || /[\x00-\x1f\x7f]/.test(value)) || field.required && !value) throw invalid()
@@ -94,6 +98,9 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         token: createHmac('sha256', runtime.sessionKey).update('unused-private-mock-bearer').digest('hex'), allowProviderWrites: config.allowProviderWrites })
       inbox = mock.inbox
       owner = mock.owner
+      // The mock host already registered this definition with its inbox; the browser only sees its descriptor.
+      const definition = createMockProviderDefinition(mock.store)
+      registrations = [{ definition, descriptor: describeProvider(definition, { connectable: false }) }]
     } else {
       const real = createRealRegistrations(config, runtime, environment)
       registrations = real.registrations
@@ -168,6 +175,16 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     const origin = request.headers.get('origin')
     return session && session.expires > Date.now() && (!origin || origin === session.origin) ? { id: owner } : null
   }
+  // Provider extensions (OAuth callbacks/handoffs) are mounted below with `authenticate`; requests arrive only afterwards.
+  let extensions: HostExtension[] = []
+  /** Native navigations declared by a mounted provider extension: its callback and its owner-checked authorization handoff. */
+  const mailboxAuthorization = (path: string) => {
+    for (const extension of extensions) {
+      const id = extension.authorization?.attemptId(path)
+      if (id !== undefined) return { extension, id }
+    }
+    return undefined
+  }
   function scopeMatches(request: Request, scope: string | undefined): boolean {
     if (!applicationAuth) return true
     const supplied = request.headers.get('x-superlocal-scope')
@@ -176,23 +193,21 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     // Only native element/download URLs have no custom header. Their opaque IDs remain
     // owner-checked by the SDK; never exempt a generic JSON GET or an encoded path alias.
     return ['GET', 'HEAD'].includes(request.method) && (/^\/v1\/messages\/[^/%]+\/media\/[^/%]+$/.test(path) || /^\/v1\/blobs\/[^/%]+$/.test(path)) ||
-      request.method === 'GET' && (/^\/host\/sender-domains\/[^/%]+\/icon$/.test(path) || path === '/v1/oauth/google/callback' || !!mailboxAuthorizationId(request))
+      request.method === 'GET' && (/^\/host\/sender-domains\/[^/%]+\/icon$/.test(path) || extensions.some(extension => extension.callbackPath === path) || !!mailboxAuthorization(path))
   }
-  const mailboxAuthorizationId = (request: Request) => request.method === 'GET' ? /^\/v1\/oauth\/google\/authorize\/([^/%]+)$/.exec(new URL(request.url).pathname)?.[1] : undefined
   function ownsMailboxAuthorization(request: Request, owner: string): boolean {
-    const id = mailboxAuthorizationId(request)
-    if (!applicationAuth || !id) return true
-    // The SDK's redirect handoff consumes a one-use ticket; check its owner before
-    // consumption, including native navigations that cannot supply the document scope.
-    return !!runtime.database.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sdk_oauth_attempts'").get() &&
-      !!runtime.database.query('SELECT 1 FROM sdk_oauth_attempts WHERE id=? AND owner=?').get(id, owner)
+    const handoff = request.method === 'GET' ? mailboxAuthorization(new URL(request.url).pathname) : undefined
+    if (!applicationAuth || !handoff) return true
+    // The extension consumes a one-use ticket on this navigation; confirm its owner first,
+    // including native navigations that cannot supply the document scope.
+    return handoff.extension.authorization!.owns(handoff.id, owner)
   }
   const authenticate = async (request: Request): Promise<{ id: string } | null> => {
     const identity = await currentIdentity(request)
     return identity && scopeMatches(request, identity.scope) && ownsMailboxAuthorization(request, identity.id) ? { id: identity.id } : null
   }
   const api = createInboxApi({ inbox: liveInbox, authenticate, allowedOrigins })
-  const extensions = registrations.flatMap(registration => registration.mount ? [registration.mount(liveInbox, authenticate)] : [])
+  extensions = registrations.flatMap(registration => registration.mount ? [registration.mount(liveInbox, authenticate)] : [])
 
   function session(request: Request): Response {
     if (applicationAuth) return authRequired()
@@ -222,7 +237,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     // Never route encoded or trailing-slash auth aliases through a more permissive handler.
     let normalized: string
     try { normalized = decodeURIComponent(url.pathname).replace(/\/+$/, '') } catch { return problem(400, 'HOST_INVALID_PATH', 'Invalid request path.') }
-    if (normalized !== url.pathname && (normalized === '/session' || normalized.startsWith('/api/auth') || normalized.startsWith('/host/auth') || applicationAuth && normalized.startsWith('/v1/oauth/google/authorize/'))) return problem(400, 'HOST_INVALID_PATH', 'Use the exact authentication path.')
+    if (normalized !== url.pathname && (normalized === '/session' || normalized.startsWith('/api/auth') || normalized.startsWith('/host/auth') || applicationAuth && !!mailboxAuthorization(normalized))) return problem(400, 'HOST_INVALID_PATH', 'Use the exact authentication path.')
     if (url.pathname === '/session') return url.search ? problem(400, 'HOST_INVALID_INPUT', 'Session initialization takes no query parameters.') : session(request)
     if (url.pathname === '/health' && request.method === 'GET') return Response.json({ ok: true }, { headers: safeHeaders })
     if (url.pathname.startsWith('/api/auth')) return applicationAuth && url.pathname === '/api/auth/callback/google' ? applicationAuth.handle(request) : problem(404, 'NOT_FOUND', 'Route not found.')
@@ -342,22 +357,21 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     if (url.pathname === '/host/config' && request.method === 'GET') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Host configuration takes no query parameters.')
       const connections = await liveInbox.connections(owner)
-      const descriptors: Array<Omit<HostProvider, 'connectionIds'>> = config.mode === 'mock'
-        ? [{ id: 'mock', name: 'Offline mock', connection: 'none', enabled: true, ready: true }]
-        : registrations.map(registration => registration.onboarding)
       return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true, aiTriage: aiConfiguration !== null, attentionOverrides: true, inboxWindow: true,
         preferenceScope: createHmac('sha256', runtime.sessionKey).update(`split-preferences:${owner}`).digest('hex'),
-        providers: descriptors.map(provider => ({ ...provider, connectionIds: connections.filter(connection => connection.providerId === provider.id).map(connection => connection.id) })) }, { headers: safeHeaders })
+        providers: registrations.map(({ descriptor }) => ({ ...descriptor, connectionIds: connections.filter(connection => connection.providerId === descriptor.id).map(connection => connection.id) })) }, { headers: safeHeaders })
     }
     const connect = /^\/host\/providers\/([a-z][a-z0-9-]*)\/(?:connect|connections\/([^/]+)\/reconnect)$/.exec(url.pathname)
     if (connect && request.method === 'POST') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Connection input belongs in the JSON body.')
-      const provider = registrations.find(provider => provider.onboarding.id === connect[1])
+      const provider = registrations.find(provider => provider.descriptor.id === connect[1])
       if (!provider) return problem(404, 'HOST_PROVIDER_DISABLED', 'This provider is not enabled in the current mode.')
-      if (!provider.onboarding.ready) return problem(409, 'HOST_PROVIDER_NOT_READY', provider.onboarding.setupMessage ?? 'Complete the provider configuration and restart.')
+      if (!provider.descriptor.ready || !provider.connect) return problem(409, 'HOST_PROVIDER_NOT_READY', provider.descriptor.setupMessage ?? 'Complete the provider configuration and restart.')
       const credentials = credentialsFor(provider, await jsonBody(request))
       if (connect[2] && !provider.reconnect) return problem(409, 'HOST_RECONNECT_UNAVAILABLE', 'This provider requires a new authorization flow.')
-      return Response.json(await (connect[2] ? provider.reconnect!(liveInbox, owner, connect[2], credentials) : provider.connect(liveInbox, owner, credentials, origin!)), { headers: safeHeaders })
+      try {
+        return Response.json(await (connect[2] ? provider.reconnect!(liveInbox, owner, connect[2], credentials) : provider.connect(liveInbox, owner, credentials, origin!)), { headers: safeHeaders })
+      } catch (error) { throw connectFailure(error, provider.descriptor.name) }
     }
     // Browser credentials go ONLY through the declared host onboarding fields, never raw SDK connection APIs.
     let path: string

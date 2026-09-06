@@ -11,6 +11,7 @@ import type {
 } from '../../src/types'
 
 export type {
+  MailScope,
   Attachment,
   MailAccount,
   MailFolder,
@@ -45,10 +46,15 @@ export interface SyncCursor {
 
 /** SDK runtime hints; separate from a provider's validated operation options. */
 export interface SyncContext {
-  /** Previously stored native identities, for providers without durable deletion history. */
+  /** Latest refreshes start at the head; backfill resumes a durable older-page cursor. */
+  lane?: 'latest' | 'backfill'
+  /** This exact checkpoint scope already completed its older-history walk. */
+  snapshotComplete?: boolean
+  /** Previously stored native identities, not proof of absence from a partial listing.
+   * Providers may intersect this untruncated hint with a bounded page instead of copying it all. */
   knownMessageIds?: string[]
-  /** Last confirmed upstream flags, not optimistic state or mailbox-local Done/snooze. */
-  knownMessageStates?: Array<{ id: string; isRead: boolean; isStarred: boolean }>
+  /** Last confirmed upstream flags/folder, not optimistic state or mailbox-local Done/snooze. */
+  knownMessageStates?: Array<{ id: string; isRead: boolean; isStarred: boolean; folder?: MailFolder }>
 }
 
 export interface SyncOptions extends SyncContext {
@@ -61,11 +67,18 @@ export interface SyncResult {
   messages: MailMessage[]
   threads: MailThread[]
   deletedMessageIds: string[]
+  /** Durable continuation for backfill or native incremental history. */
   cursor: SyncCursor | null
   hasMore: boolean
   fullSync: boolean
+  /** Native history boundary for the next latest poll, independent of older backfill pages.
+   * Without one, a fullSync latest refresh starts at the head every poll and follows hasMore
+   * only within that bounded poll. Return no changed messages and hasMore:false at a known,
+   * unchanged head to become quiet; never depend on an instance-local snapshot token. */
   recentCursor?: SyncCursor | null
   removedMessageIds?: string[]
+  /** Older-history coverage, not whether a latest head refresh has more changed pages.
+   * A page-only latest refresh preserves SyncContext.snapshotComplete after backfill finishes. */
   snapshotComplete?: boolean
   /** Mailbox-scoped instances that no longer exist, not a claim of global message deletion. */
   retiredMessageIds?: string[]
@@ -172,7 +185,9 @@ export interface InboxProvider {
   readonly accountId: string
   readonly capabilities: Readonly<ProviderCapabilities>
   getAccount(): Promise<MailAccount>
-  getSendingIdentities?(): Promise<readonly SendingIdentity[]>
+  /** Verified senders and optional selectable receiving scopes; omitted receiving means the whole source.
+   * Without this hook the SDK uses getAccount().email and aliases as the sending catalog. */
+  identities?(): Promise<{ sending: readonly SendingIdentity[]; receiving?: readonly MailScope[] }>
   listFolders(): Promise<ProviderFolder[]>
   createFolder(name: string): Promise<ProviderFolder>
   listMessages(options?: ListOptions): Promise<ProviderListResult<MailMessage>>

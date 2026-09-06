@@ -36,7 +36,6 @@ export interface ProviderCapabilities {
   send: boolean
   reply: boolean
   threads: boolean
-  nativeThreads: boolean
   folders: boolean
   createFolders: boolean
   labels: boolean
@@ -47,13 +46,7 @@ export interface ProviderCapabilities {
   markUnread: boolean
   star: boolean
   attachments: boolean
-  attachmentDownload: boolean
   search: boolean
-  drafts: boolean
-  scheduledSend: boolean
-  snooze: boolean
-  readReceipts: boolean
-  pushNotifications: boolean
 }
 
 export interface MailAccount {

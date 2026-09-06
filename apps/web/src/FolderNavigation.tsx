@@ -15,6 +15,8 @@ type FolderNavigationProps = {
   onCreateLabel: () => void;
   onEditLabel: (label: string) => void;
   canManageLabels?: boolean;
+  /** Static folders whose provider capability the active source lacks; omitted rather than shown disabled. */
+  hiddenFolders?: readonly string[];
 };
 
 function FolderNavigation({
@@ -30,6 +32,7 @@ function FolderNavigation({
   onCreateLabel,
   onEditLabel,
   canManageLabels = true,
+  hiddenFolders = [],
 }: FolderNavigationProps) {
   return (
     <>
@@ -47,7 +50,7 @@ function FolderNavigation({
         </button>
         <nav className="folder-list" aria-label="Folders">
           {folders
-            .filter(([folder]) => folder !== "All Mail")
+            .filter(([folder]) => folder !== "All Mail" && !hiddenFolders.includes(folder))
             .map(([folder, key]) => (
               <button
                 className={`folder-item ${folder === currentFolder ? "active" : ""}`}
@@ -64,8 +67,8 @@ function FolderNavigation({
                     </small>
                   )}
                 </span>
-                {folder === "Inbox" && (
-                  <span className="folder-count">{inboxCount ?? "…"}</span>
+                {folder === "Inbox" && inboxCount != null && (
+                  <span className="folder-count">{inboxCount}</span>
                 )}
                 {key && (
                   <span className="shortcut">

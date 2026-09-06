@@ -124,6 +124,7 @@ export type MailboxOption = {
   email: string;
   canSend: boolean;
   selectorKind?: "all" | "domain" | "address";
+  selectorValue?: string;
 };
 export type SendOptions = { instant?: boolean; markDone?: boolean };
 export type Preferences = {
@@ -151,9 +152,10 @@ export type Preferences = {
 };
 
 export const accounts = ["mira@example.test", "noah@example.test"];
-export const folders = [
+/** Name, shortcut key, icon, and the provider capability a source must expose for the folder to be offered (empty: always). */
+export const folders: ReadonlyArray<readonly [name: string, key: string, icon: string, capability?: "star" | "folders" | "trash"]> = [
   ["Inbox", "i", "Inbox"],
-  ["Starred", "s", "Star"],
+  ["Starred", "s", "Star", "star"],
   ["Drafts", "d", "PencilSquircle"],
   ["Sent", "t", "Send"],
   ["Done", "e", "Check"],
@@ -162,8 +164,8 @@ export const folders = [
   ["Reminders", "h", "Clock"],
   ["Muted", "m", "Envelope"],
   ["Snippets", ";", "Snippet"],
-  ["Spam", "!", "Shield"],
-  ["Trash", "#", "Trash"],
+  ["Spam", "!", "Shield", "folders"],
+  ["Trash", "#", "Trash", "trash"],
   ["All Mail", "a", "Envelope"],
 ];
 export const defaultPreferences: Preferences = {

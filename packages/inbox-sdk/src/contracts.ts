@@ -1,7 +1,6 @@
 import type { Database } from 'bun:sqlite'
 import type { InboxProvider, ProviderCredentials, MessageMutation, SyncCursor, SendingIdentity } from '../server/sdk/types'
 import type { Participant, ProviderCapabilities } from './types'
-import type { ConnectionSources } from '../server/sdk/mail-sources'
 
 export const API_VERSION = '1' as const
 export type { Participant, ProviderCapabilities, SendingIdentity }
@@ -76,6 +75,53 @@ export interface MediaOptions {
 
 export interface MediaContent { contentType: string; content: Uint8Array; noStore?: boolean }
 
+/** A choice offered by a select field. Optional overrides adapt the other fields to that choice. */
+export interface ProviderOnboardingOption {
+  value: string
+  label: string
+  /** Replacement method summary when this option stands alone or is selected. */
+  summary?: string
+  /** Replacement labels for named fields while this option is selected. */
+  fieldLabels?: Readonly<Record<string, string>>
+  /** Fields that do not apply while this option is selected; they are not collected. */
+  hiddenFields?: readonly string[]
+  credentialHelp?: ProviderCredentialHelp
+}
+
+export interface ProviderOnboardingField {
+  name: string
+  label: string
+  type: 'text' | 'password' | 'email' | 'select'
+  required: boolean
+  /** Shown only in the collapsed advanced section. */
+  advanced?: boolean
+  defaultValue?: string
+  options?: readonly ProviderOnboardingOption[]
+}
+
+export interface ProviderCredentialHelp { text: string; url: string; linkLabel: string }
+
+/**
+ * Descriptor-driven onboarding: everything a host UI needs to collect a provider's credentials
+ * without provider-specific code. Hosts add readiness, secrets and presets; they do not author copy.
+ */
+export interface ProviderOnboarding {
+  /** Short method summary shown in the provider list, e.g. "Email and app-specific password". */
+  summary?: string
+  /** Submit label for a new connection; hosts fall back to "Connect <name>". */
+  actionLabel?: string
+  /** Shown before an OAuth redirect starts, e.g. where the user is sent and that they return here. */
+  redirectNote?: string
+  /** Credential fields collected by the host, in display order. Ignored for OAuth providers. */
+  fields?: readonly ProviderOnboardingField[]
+  /** Guidance for obtaining the credential, with a link the user can follow. */
+  credentialHelp?: ProviderCredentialHelp
+  /** Explains the collapsed advanced section when advanced fields exist. */
+  advancedNote?: string
+  /** Default explanation when the host cannot offer this provider yet; hosts override with specifics. */
+  setupMessage?: string
+}
+
 export interface ProviderDefinition {
   id: string
   name: string
@@ -86,10 +132,11 @@ export interface ProviderDefinition {
   /** Runtime cancellation is separate from provider-validated credential fields. */
   create(credentials: ProviderCredentials & Record<string, unknown>, context?: { signal: AbortSignal }): InboxProvider | Promise<InboxProvider>
   refresh?(credentials: Record<string, unknown>, signal: AbortSignal, context?: CredentialContext): Promise<Record<string, unknown>>
-  discover?(provider: InboxProvider): Promise<ConnectionSources>
   mailboxSelection?: 'automatic' | 'manual'
   /** False when the provider cannot prove that replacement credentials address the same store. */
   credentialReconnect?: boolean
+  /** Host-independent onboarding descriptor. Without it, hosts show only the provider name. */
+  onboarding?: ProviderOnboarding
 }
 
 export interface InboxOptions {
@@ -204,6 +251,8 @@ export interface MailboxSyncStatus {
   /** Opaque binding to the current effective source selection, not an individual mailbox view. */
   scopeKey: string
   state: 'syncing' | 'waiting' | 'error' | 'paused' | 'idle'
+  /** Persisted source coverage; optional for compatibility with older SDK hosts. */
+  coverage?: Account['sync']['coverage']
   activeLanes: Array<'latest' | 'backfill'>
   /** Earliest permitted retry, not a promise that a worker will run then. */
   retryAt: string | null

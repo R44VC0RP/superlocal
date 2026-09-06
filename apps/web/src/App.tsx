@@ -214,13 +214,17 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     const url = new URL(location.href);
     const connection = url.searchParams.get("connection");
     if (connection !== "connected" && connection !== "failed") return;
-    const providerId = url.searchParams.get("provider") || "gmail";
+    const providerId = url.searchParams.get("provider");
     const connectionId = url.searchParams.get("connectionId");
     for (const key of ["connection", "provider", "connectionId"]) url.searchParams.delete(key);
     history.replaceState(history.state, "", url);
-    if (connection === "connected") {
+    if (connection === "connected" && providerId) {
       // Resume inline setup without closing any other settings draft on completion.
       setOnboardingReturn({ providerId, connectionId: /^[A-Za-z0-9_-]{1,128}$/.test(connectionId ?? "") ? connectionId : null });
+      openSettings("Add Accounts");
+    } else if (connection === "connected") {
+      // No provider identified: never assume one. Finish setup from the account list instead.
+      setNotice({ text: "Account connected. Finish setup in Add Accounts." });
       openSettings("Add Accounts");
     } else {
       setNotice({ text: "Account connection could not be completed. Try again in Add Accounts." });
@@ -311,6 +315,16 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const matchingWindow = inbox.host?.inboxWindow && inbox.window && JSON.stringify(inbox.window.query) === JSON.stringify(windowQuery) ? inbox.window : null;
   const activeWindow = inbox.host?.inboxWindow ? matchingWindow ?? { keys: [], totals: unknownTotals } : undefined;
   useEffect(() => { void store.setWindowQuery(windowQuery).catch(actionError); }, [store, windowQuery]);
+  // Fast opens and retained views show nothing; only a genuinely slow load announces itself.
+  const [slowLoading, setSlowLoading] = useState(false);
+  useEffect(() => {
+    if (!inbox.loading) { setSlowLoading(false); return; }
+    const timer = setTimeout(() => setSlowLoading(true), 150);
+    return () => clearTimeout(timer);
+  }, [inbox.loading]);
+  // Static folders follow the receiving sources' capabilities; a unified view offers what any selected source supports.
+  const hiddenFolders = useMemo(() => folders.filter(([, , , capability]) => capability && !store.sourceCapability(capability, route.account)).map(([name]) => name),
+    [store, inbox.sources, inbox.mailboxes, inbox.viewPreferences, route.account]);
   useEffect(() => {
     setThreadLookupIssue(null);
     if (!inbox.host?.inboxWindow || !route.thread) { store.pinWindow("reader", []); return; }
@@ -1108,7 +1122,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   function updateDraft(draft: Draft) {
     const current = drafts.find(value => value.id === draft.id);
     if (current && current.account !== draft.account) {
-      void store.moveDraft(draft.id, draft.account).then(moved => {
+      void store.moveDraft(draft.id, draft.account, draft.from).then(moved => {
         navigate({ account: moved.account, draft: moved.id, thread: undefined, view: undefined });
       }).catch(actionError);
     } else store.editDraft(draft);
@@ -2109,7 +2123,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                     <span className="select-square checked">
                       <Icon name="Check" size={11} />
                     </span>
-                    <span>{windowSelection ? windowSelection.count ?? "…" : selected.length} selected</span>
+                    <span>{windowSelection ? windowSelection.count == null ? "All selected" : `${windowSelection.count} selected` : `${selected.length} selected`}</span>
                     <Icon name="ChevronDown" size={13} />
                   </button>
                   {[
@@ -2144,9 +2158,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                       onClick={() => goFolder("Inbox", split)}
                     >
                       <span className="split-tab-label">{split}</span>
-                      <span className="split-tab-count">
-                        {splitCounts[split] == null ? "…" : splitCounts[split] || ""}
-                      </span>
+                      {splitCounts[split] ? (
+                        <span className="split-tab-count">{splitCounts[split]}</span>
+                      ) : null}
                     </button>
                   ))}
                   <IconButton
@@ -2326,7 +2340,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                 />
               )}
               {inbox.host?.inboxWindow && !currentMail && <div className="mail-window-status" role="status">
-                {inbox.loading ? "Loading conversations…" : null}
+                {inbox.loading && slowLoading ? "Loading conversations…" : null}
                 {!inbox.loading && matchingWindow?.keys.length === 0 && (!matchingWindow.exhausted || matchingWindow.hasNewer) && (matchingWindow.nextCursor || matchingWindow.hasNewer
                   ? <span>No matches in the conversations checked.</span>
                   : <><span>Could not finish loading this view.</span><button type="button" className="text-button" disabled={inbox.refreshing} onClick={() => { void store.refresh().catch(actionError); }}>Retry</button></>)}
@@ -2547,6 +2561,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         }}
         onEditLabel={editLabel}
         canManageLabels={!isUnified}
+        hiddenFolders={hiddenFolders}
       />
       <MailCommandDialog
         mode={commandMode ?? "command"}

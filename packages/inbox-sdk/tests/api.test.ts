@@ -36,6 +36,7 @@ import { trainClassifier, predictClassifier, evaluateClassifier, evaluatePredict
 import { validateLinearModel, predictLinearClassifier, type LinearModel } from '../../../apps/local-host/src/classification/linear'
 import { auditExamples, auditInputHash, compareAudits } from '../../../apps/local-host/src/classification/audit'
 import { createMockHost } from '../../../apps/mock-api/src/host'
+import { createMockProviderDefinition } from '../../../apps/mock-api/src/provider'
 import { MockMailStore } from '../../../apps/mock-api/src/store'
 import { seedMockMail } from '../../../apps/mock-api/src/seed'
 import type {
@@ -52,7 +53,7 @@ import type { ConnectionSources } from '../server/sdk/mail-sources'
 import type {
   Attachment, AttachmentData, InboxProvider, MailAccount, MailMessage, MailThread,
   MessageMutation, Participant, ProviderCapabilities, ProviderCredentials,
-  ProviderFolder, SendInput, SendResult, SyncCursor, SyncOptions, SyncResult,
+  ProviderFolder, SendInput, SendResult, SyncContext, SyncCursor, SyncOptions, SyncResult,
 } from '../server/sdk/types'
 
 const TEMP_ROOT = '/private/var/folders/2j/6mslx1715gx8frsyn66sf1sh0000gn/T/opencode'
@@ -795,12 +796,16 @@ describe('Google application authentication', () => {
     // Only native mailbox adapters are replaced; BA, encrypted SDK storage, owner
     // checks, routes, and real host onboarding descriptors execute unchanged.
     const gmailFactory = spyOn(gmail, 'create').mockImplementation(credentials => factory('gmail', credentials))
-    const inboundFactory = spyOn(inbound, 'create').mockImplementation(credentials => factory('inbound', credentials))
-    const inboundDiscovery = spyOn(inbound, 'discover').mockImplementation(async provider => {
-      const account = await provider.getAccount()
-      return { identities: [{ email: account.email, name: account.name }], sources: [{ kind: 'address', value: account.email, canReceive: true, canSend: true, canFilter: true }] }
+    const inboundFactory = spyOn(inbound, 'create').mockImplementation(credentials => {
+      const provider = factory('inbound', credentials)
+      provider.identities = async () => {
+        const account = await provider.getAccount()
+        return { sending: [{ email: account.email, isPrimary: true, isDefault: true }],
+          receiving: [{ kind: 'address', value: account.email, canReceive: true, canSend: true, canFilter: true }] }
+      }
+      return provider
     })
-    cleanup.push(async () => { gmailFactory.mockRestore(); inboundFactory.mockRestore(); inboundDiscovery.mockRestore() })
+    cleanup.push(async () => { gmailFactory.mockRestore(); inboundFactory.mockRestore() })
     const f = await fixture(['allowed@example.test', 'other@example.test'], true)
     const config = { ...f.config, providers: { ...f.config.providers, inbound: { enabled: true } } }
     await f.restart(config)
@@ -1561,23 +1566,106 @@ describe('IMAP host onboarding boundary', () => {
       }
     } finally { host.inbox.createConnection = original }
   })
+
+  test('onboarding descriptors, configurable provider ids and connect failures derive from SDK definitions, not per-provider host code', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'descriptor-host-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const configPath = join(root, 'local.json')
+    const generated = loadLocalConfig({ configPath, environment: {} })
+    const session = async (host: Awaited<ReturnType<typeof createLocalHost>>) => {
+      const base = `http://localhost:${host.config.backend.port}`
+      const response = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: host.config.web.origin, 'X-Superlocal': '1' } }))
+      const headers = { Origin: host.config.web.origin, Cookie: response.headers.get('set-cookie')!.split(';')[0]!, 'Content-Type': 'application/json' }
+      return { base, headers, providers: async () => (await (await host.fetch(new Request(`${base}/host/config`, { headers }))).json()).providers as Array<Record<string, any>> }
+    }
+    // Mock mode: the offline definition describes itself; nothing is hand-built for the browser.
+    const mockHost = await createLocalHost({ ...generated, dataDir: join(root, 'mock-runtime') }, {})
+    cleanup.push(() => mockHost.close())
+    const mockDefinition = createMockProviderDefinition(new MockMailStore(join(root, 'unused-upstream.sqlite')))
+    expect(await (await session(mockHost)).providers()).toEqual([expect.objectContaining({ id: 'mock', name: mockDefinition.name, connection: 'none', ready: true, mailboxSelection: 'automatic', connectionIds: expect.any(Array) })])
+    // Every built-in SDK provider is a configuration key: Outlook can be enabled without host changes; unknown ids are rejected.
+    const raw = JSON.parse(await readFile(configPath, 'utf8'))
+    expect(raw.providers.outlook).toEqual({ enabled: false })
+    delete raw.providers.outlook
+    await writeFile(configPath, JSON.stringify({ ...raw, providers: { ...raw.providers, inbound: { enabled: true }, gmail: { ...raw.providers.gmail, enabled: true },
+      imap: { enabled: true, servers: [{ id: 'fixture-mail', name: 'Fixture Mail', imap: { host: 'imap.fixture-mail.invalid-tld.net', port: 993, secure: true }, sentCopy: 'server' }] } } }))
+    expect(loadLocalConfig({ configPath, environment: {} }).providers.outlook).toEqual({ enabled: false })
+    await writeFile(configPath, JSON.stringify({ ...raw, providers: { ...raw.providers, outlook: { enabled: true }, inbound: { enabled: true }, gmail: { ...raw.providers.gmail, enabled: true },
+      imap: { enabled: true, servers: [{ id: 'fixture-mail', name: 'Fixture Mail', imap: { host: 'imap.fixture-mail.invalid-tld.net', port: 993, secure: true }, sentCopy: 'server' }] } } }))
+    const config = loadLocalConfig({ configPath, environment: {} })
+    expect(config.providers.outlook).toEqual({ enabled: true })
+    await writeFile(configPath, JSON.stringify({ ...raw, providers: { ...raw.providers, fastmail: { enabled: true } } }))
+    expect(() => loadLocalConfig({ configPath, environment: {} })).toThrow()
+    await writeFile(configPath, JSON.stringify({ ...raw, providers: { ...raw.providers, outlook: { enabled: 'yes' } } }))
+    expect(() => loadLocalConfig({ configPath, environment: {} })).toThrow()
+    const host = await createLocalHost({ ...config, mode: 'real', dataDir: join(root, 'real-runtime') }, {})
+    cleanup.push(() => host.close())
+    const { base, headers, providers } = await session(host)
+    const listed = await providers()
+    const definition = (id: string) => builtInProviders.find(provider => provider.id === id)!
+    expect(listed.map(provider => provider.id)).toEqual(builtInProviders.map(provider => provider.id))
+    // OAuth without a configured client: the SDK copy is present, the host adds readiness and its own setup instructions.
+    expect(listed.find(provider => provider.id === 'gmail')).toEqual(expect.objectContaining({ connection: 'oauth', ready: false, mailboxSelection: 'automatic',
+      summary: definition('gmail').onboarding!.summary, actionLabel: definition('gmail').onboarding!.actionLabel, redirectNote: definition('gmail').onboarding!.redirectNote, setupMessage: expect.stringContaining('providers.gmail.oauth.clientId') }))
+    expect(listed.find(provider => provider.id === 'gmail')!.fields).toBeUndefined()
+    expect(listed.find(provider => provider.id === 'outlook')).toEqual(expect.objectContaining({ connection: 'oauth', ready: false, actionLabel: 'Sign in with Microsoft', setupMessage: expect.stringContaining('Outlook') }))
+    expect(listed.find(provider => provider.id === 'inbound')).toEqual(expect.objectContaining({ connection: 'credentials', ready: true, mailboxSelection: 'manual',
+      summary: definition('inbound').onboarding!.summary, fields: definition('inbound').onboarding!.fields }))
+    // Two IMAP presets: a select field carries per-preset labels, hidden fields and help; the SDK's generic field copy remains the base.
+    const imap = listed.find(provider => provider.id === 'imap')!
+    expect(imap).toEqual(expect.objectContaining({ name: 'IMAP', connection: 'credentials', ready: true, reconnect: true, mailboxSelection: 'automatic', summary: definition('imap').onboarding!.summary,
+      advancedNote: definition('imap').onboarding!.advancedNote }))
+    expect(imap.credentialHelp).toBeUndefined()
+    expect(imap.fields.map((field: { name: string }) => field.name)).toEqual(['preset', 'email', 'password', 'imapUsername', 'smtpUsername'])
+    expect(imap.fields[0]).toEqual(expect.objectContaining({ type: 'select', defaultValue: 'icloud', options: [
+      expect.objectContaining({ value: 'icloud', label: 'iCloud Mail', fieldLabels: { password: 'App-specific password' }, hiddenFields: ['imapUsername', 'smtpUsername'], credentialHelp: expect.objectContaining({ url: 'https://support.apple.com/en-us/102654', linkLabel: expect.any(String) }) }),
+      { value: 'fixture-mail', label: 'Fixture Mail' },
+    ] }))
+    expect(imap.fields[2]).toEqual(expect.objectContaining({ name: 'password', label: 'Mail password' }))
+    expect(JSON.stringify(listed)).not.toContain('imap.mail.me.com')
+    // Connect failures share one host vocabulary keyed on the SDK code; provider detail and raw messages stay server-side.
+    const original = host.inbox.createConnection
+    const failures: Array<[unknown, number, string]> = [
+      [new InboxError('CONNECTION_EXISTS', 'private-upstream-detail', 409), 409, 'HOST_CONNECT_ALREADY_CONNECTED'],
+      [new InboxError('AUTHENTICATION', 'private-upstream-detail', 401), 409, 'HOST_CONNECT_AUTHENTICATION'],
+      [new CredentialError('revoked', 'private-upstream-detail'), 409, 'HOST_CONNECT_AUTHENTICATION'],
+      [new InboxError('VALIDATION', 'private-upstream-detail', 400), 400, 'HOST_INVALID_CREDENTIALS'],
+      [new InboxError('RATE_LIMITED', 'private-upstream-detail', 429), 429, 'HOST_CONNECT_RATE_LIMITED'],
+      [new TypeError('private-upstream-detail'), 409, 'HOST_CONNECT_FAILED'],
+    ]
+    try {
+      for (const [error, status, code] of failures) {
+        host.inbox.createConnection = async () => { throw error }
+        for (const [path, credentials] of [['inbound', { apiKey: 'synthetic-key' }], ['imap', { preset: 'fixture-mail', email: 'reader@fixture-mail.invalid-tld.net', password: 'synthetic-password' }]] as const) {
+          const response = await host.fetch(new Request(`${base}/host/providers/${path}/connect`, { method: 'POST', headers, body: JSON.stringify({ credentials }) }))
+          expect([path, response.status]).toEqual([path, status])
+          const body = await response.json()
+          expect(body.code).toBe(code)
+          expect(JSON.stringify(body)).not.toContain('private-upstream-detail')
+        }
+      }
+      host.inbox.createConnection = async () => ({ id: 'synthetic-connection' }) as Connection
+      // Fields hidden by the selected preset are refused like undeclared ones; OAuth without a coordinator cannot start.
+      expect((await host.fetch(new Request(`${base}/host/providers/imap/connect`, { method: 'POST', headers, body: JSON.stringify({ credentials: { preset: 'icloud', email: 'reader@icloud.com', password: 'p', imapUsername: 'reader' } }) }))).status).toBe(400)
+      expect((await host.fetch(new Request(`${base}/host/providers/imap/connect`, { method: 'POST', headers, body: JSON.stringify({ credentials: { preset: 'fixture-mail', email: 'reader@fixture-mail.invalid-tld.net', password: 'p', imapUsername: 'reader' } }) }))).status).toBe(200)
+      expect((await host.fetch(new Request(`${base}/host/providers/outlook/connect`, { method: 'POST', headers, body: '{}' }))).status).toBe(409)
+      expect((await (await host.fetch(new Request(`${base}/host/providers/outlook/connect`, { method: 'POST', headers, body: '{}' }))).json()).code).toBe('HOST_PROVIDER_NOT_READY')
+      expect((await host.fetch(new Request(`${base}/host/providers/fastmail/connect`, { method: 'POST', headers, body: '{}' }))).status).toBe(404)
+    } finally { host.inbox.createConnection = original }
+  })
 })
 
 const fullCapabilities: ProviderCapabilities = {
   sync: true, incrementalSync: true, deltaSync: true, send: true, reply: true,
-  threads: true, nativeThreads: true, folders: true, createFolders: true,
+  threads: true, folders: true, createFolders: true,
   labels: true, archive: true, trash: true, permanentDelete: true, markRead: true,
-  markUnread: true, star: true, attachments: true, attachmentDownload: true,
-  search: true, drafts: true, scheduledSend: true, snooze: true,
-  readReceipts: true, pushNotifications: true,
+  markUnread: true, star: true, attachments: true, search: true,
 }
 const restrictedCapabilities: ProviderCapabilities = {
   ...fullCapabilities,
-  send: false, reply: false, nativeThreads: false, createFolders: false,
+  send: false, reply: false, createFolders: false,
   labels: false, archive: false, trash: false, permanentDelete: false,
-  markRead: false, markUnread: false, star: false, attachments: false,
-  search: false, drafts: false, scheduledSend: false, snooze: false,
-  readReceipts: false, pushNotifications: false,
+  markRead: false, markUnread: false, star: false, attachments: false, search: false,
 }
 
 function participant(email: string, name = email): Participant { return { email, name } }
@@ -1645,7 +1733,7 @@ function referenceMailbox(key: string, email: string, seed: MailMessage[], alias
     getAccount: 0, listFolders: 0, listMessages: 0, listThreads: 0,
     getMessage: [] as string[], getThread: [] as string[], disconnect: 0,
     createFolder: [] as string[],
-    sync: [] as Array<{ cursor: SyncCursor | string | null; options: SyncOptions }>,
+    sync: [] as Array<{ cursor: SyncCursor | string | null; options: SyncOptions; context?: SyncContext }>,
     send: [] as SendInput[],
     mutate: [] as Array<{ id: string; changes: MessageMutation }>,
     attachment: [] as Array<{ messageId: string; attachmentId: string; contentId?: string }>,
@@ -1759,8 +1847,8 @@ function referenceMailbox(key: string, email: string, seed: MailMessage[], alias
           if (!row) throw new ProviderNotFoundError(type)
           return row
         },
-        async sync(cursor = null, options = {}) {
-          calls.sync.push({ cursor: structuredClone(cursor), options: structuredClone(options) })
+        async sync(cursor = null, options = {}, context) {
+          calls.sync.push({ cursor: structuredClone(cursor), options: structuredClone(options), context: structuredClone(context) })
           if (!capabilities.sync) throw new UnsupportedOperationError(type, 'sync')
           if (syncReceipts.length) {
             const result = await receive(syncReceipts.shift()!)
@@ -1888,19 +1976,20 @@ async function fixture(options: Partial<InboxOptions> & { googleOAuth?: GoogleOA
   const definitions: ProviderDefinition[] = [FULL, RESTRICTED, DYNAMIC, SCOPED, ...(options.googleOAuth ? ['gmail'] : [])].map(id => ({
     id, name: id, connection: id === 'gmail' ? 'oauth' : 'credentials', scopes: ['mail'],
     nativeCategoryRoles: { 'native-promotions': 'promotions' },
-    ...(id === SCOPED ? {
-      mailboxSelection: 'manual' as const,
-      async discover(provider: InboxProvider) {
-        const data = discoveries.get((await provider.getAccount()).name)
-        if (!data) throw new ProviderError(id, 'VALIDATION', 'Reference discovery was not configured')
-        return structuredClone(data)
-      },
-    } : {}),
+    ...(id === SCOPED ? { mailboxSelection: 'manual' as const } : {}),
     create(credentials) {
       if (id === SCOPED && credentials.apiKey !== SECRET) throw new ProviderAuthenticationError(id, 'Invalid reference API key')
       const box = boxes.get(id === 'gmail' ? google.access.get(String(credentials.accessToken)) ?? '' : String(credentials.mailbox))
       if (!box) throw new ProviderAuthenticationError(id, 'Unknown reference mailbox')
-      return box.adapter(credentials, id, id === RESTRICTED ? restrictedCapabilities : fullCapabilities)
+      const provider = box.adapter(credentials, id, id === RESTRICTED ? restrictedCapabilities : fullCapabilities)
+      if (id === SCOPED) provider.identities = async () => {
+        const account = await provider.getAccount(), data = discoveries.get(account.name)
+        if (!data) throw new ProviderError(id, 'VALIDATION', 'Reference discovery was not configured')
+        return { sending: data.identities.map(({ email }) => ({ email,
+          isPrimary: email.toLowerCase() === account.email.toLowerCase(), isDefault: email.toLowerCase() === account.email.toLowerCase() })),
+          receiving: structuredClone(data.sources) }
+      }
+      return provider
     },
   }))
   const settings: InboxOptions = {
@@ -5754,7 +5843,7 @@ describe('mail HTTP ownership and provider lifecycle', () => {
       providerId, credentials: { mailbox: 'local-workflows', accessToken: SECRET },
     }, 'POST', 201)
     await h.sync('alice', account.id)
-    expect(account.capabilities).toMatchObject({ snooze: false, scheduledSend: false, drafts: false, labels: false })
+    expect(account.capabilities).toEqual(capabilities)
     expect(account.features).toMatchObject({ snooze: true, scheduledSend: true, undoSend: true, localDrafts: true, localLabels: true })
     const message = (await h.page()).items[0]!
     await h.mutate('alice', [message.id], { snoozedUntil: new Date(EPOCH + 60_000).toISOString() }, 'local-only-snooze')
@@ -6952,7 +7041,7 @@ describe('blob privacy and draft editing', () => {
 })
 
 describe('source-scoped sending identities', () => {
-  test('token-only Gmail grants discover and send through the real adapter while preserving the native primary fence', async () => {
+  test('token-only Gmail uses one cached identity exchange per send and accepts normalized or aliased primaries', async () => {
     const primary = 'primary@example.test', alias = 'accepted@example.test', pending = 'pending@example.test'
     const calls: string[] = [], sent: string[] = []
     let responsePrimary = primary
@@ -6975,7 +7064,7 @@ describe('source-scoped sending identities', () => {
         if (request.method === 'POST' && url.pathname === '/gmail/v1/users/me/messages/send') {
           const body = await request.json() as { raw: string }
           sent.push(Buffer.from(body.raw, 'base64url').toString('utf8'))
-          return Response.json({ id: 'fictional-gmail-sent', threadId: 'fictional-gmail-thread' })
+          return Response.json({ id: `fictional-gmail-sent-${sent.length}`, threadId: 'fictional-gmail-thread' })
         }
         throw new Error('Unexpected Gmail request; live network is forbidden')
       }) as typeof fetch,
@@ -6985,6 +7074,7 @@ describe('source-scoped sending identities', () => {
     // Matches the OAuth grant shape: profile email is not copied into credentials.
     const account = await client.connect({ providerId: 'gmail', credentials: { accessToken: SECRET } })
     expect(account).toMatchObject({ providerId: 'gmail', email: primary, status: 'connected' })
+    expect(calls.filter(call => call.endsWith('/settings/sendAs'))).toHaveLength(0)
     const response = await h.request('alice', `/accounts/${account.id}/sending-identities`)
     expect(response.status).toBe(200)
     expect(response.headers.get('cache-control')).toBe('no-store')
@@ -6999,16 +7089,106 @@ describe('source-scoped sending identities', () => {
     await h.inbox.runDue()
     expect(await client.operation(operation.id)).toMatchObject({ accountId: account.id, status: 'succeeded' })
     expect(sent).toHaveLength(1)
+    expect(calls.filter(call => call.endsWith('/settings/sendAs'))).toHaveLength(1)
     expect(sent[0]!.split(/\r?\n/).find(line => line.startsWith('From:'))).toBe(`From: ${alias}`)
+    // Once stale, submit fetches one new set; immediate dispatch reuses that set.
+    h.clock.value += 60_001
+    const cold = await client.createDraft({ accountId: account.id, from: alias, to: [participant('recipient@example.test')] })
+    const coldOperation = await client.submit(cold.id, { revision: cold.revision, idempotencyKey: 'token-only-cold' })
+    expect(calls.filter(call => call.endsWith('/settings/sendAs'))).toHaveLength(2)
+    await h.inbox.runDue()
+    expect(await client.operation(coldOperation.id)).toMatchObject({ status: 'succeeded' })
+    expect(calls.filter(call => call.endsWith('/settings/sendAs'))).toHaveLength(2)
     const unverified = await client.createDraft({ accountId: account.id, from: pending, to: [participant('recipient@example.test')] })
     await expect(client.submit(unverified.id, { revision: unverified.revision, idempotencyKey: 'token-only-pending' })).rejects.toMatchObject({ code: 'FORBIDDEN_SENDER', status: 403 })
-    responsePrimary = 'different-account@example.test'
-    await expect(client.sendingIdentities(account.id, { refresh: true })).rejects.toMatchObject({ code: 'INVALID_PROVIDER', status: 502 })
+    responsePrimary = primary.toUpperCase()
+    expect((await client.sendingIdentities(account.id, { refresh: true })).identities[0]).toEqual({ email: responsePrimary, isPrimary: true, isDefault: true })
+    expect(h.logs.filter(log => log.code === 'SENDING_PRIMARY_ALIAS')).toEqual([])
+    responsePrimary = 'canonical-alias@example.test'
+    expect((await client.sendingIdentities(account.id, { refresh: true })).identities[0]).toEqual({ email: responsePrimary, isPrimary: true, isDefault: true })
+    expect(h.logs.filter(log => log.code === 'SENDING_PRIMARY_ALIAS')).toEqual([{ code: 'SENDING_PRIMARY_ALIAS', operation: 'identities' }])
     expect((await client.account(account.id)).email).toBe(primary)
-    expect(sent).toHaveLength(1)
+    expect(sent).toHaveLength(2)
     expect(calls.filter(call => call.endsWith('/profile'))).toHaveLength(1)
     expect(calls.filter(call => call.endsWith('/labels/INBOX'))).toHaveLength(1)
-    expect(calls.filter(call => call.endsWith('/settings/sendAs'))).toHaveLength(5)
+    expect(calls.filter(call => call.endsWith('/settings/sendAs'))).toHaveLength(4)
+  })
+
+  test('providers without identities derive a usable single From and default from account email or a sole alias', async () => {
+    for (const email of ['legacy@example.test', '']) {
+      const sender = email || 'sole-alias@example.test'
+      const box = referenceMailbox('fallback-sender', email, [], email ? [] : [sender, sender.toUpperCase()])
+      const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => box.adapter(credentials, DYNAMIC, fullCapabilities) }] })
+      const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+      expect((await h.inbox.mailbox('alice', account.id)).defaultSender).toBe(sender)
+      expect(await h.inbox.sendingIdentities('alice', account.id)).toEqual({ sourceId: account.id, checkedAt: null,
+        identities: [{ email: sender, isPrimary: Boolean(email), isDefault: Boolean(email) }] })
+      const draft = await h.draft('alice', account.id, { to: [participant('recipient@example.test')] })
+      expect(draft.from).toBe(sender)
+      await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+      const operation = await h.submit('alice', draft, 'fallback-sender')
+      await h.inbox.runDue()
+      expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'succeeded' })
+      expect(box.calls.send.map(input => input.from)).toEqual([sender])
+    }
+  })
+
+  test('offline mock identities retain receiving scopes without scanning mail or losing store ownership', async () => {
+    const store = new MockMailStore(':memory:')
+    try {
+      const mailbox = store.createMailbox({ owner: 'alice', seedKey: 'identities', name: 'Fictional mailbox',
+        email: 'reader@example.test', aliases: ['alias@example.test'], color: '#123456' })
+      const definition = createMockProviderDefinition(store)
+      const h = await fixture({ providers: [definition] })
+      const account = await h.inbox.connect('alice', { providerId: definition.id, credentials: { databaseId: store.identity, storeId: mailbox.id } })
+      store.linkSource({ owner: 'alice', storeId: mailbox.id, accountId: account.id }, account.connectionId!)
+      const inventory = spyOn(store, 'snapshot').mockImplementation(() => { throw new Error('Identity discovery must not scan mail') })
+      try {
+        expect((await h.inbox.sendingIdentities('alice', account.id)).identities).toEqual([
+          { email: mailbox.email, isPrimary: true, isDefault: true }, { email: mailbox.aliases[0]!, isPrimary: false, isDefault: false },
+        ])
+        expect((await h.inbox.mailboxCandidates('alice', account.connectionId!)).map(candidate => ({ selector: candidate.selector, identities: candidate.identities }))).toEqual([
+          { selector: { kind: 'address', value: mailbox.email }, identities: [mailbox.email] },
+          { selector: { kind: 'address', value: mailbox.aliases[0]! }, identities: mailbox.aliases },
+          { selector: { kind: 'domain', value: 'example.test' }, identities: [mailbox.email, ...mailbox.aliases] },
+        ])
+        await expect(h.inbox.sendingIdentities('bob', account.id)).rejects.toMatchObject({ code: 'NOT_FOUND' })
+        await expect(h.inbox.mailboxCandidates('bob', account.connectionId!)).rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(inventory).not.toHaveBeenCalled()
+      } finally { inventory.mockRestore() }
+    } finally { store.close() }
+  })
+
+  test('a provider without account email derives the single sender at creation and identity refresh', async () => {
+    const sole = { email: 'verified@example.test', isPrimary: true, isDefault: true }
+    for (const initiallyEmpty of [false, true]) {
+      const box = referenceMailbox('no-account-email', '', [native('reply-parent')])
+      let identities = initiallyEmpty ? [] : [sole], calls = 0
+      const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
+        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() { calls++; return { sending: structuredClone(identities) } },
+      }) }] })
+      const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
+      expect(account.capabilities.send).toBe(true)
+      expect((await h.inbox.mailbox('alice', account.id)).defaultSender).toBe(initiallyEmpty ? null : sole.email)
+      expect(calls).toBe(1)
+      if (initiallyEmpty) {
+        identities = [sole]
+        await h.inbox.sendingIdentities('alice', account.id, { refresh: true })
+        expect((await h.inbox.mailbox('alice', account.id)).defaultSender).toBe(sole.email)
+      }
+      await h.inbox.sync('alice', account.id)
+      const parent = (await h.inbox.messages('alice', { accountId: account.id })).items[0]!
+      const reply = await h.inbox.createDraft('alice', { accountId: account.id, sourceMessageId: parent.id, mode: 'reply' })
+      expect(reply.from).toBe(sole.email)
+      const draft = await h.draft('alice', account.id, { mailboxId: account.id, to: [participant('recipient@example.test')] })
+      expect(draft.from).toBe(sole.email)
+      await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
+      const operation = await h.submit('alice', draft, 'email-less-sender')
+      await h.inbox.runDue()
+      expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'succeeded' })
+      expect(calls).toBe(initiallyEmpty ? 2 : 1)
+      expect(box.calls.send.map(input => input.from)).toEqual([sole.email])
+    }
   })
 
   test('sending identities use an owner/source cache, explicit refresh, bounded metadata and no-store HTTP/client', async () => {
@@ -7019,7 +7199,7 @@ describe('source-scoped sending identities', () => {
     let wait: (() => Promise<SendingIdentity[]>) | undefined
     const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
       ...box.adapter(credentials, DYNAMIC, fullCapabilities),
-      async getSendingIdentities() { calls++; return wait ? wait() : structuredClone(identities) },
+      async identities() { calls++; return { sending: wait ? await wait() : structuredClone(identities) } },
     }) }] })
     const a = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
     const b = await h.inbox.connect('bob', { providerId: DYNAMIC, credentials: {} })
@@ -7071,7 +7251,7 @@ describe('source-scoped sending identities', () => {
     const box = referenceMailbox('senders-bounds', primary.email, [])
     let calls = 0, wait: (() => Promise<SendingIdentity[]>) | undefined
     const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
-      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() { calls++; return wait ? wait() : [primary] },
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() { calls++; return { sending: wait ? await wait() : [primary] } },
     }) }] })
     const accounts: Account[] = []
     for (let index = 0; index < 129; index++) {
@@ -7107,7 +7287,7 @@ describe('source-scoped sending identities', () => {
       native('invented', { to: [participant('alias+invented@example.test')] }),
     ])
     const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
-      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() { return [primary, alias, second] },
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() { return { sending: [primary, alias, second] } },
     }) }] })
     const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
     await h.inbox.sync('alice', account.id)
@@ -7139,9 +7319,9 @@ describe('source-scoped sending identities', () => {
     const box = referenceMailbox('senders-revoke', primary.email, [], [alias.email, 'pending@example.test'])
     let identities = [primary, alias], calls = 0, outage = false
     const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
-      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() {
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() {
         calls++; if (outage) throw new ProviderError(DYNAMIC, 'AUTHORIZATION', 'Fictional settings unavailable')
-        return structuredClone(identities)
+        return { sending: structuredClone(identities) }
       },
     }) }] })
     const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
@@ -7157,11 +7337,11 @@ describe('source-scoped sending identities', () => {
     outage = true
     expect(await h.inbox.submit('alice', draft.id, { revision: draft.revision, idempotencyKey: 'accepted-then-removed' })).toEqual(operation)
     expect(calls).toBe(submittedCalls)
-    outage = false; identities = [primary]
+    outage = false; identities = [primary]; h.clock.value += 60_001
     await h.inbox.runDue()
     expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'failed', problem: { code: 'FORBIDDEN_SENDER' } })
     expect(await h.inbox.draft('alice', draft.id)).toMatchObject({ from: alias.email, status: 'active' })
-    outage = true
+    outage = true; h.clock.value += 60_001
     await expect(h.inbox.submit('alice', draft.id, { revision: draft.revision, idempotencyKey: 'settings-outage' })).rejects.toMatchObject({ code: 'AUTHORIZATION' })
     expect((await h.inbox.account('alice', account.id)).status).toBe('connected')
     expect(await h.inbox.draft('alice', draft.id)).toMatchObject({ from: alias.email, status: 'active' })
@@ -7195,16 +7375,16 @@ describe('source-scoped sending identities', () => {
       const box = referenceMailbox(`senders-outage-${code}`, primary.email, [])
       let outage = false, removed = false
       const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
-        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() {
+        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() {
           if (outage) throw new ProviderError(DYNAMIC, code, 'Fictional outage', { retryable: code !== 'AUTHORIZATION', retryAfter: 1 })
-          return removed ? [primary] : [primary, alias]
+          return { sending: removed ? [primary] : [primary, alias] }
         },
       }) }] })
       const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
       const draft = await h.draft('alice', account.id, { from: alias.email, to: [participant('recipient@example.test')] })
       await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
       const operation = await h.submit('alice', draft, `outage-${code}`)
-      outage = true; await h.inbox.runDue()
+      outage = true; h.clock.value += 60_001; await h.inbox.runDue()
       expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: code === 'AUTHORIZATION' ? 'failed' : 'pending', problem: { code } })
       expect((await h.inbox.account('alice', account.id)).status).toBe('connected')
       if (code !== 'AUTHORIZATION') {
@@ -7221,7 +7401,7 @@ describe('source-scoped sending identities', () => {
     const box = referenceMailbox('senders-revision', primary.email, [])
     let wait: (() => Promise<SendingIdentity[]>) | undefined, calls = 0
     const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
-      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() { calls++; return wait ? wait() : [primary] },
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() { calls++; return { sending: wait ? await wait() : [primary] } },
     }) }] })
     const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
     const draft = await h.draft('alice', account.id, { to: [participant('recipient@example.test')] })
@@ -7246,8 +7426,8 @@ describe('source-scoped sending identities', () => {
     let rotate = false, wait: (() => Promise<SendingIdentity[]>) | undefined
     const h = await fixture({ resolveCredentials: context => Promise.resolve(rotate ? { accessToken: 'new-fictional' } : { ...context.credentials }),
       providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
-        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() {
-          return credentials.accessToken === 'old-fictional' && wait ? wait() : [primary]
+        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() {
+          return { sending: credentials.accessToken === 'old-fictional' && wait ? await wait() : [primary] }
         },
       }) }] })
     const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: { accessToken: 'old-fictional' } })
@@ -7271,7 +7451,7 @@ describe('source-scoped sending identities', () => {
     let removed = false, checks = 0, wait: (() => Promise<AttachmentData>) | undefined
     const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
       ...box.adapter(credentials, DYNAMIC, fullCapabilities),
-      async getSendingIdentities() { checks++; return removed ? [primary] : [primary, alias] },
+      async identities() { checks++; return { sending: removed ? [primary] : [primary, alias] } },
       async getAttachment() { return wait!() },
     }) }] })
     const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
@@ -7281,7 +7461,7 @@ describe('source-scoped sending identities', () => {
     await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
     const operation = await h.submit('alice', draft, 'attachment-before-sender')
     const barrier = h.gate({ attachment, filename: attachment.filename, contentType: attachment.contentType, content: new Uint8Array([1, 2, 3]) })
-    wait = barrier.wait
+    wait = barrier.wait; h.clock.value += 60_001
     const due = h.pending(h.inbox.runDue())
     await bounded(barrier.entered, 'attachment before sending identity check')
     expect(checks).toBe(1)
@@ -7297,15 +7477,15 @@ describe('source-scoped sending identities', () => {
     let token = 'first-fictional', wait: (() => Promise<SendingIdentity[]>) | undefined
     const h = await fixture({ resolveCredentials: async () => ({ accessToken: token }),
       providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
-        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() {
-          return credentials.accessToken === 'first-fictional' ? wait ? wait() : [primary, alias] : [primary]
+        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() {
+          return { sending: credentials.accessToken === 'first-fictional' ? wait ? await wait() : [primary, alias] : [primary] }
         },
       }) }] })
     const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: { accessToken: token } })
     const draft = await h.draft('alice', account.id, { from: alias.email, to: [participant('recipient@example.test')] })
     await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
     const operation = await h.submit('alice', draft, 'queued-version')
-    const barrier = h.gate([primary, alias]); wait = barrier.wait
+    const barrier = h.gate([primary, alias]); wait = barrier.wait; h.clock.value += 60_001
     const due = h.pending(h.inbox.runDue())
     await bounded(barrier.entered, 'queued old credential sender lookup')
     token = 'replacement-fictional'
@@ -7325,8 +7505,8 @@ describe('source-scoped sending identities', () => {
     let calls = 0, refreshed = 0
     const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC,
       async refresh() { refreshed++; return { accessToken: 'replacement-fictional' } },
-      create: credentials => ({ ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() {
-        calls++; return credentials.accessToken === 'replacement-fictional' ? [primary] : [primary, alias]
+      create: credentials => ({ ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() {
+        calls++; return { sending: credentials.accessToken === 'replacement-fictional' ? [primary] : [primary, alias] }
       } }),
     }] })
     const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: { accessToken: 'first-fictional' } })
@@ -7335,7 +7515,7 @@ describe('source-scoped sending identities', () => {
     const operation = await h.submit('alice', draft, 'retry-auth')
     box.nextSend(new ProviderAuthenticationError(DYNAMIC))
     await h.inbox.runDue()
-    expect(calls).toBe(3); expect(refreshed).toBe(1); expect(box.calls.send).toHaveLength(1)
+    expect(calls).toBe(2); expect(refreshed).toBe(1); expect(box.calls.send).toHaveLength(1)
     expect(await h.inbox.operation('alice', operation.id)).toMatchObject({ status: 'failed', problem: { code: 'FORBIDDEN_SENDER' } })
     expect(await h.inbox.draft('alice', draft.id)).toMatchObject({ status: 'active', from: alias.email })
   })
@@ -7346,13 +7526,13 @@ describe('source-scoped sending identities', () => {
     const box = referenceMailbox('senders-timeout', primary.email, [])
     let wait: (() => Promise<SendingIdentity[]>) | undefined, removed = false
     const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
-      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() { return wait ? wait() : removed ? [primary] : [primary, alias] },
+      ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() { return { sending: wait ? await wait() : removed ? [primary] : [primary, alias] } },
     }) }] })
     const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
     const draft = await h.draft('alice', account.id, { from: alias.email, to: [participant('recipient@example.test')] })
     await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
     const operation = await h.submit('alice', draft, 'timed-out-lookup')
-    const barrier = h.gate([primary, alias]); wait = barrier.wait
+    const barrier = h.gate([primary, alias]); wait = barrier.wait; h.clock.value += 60_001
     const timeout = AbortSignal.timeout.bind(AbortSignal), interrupted = new AbortController()
     const spy = spyOn(AbortSignal, 'timeout').mockImplementation(ms => ms === 30_000 ? interrupted.signal : timeout(ms))
     try {
@@ -7374,13 +7554,13 @@ describe('source-scoped sending identities', () => {
       const box = referenceMailbox(`senders-${action}`, primary.email, [])
       let wait: (() => Promise<SendingIdentity[]>) | undefined
       const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
-        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async getSendingIdentities() { return wait ? wait() : [primary] },
+        ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() { return { sending: wait ? await wait() : [primary] } },
       }) }] })
       const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: {} })
       const draft = await h.draft('alice', account.id, { mailboxId: account.id, to: [participant('recipient@example.test')] })
       await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
       const operation = await h.submit('alice', draft, `dispatch-${action}`)
-      const barrier = h.gate([primary]); wait = barrier.wait
+      const barrier = h.gate([primary]); wait = barrier.wait; h.clock.value += 60_001
       const due = h.pending(h.inbox.runDue())
       await bounded(barrier.entered, 'queued sender lookup')
       if (action === 'detach') await h.inbox.updateMailbox('alice', account.id, { status: 'detached' }, (await h.inbox.mailbox('alice', account.id)).revision)
@@ -7694,7 +7874,8 @@ describe('worker leases, sync checkpoints, and delayed actions', () => {
     const { account, box } = await h.connect('alice', 'sync-lanes')
     const baseline = await h.inbox.changes('alice')
     const current = native('current', { isRead: true, bodyText: 'Current authoritative body', receivedAt: '2026-09-01T11:00:00.000Z' })
-    box.nextSync(receipt([current], 'latest-1', { fullSync: true, hasMore: true }))
+    box.nextSync(receipt([current], 'latest-1', { fullSync: true, hasMore: true, snapshotComplete: false,
+      recentCursor: { provider: FULL, kind: 'history', value: 'latest-1' } }))
     await h.sync('alice', account.id, { lane: 'latest' })
     const currentId = (await h.page()).items[0]!.id
     expect((await h.inbox.account('alice', account.id)).sync.coverage).toBe('partial')
@@ -7720,6 +7901,123 @@ describe('worker leases, sync checkpoints, and delayed actions', () => {
     expect(changes.events.filter(event => event.type === 'mail.changed' && event.entityId === currentId).every(event => event.reason !== 'arrival')).toBe(true)
     expect(changes.events.filter(event => oldIds.includes(event.entityId)).map(event => event.reason)).toEqual(['backfill', 'backfill'])
     expect(changes.events.filter(event => event.type === 'mail.changed' && event.reason === 'arrival').map(event => event.entityId)).toEqual([arrivalId])
+  })
+
+  test('page-only latest polls stay complete and idle after durable backfill, without losing arrival reasons', async () => {
+    const h = await fixture({ syncIntervalMs: 1000 })
+    const { account, box } = await h.connect('alice', 'page-only-quiet')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const input = { mailboxIds: [mailbox.id] }
+    box.nextSync(receipt([native('head')], 'head-next', { fullSync: true, hasMore: true, snapshotComplete: false,
+      cursor: { provider: FULL, kind: 'page', value: 'head-next' } }))
+    box.nextSync(receipt([], 'known-head', { fullSync: true, cursor: null, snapshotComplete: false }))
+    expect(await h.inbox.syncMailbox('alice', mailbox.id)).toMatchObject({ synchronized: 1, hasMore: false })
+    expect(box.calls.sync.map(call => cursorValue(call.cursor))).toEqual([null, 'head-next'])
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', coverage: 'partial' })
+    box.nextSync(receipt([native('older')], 'older-next', { fullSync: true, hasMore: true, snapshotComplete: false,
+      cursor: { provider: FULL, kind: 'page', value: 'older-next' } }))
+    await h.inbox.syncMailbox('alice', mailbox.id, { lane: 'backfill' })
+    await h.restart()
+    box.nextSync(receipt([], 'known-head', { fullSync: true, cursor: null, snapshotComplete: false }))
+    box.nextSync(receipt([native('oldest')], 'backfill-done', { fullSync: true, cursor: null, snapshotComplete: true }))
+    h.clock.value += 1001
+    await h.inbox.poll()
+    expect(box.calls.sync.slice(-2).map(call => [call.context?.lane, cursorValue(call.cursor)])).toEqual([
+      ['latest', null], ['backfill', 'older-next'],
+    ])
+    expect(box.calls.sync.at(-1)!.context?.knownMessageIds?.sort()).toEqual(['head', 'older'])
+    const baseline = await h.inbox.changes('alice')
+    for (let poll = 0; poll < 5; poll++) {
+      const before = box.calls.sync.length
+      box.nextSync(() => {
+        const call = box.calls.sync.at(-1)!
+        expect(call.cursor).toBeNull()
+        expect(call.context).toMatchObject({ lane: 'latest', snapshotComplete: true })
+        return receipt([], 'quiet', { fullSync: true, cursor: null, snapshotComplete: call.context!.snapshotComplete })
+      })
+      h.clock.value += 1001
+      await h.inbox.poll()
+      expect(box.calls.sync).toHaveLength(before + 1)
+      expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', coverage: 'complete', activeLanes: [] })
+    }
+    expect((await h.inbox.changes('alice', { since: baseline.state })).events).toEqual([])
+    box.nextSync(receipt([native('arrival-a')], 'arrival-next', { fullSync: true, hasMore: true, snapshotComplete: true,
+      cursor: { provider: FULL, kind: 'page', value: 'arrival-next' } }))
+    box.nextSync(receipt([native('arrival-b')], 'arrivals-done', { fullSync: true, cursor: null, snapshotComplete: true }))
+    expect(await h.inbox.syncMailbox('alice', mailbox.id)).toMatchObject({ synchronized: 2, hasMore: false })
+    expect((await h.inbox.changes('alice', { since: baseline.state })).events.filter(event => event.type === 'mail.changed').map(event => event.reason)).toEqual(['arrival', 'arrival'])
+    expect((await h.inbox.mailboxSyncStatus('alice', input))[0]).toMatchObject({ state: 'idle', coverage: 'complete' })
+    expect(box.calls.mutate).toEqual([])
+    expect(box.calls.getMessage).toEqual([])
+  })
+
+  test('page-only head refreshes stop after ten pages and cursor failures never start unsolicited backfill', async () => {
+    const h = await fixture({ syncIntervalMs: 1000 })
+    const { box } = await h.connect('alice', 'page-only-bounded')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    for (let page = 0; page < 10; page++) box.nextSync(receipt(Array.from({ length: 60 }, (_, index) => native(`bounded-${page}-${index}`)), `page-${page}`, {
+      fullSync: true, hasMore: true, snapshotComplete: false, cursor: { provider: FULL, kind: 'page', value: `page-${page}` },
+    }))
+    expect(await h.inbox.syncMailbox('alice', mailbox.id)).toMatchObject({ synchronized: 600, hasMore: true })
+    expect(box.calls.sync).toHaveLength(10)
+    box.nextSync(new ProviderCursorExpiredError(FULL))
+    await expect(h.inbox.syncMailbox('alice', mailbox.id)).rejects.toMatchObject({ code: 'INVALID_CURSOR' })
+    expect(box.calls.sync.at(-1)!.cursor).toBeNull()
+    await h.restart()
+    box.nextSync(receipt([], 'quiet', { fullSync: true, cursor: null, snapshotComplete: false }))
+    h.clock.value += 1001
+    await h.inbox.poll()
+    expect(box.calls.sync).toHaveLength(12)
+    expect(box.calls.sync.every(call => call.context?.lane === 'latest')).toBe(true)
+    expect(box.calls.sync.at(-1)!.context?.knownMessageIds).toHaveLength(600)
+    expect(box.calls.sync.at(-1)!.context?.knownMessageStates).toHaveLength(600)
+    expect((await h.inbox.mailboxSyncStatus('alice', { mailboxIds: [mailbox.id] }))[0]).toMatchObject({ state: 'idle', coverage: 'partial' })
+    expect((await h.page()).total).toBe(600)
+  })
+
+  test('a held page-only head cannot overwrite concurrently completed or explicitly restarted backfill coverage', async () => {
+    const h = await fixture()
+    const { box } = await h.connect('alice', 'page-only-coverage-race')
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    box.nextSync(receipt([], 'older', { fullSync: true, hasMore: true, snapshotComplete: false,
+      cursor: { provider: FULL, kind: 'page', value: 'older' } }))
+    await h.inbox.syncMailbox('alice', mailbox.id, { lane: 'backfill' })
+    for (const complete of [true, false]) {
+      const held = h.gate(receipt([], 'held-head', { fullSync: true, cursor: null, snapshotComplete: !complete }))
+      box.nextSync(held.wait)
+      const latest = h.pending(h.inbox.syncMailbox('alice', mailbox.id))
+      await bounded(held.entered, 'head before backfill coverage changes')
+      box.nextSync(receipt([], 'history', { fullSync: true, hasMore: !complete, snapshotComplete: complete,
+        cursor: complete ? null : { provider: FULL, kind: 'page', value: 'restarted-history' } }))
+      await h.inbox.syncMailbox('alice', mailbox.id, { lane: 'backfill', reset: !complete })
+      held.release()
+      await latest
+      expect((await h.inbox.mailboxSyncStatus('alice', { mailboxIds: [mailbox.id] }))[0]).toMatchObject({
+        state: 'idle', coverage: complete ? 'complete' : 'partial', activeLanes: [],
+      })
+    }
+  })
+
+  test('later pages of a page-only head refresh keep the original mutation fence for updates and removals', async () => {
+    const h = await fixture()
+    const { box } = await h.seed('alice', 'page-only-fence', [native('same', { bodyText: 'Current body' })])
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!
+    const message = (await h.page()).items[0]!
+    box.nextSync(receipt([], 'head-next', { fullSync: true, hasMore: true, snapshotComplete: true,
+      cursor: { provider: FULL, kind: 'page', value: 'head-next' } }))
+    const held = h.gate(receipt([native('same', { bodyText: 'Obsolete body', isRead: false })], 'head-end', {
+      fullSync: true, cursor: null, snapshotComplete: true,
+      deletedMessageIds: ['same'], retiredMessageIds: ['same'], removedMessageIds: ['same'],
+    }))
+    box.nextSync(held.wait)
+    const syncing = h.pending(h.inbox.syncMailbox('alice', mailbox.id))
+    await bounded(held.entered, 'later head page before mutation')
+    await h.mutate('alice', [message.id], { isRead: true }, 'newer-than-head-refresh')
+    held.release()
+    await syncing
+    expect(await h.inbox.message('alice', message.id)).toMatchObject({ isRead: true, bodyText: 'Current body', folder: 'inbox' })
+    expect(box.calls.mutate).toEqual([])
+    expect((await h.page()).total).toBe(1)
   })
 
   test('a fresh upstream sync refreshes content while preserving unapplied local mutation intent through restart', async () => {
@@ -7758,19 +8056,27 @@ describe('worker leases, sync checkpoints, and delayed actions', () => {
     expect(JSON.stringify(h.logs)).not.toContain(BODY_SECRET)
   })
 
-  test('an expired provider cursor restarts safely without changing public IDs or inventing arrivals', async () => {
+  test('an expired provider cursor preserves public IDs and keeps snapshot imports distinct from arrivals', async () => {
     const h = await fixture()
     const { account, box } = await h.seed('alice', 'expired-cursor')
     const message = (await h.page()).items[0]!
     const baseline = await h.inbox.changes('alice')
     box.nextSync(new ProviderCursorExpiredError(FULL))
-    box.nextSync(receipt([native('same', { isRead: true })], 'fresh-checkpoint', { fullSync: true }))
+    box.nextSync(receipt([native('same', { isRead: true }), native('after-expiry'), native('older-recovered', { receivedAt: '2016-01-01T00:00:00.000Z' })], 'fresh-checkpoint', { fullSync: true }))
     await h.sync('alice', account.id)
     expect(cursorValue(box.calls.sync.at(-2)!.cursor)).not.toBeNull()
     expect(cursorValue(box.calls.sync.at(-1)!.cursor)).toBeNull()
-    expect((await h.page()).items.map(item => item.id)).toEqual([message.id])
+    const page = await h.page()
+    const arrival = page.items.find(item => item.subject === 'Subject after-expiry')!
+    const historical = page.items.find(item => item.subject === 'Subject older-recovered')!
+    expect(page.items.map(item => item.id).sort()).toEqual([message.id, arrival.id, historical.id].sort())
     expect((await h.inbox.message('alice', message.id)).isRead).toBe(true)
-    expect((await h.inbox.changes('alice', { since: baseline.state })).events.filter(event => event.reason === 'arrival')).toEqual([])
+    const events = (await h.inbox.changes('alice', { since: baseline.state })).events
+    // Recovery replays a snapshot, which can include previously unseen historical mail.
+    // It must not grant automatic AI admission merely because this account was initialized.
+    expect(events.filter(event => event.reason === 'arrival')).toEqual([])
+    expect(events.filter(event => event.type === 'mail.changed' && [arrival.id, historical.id].includes(event.entityId)).map(event => event.reason)).toEqual(['initial', 'initial'])
+    expect(events.filter(event => event.entityId === message.id).map(event => event.reason)).toEqual(['initial'])
   })
 
   test('a failed SQLite sync commit exposes neither a partial page nor an advanced checkpoint', async () => {
@@ -9928,7 +10234,7 @@ describe('mailbox sync status', () => {
     await h.restart(database)
     const input = { mailboxIds: [mailbox.id] }
     const before = await h.inbox.mailboxSyncStatus('alice', input)
-    expect(before).toEqual([{ sourceId: account.id, scopeKey: expect.any(String), state: 'idle', activeLanes: [], retryAt: null, problemCode: null, lastBatch: null, lastSyncAt: null }])
+    expect(before).toEqual([{ sourceId: account.id, scopeKey: expect.any(String), state: 'idle', coverage: 'empty', activeLanes: [], retryAt: null, problemCode: null, lastBatch: null, lastSyncAt: null }])
     let wakes = 0
     const unsubscribe = h.inbox.subscribe('alice', () => { wakes++ })
     const baseline = await h.inbox.changes('alice')
@@ -9980,13 +10286,13 @@ describe('mailbox sync status', () => {
     expect(posted.headers.has('if-none-match')).toBe(false)
     latest.release()
     await bounded(syncingLatest, 'latest commit')
-    expect(await client.mailboxSyncStatus(input)).toEqual([{ ...before[0], state: 'syncing', activeLanes: ['backfill'],
+    expect(await client.mailboxSyncStatus(input)).toEqual([{ ...before[0], state: 'syncing', coverage: 'partial', activeLanes: ['backfill'],
       lastBatch: { lane: 'latest', processed: 2, completedAt: new Date(EPOCH).toISOString(), hasMore: true }, lastSyncAt: new Date(EPOCH).toISOString() }])
     expect((await h.page()).total).toBe(1) // Two committed records, one canonical message; never unique-new progress.
     h.clock.value += 1000
     backfill.release()
     await bounded(syncingBackfill, 'backfill commit')
-    expect((await client.mailboxSyncStatus(input))[0]).toMatchObject({ state: 'idle', activeLanes: [], lastBatch: { lane: 'backfill', processed: 1, hasMore: false } })
+    expect((await client.mailboxSyncStatus(input))[0]).toMatchObject({ state: 'idle', coverage: 'complete', activeLanes: [], lastBatch: { lane: 'backfill', processed: 1, hasMore: false } })
     const folder = h.gate(receipt([], 'sent-held'))
     box.nextSync(folder.wait)
     const syncingFolder = h.pending(h.inbox.sync('alice', account.id, { folder: 'sent' }))
@@ -10003,7 +10309,7 @@ describe('mailbox sync status', () => {
     expect(box.calls.sync).toHaveLength(callsAfterFolder)
     await h.restart()
     const restarted = (await h.inbox.mailboxSyncStatus('alice', input))[0]!
-    expect(restarted).toMatchObject({ state: 'idle', activeLanes: [], lastBatch: null, lastSyncAt: completedAt, scopeKey: before[0]!.scopeKey })
+    expect(restarted).toMatchObject({ state: 'idle', coverage: 'complete', activeLanes: [], lastBatch: null, lastSyncAt: completedAt, scopeKey: before[0]!.scopeKey })
   })
 
   test('normalizes provider, validation and rolled-back persistence failures and always clears activity', async () => {

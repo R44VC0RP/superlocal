@@ -18,23 +18,34 @@
   overscroll-behavior: contain;
 }
 .mail-sync-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
   padding-block: 6px;
+  min-width: 0;
 }
-.mail-sync-glyph {
-  flex: 0 0 14px;
-  height: 18px;
+.mail-sync-row p {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--muted);
+  gap: 6px;
+  margin: 0;
+  min-width: 0;
 }
-.mail-sync-glyph > svg { width: 14px; height: 14px; }
+.mail-sync-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 50%;
+  color: var(--text);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mail-sync-name > span { color: var(--muted); font-weight: 400; }
+.mail-sync-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .mail-sync-progress {
   height: 3px;
-  margin-block: 7px;
+  margin-block: 7px 2px;
   overflow: hidden;
   border-radius: 2px;
   background: var(--border);
@@ -52,19 +63,6 @@
   opacity: 1;
   animation: mail-sync-slide 1.5s ease-in-out infinite alternate;
 }
-.mail-sync-copy { min-width: 0; flex: 1; }
-.mail-sync-name {
-  color: var(--text);
-  font-weight: 500;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.mail-sync-name > span { color: var(--muted); font-weight: 400; }
-.mail-sync-copy p { margin: 2px 0 0; overflow-wrap: anywhere; }
-.mail-sync-count { font-variant-numeric: tabular-nums; }
-.mail-sync-unavailable { margin: 0 0 6px; color: var(--text); }
-.mail-sync-unavailable > span { display: block; color: var(--muted); }
 .mail-sync-settings {
   display: inline-flex;
   align-items: center;

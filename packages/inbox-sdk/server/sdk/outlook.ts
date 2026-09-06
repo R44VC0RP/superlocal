@@ -1,9 +1,12 @@
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import {
   attachmentContent,
   attachmentUrl,
   buildThreads,
   clampLimit,
   createMailAccount,
+  encodeBase64Url,
+  decodeBase64Url,
   htmlToPlainText,
   normalizeCursor,
   normalizeDate,
@@ -139,7 +142,6 @@ const OUTLOOK_CAPABILITIES: Readonly<ProviderCapabilities> = Object.freeze({
   send: true,
   reply: true,
   threads: true,
-  nativeThreads: true,
   folders: true,
   createFolders: true,
   labels: true,
@@ -150,13 +152,7 @@ const OUTLOOK_CAPABILITIES: Readonly<ProviderCapabilities> = Object.freeze({
   markUnread: true,
   star: true,
   attachments: true,
-  attachmentDownload: true,
   search: true,
-  drafts: false,
-  scheduledSend: false,
-  snooze: false,
-  readReceipts: false,
-  pushNotifications: false,
 })
 
 function graphParticipant(recipient: GraphRecipient | undefined): Participant {
@@ -195,6 +191,8 @@ export class OutlookProvider implements InboxProvider {
   private readonly fetcher: typeof globalThis.fetch
   private readonly folderIds = new Map<string, MailFolder>()
   private readonly requests = new AbortController()
+  // Preview continuations are instance-bound, like Inbound snapshots; durable sync uses its separate cursor.
+  private readonly cursorKey = randomBytes(32)
 
   constructor(credentials: OutlookCredentials) {
     if (!credentials.accountId || !credentials.accessToken) {
@@ -459,7 +457,38 @@ export class OutlookProvider implements InboxProvider {
     return { id: folder.id, name: folder.displayName, folder: 'inbox', kind: 'folder', path: folder.displayName, custom: true }
   }
 
-  async listMessages(options: ListOptions = {}): Promise<ProviderListResult<MailMessage>> {
+  private listScope(kind: 'messages' | 'threads', options: ListOptions): string {
+    return JSON.stringify([this.accountId, kind, this.folderPath(options.folder), options.folder === 'starred', options.search ?? '', Boolean(options.unreadOnly)])
+  }
+
+  private listCursor(kind: 'messages' | 'threads', options: ListOptions): { next?: string; seen: string[] } {
+    if (options.cursor === undefined || options.cursor === null) return { seen: [] }
+    try {
+      if (options.cursor.length > 16 * 1024 * 1024) throw new Error()
+      const [encoded, signature, extra] = options.cursor.split('.')
+      if (!encoded || !signature || extra) throw new Error()
+      const expected = createHmac('sha256', this.cursorKey).update(encoded).digest('base64url')
+      if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) throw new Error()
+      const value = JSON.parse(decodeBase64Url(encoded).toString('utf8'))
+      if (value.version !== 1 || value.scope !== this.listScope(kind, options) || typeof value.next !== 'string' ||
+        !Array.isArray(value.seen) || value.seen.length > 20_000 || value.seen.some((id: unknown) => typeof id !== 'string' || !id || id.length > 4096)) throw new Error()
+      const url = new URL(this.resolveUrl(value.next))
+      const base = new URL(this.baseUrl)
+      if (url.pathname !== base.pathname.replace(/\/$/, '') + this.folderPath(options.folder)) throw new Error()
+      return { next: value.next, seen: value.seen }
+    } catch { throw new ProviderCursorExpiredError('outlook', 'Graph list cursor does not match this account, resource or selection') }
+  }
+
+  private encodeListCursor(kind: 'messages' | 'threads', options: ListOptions, next: string | undefined, seen: string[]): string | null {
+    if (!next) return null
+    const target = new URL(this.resolveUrl(next)), base = new URL(this.baseUrl)
+    if (target.pathname !== base.pathname.replace(/\/$/, '') + this.folderPath(options.folder)) throw new ProviderCursorExpiredError('outlook', 'Graph list continuation changed resource')
+    const encoded = encodeBase64Url(JSON.stringify({ version: 1, scope: this.listScope(kind, options), next, seen }))
+    if (seen.length > 20_000 || encoded.length > 16 * 1024 * 1024 - 64) throw new ProviderCursorExpiredError('outlook', 'Graph list continuation exceeded its bounded identity budget')
+    return `${encoded}.${createHmac('sha256', this.cursorKey).update(encoded).digest('base64url')}`
+  }
+
+  private async listPage(options: ListOptions, next?: string): Promise<GraphCollection<GraphMessage>> {
     const limit = clampLimit(options.limit)
     const params = new URLSearchParams({ $top: String(limit), $select: MESSAGE_FIELDS })
     const filters: string[] = []
@@ -468,28 +497,32 @@ export class OutlookProvider implements InboxProvider {
     if (filters.length) params.set('$filter', filters.join(' and '))
     if (options.search) params.set('$search', `"${options.search.replace(/"/g, '\\"')}"`)
     else params.set('$orderby', 'receivedDateTime desc')
+    const result = await this.collection<GraphMessage>(next ?? `${this.folderPath(options.folder)}?${params}`, {}, limit)
+    if (next && result['@odata.nextLink'] && this.resolveUrl(result['@odata.nextLink']) === this.resolveUrl(next)) throw new ProviderCursorExpiredError('outlook', 'Graph list continuation did not advance')
+    return result
+  }
 
-    const path = options.cursor ?? `${this.folderPath(options.folder)}?${params}`
-    const result = await this.collection<GraphMessage>(path, {}, limit)
-
-    // Graph search can ignore the immutable-ID preference, so re-fetch search hits individually.
+  async listMessages(options: ListOptions = {}): Promise<ProviderListResult<MailMessage>> {
+    const cursor = this.listCursor('messages', options)
+    const result = await this.listPage(options, cursor.next)
     const items = await this.hydrateMessages(result.value, options.folder, Boolean(options.search))
-    return {
-      items,
-      nextCursor: result['@odata.nextLink'] ?? null,
-      hasMore: Boolean(result['@odata.nextLink']),
-      ...(result['@odata.count'] === undefined ? {} : { total: result['@odata.count'] }),
-    }
+    const nextCursor = this.encodeListCursor('messages', options, result['@odata.nextLink'], [])
+    return { items, nextCursor, hasMore: !!nextCursor, ...(result['@odata.count'] === undefined ? {} : { total: result['@odata.count'] }) }
   }
 
   async listThreads(options: ListOptions = {}): Promise<ProviderListResult<MailThread>> {
-    const messages = await this.listMessages(options)
-    return {
-      items: buildThreads(messages.items),
-      nextCursor: messages.nextCursor,
-      hasMore: messages.hasMore,
-      ...(messages.total === undefined ? {} : { total: messages.total }),
+    const cursor = this.listCursor('threads', options), seen = new Set(cursor.seen)
+    const page = await this.listPage(options, cursor.next)
+    const items: MailThread[] = []
+    for (const message of page.value) {
+      const id = typeof message.conversationId === 'string' && message.conversationId ? message.conversationId : message.id
+      if (seen.has(id)) continue
+      if (seen.size >= 20_000) throw new ProviderCursorExpiredError('outlook', 'Graph conversation listing exceeded its bounded identity budget')
+      seen.add(id)
+      items.push(await this.getThread(id))
     }
+    const nextCursor = this.encodeListCursor('threads', options, page['@odata.nextLink'], [...seen])
+    return { items, nextCursor, hasMore: !!nextCursor }
   }
 
   async getMessage(messageId: string): Promise<MailMessage> {
@@ -509,11 +542,14 @@ export class OutlookProvider implements InboxProvider {
     const messages: MailMessage[] = []
     let path: string | undefined = `/me/messages?${params}`
     const seen = new Set<string>()
+    let retainedBytes = 0
     while (path) {
       const url = this.resolveUrl(path)
       if (seen.has(url)) throw new ProviderCursorExpiredError('outlook', 'Graph thread pagination cursor repeated')
       seen.add(url)
       const page: GraphCollection<GraphMessage> = await this.collection<GraphMessage>(path)
+      retainedBytes += Buffer.byteLength(JSON.stringify(page.value))
+      if (messages.length + page.value.length > 20_000 || seen.size > 10_000 || retainedBytes > 16 * 1024 * 1024) throw new ProviderError('outlook', 'UPSTREAM', 'Graph conversation exceeds the bounded message budget')
       messages.push(...await this.hydrateMessages(page.value))
       path = page['@odata.nextLink']
     }

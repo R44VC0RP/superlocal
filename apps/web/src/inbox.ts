@@ -1,6 +1,6 @@
 import { projectMailboxMail } from "../../shared/mail-projection";
 import { INBOX_FIRST_PAGE_LIMIT, INBOX_PAGE_LIMIT, INBOX_AUTO_PREFETCH_LIMIT, INBOX_WINDOW_LIMIT, INBOX_WINDOW_BYTE_LIMIT, INBOX_LOOKUP_LIMIT,
-  type InboxWindowPage, type InboxWindowRow, type InboxWindowState, type InboxTotals, type InboxViewQuery, type InboxSelection, type InboxActionReceiptReference, type InboxSenderInput } from "../../shared/inbox-window";
+  type InboxWindowPage, type InboxWindowRow, type InboxWindowState, type InboxWindowChanges, type InboxTotals, type InboxViewQuery, type InboxSelection, type InboxActionReceiptReference, type InboxSenderInput } from "../../shared/inbox-window";
 import { createInboxWindowTransport } from "./host";
 import { ApiError, createInboxClient, type InboxClient } from "inbox-sdk/client";
 import { measurePerformance, measureRequest, measureWork } from "./browser-logs";
@@ -27,6 +27,23 @@ import { CATEGORY_BATCH_LIMIT, CATEGORY_MEMBERSHIP_LIMIT, CATEGORY_BODY_LIMIT, c
 
 type Edit = { draft: Draft; revision: number; version: number; error?: string; errorKind?: "recipients" };
 type WindowCheckpoint = Readonly<Pick<InboxWindowState, "indexRevision" | "readCursor">>;
+/** An inactive view kept for instant return: its published window, resident rows and paging/replay bookkeeping. */
+type RetainedView = {
+  window: InboxActiveWindow;
+  rows: Map<string, InboxWindowRow>;
+  boundaryCursors: Map<string, string>;
+  newerCursor: string | null;
+  localRemoved: Map<string, string>;
+  removalFences: Map<string, { revision: number; removed: boolean }>;
+  replayCheckpoint?: WindowCheckpoint;
+  bytes: number;
+};
+/** Recent inactive views retained besides the active one. Search results are not retained. */
+const RETAINED_VIEW_LIMIT = 3;
+/** Bounded one-shot count requests per view open; unknown totals render as nothing, never a guess. */
+const COUNT_REQUEST_LIMIT = 5;
+const viewKey = (query: InboxViewQuery) => JSON.stringify(query);
+const expiredQuery = (error: unknown) => error instanceof InboxViewPreferencesError && error.code === "HOST_INBOX_QUERY_EXPIRED";
 type ThreadHistory = { contextVersion: string; summaries: MailboxMessageSummary[]; cursor: string | null; exhausted: boolean; truncated?: boolean; error?: string };
 type ThreadValidation = { row: InboxWindowRow; controller: AbortController; promise: Promise<{ summaries: MailboxMessageSummary[]; error?: string }> };
 class DraftRecipientError extends Error {}
@@ -318,6 +335,8 @@ export class InboxStore {
   private windowSenderEpoch = 0;
   private windowChanges?: Promise<void>;
   private windowReplayCheckpoint?: WindowCheckpoint;
+  private retainedViews = new Map<string, RetainedView>();
+  private windowCounts?: { queryId: string; promise: Promise<void> };
   private windowMetadataEvents: ChangeEvent[] = [];
   private windowDetails = new Map<string, ThreadHistory>();
   private threadMessagePins = new Map<string, Map<string, string>>();
@@ -366,10 +385,69 @@ export class InboxStore {
 
   setWindowQuery = (query: InboxViewQuery): Promise<void> => {
     if (JSON.stringify(query) === JSON.stringify(this.windowQuery)) return this.windowLoading ?? Promise.resolve();
+    // Take the destination out of the retained set before retaining the outgoing view, so it never counts against the limit.
+    const retained = this.retainedViews.get(viewKey(query));
+    if (retained) this.retainedViews.delete(viewKey(query));
+    this.retainWindow();
     this.windowQuery = { ...query };
     this.windowEpoch++; this.windowController.abort(); this.windowController = new AbortController();
-    return this.state.host?.inboxWindow ? this.openWindow() : Promise.resolve();
+    if (!this.state.host?.inboxWindow) return Promise.resolve();
+    return retained ? this.restoreWindow(retained) : this.openWindow();
   };
+  /** Keeps the published active view for an instant return. Reader pins, intents and Undo stay with the active view. */
+  private retainWindow() {
+    const window = this.state.window;
+    if (!window || window.query.search || viewKey(window.query) !== viewKey(this.windowQuery)) return;
+    const rows = new Map<string, InboxWindowRow>();
+    for (const key of window.keys) { const row = this.windowRows.get(key); if (row) rows.set(key, row); }
+    const key = viewKey(window.query);
+    this.retainedViews.delete(key);
+    this.retainedViews.set(key, { window: { ...window, paging: false }, rows, boundaryCursors: new Map(this.windowBoundaryCursors), newerCursor: this.windowNewerCursor,
+      localRemoved: new Map(this.windowLocalRemoved), removalFences: new Map(this.windowRemovalFences), replayCheckpoint: this.windowReplayCheckpoint,
+      bytes: new TextEncoder().encode(JSON.stringify([...rows.values()])).length * 2 });
+    while (this.retainedViews.size > RETAINED_VIEW_LIMIT) this.retainedViews.delete(this.retainedViews.keys().next().value!);
+  }
+  /** Publishes a retained view immediately, then runs one bounded catch-up from its saved checkpoint. */
+  private restoreWindow(view: RetainedView): Promise<void> {
+    const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
+    this.windowController.abort(); this.windowController = new AbortController();
+    this.clearThreadMessagePins();
+    // An aborted open or drain of the previous view must not gate this view's reconciliation.
+    this.windowLoading = undefined; this.windowPaging = undefined; this.windowChanges = undefined;
+    this.windowReplayCheckpoint = view.replayCheckpoint; this.windowBoundaryCursors = view.boundaryCursors; this.windowNewerCursor = view.newerCursor;
+    this.windowLocalRemoved = view.localRemoved; this.windowRemovalFences = view.removalFences; this.windowAutoDone = true;
+    for (const [key, row] of view.rows) {
+      const current = this.windowRows.get(key);
+      if (!current || current.sourceGeneration === row.sourceGeneration && current.revision < row.revision) this.windowRows.set(key, row);
+    }
+    const keys = this.trimWindow(view.window.keys);
+    this.publish({ window: { ...view.window, query, keys, paging: false, residentBytes: this.windowBytes() }, loading: false, loaded: true, refreshing: false });
+    this.rebuild();
+    const work = this.readWindowChanges().catch(error => { if (epoch === this.windowEpoch && generation === this.generation) this.fail(error, "refresh"); });
+    this.scheduleCountFill(epoch, generation);
+    return work;
+  }
+  private scheduleCountFill(epoch: number, generation: number) {
+    const window = this.state.window;
+    if (!window || window.totals.conversations !== null || this.windowCounts?.queryId === window.state.queryId) return;
+    const queryId = window.state.queryId, signal = AbortSignal.any([this.windowController.signal, this.controller.signal]);
+    const transport = createInboxWindowTransport(() => signal, (input, init) => this.fetch(input, init));
+    // Wait for the first paint and an idle moment; navigation cancels the fill and wakes never restart it.
+    const idle = new Promise<void>(resolve => { typeof requestIdleCallback === "function" ? requestIdleCallback(() => resolve(), { timeout: 2000 }) : setTimeout(resolve, 300); });
+    const job = { queryId, promise: idle.then(async () => {
+      for (let attempt = 0; attempt < COUNT_REQUEST_LIMIT; attempt++) {
+        this.windowCheck(epoch, generation); signal.throwIfAborted();
+        const result = await transport.counts({ queryId });
+        this.windowCheck(epoch, generation);
+        const current = this.state.window;
+        if (!current || result.state.scopeState !== current.state.scopeState) return;
+        if (result.totals.conversations === null) { await pause(50, signal); continue; }
+        if (JSON.stringify(result.totals) !== JSON.stringify(current.totals)) this.publish({ window: { ...current, totals: result.totals } });
+        return;
+      }
+    }).catch(() => {}).finally(() => { if (this.windowCounts === job) this.windowCounts = undefined; }) };
+    this.windowCounts = job;
+  }
   private windowCheck(epoch: number, generation: number) {
     this.controller.signal.throwIfAborted(); this.applicationScope.signal.throwIfAborted();
     if (epoch !== this.windowEpoch || generation !== this.generation) throw new DOMException("Inbox view changed", "AbortError");
@@ -490,12 +568,15 @@ export class InboxStore {
     const resident = new Map(this.state.mail.filter(mail => this.windowRows.has(mail.id)).map(mail => [mail.id, mail]));
     for (const row of this.windowRows.values()) if (!resident.has(row.key)) resident.set(row.key, row.mail);
     return size([...this.windowRows.values()]) + size([...resident.values()]) + size([...this.windowDetails.values()]) + size([...this.details.values()])
-      + size([...this.threadMessagePins].map(([id, pins]) => [id, [...pins]])) + [...this.windowPinnedBytes.values()].reduce((sum, value) => sum + value, 0);
+      + size([...this.threadMessagePins].map(([id, pins]) => [id, [...pins]])) + [...this.windowPinnedBytes.values()].reduce((sum, value) => sum + value, 0)
+      + [...this.retainedViews.values()].reduce((sum, view) => sum + view.bytes, 0);
   }
   private trimWindow(keys: string[], evict: "start" | "end" = "start"): string[] {
     const pins = this.pinnedWindowKeys();
     const active = new Set(keys);
     for (const id of this.windowRows.keys()) if (!active.has(id) && !pins.has(id)) { this.windowRows.delete(id); this.windowDetails.delete(id); this.clearThreadMessagePins(id); }
+    // Retained inactive views are the cheapest to lose: oldest first, before any body cache or active row.
+    while (this.retainedViews.size && this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT / 2) this.retainedViews.delete(this.retainedViews.keys().next().value!);
     // Body eviction is not metadata deletion and never drops command intent/fences.
     while (this.details.size && this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT / 2) this.details.delete(this.details.keys().next().value!);
     while (this.windowRows.size > INBOX_WINDOW_LIMIT || this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) {
@@ -604,6 +685,7 @@ export class InboxStore {
       }
       // Publish the first page before requesting at most one additional buffer page.
       void this.prefetchWindow(epoch, generation).catch(error => { if (!(error instanceof DOMException && error.name === "AbortError")) this.fail(error, "refresh"); });
+      this.scheduleCountFill(epoch, generation);
     })().catch(error => { if (epoch === this.windowEpoch && generation === this.generation) this.fail(error, "refresh"); throw error; })
       .finally(() => { if (this.windowLoading === work) this.windowLoading = undefined; });
     this.windowLoading = work; return work;
@@ -794,10 +876,19 @@ export class InboxStore {
       let cursor: string | undefined;
       do {
         const flagEpoch = this.flagEpoch;
-        const page = await this.windowTransport.changes({ ...input, cursor });
+        let page: InboxWindowChanges;
+        try { page = await this.windowTransport.changes({ ...input, cursor }); }
+        catch (error) {
+          // A retained or long-idle view whose host query expired reopens normally instead of failing.
+          this.windowCheck(epoch, generation);
+          if (expiredQuery(error)) { await this.openWindow(); return; }
+          throw error;
+        }
         this.windowCheck(epoch, generation);
-        if (page.resetReason) { await this.openWindow(); return; }
-        if (page.state.scopeState !== current.state.scopeState) { await this.openWindow(); return; }
+        if (page.resetReason || page.state.scopeState !== current.state.scopeState) {
+          // Scope/source/preference resets invalidate every retained view of this scope, not only the active one.
+          this.retainedViews.clear(); await this.openWindow(); return;
+        }
         // A giant's bounded context hash can stay unchanged when deeper cached summaries change.
         await this.receiveWindowRows([...page.upserts, ...page.newHead], flagEpoch, new Set(page.upserts.map(row => row.key)));
         this.windowCheck(epoch, generation);
@@ -1147,6 +1238,8 @@ export class InboxStore {
     }
     try {
       const { source } = this.account(boxId);
+      // Local receiving-state actions need no provider capability. "inbox" is local (un-done) for mail still in
+      // the native inbox; a native move out of spam/trash is checked against `folders` at action time with the mail.
       if (["done", "not-important", "inbox", "remind", "label", "cancel"].includes(action)) return true;
       if (source.status !== "connected") return false;
       if (!this.state.host?.allowProviderWrites) return false;
@@ -1156,9 +1249,21 @@ export class InboxStore {
       if (action === "unread") return source.capabilities.markRead && source.capabilities.markUnread;
       if (action === "star") return source.capabilities.star;
       if (action === "trash") return source.capabilities.trash;
-      if (["spam", "inbox"].includes(action)) return source.capabilities.folders;
+      if (action === "spam") return source.capabilities.folders;
       return false;
     } catch { return false; }
+  }
+  /** Whether a view's receiving source exposes a provider capability; a unified view needs any selected source. Unknown scope hides nothing. */
+  sourceCapability(capability: keyof Account["capabilities"], boxId: string): boolean {
+    const ids = boxId === UNIFIED_ACCOUNT ? this.unifiedMailboxIds() : [boxId];
+    const sources = ids.flatMap(id => { try { return [this.account(id).source]; } catch { return []; } });
+    return !sources.length || sources.some(source => source.capabilities[capability]);
+  }
+  /** Native folder membership by role: `folderIds` carry provider IDs, so a literal role never matches them directly. */
+  private hasFolderRole(row: MailboxMessageSummary, role: string): boolean {
+    if (row.folder === role) return true;
+    const catalog = this.folders.get(row.sourceId);
+    return !!catalog && row.folderIds.some(id => catalog.some(folder => folder.id === id && folder.role === role));
   }
 
   async search(boxId: string, query: string, signal: AbortSignal): Promise<Set<string>> {
@@ -1259,6 +1364,7 @@ export class InboxStore {
     return () => {
       window.removeEventListener("focus", onFocus);
       this.started = false; this.generation++; this.controller.abort(); this.clearThreadMessagePins();
+      this.retainedViews.clear(); this.windowCounts = undefined;
       this.client.clearCache();
       clearTimeout(this.refreshTimer);
       clearTimeout(this.aiPollTimer); clearTimeout(this.aiHoldTimer); this.aiPollPromise = undefined; this.aiHolds.clear();
@@ -1415,7 +1521,7 @@ export class InboxStore {
             }
             if (previous && JSON.stringify(previous) === JSON.stringify(row)) continue;
             const threadKey = nativeKey(row.sourceId, row.threadId);
-            if (!previous && arrivals.has(key) && !this.knownThreads.has(threadKey) && this.aiHolds.size < 256 && row.folder === "inbox" && !row.folderIds.includes("sent")
+            if (!previous && arrivals.has(key) && !this.knownThreads.has(threadKey) && this.aiHolds.size < 256 && row.folder === "inbox" && !this.hasFolderRole(row, "sent")
               && this.state.ai?.configured && this.state.ai.settings.enabled && this.state.ai.settings.mode === "apply"
               && (this.state.ai.settings.mailboxIds === null || row.memberships.some(member => this.state.ai!.settings.mailboxIds!.includes(member.mailboxId)))) {
               // Only genuinely new conversations get a small presentation hold.
@@ -1751,6 +1857,8 @@ export class InboxStore {
       if (host.inboxWindow) {
         this.publish({ policy: currentPolicy, host, viewPreferences, splitPreferences, attentionFeedback: this.feedbackEpoch === feedbackEpoch ? attentionFeedback : this.state.attentionFeedback, mailboxes: selected, sources: accounts });
         this.rebuildWindow();
+        // A full refresh re-reads scope metadata; retained views belong to the previous scope.
+        this.retainedViews.clear();
         await this.openWindow();
         void this.discoverFolders();
         return;
@@ -1906,7 +2014,7 @@ export class InboxStore {
     const timing = measurePerformance({ kind: "rebuild", full: !onlyThreads });
     const accounts: MailboxOption[] = this.boxes.map(box => {
       const source = this.sourceAccounts.find(account => account.id === box.sourceId)!;
-      return { id: box.id, sourceId: source.id, sourceGeneration: source.generation, name: box.name || source.name, email: box.defaultSender || source.email, selectorKind: box.selector.kind,
+      return { id: box.id, sourceId: source.id, sourceGeneration: source.generation, name: box.name || source.name, email: box.defaultSender || source.email, selectorKind: box.selector.kind, selectorValue: box.selector.kind === "all" ? undefined : box.selector.value,
         canSend: this.state.host?.allowProviderWrites === true && source.status === "connected" && box.status === "active" && source.capabilities.send && !!box.defaultSender };
     });
     const mail: Mail[] = [], labelNames: Record<string, string[]> = {};
@@ -1933,7 +2041,7 @@ export class InboxStore {
         senderHistory.set(key, previous && previous.revision > row.revision ? { ...previous, mailboxIds } : {
           id: row.id, sourceId: source.id, threadId: row.threadId, revision: row.revision,
           from: row.from, to: row.to, cc: row.cc, subject: row.subject, receivedAt: row.receivedAt, folder: row.folder,
-          outgoing: row.folder === "sent" || row.folderIds.includes("sent") || sentMessages.get(row.id)?.accountId === source.id,
+          outgoing: this.hasFolderRole(row, "sent") || sentMessages.get(row.id)?.accountId === source.id,
           mailboxIds,
         });
         const group = groups.get(row.threadId) ?? []; group.push(row); groups.set(row.threadId, group);
@@ -2269,11 +2377,11 @@ export class InboxStore {
     this.draftEpoch++; this.popouts.set(raw.id, input.popOut ?? false); this.rawDrafts.set(raw.id, raw); this.rebuild();
     return this.state.drafts.find(draft => draft.id === raw.id)!;
   };
-  moveDraft = async (id: string, boxId: string): Promise<Draft> => {
+  moveDraft = async (id: string, boxId: string, from?: string): Promise<Draft> => {
     const raw = await this.flushDraft(id), current = this.state.drafts.find(draft => draft.id === id)!;
     const { source, box } = this.account(boxId);
     if (!this.state.accounts.find(account => account.id === boxId)?.canSend) throw new Error("This mailbox cannot send messages.");
-    const input = await this.draftInput({ ...current, account: boxId, from: box.defaultSender! }, source.id);
+    const input = await this.draftInput({ ...current, account: boxId, from: from ?? box.defaultSender! }, source.id);
     let saved: SdkDraft;
     if (source.id === raw.accountId) saved = await this.client.updateDraft(id, { ...input, mailboxId: boxId }, raw.revision, this.requestOptions());
     else {

@@ -25,11 +25,9 @@ function coverage(candidates: MailboxCandidate[]): MailboxCandidate[] {
   return eligible.filter(candidate => candidate.selector.kind !== "address" || !domains.has(candidate.selector.value.split("@").at(-1) ?? ""));
 }
 
-const method = (provider: HostProvider) =>
-  provider.connection === "oauth" ? "Sign in with your Google account"
-  : provider.fields?.some(field => field.name === "apiKey") ? "Paste an API key"
-  : provider.fields?.some(field => field.type === "password") ? "Email and app-specific password"
-  : "";
+// Copy comes from the host descriptor (SDK onboarding + host presets); nothing here knows a provider by name.
+const selectField = (provider: HostProvider) => provider.fields?.find(field => field.type === "select");
+const defaultOption = (provider: HostProvider) => { const field = selectField(provider); return field?.defaultValue ?? field?.options?.[0]?.value ?? ""; };
 
 const statusLabel = (source: Account) =>
   source.status === "reconnect_required" ? "Sign-in required" : source.status === "disconnected" ? "Disconnected" : "Connected";
@@ -248,8 +246,8 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
             const disabled = !item.ready || !configuration.allowProviderWrites;
             return <button key={item.id} type="button" className="provider-option" disabled={disabled}
               title={!item.ready ? item.setupMessage || "Configure this provider in your local host before connecting." : undefined}
-              onClick={() => { setPreset(item.fields?.find(field => field.type === "select")?.defaultValue ?? ""); setStep({ kind: "connect", providerId: item.id, reconnectId: null }); }}>
-              <span className="mailbox-row-label"><span>{item.name}</span><small>{!item.ready ? "Setup required" : method(item)}</small></span>
+              onClick={() => { setPreset(defaultOption(item)); setStep({ kind: "connect", providerId: item.id, reconnectId: null }); }}>
+              <span className="mailbox-row-label"><span>{item.name}</span><small>{!item.ready ? "Setup required" : item.summary ?? ""}</small></span>
               <Icon name="ChevronRight" size={14} />
             </button>;
           })}
@@ -272,7 +270,7 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
                 </span>
                 {writable && incomplete && <button type="button" className="settings-text-button" onClick={() => setUp(owner, [connectionId])}>Finish setup</button>}
                 {writable && owner.reconnect && <button type="button" className="settings-text-button" onClick={() => {
-                  setPreset(owner.fields?.find(field => field.type === "select")?.defaultValue ?? "");
+                  setPreset(defaultOption(owner));
                   setStep({ kind: "connect", providerId: owner.id, reconnectId: connectionId });
                 }}>Reconnect</button>}
                 {writable && owner.connection === "oauth" && attention && <button type="button" className="settings-text-button" onClick={() => setStep({ kind: "connect", providerId: owner.id, reconnectId: null })}>Sign in again</button>}
@@ -288,31 +286,35 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
 
   if (step.kind === "connect") {
     const reconnecting = snapshot.sources.find(source => source.connectionId === step.reconnectId);
-    const hasPreset = provider.fields?.some(field => field.type === "select") ?? false;
-    const currentPreset = preset || provider.fields?.find(field => field.type === "select")?.defaultValue || "icloud";
-    const isIcloud = !hasPreset || currentPreset === "icloud";
+    // The selected option (a host preset) may relabel or hide fields and carry its own help.
+    const currentPreset = preset || defaultOption(provider);
+    const option = selectField(provider)?.options?.find(item => item.value === currentPreset);
+    const hidden = new Set(option?.hiddenFields ?? []);
+    const visible = (provider.fields ?? []).filter(field => !hidden.has(field.name));
+    const advanced = visible.filter(field => field.advanced);
+    const help = option?.credentialHelp ?? provider.credentialHelp;
     const fieldInput = (field: Field) => <label className="settings-field" key={field.name}>
-      <span>{field.type === "password" && provider.id === "imap" && !isIcloud ? "Mail password" : field.label}</span>
+      <span>{option?.fieldLabels?.[field.name] ?? field.label}</span>
       {field.type === "select" ? <select name={field.name} required={field.required} value={currentPreset} onChange={event => setPreset(event.target.value)}>
-        {field.options?.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+        {field.options?.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}
       </select> : <input name={field.name} type={field.type} required={field.required} maxLength={4096}
-        defaultValue={field.name === "email" ? reconnecting?.email : field.defaultValue} readOnly={field.name === "email" && !!reconnecting}
+        defaultValue={field.type === "email" ? reconnecting?.email : field.defaultValue} readOnly={field.type === "email" && !!reconnecting}
         autoComplete={field.type === "email" ? "email" : "off"} autoCapitalize="none" spellCheck={false} />}
     </label>;
     return (
       <form className="provider-flow provider-connect" ref={root as unknown as RefObject<HTMLFormElement>} tabIndex={-1} key={`${provider.id}:${step.reconnectId ?? ""}`} onSubmit={event => void connect(event, provider, step.reconnectId)}>
         {provider.connection === "oauth" ? <>
-          <p className="settings-note">You will be sent to Google to approve access, then brought back here while your mail loads.</p>
+          {provider.redirectNote && <p className="settings-note">{provider.redirectNote}</p>}
           <button className="settings-button" type="submit">{provider.actionLabel || `Sign in with ${provider.name}`}</button>
         </> : <>
-          {reconnecting && <p className="settings-note">Enter a new password for {reconnecting.email || reconnecting.name}. Server settings stay the same.</p>}
-          {(provider.fields ?? []).filter(field => !field.advanced).map(fieldInput)}
-          {!isIcloud && provider.fields?.some(field => field.advanced) && <details className="provider-advanced">
-            <summary>Advanced server settings</summary>
-            <p className="settings-note">Server endpoints and required TLS are set by the selected host preset. Change presets in the local host configuration.</p>
-            {provider.fields.filter(field => field.advanced).map(fieldInput)}
+          {reconnecting && <p className="settings-note">Enter the new credentials for {reconnecting.email || reconnecting.name}. Everything else about this connection stays the same.</p>}
+          {visible.filter(field => !field.advanced).map(fieldInput)}
+          {advanced.length > 0 && <details className="provider-advanced">
+            <summary>Advanced settings</summary>
+            {provider.advancedNote && <p className="settings-note">{provider.advancedNote}</p>}
+            {advanced.map(fieldInput)}
           </details>}
-          {provider.credentialHelp && isIcloud && <p className="settings-note">{provider.credentialHelp.text} <a href={provider.credentialHelp.url} target="_blank" rel="noopener noreferrer">Create an app-specific password</a></p>}
+          {help && <p className="settings-note">{help.text} <a href={help.url} target="_blank" rel="noopener noreferrer">{help.linkLabel}</a></p>}
           <button className="settings-button" type="submit">{step.reconnectId ? "Reconnect" : provider.actionLabel || `Connect ${provider.name}`}</button>
         </>}
       </form>

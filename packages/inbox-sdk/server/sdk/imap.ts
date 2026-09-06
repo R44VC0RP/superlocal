@@ -300,7 +300,6 @@ export class ImapProvider implements InboxProvider {
       send: canSend,
       reply: canSend,
       threads: true,
-      nativeThreads: false,
       folders: true,
       createFolders: true,
       labels: false,
@@ -311,13 +310,7 @@ export class ImapProvider implements InboxProvider {
       markUnread: true,
       star: true,
       attachments: true,
-      attachmentDownload: true,
       search: true,
-      drafts: false,
-      scheduledSend: false,
-      snooze: false,
-      readReceipts: false,
-      pushNotifications: false,
     })
     credentials.signal?.addEventListener('abort', this.abort, { once: true })
   }

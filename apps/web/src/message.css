@@ -349,25 +349,87 @@
   flex-shrink: 0;
   color: inherit;
 }
-.compose-from select {
+.compose-sender-picker {
+  position: relative;
   min-width: 0;
-  max-width: calc(100% - 84px);
+  max-width: calc(100% - 64px);
+}
+.compose-sender-trigger {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 32px;
   border: 0;
-  outline: none;
   padding: 2px 4px;
   background: transparent;
   color: inherit;
   font: inherit;
-  appearance: none;
   cursor: pointer;
+  text-align: left;
 }
-.compose-from option {
-  background: var(--panel);
+.compose-sender-trigger > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.compose-from > .icon {
-  margin-left: 7px;
+.compose-sender-trigger > .icon {
+  flex-shrink: 0;
   color: var(--subtle);
 }
+.compose-sender-options {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 45;
+  width: max-content;
+  min-width: min(280px, 100%);
+  max-width: min(420px, calc(100vw - 110px));
+  max-height: min(320px, 45vh);
+  overflow: auto;
+  overscroll-behavior: contain;
+  box-sizing: border-box;
+  padding: 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  box-shadow: 0 10px 35px rgba(0, 0, 0, 0.3);
+  color: var(--text);
+  font-size: var(--ui-small);
+  line-height: 20px;
+  font-weight: 400;
+}
+.compose-sender-group {
+  padding: 5px 8px;
+  color: var(--subtle);
+  overflow-wrap: anywhere;
+}
+.compose-sender-options [role="group"] + [role="group"] {
+  margin-top: 5px;
+}
+.compose-sender-options [role="option"] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.compose-sender-options [role="option"] > span {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.compose-sender-options [role="option"] > .icon { flex-shrink: 0; }
+.compose-sender-options [role="option"].is-active { background: var(--hover); }
 .compose-sender-status {
   padding-left: 64px;
   color: var(--muted);
@@ -392,7 +454,7 @@
   text-decoration: underline;
   cursor: pointer;
 }
-.compose-from select:focus-visible,
+.compose-view .compose-sender-trigger:focus-visible,
 .compose-sender-status button:focus-visible {
   outline: 2px solid var(--muted);
   outline-offset: 2px;
@@ -1555,7 +1617,7 @@
   }
   .compose-recipient-input-wrap > input,
   .compose-subject,
-  .compose-from select,
+  .compose-sender-trigger,
   .compose-editor,
   .message-menu input,
   .message-modal input,

@@ -670,6 +670,75 @@ test("SDK-backed sending identities stay composer-scoped and preserve explicit d
 
     const compose = await store.newDraft(primary.id, { to: "recipient@example.test", subject: "Explicit sender", body: "<p>Keep this writing</p>" });
     assert.equal(created.at(-1)!.from, primary.email, "new compose retains the existing mailbox default");
+    const [{ createElement }, { renderToStaticMarkup }, { mock }, runtime, developmentRuntime] = await Promise.all([
+      import("react"), import("react-dom/server"), import("bun:test"), import("react/jsx-runtime"), import("react/jsx-dev-runtime"),
+    ]);
+    const { jsx, jsxs, Fragment } = runtime, { jsxDEV } = developmentRuntime;
+    type FromControl = { value: string; disabled: boolean; "aria-busy": boolean; "aria-expanded": boolean };
+    let fromControl: FromControl | undefined;
+    const renderedOptions: Array<{ value: string; children: string; onClick: () => void }> = [], draftChanges: Draft[] = [], identityDemand: string[] = [];
+    // Observe the rendered control's real handler; keep React's actual server renderer and hooks.
+    const capture = (render: (...args: any[]) => any) => (...args: any[]) => {
+      const [type, props] = args;
+      if (type === "button" && props.role === "combobox" && props["aria-label"] === "From") fromControl = props;
+      if (type === "button" && props.role === "option") renderedOptions.push({ ...props, children: props["aria-label"] });
+      return render(...args);
+    };
+    mock.module("react/jsx-runtime", () => ({ Fragment, jsx: capture(jsx), jsxs: capture(jsxs) }));
+    mock.module("react/jsx-dev-runtime", () => ({ Fragment, jsxDEV: capture(jsxDEV) }));
+    try {
+      const { default: Composer, sendingAddressGroups } = await import("../src/Composer.tsx");
+      const addressBox: MailboxOption = { ...primary, id: "address-view", selectorKind: "address", selectorValue: alias, email: alias };
+      const domainBox: MailboxOption = { ...primary, id: "domain-view", selectorKind: "domain", selectorValue: primary.email.split("@")[1] };
+      const sourceCatalog = [{ email: primary.email }, { email: alias }, { email: "elsewhere@other.test" }];
+      const groups = sendingAddressGroups([primary, addressBox, domainBox, secondary], {
+        [primary.id]: sourceCatalog, [addressBox.id]: sourceCatalog, [domainBox.id]: sourceCatalog,
+        [secondary.id]: [{ email: secondary.email }, { email: secondBox.aliases[0]! }],
+      }, addressBox.id);
+      assert.deepEqual(groups.find(group => group.account.id === addressBox.id)!.identities.map(identity => identity.email), [alias]);
+      assert.equal(groups.flatMap(group => group.identities).filter(identity => identity.email === alias).length, 1, "overlapping receiving views never duplicate the same sender");
+      assert.ok(groups.find(group => group.account.id === secondary.id)!.identities.some(identity => identity.email === secondBox.aliases[0]), "all finite aliases from other sources are offered");
+      const domainOnly = sendingAddressGroups([domainBox], { [domainBox.id]: sourceCatalog }, domainBox.id);
+      assert.deepEqual(domainOnly[0].identities.map(identity => identity.email), [primary.email, alias], "domain views exclude source aliases outside their authorized receiving domain");
+      const readOnly = { ...secondary, id: "read-only-mailbox", email: "read-only@example.test", canSend: false };
+      const renderComposer = (draft: Draft) => {
+        fromControl = undefined; renderedOptions.length = 0;
+        const html = renderToStaticMarkup(createElement(Composer, { draft, preferences: defaultPreferences, accounts: [primary, secondary, readOnly],
+          loadSendingIdentities: (id, input) => { identityDemand.push(id); return store.sendingIdentities(id, input); },
+          onChange: next => { draftChanges.push(next); }, onSend: async () => false, onDiscard: async () => false, onClose: () => {}, autoFocus: false }));
+        assert.ok(fromControl, "the rendered composer exposes one From control");
+        return { html, from: html.slice(html.indexOf('class="compose-sender-picker"'), html.indexOf('class="compose-sender-status')), control: fromControl, options: [...renderedOptions] };
+      };
+      const unsaved = { ...compose, dirty: true, saving: false, to: "unfinished-recipient", cc: "copy@example.test" };
+      const initial = renderComposer(unsaved);
+      assert.equal(initial.control.disabled, false); assert.equal(initial.control["aria-busy"], true);
+      assert.deepEqual(identityDemand, [], "the synchronous render is usable before identity discovery starts");
+      assert.equal(initial.control["aria-expanded"], false);
+      assert.equal((initial.from.match(/role="group"/g) ?? []).length, 2);
+      assert.ok(initial.from.includes(`role="group" aria-label="${primary.email}"`)); assert.ok(initial.from.includes(`role="group" aria-label="${secondary.email}"`));
+      assert.ok(!initial.from.includes(readOnly.email)); assert.doesNotMatch(initial.html, /aria-label="Mailbox"|Unsaved recipient changes/);
+      const other = initial.options.find(option => option.children === secondary.email)!;
+      assert.ok(other); other.onClick();
+      assert.equal(draftChanges.length, 1, "a single From selection publishes one atomic draft update");
+      assert.deepEqual(draftChanges[0], { ...unsaved, account: secondary.id, from: secondary.email, updated: draftChanges[0].updated });
+      assert.equal(renderComposer(draftChanges[0]).control.value, other.value);
+      const chosen = renderComposer({ ...compose, from: alias });
+      assert.equal(chosen.control.value, JSON.stringify([primary.id, alias]), "an explicit saved alias is not replaced by a seed while discovery is pending");
+      for (const [mode, sourceMessageId] of [["new", "fictional-reply-origin"], ["reply", undefined], ["replyAll", undefined], ["forward", undefined]] as const) {
+        draftChanges.length = 0;
+        const reply = renderComposer({ ...compose, mode, sourceMessageId, from: alias });
+        assert.doesNotMatch(reply.from, /class="compose-sender-group"/); assert.ok(!reply.from.includes(secondary.email));
+        assert.ok(reply.options.some(option => option.children === primary.email));
+        assert.ok(!reply.options.some(option => option.value === other.value), "a source-bound draft exposes no cross-account option");
+      }
+      const unavailable = renderComposer({ ...compose, account: readOnly.id, from: "unavailable@example.test" });
+      assert.match(unavailable.html, /This address is not in the available senders\./); assert.match(unavailable.html, /Retry sending addresses/);
+      assert.ok(unavailable.from.includes("unavailable@example.test (Unavailable)"));
+      assert.ok(!unavailable.options.some(option => option.value === unavailable.control.value), "an unavailable saved address is visible but cannot be newly selected");
+    } finally {
+      mock.module("react/jsx-runtime", () => ({ Fragment, jsx, jsxs }));
+      mock.module("react/jsx-dev-runtime", () => ({ Fragment, jsxDEV }));
+    }
     store.editDraft({ ...compose, from: alias, popOut: true });
     await store.flushDraft(compose.id);
     await store.reloadDraft(compose.id);
@@ -707,6 +776,17 @@ test("SDK-backed sending identities stay composer-scoped and preserve explicit d
     assert.equal(saved.from, "removed@example.test", "reload never replaces an unavailable saved sender");
     store.editDraft({ ...saved, from: alias }); await store.flushDraft(saved.id);
     assert.equal(store.getSnapshot().drafts.find(draft => draft.id === compose.id)!.sendError, undefined);
+
+    const crossSource = await store.newDraft(primary.id, { to: "recipient@example.test", subject: "Move exact sender", body: "<p>Preserve across mailboxes</p>" });
+    const secondaryAlias = secondBox.aliases[0]!;
+    const moved = await store.moveDraft(crossSource.id, secondary.id, secondaryAlias);
+    assert.equal(moved.from, secondaryAlias, "cross-source From selection retains the exact alias rather than the target default");
+    assert.equal(moved.account, secondary.id); assert.equal(moved.body, crossSource.body); assert.equal(moved.to, crossSource.to);
+    await store.reloadDraft(moved.id);
+    const reloadedMove = store.getSnapshot().drafts.find(draft => draft.id === moved.id)!;
+    assert.equal(reloadedMove.from, secondaryAlias);
+    const movedOperation = await store.submit(reloadedMove);
+    assert.ok(["pending", "processing", "succeeded"].includes(movedOperation.status), "the selected alias is accepted by the real SDK submission path");
 
     identityGate = new Promise(resolve => { releaseIdentity = resolve; }); identityHeld = false;
     const detachedRead = store.sendingIdentities(secondary.id, { refresh: true });
@@ -2737,6 +2817,9 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       const pages: PageInput[] = [], changes: ChangesInput[] = [], querySignals: AbortSignal[] = [], published: number[] = [], mismatchedCheckpoints: number[] = [];
       const captures: Array<{ path: string; id: string; account: string; queryId?: string }> = [];
       let queries = 0, revision = 1, holdQuery = false, heldQuery = false, stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+      // The host count pager is resumable: unknown until its bounded passes finish, then exact.
+      const countRequests: string[] = [], countsKnownAfter = name === "sparse" ? 3 : Infinity;
+      const knownTotals: Page["totals"] = { conversations: 6, messages: 6, inbox: 7, splits: { Important: 7, Other: 2 }, folders: { Inbox: 7 }, holding: false };
       let reversePage: ((input: PageInput) => Page | Promise<Page>) | undefined;
       let reverseDelta: { upserts?: Row[]; newHead: Row[]; removed: Array<{ key: string; reason: "deleted" }> } | undefined;
       let scopeChanges: ((input: ChangesInput) => Promise<Response>) | undefined;
@@ -2793,6 +2876,10 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           if (delta) revision++;
           return Response.json({ state: state(), upserts: delta?.upserts ?? [], newHead: delta?.newHead ?? [], removed: delta?.removed ?? [], totals, nextCursor: null, throughRevision: revision, resetReason: null });
         }
+        if (url.pathname === "/host/inbox/counts") {
+          const body = JSON.parse(String(init?.body)) as { queryId: string }; countRequests.push(body.queryId);
+          return Response.json({ state: state(), totals: countRequests.length >= countsKnownAfter ? knownTotals : totals });
+        }
         if (url.pathname === "/host/inbox/messages" && detailRead) return Response.json(await detailRead(JSON.parse(String(init?.body))));
         if (url.pathname === "/host/inbox/lookup" && lookupRead) return Response.json({ state: state(), entries: lookupRead(JSON.parse(String(init?.body)).ids).map(row => ({ key: row.key, status: "found", row })) });
         if (url.pathname.startsWith(`/v1/mailboxes/${box.id}/messages/`) && url.pathname.endsWith("/summary") && summaryRead) {
@@ -2824,9 +2911,17 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       await sleep(650);
       assert.equal(queries, 1); assert.equal(pages.length, sizes.length > 1 ? 1 : 0, `${name}: initial response plus at most one automatic buffer`);
       assert.equal(changes.length, 0, `${name}: incomplete context does not start an index-completion poller`);
-      assert.equal(store.getSnapshot().window!.totals.conversations, null, "unknown totals never become zero");
+      // One idle count fill per view open: at most five bounded requests, exact totals when complete, nothing otherwise.
+      await until(() => countRequests.length === Math.min(5, countsKnownAfter), `${name}: the count fill settles`);
+      await sleep(120); assert.equal(countRequests.length, Math.min(5, countsKnownAfter), `${name}: a one-shot fill stops at its cap or first complete answer`);
+      assert.ok(countRequests.every(id => id === "query-1"), "count fills address the opened view's query");
+      if (name === "sparse") assert.deepEqual(store.getSnapshot().window!.totals, knownTotals, "complete totals are published without a rebuild");
+      else assert.equal(store.getSnapshot().window!.totals.conversations, null, "unknown totals never become zero");
       const html = render();
       assert.doesNotMatch(html, /ai-sorting-warning|Sorting details|Indexing conversations|Loading conversations…/);
+      assert.doesNotMatch(html, /…<\/span>/, "unknown counts render nothing, not an ellipsis");
+      if (name === "sparse") assert.match(html, /split-tab-count">7</, "known split totals render as exact numbers");
+      else assert.doesNotMatch(html, /split-tab-count/, "unknown split totals render the tab label alone");
       if (name === "full") {
         const healthy: AiTriageState = { configured: true, provider: null, problemCode: null,
           settings: { revision: 1, enabled: true, mode: "apply", model: "fixture-model", mailboxIds: null, personalization: true, readingSignals: false, interests: [] },
@@ -3460,6 +3555,63 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           const buffered = pages.length; await sleep(650);
           assert.equal(changes.length, 1); assert.equal(pages.length, buffered, "ordinary deltas cannot restart automatic prefetch");
           assert.equal(store.getSnapshot().window!.query.folder, "Sent"); assert.equal(store.getSnapshot().error, null);
+          const fillsBeforeWake = countRequests.length;
+          await store.retry(); await sleep(400);
+          assert.equal(countRequests.length, fillsBeforeWake, "wakes and reconciliation never re-run the count fill");
+
+          // Returning to a retained view publishes its rows at once, then reconciles with one bounded drain.
+          const inboxQuery = { ...store.getSnapshot().window!.query, folder: "Inbox" };
+          const queriesBefore = queries, drainsBefore = changes.length, pagesBefore = pages.length, fillsBefore = countRequests.length;
+          const restoring = store.setWindowQuery(inboxQuery);
+          const immediate = store.getSnapshot();
+          assert.equal(immediate.window!.query.folder, "Inbox"); assert.equal(immediate.loading, false); assert.equal(immediate.loaded, true);
+          assert.equal(immediate.window!.keys.length, 6, "the retained Inbox rows are visible before any request");
+          assert.ok(immediate.mail.some(mail => mail.id === row(0).key) && immediate.mail.some(mail => mail.id === row(300).key));
+          assert.equal(immediate.window!.paging, false); assert.equal(immediate.window!.nextCursor, null);
+          assert.doesNotMatch(render(), /Loading conversations…/);
+          await restoring;
+          assert.equal(queries, queriesBefore, "returning to a retained view issues no query");
+          assert.equal(changes.length, drainsBefore + 1); assert.equal(changes.at(-1)!.cursor, undefined);
+          assert.deepEqual(new Set(changes.at(-1)!.residentKeys), new Set(immediate.window!.keys), "the drain reconciles exactly the restored rows");
+          assert.equal(changes.at(-1)!.sinceRevision, immediate.window!.state.indexRevision, "the drain resumes from the view's saved checkpoint");
+          await sleep(450);
+          assert.equal(changes.length, drainsBefore + 1, "exactly one catch-up drain, no poller");
+          assert.equal(pages.length, pagesBefore, "a restored view never restarts automatic prefetch");
+          assert.equal(countRequests.length, fillsBefore + 1, "a restored view with unknown totals fills once; the host answers from its cache");
+          assert.deepEqual(store.getSnapshot().window!.totals, knownTotals);
+          assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+
+          // Three inactive views are retained; leaving a fourth distinct view evicts the oldest (Sent, then Inbox).
+          for (const folder of ["Trash", "Done", "Reminders"]) {
+            const before = queries; await store.setWindowQuery({ ...inboxQuery, folder });
+            assert.equal(queries, before + 1, `${folder} is a fresh view`);
+          }
+          const beforeReturn = queries;
+          await store.setWindowQuery({ ...inboxQuery, folder: "Sent" });
+          assert.equal(queries, beforeReturn + 1, "the oldest inactive view (Sent) was evicted by the fourth");
+          for (const folder of ["Reminders", "Done", "Trash"]) {
+            await store.setWindowQuery({ ...inboxQuery, folder });
+            assert.equal(queries, beforeReturn + 1, `${folder} stays retained`);
+            assert.equal(store.getSnapshot().window!.query.folder, folder); assert.equal(store.getSnapshot().loading, false);
+          }
+          const evicted = queries; await store.setWindowQuery(inboxQuery);
+          assert.equal(queries, evicted + 1, "Inbox, the oldest after Sent, was evicted in turn and reopens normally");
+          assert.equal(store.getSnapshot().error, null);
+
+          const { syncNotices } = await import("../src/MailSyncStatus.tsx");
+          type SyncRow = import("inbox-sdk/types").MailboxSyncStatus & { coverage?: "empty" | "partial" | "complete" };
+          const syncRow = (patch: Partial<SyncRow>): SyncRow => ({ sourceId: source.id, scopeKey: "scope", state: "idle", activeLanes: [], retryAt: null, problemCode: null,
+            lastBatch: { lane: "latest", processed: 40, completedAt: deadline, hasMore: false }, lastSyncAt: deadline, ...patch });
+          const complete = { ...source, sync: { ...source.sync, coverage: "complete" as const } };
+          assert.deepEqual(syncNotices([syncRow({}), syncRow({ state: "syncing", activeLanes: ["latest"] }), syncRow({ lastBatch: { lane: "latest", processed: 3, completedAt: deadline, hasMore: true } })], [source]), [],
+            "healthy, idle and routine latest-lane syncing show nothing");
+          assert.deepEqual(syncNotices([syncRow({ state: "syncing", activeLanes: ["backfill"], coverage: "complete" })], [source]), [], "a complete inbox hides backfill housekeeping");
+          assert.deepEqual(syncNotices([syncRow({ state: "syncing", activeLanes: ["backfill"] })], [complete]), [], "source coverage stands in when the row has none");
+          assert.deepEqual(syncNotices([syncRow({ state: "syncing", activeLanes: ["backfill"] })], [source]).map(notice => [notice.kind, notice.text]), [["importing", "Importing older mail…"]]);
+          assert.deepEqual(syncNotices([syncRow({ lastBatch: { lane: "backfill", processed: 100, completedAt: deadline, hasMore: true } })], [source]).map(notice => notice.kind), ["importing"], "an unfinished first import stays visible between batches");
+          const actionable = syncNotices([syncRow({ state: "paused" }), syncRow({ sourceId: "other", state: "error", problemCode: "CREDENTIALS_REVOKED" }), syncRow({ sourceId: "third", state: "error", problemCode: "NETWORK", coverage: "complete" })], [complete]);
+          assert.deepEqual(actionable.map(notice => [notice.kind, notice.text]), [["reconnect", "Reconnect to resume syncing"], ["error", "Couldn’t reach the mail provider"], ["paused", "Sync paused"]]);
+          for (const notice of actionable) assert.doesNotMatch(notice.text, /[A-Z]{2,}|between batches|Last batch/);
         }
       }
       assert.deepEqual(mismatchedCheckpoints, [], "every published checkpoint keeps its revision and token paired, including a deferred pin replay");

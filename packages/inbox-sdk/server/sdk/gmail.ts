@@ -41,6 +41,7 @@ import {
   type SendResult,
   type SyncCursor,
   type SyncOptions,
+  type SyncContext,
   type SyncResult,
 } from './types'
 
@@ -105,7 +106,6 @@ const GMAIL_CAPABILITIES: Readonly<ProviderCapabilities> = Object.freeze({
   send: true,
   reply: true,
   threads: true,
-  nativeThreads: true,
   folders: true,
   createFolders: true,
   labels: true,
@@ -116,13 +116,7 @@ const GMAIL_CAPABILITIES: Readonly<ProviderCapabilities> = Object.freeze({
   markUnread: true,
   star: true,
   attachments: true,
-  attachmentDownload: true,
   search: true,
-  drafts: false,
-  scheduledSend: false,
-  snooze: false,
-  readReceipts: false,
-  pushNotifications: false,
 })
 
 const GMAIL_FOLDER_LABELS: Partial<Record<MailFolder, string>> = {
@@ -495,7 +489,6 @@ export class GmailProvider implements InboxProvider {
       send,
       reply: send,
       threads: read,
-      nativeThreads: read,
       folders: read || manageLabels || scopes.includes('https://www.googleapis.com/auth/gmail.metadata'),
       createFolders: manageLabels,
       labels: modify,
@@ -506,7 +499,6 @@ export class GmailProvider implements InboxProvider {
       markUnread: modify,
       star: modify,
       attachments: read,
-      attachmentDownload: read,
       search: read,
     })
     this.accountId = credentials.accountId
@@ -665,7 +657,7 @@ export class GmailProvider implements InboxProvider {
     })
   }
 
-  async getSendingIdentities(): Promise<readonly SendingIdentity[]> {
+  async identities(): Promise<{ sending: readonly SendingIdentity[] }> {
     const validAddress = (value: unknown): value is string => {
       if (typeof value !== 'string' || value.length > 254) return false
       const parts = value.split('@')
@@ -717,7 +709,7 @@ export class GmailProvider implements InboxProvider {
       })
     }
     if (primaryCount !== 1) throw invalid()
-    return identities
+    return { sending: identities }
   }
 
   async listFolders(): Promise<ProviderFolder[]> {
@@ -856,7 +848,8 @@ export class GmailProvider implements InboxProvider {
     }
   }
 
-  async sync(cursor?: SyncCursor | string | null, options: SyncOptions = {}): Promise<SyncResult> {
+  async sync(cursor?: SyncCursor | string | null, options: SyncOptions = {}, context?: SyncContext): Promise<SyncResult> {
+    options = { ...context, ...options }
     const current = normalizeCursor('gmail', cursor, 'history')
     if (current && current.kind !== 'history' && current.kind !== 'page') {
       throw new ProviderCursorExpiredError('gmail', 'Gmail synchronization requires a history or page cursor')
