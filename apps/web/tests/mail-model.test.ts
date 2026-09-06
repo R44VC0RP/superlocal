@@ -2681,6 +2681,423 @@ test("sender selection follows the exact message or outgoing recipient, never th
   assert.equal(senderContact({ ...thread, messages: [thread.messages[2]] }, history, boxes).role, "recipient");
 });
 
+test("demand-driven host windows bound automatic requests and render unknown totals without false empty states", async () => {
+  if (process.env.INBOX_DEMAND_WINDOW_TEST_CHILD !== "1") {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "demand-driven host windows", "--timeout", "15000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_DEMAND_WINDOW_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const [{ InboxStore }, { mock }, { createElement }, { renderToStaticMarkup }] = await Promise.all([
+    import("../src/inbox.ts"), import("bun:test"), import("react"), import("react-dom/server"),
+  ]);
+  type Page = import("../../shared/inbox-window").InboxWindowPage;
+  type Row = import("../../shared/inbox-window").InboxWindowRow;
+  type PageInput = import("../../shared/inbox-window").InboxPageInput;
+  type ChangesInput = import("../../shared/inbox-window").InboxChangesInput;
+  type MessagesInput = import("../../shared/inbox-window").InboxMessagesInput;
+  type MessagesPage = import("../../shared/inbox-window").InboxMessagesPage;
+  const source: import("inbox-sdk/types").Account = { id: "fictional-source", providerId: "mock", email: "owner@example.test", name: "Fictional account", generation: 1,
+    status: "connected", revision: 1, sync: { lastSyncAt: null, coverage: "partial", problem: null },
+    features: { localDrafts: true, localLabels: true, snooze: true, scheduledSend: false, undoSend: false },
+    capabilities: { sync: true, incrementalSync: true, deltaSync: false, send: false, reply: false, threads: true, nativeThreads: true,
+      folders: false, createFolders: false, labels: false, archive: false, trash: false, permanentDelete: false, markRead: false, markUnread: false,
+      star: false, attachments: false, attachmentDownload: false, search: true, drafts: false, scheduledSend: false, snooze: false, readReceipts: false, pushNotifications: false } };
+  const box: import("inbox-sdk/types").Mailbox = { id: "fictional-box", sourceId: source.id, connectionId: "fictional-connection", name: "Fictional inbox",
+    selector: { kind: "all" }, status: "active", defaultSender: source.email, revision: 1, receiving: "ready" };
+  const totals: Page["totals"] = { conversations: null, messages: null, inbox: null, splits: { Important: null, Other: null }, folders: {}, holding: null };
+  const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
+  const globals = ["location", "window", "document", "localStorage", "history", "matchMedia", "innerHeight"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  const until = async (check: () => boolean, message: string) => {
+    for (let attempt = 0; attempt < 300 && !check(); attempt++) await sleep(5);
+    assert.ok(check(), message);
+  };
+  let store: InstanceType<typeof InboxStore>, stop: (() => void) | undefined, releaseQuery: (() => void) | undefined, releaseReverse: (() => void) | undefined, releaseHistory: (() => void) | undefined;
+  let renderedAi: AiTriageState | null = null, renderedAiError: string | null = "Saved sorting diagnostics are unavailable.";
+  try {
+    console.info = () => {}; console.warn = () => {};
+    const storage = new Map<string, string>();
+    Object.assign(globalThis, { location: new URL(`http://localhost:41999/#/account=${box.id}&folder=Inbox&split=Important`), window: new EventTarget(),
+      document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
+      localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+      history: { state: null }, matchMedia: () => ({ matches: false }), innerHeight: 1000,
+    });
+    mock.module("../src/use-inbox.ts", () => ({ useInbox: () => ({ ...store.getSnapshot(), store, ai: renderedAi, aiError: renderedAiError }) }));
+    const { default: App } = await import("../src/App.tsx");
+    const render = () => renderToStaticMarkup(createElement(App));
+    for (const [name, sizes] of [["full", [100, 100, 0, 1]], ["sparse", [3, 2, 0, 1]], ["empty", [0, 0, 0, 1]], ["exhausted", [0]], ["unfinished", [0]]] as const) {
+      const pages: PageInput[] = [], changes: ChangesInput[] = [], querySignals: AbortSignal[] = [], published: number[] = [];
+      const captures: Array<{ path: string; id: string; account: string; queryId?: string }> = [];
+      let queries = 0, revision = 1, holdQuery = false, heldQuery = false, stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+      let reversePage: ((input: PageInput) => Page | Promise<Page>) | undefined;
+      let reverseDelta: { upserts?: Row[]; newHead: Row[]; removed: Array<{ key: string; reason: "deleted" }> } | undefined;
+      let detailRead: ((input: MessagesInput) => MessagesPage | Promise<MessagesPage>) | undefined;
+      let lookupRead: ((ids: string[]) => Row[]) | undefined;
+      let bodyRead: ((id: string) => import("inbox-sdk/types").Message) | undefined;
+      const state = (): Page["state"] => ({ queryId: `query-${queries}`, queryGeneration: 1, indexRevision: revision, scopeState: "fictional-scope",
+        preferenceRevision: "1", sources: [{ sourceId: source.id, generation: 1 }], sdkState: "fictional-state", indexing: true, catchup: "current" });
+      const row = (index: number): Row => {
+        const id = `${box.id}:thread-${index}`, messageId = `message-${index}`;
+        return { key: id, sourceId: source.id, threadId: `thread-${index}`, sourceGeneration: 1, revision: 1, pageCursor: `row-${index}`,
+          mail: { ...inbox, id, account: box.id, mailboxId: box.id, sourceId: source.id, sdkThreadId: `thread-${index}`, subject: `Fictional page row ${index}`,
+            receivedAt: Date.parse(deadline) - index * 1000, folder: "Inbox", locations: ["Inbox"], messages: [{ ...inbox.messages[0], id: messageId, body: "", loaded: false }] },
+          summaries: [], messagesComplete: false, counts: { messages: 1, memberships: 1, unread: 1, done: 0, snoozed: 0 },
+          targets: [{ mailboxId: box.id, messageId, revision: 1 }], targetsComplete: true, actionContextComplete: false, contextVersion: `context-${index}` };
+      };
+      const page = (index: number): Page => ({ state: state(), totals, rows: Array.from({ length: sizes[index] ?? 0 }, (_, i) => row(index * 100 + i)),
+        nextCursor: index < sizes.length - 1 ? `cursor-${index + 1}` : null, exhausted: index >= sizes.length - 1 && (name !== "unfinished" || queries > 1) });
+      globalThis.fetch = (async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+        if (url.pathname === "/v1/accounts") return Response.json([source]);
+        if (url.pathname === "/v1/mailboxes") return Response.json([box]);
+        if (url.pathname === "/v1/changes") return Response.json({ state: "fictional-state", events: [], hasMore: false, resetRequired: false });
+        if (["/v1/labels", "/v1/drafts", `/v1/accounts/${source.id}/folders`].includes(url.pathname)) return Response.json([]);
+        if (url.pathname === "/v1/policy") return Response.json({ remoteImages: false, undoSendSeconds: 0 });
+        if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: false, providers: [], inboxWindow: true });
+        if (url.pathname === "/host/inbox-preferences") return Response.json({ revision: 1, unifiedMode: "selected", includedMailboxIds: [box.id], pinnedMailboxIds: [] });
+        if (url.pathname === "/host/inbox/query") {
+          queries++; querySignals.push(init!.signal!);
+          if (holdQuery) { heldQuery = true; await new Promise<void>(resolve => { releaseQuery = resolve; }); }
+          return Response.json(page(0));
+        }
+        if (url.pathname === "/host/inbox/page") {
+          const body = JSON.parse(String(init?.body)) as PageInput; pages.push(body);
+          assert.equal(body.queryId, state().queryId); assert.ok(body.limit! <= 100);
+          if (reversePage) return Response.json(await reversePage(body));
+          return Response.json(page(Number(body.cursor!.slice("cursor-".length))));
+        }
+        if (url.pathname === "/host/inbox/changes") {
+          const body = JSON.parse(String(init?.body)) as ChangesInput; changes.push(body);
+          assert.ok(body.residentKeys.length <= 1000); assert.equal(body.limit, 100);
+          const delta = reverseDelta; reverseDelta = undefined;
+          if (delta) revision++;
+          return Response.json({ state: state(), upserts: delta?.upserts ?? [], newHead: delta?.newHead ?? [], removed: delta?.removed ?? [], totals, nextCursor: null, throughRevision: revision, resetReason: null });
+        }
+        if (url.pathname === "/host/inbox/messages" && detailRead) return Response.json(await detailRead(JSON.parse(String(init?.body))));
+        if (url.pathname === "/host/inbox/lookup" && lookupRead) return Response.json({ state: state(), entries: lookupRead(JSON.parse(String(init?.body)).ids).map(row => ({ key: row.key, status: "found", row })) });
+        if (url.pathname.startsWith(`/v1/mailboxes/${box.id}/messages/`) && bodyRead) return Response.json(bodyRead(decodeURIComponent(url.pathname.split("/").at(-1)!)));
+        if (["/host/inbox/zero/create", "/host/inbox/selection/create"].includes(url.pathname)) {
+          captures.push({ path: url.pathname, ...JSON.parse(String(init?.body)) });
+          return Response.json({ code: "HOST_INBOX_PREPARING", error: "Capture preparation is not ready." }, { status: 503 });
+        }
+        if (url.pathname === "/v1/events") return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+          stream = controller; controller.enqueue(new TextEncoder().encode('event: ready\ndata: {"state":"fictional-state"}\n\n'));
+        } }), { headers: { "content-type": "text/event-stream" } });
+        assert.fail(`Unexpected request in demand-only fixture: ${url.pathname}`);
+      }) as typeof fetch;
+      store = new InboxStore();
+      const unsubscribe = store.subscribe(() => { if (store.getSnapshot().loaded) published.push(store.getSnapshot().window!.keys.length); });
+      stop = store.start();
+      await until(() => !!store.getSnapshot().window && !store.getSnapshot().window!.paging && !!stream, `${name}: bounded initial response settled`);
+      assert.equal(published[0], sizes[0], `${name}: the first response is usable before the buffer arrives`);
+      assert.equal(store.getSnapshot().loaded, true); assert.equal(store.getSnapshot().loading, false);
+      assert.equal(store.getSnapshot().window!.keys.length, sizes[0] + (sizes[1] ?? 0));
+      await sleep(650);
+      assert.equal(queries, 1); assert.equal(pages.length, sizes.length > 1 ? 1 : 0, `${name}: initial response plus at most one automatic buffer`);
+      assert.equal(changes.length, 0, `${name}: incomplete context does not start an index-completion poller`);
+      assert.equal(store.getSnapshot().window!.totals.conversations, null, "unknown totals never become zero");
+      const html = render();
+      assert.doesNotMatch(html, /ai-sorting-warning|Sorting details|Indexing conversations|Loading conversations…/);
+      if (name === "full") {
+        const healthy: AiTriageState = { configured: true, provider: null, problemCode: null,
+          settings: { revision: 1, enabled: true, mode: "apply", model: "fixture-model", mailboxIds: null, personalization: true, readingSignals: false, interests: [] },
+          queue: { pending: 0, processing: 0, failed: 0 }, jobs: [], cursor: 0,
+          usage: { attempts: 0, completed: 0, failed: 0, reused: 0, unknownUsage: 0, unpriced: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0,
+            cacheWriteInputTokens: 0, reasoningOutputTokens: 0, estimatedMinimumUsd: 0, estimatedMaximumUsd: 0 } };
+        const sortingCases: Array<{ ai: AiTriageState | null; error: string | null; label: string | null }> = [
+          { ai: healthy, error: null, label: null },
+          { ai: { ...healthy, queue: { ...healthy.queue, failed: 56 } }, error: null, label: null },
+          { ai: healthy, error: "Current sorting status could not be read.", label: "Sorting status unavailable" },
+          { ai: { ...healthy, configured: false }, error: null, label: "Automatic sorting unavailable" },
+          { ai: { ...healthy, problemCode: "AI_MODEL_UNAVAILABLE" }, error: null, label: "Automatic sorting needs attention" },
+          { ai: { ...healthy, settings: { ...healthy.settings, mailboxIds: [] } }, error: null, label: "No mailboxes selected" },
+          { ai: { ...healthy, configured: false, problemCode: "AI_MODEL_UNAVAILABLE", settings: { ...healthy.settings, enabled: false, mailboxIds: [] } }, error: "Unavailable", label: null },
+          { ai: { ...healthy, configured: false, problemCode: "AI_MODEL_UNAVAILABLE", settings: { ...healthy.settings, mode: "preview", mailboxIds: [] } }, error: "Unavailable", label: null },
+          { ai: null, error: null, label: null },
+          { ai: null, error: "Saved sorting diagnostics are unavailable.", label: null },
+        ];
+        for (const { ai, error, label } of sortingCases) {
+          renderedAi = ai; renderedAiError = error;
+          const current = render(), hints = [...current.matchAll(/<button\b[^>]*aria-label="Settings — ([^"]+)"[^>]*>/g)];
+          assert.deepEqual(hints.map(match => match[1]), label ? [label, label] : [], "only current enabled-Apply outages hint on both existing Settings gears");
+          assert.equal([...current.matchAll(/data-sorting-issue="true"/g)].length, label ? 2 : 0, "historical failures, off/preview and missing state never add a status dot");
+          for (const [button] of hints) assert.ok(button.includes(`title="Settings — ${label}"`), "the tooltip matches the accessible gear name");
+          assert.doesNotMatch(current, /ai-sorting-warning|Sorting details/);
+        }
+        renderedAi = null; renderedAiError = "Saved sorting diagnostics are unavailable.";
+        const [{ GuidedZero }, { Notice, default: Notices }, { InboxViewPreferencesError }] = await Promise.all([
+          import("../src/GuidedZero.tsx"), import("../src/Notices.tsx"), import("../src/host.ts"),
+        ]);
+        const noop = () => {};
+        const preparation: import("../src/GuidedZero.tsx").GuidedZeroState = { session: null, active: false, scoped: false, preparing: true, busy: false, error: "", retry: null,
+          storageError: false, undo: null, undoBlocked: false, remainingNow: null, remainingCount: null, decidedCount: 0, initialCount: null, overflowCount: 0,
+          offers: [], checked: [], confirming: false, handling: false, currentOutside: false, hasNextPage: false,
+          start: noop, pause: noop, review: noop, decide: noop, captureLater: () => false, remind: async () => {}, toggleChecked: noop, setConfirming: noop,
+          moveBatch: noop, browse: noop, continueReview: noop, handle: noop };
+        // Render contracts only: browser acceptance exercises actual Start/Back and scoped Select all callbacks.
+        for (const busy of [false, true]) {
+          const markup = renderToStaticMarkup(createElement(GuidedZero, { state: { ...preparation, busy }, onHandle: noop, onLater: noop }));
+          assert.match(markup, /Preparing cleanup\. You can return to your inbox while it gets ready\./);
+          assert.doesNotMatch(markup, /role="alert"|zero-error|Retry existing request|conversations selected/);
+          const start = markup.match(/<button\b([^>]*)>Start session<\/button>/)!;
+          assert.ok(start); assert.equal(start[1].includes("disabled"), busy, "Start is an explicit retry only when the prior request is settled");
+          assert.doesNotMatch(markup.match(/<button\b[^>]*>Back to inbox<\/button>/)![0], /disabled/, "leaving preparation remains available during its request");
+        }
+        const readyBody = renderToStaticMarkup(createElement(GuidedZero, { state: { ...preparation, preparing: false }, onHandle: noop, onLater: noop }));
+        assert.match(readyBody, /Work through unhandled Important conversations, including already-read mail\./);
+        assert.doesNotMatch(readyBody, /Preparing cleanup/);
+        const realFailure = renderToStaticMarkup(createElement(GuidedZero, { state: { ...preparation, preparing: false, error: "Existing action remains unconfirmed.", retry: async () => {} }, onHandle: noop, onLater: noop }));
+        assert.match(realFailure, /role="alert"/); assert.match(realFailure, />Retry existing request<\/button>/);
+        const selectionNotice = renderToStaticMarkup(createElement(Notices, { issues: [], onRetry: noop, onDismiss: noop },
+          createElement("div", { role: "status" }, createElement(Notice, { quiet: true, title: "Preparing selection…", action: { label: "Select all", onClick: noop }, onDismiss: noop }))));
+        assert.match(selectionNotice, /notice-quiet/); assert.match(selectionNotice, /Preparing selection…/); assert.match(selectionNotice, />Select all<\/button>/);
+        assert.doesNotMatch(selectionNotice, /role="alert"|conversations selected/);
+        const isPreparing = (error: unknown) => error instanceof InboxViewPreferencesError && error.code === "HOST_INBOX_PREPARING" && error.status === 503;
+        await assert.rejects(store.windowTransport.zeroCreate({ id: crypto.randomUUID(), account: box.id }), isPreparing);
+        await assert.rejects(store.createWindowSelection(), isPreparing);
+        await sleep(30); assert.equal(captures.length, 2, "preparation rejection does not trigger a transport retry or create an accepted reference");
+        await assert.rejects(store.createWindowSelection(), isPreparing);
+        assert.notEqual(captures[1].id, captures[2].id, "another explicit selection attempt uses a fresh capture ID");
+        assert.ok(captures.every(capture => capture.account === box.id));
+      }
+      if (name === "unfinished") {
+        assert.match(html, /Could not finish loading this view\./);
+        assert.match(html, />Retry<\/button>/);
+        assert.doesNotMatch(html, /No matches in the conversations checked\.|No matching conversations in cached mail\.|Load older conversations/);
+        await store.refresh();
+        assert.equal(queries, 2, "the Retry refresh operation opens a fresh query rather than rereading an unfinished delta");
+        assert.equal(store.getSnapshot().window!.exhausted, true);
+        assert.match(render(), /No matching conversations in cached mail\./);
+        assert.doesNotMatch(render(), /Could not finish loading this view\./);
+      } else if (sizes.length === 1) {
+        assert.match(html, /No matching conversations in cached mail\./, "exhausted Inbox renders its existing empty view with unknown global totals");
+        assert.doesNotMatch(html, /Load older conversations/);
+        await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Trash" });
+        assert.doesNotMatch(render(), /No matching conversations in cached mail\./, "a different query's exhaustion cannot empty the current route");
+        location.hash = `#/account=${box.id}&folder=Trash&split=Important`;
+        assert.match(render(), /No matches in cached mail\./, "an exhausted non-Inbox view keeps its appropriate empty state");
+        location.hash = `#/account=${box.id}&folder=Inbox&split=Important`;
+      } else {
+        assert.match(html, /Load older conversations/);
+        assert.doesNotMatch(html, /No matching conversations in cached mail\./, "an empty bounded page with a cursor is not exhaustion");
+        if (name === "empty") assert.match(html, /No matches in the conversations checked\./, "a partial empty scan explains only the checked conversations");
+        else assert.doesNotMatch(html, /No matches in the conversations checked\./, "nonempty pages do not add status prose");
+        const first = store.getSnapshot().mail[0];
+        await store.loadMoreWindow();
+        assert.equal(pages.length, 2); assert.equal(pages[1].cursor, "cursor-2");
+        assert.equal(store.getSnapshot().window!.nextCursor, "cursor-3", "an explicit empty response retains its next cursor");
+        if (name === "empty") assert.match(render(), /No matches in the conversations checked\./, "empty explicit scans keep the useful line and continuation");
+        await store.loadMoreWindow();
+        assert.equal(pages.length, 3); assert.equal(pages[2].cursor, "cursor-3");
+        assert.ok(store.getSnapshot().mail.some(mail => mail.id === `${box.id}:thread-300`), "explicit demand reaches a match beyond empty scans");
+        if (first) assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), first, "unchanged resident identities survive demand paging");
+        if (name === "full") {
+          const reader = store.getSnapshot().mail.find(mail => mail.id === row(0).key)!;
+          const draft = store.getSnapshot().mail.find(mail => mail.id === row(1).key)!;
+          const draftsBefore = structuredClone(store.getSnapshot().drafts);
+          store.pinWindow("reader", [reader.id], [reader]); store.pinWindow("draft:reverse", [draft.id], [draft]);
+          let arrived = false, firstNewer = true;
+          const older = (start: number, limit = 100): Page => {
+            const end = Math.min(start + limit, arrived ? 1049 : 1050);
+            return { state: state(), totals, rows: Array.from({ length: Math.max(0, end - start) }, (_, i) => row(start + i)),
+              nextCursor: end < (arrived ? 1049 : 1050) ? `older-page-${end}` : null, exhausted: end >= (arrived ? 1049 : 1050) };
+          };
+          reversePage = async input => {
+            if (input.seek === "start") return older(arrived ? -1 : 0, input.limit);
+            if (input.seek === "end") return { state: state(), totals, rows: [], nextCursor: "empty-end-newer", exhausted: false };
+            if (input.cursor === "empty-end-newer") return { state: state(), totals, rows: [row(1048)], nextCursor: "end-next-newer", exhausted: false };
+            if (input.cursor?.startsWith("older-page-")) return older(Number(input.cursor.slice("older-page-".length)), input.limit);
+            if (input.cursor?.startsWith("newer-gap-")) {
+              const anchor = Number(input.cursor.slice("newer-gap-".length));
+              const result: Page = { state: state(), totals, rows: [anchor - 2, anchor - 1].map(i => ({ ...row(i), pageCursor: `newer-row-${i}` })),
+                nextCursor: `newer-progress-${anchor - 2}`, exhausted: false };
+              await new Promise<void>(resolve => { releaseReverse = resolve; }); return result;
+            }
+            if (input.cursor?.startsWith("newer-progress-")) return { state: state(), totals, rows: [], nextCursor: "newer-after-sparse", exhausted: false };
+            const anchor = Number(input.cursor?.replace(/^(?:row-|newer-row-|terminal-row-)/, ""));
+            assert.ok(Number.isInteger(anchor), "reverse requests use an exact row bookmark or the last directional continuation");
+            if (input.direction !== "newer") return older(anchor + 1, input.limit);
+            if (firstNewer) { firstNewer = false; return { state: state(), totals, rows: [], nextCursor: `newer-gap-${anchor}`, exhausted: false }; }
+            const indices = [...(arrived ? [-1] : []), ...Array.from({ length: anchor }, (_, i) => i)];
+            assert.ok(indices.length <= input.limit!);
+            return { state: state(), totals, rows: indices.map(i => ({ ...row(i), pageCursor: `terminal-row-${i}` })), nextCursor: null, exhausted: true };
+          };
+          await store.seekWindow("start");
+          for (let i = 0; i < 10; i++) await store.loadMoreWindow();
+          assert.equal(store.getSnapshot().window!.keys[0], row(52).key, "two pinned parents force a mid-page head eviction at the unchanged 1000-row cap");
+          assert.equal(store.getSnapshot().window!.exhausted, true); assert.equal(store.getSnapshot().window!.nextCursor, null);
+          await store.loadNewerWindow();
+          assert.equal(pages.at(-1)!.cursor, "row-52", "head eviction uses the exact first resident row, not its page boundary");
+          assert.equal(store.getSnapshot().window!.keys[0], row(52).key); assert.equal(store.getSnapshot().window!.hasNewer, true);
+          const pending = store.loadNewerWindow();
+          await until(() => !!releaseReverse, "sparse newer response is held");
+          assert.equal(pages.at(-1)!.cursor, "newer-gap-52", "an empty newer response advances its separate continuation");
+          assert.strictEqual(store.loadNewerWindow(), pending); assert.strictEqual(store.loadMoreWindow(), pending, "both paging directions share the in-flight guard");
+          const { pageCursor: _bookmark, ...arrival } = row(-1);
+          reverseDelta = { newHead: [arrival], removed: [{ key: row(1049).key, reason: "deleted" }] }; arrived = true;
+          await store.retry();
+          assert.equal(store.getSnapshot().window!.keys[0], arrival.key);
+          releaseReverse!(); releaseReverse = undefined; await pending;
+          assert.equal(store.getSnapshot().window!.state.indexRevision, 2, "a late page cannot regress a concurrent delta revision");
+          assert.equal(store.getSnapshot().window!.keys[0], arrival.key, "newer paging merges the latest resident head");
+          assert.ok(!store.getSnapshot().window!.keys.includes(row(1049).key));
+          assert.equal(store.getSnapshot().window!.nextCursor, "row-1046", "tail eviction retains a bookmark from a terminal older page");
+          await store.loadNewerWindow();
+          assert.equal(pages.at(-1)!.cursor, "newer-progress-50", "sparse continuation wins over the concurrently arrived first row");
+          await store.loadMoreWindow(2);
+          assert.equal(pages.at(-1)!.cursor, "row-1046");
+          assert.equal(store.getSnapshot().window!.keys[0], row(51).key);
+          await store.loadNewerWindow();
+          assert.equal(pages.at(-1)!.cursor, "newer-row-51", "head-evicting older demand rebases an in-progress newer walk");
+          assert.equal(store.getSnapshot().window!.hasNewer, false);
+          await store.loadMoreWindow(20);
+          assert.equal(pages.at(-1)!.cursor, "row-998", "older demand resumes at the exact retained tail");
+          assert.equal(store.getSnapshot().window!.keys[0], row(21).key);
+          await store.loadNewerWindow();
+          assert.equal(pages.at(-1)!.cursor, "terminal-row-21", "terminal newer responses retain each row's reversible bookmark");
+          assert.deepEqual(store.getSnapshot().window!.keys.slice(1, 101), Array.from({ length: 100 }, (_, i) => row(i).key));
+          assert.ok(store.getSnapshot().mail.length <= 1000); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === reader.id), reader);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === draft.id), draft); assert.deepEqual(store.getSnapshot().drafts, draftsBefore);
+          await store.seekWindow("end");
+          assert.deepEqual(store.getSnapshot().window!.keys, []); assert.equal(store.getSnapshot().window!.exhausted, true); assert.equal(store.getSnapshot().window!.hasNewer, true);
+          assert.match(render(), /Load newer conversations/);
+          assert.doesNotMatch(render(), /No matching conversations in cached mail\./, "an empty oldest scan with newer continuation is not an empty mailbox");
+          await store.loadNewerWindow();
+          assert.equal(pages.at(-1)!.cursor, "empty-end-newer", "empty end pages do not fall back to seek:start");
+          assert.deepEqual(store.getSnapshot().window!.keys, [row(1048).key]); assert.equal(store.getSnapshot().window!.nextCursor, null);
+          await store.seekWindow("start");
+          const afterSeek = pages.length; await store.loadNewerWindow(); await sleep(30);
+          assert.equal(pages.length, afterSeek, "explicit seeks neither retain stale newer continuations nor restart automatic prefetch");
+          store.pinWindow("reader", []); store.pinWindow("draft:reverse", []);
+
+          type Summary = import("inbox-sdk/types").MailboxMessageSummary;
+          const { projectMailboxMail } = await import("../../shared/mail-projection.ts");
+          const giantKey = `${box.id}:giant`, deepId = "giant-501";
+          let deepRevision = 1, deepBodyRevision = 1, giantRevision = revision, holdHistory = false;
+          const summary = (index: number, threadId = "giant"): Summary => {
+            const id = `${threadId}-${index}`, deep = threadId === "giant" && index === 501;
+            return { id, accountId: source.id, sourceId: source.id, threadId, revision: deep ? deepRevision : 1,
+              bodyRevision: deep ? `giant-body-${deepBodyRevision}` : `body-${id}`, from: { name: "Fictional sender", email: "sender@example.test" },
+              to: [{ name: "Owner", email: source.email }], cc: [], subject: "Fictional conversation", preview: "Fictional history.",
+              receivedAt: new Date(Date.parse(deadline) + index * 1000).toISOString(), isRead: deep && deepRevision === 2, isStarred: index === 1 || deep && deepRevision === 2,
+              folder: "inbox", folderIds: ["inbox"], labelIds: [], hasAttachments: false,
+              memberships: [{ mailboxId: box.id, messageId: id, revision: deep ? deepRevision : 1, done: false,
+                snoozedUntil: index === 2 ? deadline : deep && deepRevision === 2 ? "2026-10-03T12:00:00.000Z" : null }] };
+          };
+          const projected = (summaries: Summary[]) => projectMailboxMail({ sources: [source], mailboxes: [box], labels: [], summaries,
+            includedMailboxIds: [], allowProviderWrites: false, now: Date.now(), displayTime: () => ({ date: "Today", group: "Today" }) }).mail[0];
+          const giantRow = (): Row => {
+            const preview = Array.from({ length: 50 }, (_, i) => summary(651 + i));
+            return { key: giantKey, sourceId: source.id, threadId: "giant", sourceGeneration: 1, revision: giantRevision,
+              mail: { ...projected(preview), starred: true }, summaries: preview, messagesComplete: false,
+              counts: { messages: 700, memberships: 700, unread: deepRevision === 2 ? 699 : 700, done: 0, snoozed: deepRevision === 2 ? 2 : 1 },
+              targets: Array.from({ length: 500 }, (_, i) => ({ mailboxId: box.id, messageId: `giant-${i + 1}`, revision: 1 })),
+              targetsComplete: false, actionContextComplete: false, contextVersion: "same-giant-context" };
+          };
+          const otherSummary = summary(1, "companion");
+          const companionRow: Row = { key: `${box.id}:companion`, sourceId: source.id, threadId: "companion", sourceGeneration: 1, revision: 1,
+            mail: projected([otherSummary]), summaries: [otherSummary], messagesComplete: true,
+            counts: { messages: 1, memberships: 1, unread: 1, done: 0, snoozed: 0 }, targets: [{ mailboxId: box.id, messageId: otherSummary.id, revision: 1 }],
+            targetsComplete: true, actionContextComplete: true, contextVersion: "companion-context" };
+          const detailReads: MessagesInput[] = [], bodyReads: string[] = [];
+          reversePage = () => ({ state: state(), totals, rows: [giantRow(), companionRow], nextCursor: null, exhausted: true });
+          lookupRead = ids => ids.map(id => { assert.equal(id, giantKey); return giantRow(); });
+          detailRead = async input => {
+            assert.equal(input.id, giantKey); assert.equal(input.limit, 100); detailReads.push(structuredClone(input));
+            const offset = input.cursor ? Number(input.cursor.slice("detail-".length)) : 0, end = 700 - offset * 100;
+            const result: MessagesPage = { state: state(), key: giantKey, contextVersion: "same-giant-context", total: 700, messages: [],
+              summaries: Array.from({ length: 100 }, (_, i) => summary(end - 99 + i)), nextCursor: end > 100 ? `detail-${offset + 1}` : null, exhausted: end <= 100 };
+            if (holdHistory && offset === 2) await new Promise<void>(resolve => { releaseHistory = resolve; });
+            return result;
+          };
+          bodyRead = id => {
+            assert.ok(id === deepId || id === otherSummary.id); bodyReads.push(id);
+            const message = id === deepId ? summary(501) : otherSummary;
+            return { ...message, snoozedUntil: null, bcc: [], attachments: [], bodyFormat: "html", bodyHtml: `<p>${message.bodyRevision}</p>`, bodyText: message.bodyRevision! };
+          };
+          await store.seekWindow("start");
+          assert.ok(!giantRow().summaries.some(message => message.id === deepId) && !giantRow().targets.some(target => target.messageId === deepId));
+          await store.loadThread(companionRow.key);
+          const companion = store.getSnapshot().mail.find(mail => mail.id === companionRow.key)!;
+          await store.loadMoreMessages(giantKey); await store.loadMoreMessages(giantKey); await store.loadThread(giantKey, deepId);
+          let cachedMail = store.getSnapshot().mail;
+          const cachedGiant = cachedMail.find(mail => mail.id === giantKey)!;
+          assert.equal(cachedGiant.messages.length, 200); assert.equal(cachedGiant.messages.find(message => message.id === deepId)!.body, "<p>giant-body-1</p>");
+          await store.lookupWindow([giantKey]);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), cachedGiant, "an unchanged giant lookup keeps its valid deep detail window");
+          cachedMail = store.getSnapshot().mail;
+          await store.loadThread(giantKey, deepId); await store.loadThread(companionRow.key);
+          assert.strictEqual(store.getSnapshot().mail, cachedMail); assert.equal(bodyReads.length, 2, "valid cached opens publish no model and issue no body request");
+          holdHistory = true;
+          const lateHistory = store.loadMoreMessages(giantKey);
+          void lateHistory.catch(() => {});
+          await until(() => !!releaseHistory, "old giant detail page is held");
+          deepRevision = 2; deepBodyRevision = 2; giantRevision = revision + 1;
+          reverseDelta = { upserts: [giantRow()], newHead: [], removed: [] }; await store.retry();
+          let updated = store.getSnapshot().mail.find(mail => mail.id === giantKey)!;
+          assert.equal(updated.window!.contextVersion, cachedGiant.window!.contextVersion, "deep body/flag/membership changes intentionally retain the host's bounded context hash");
+          assert.equal(updated.messages.length, 50, "an affected giant upsert drops deep summaries even when the context hash matches");
+          assert.ok(!updated.messages.some(message => message.id === deepId)); assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
+          assert.equal(bodyReads.length, 2, "delta invalidation does not fetch bodies or clear an unrelated cached reader");
+          holdHistory = false;
+          await store.loadMoreMessages(giantKey); await store.loadMoreMessages(giantKey);
+          assert.equal(detailReads.at(-2)!.cursor, undefined, "fresh demand restarts bounded detail metadata instead of continuing an invalidated window");
+          let deep = store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.find(message => message.id === deepId)!;
+          assert.equal(deep.bodyRevision, "giant-body-2"); assert.equal(deep.loaded, false); assert.equal(deep.isRead, true); assert.equal(deep.isStarred, true);
+          assert.equal(deep.memberships![0].snoozedUntil, "2026-10-03T12:00:00.000Z");
+          await store.loadThread(giantKey, deepId);
+          assert.equal(bodyReads.length, 3); assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.find(message => message.id === deepId)!.body, "<p>giant-body-2</p>");
+          cachedMail = store.getSnapshot().mail;
+          releaseHistory!(); releaseHistory = undefined; await lateHistory;
+          assert.strictEqual(store.getSnapshot().mail, cachedMail, "a held same-context page from the old giant revision cannot restore stale deep summaries");
+          assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.length, 200);
+          deepRevision = 3; giantRevision = revision + 1;
+          reverseDelta = { upserts: [giantRow()], newHead: [], removed: [] }; await store.retry();
+          assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.length, 50);
+          await store.loadMoreMessages(giantKey); await store.loadMoreMessages(giantKey);
+          deep = store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.find(message => message.id === deepId)!;
+          assert.equal(deep.loaded, true); assert.equal(deep.isRead, false); assert.equal(deep.isStarred, false); assert.equal(deep.memberships![0].snoozedUntil, null);
+          assert.equal(deep.body, "<p>giant-body-2</p>", "a metadata-only deep update reuses the still-valid body cache after fresh summaries arrive");
+          cachedMail = store.getSnapshot().mail;
+          await store.loadThread(giantKey, deepId); await store.loadThread(companionRow.key);
+          assert.strictEqual(store.getSnapshot().mail, cachedMail); assert.equal(bodyReads.length, 3);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
+          assert.ok(detailReads.every(input => input.limit === 100)); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+        }
+        if (name === "sparse") {
+          holdQuery = true;
+          const foreground = store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Sent" });
+          await until(() => heldQuery, "foreground query is held");
+          for (let i = 1; i <= 3; i++) {
+            const event = { id: `event-${i}`, type: i === 1 ? "account.updated" : "mail.changed", accountId: source.id, entityId: source.id,
+              change: "updated", reason: "mutation", at: deadline };
+            stream!.enqueue(new TextEncoder().encode(`event: ${event.type}\nid: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`));
+          }
+          await sleep(150);
+          assert.equal(queries, 2); assert.equal(changes.length, 0, "SSE reconciliation waits behind the active foreground query");
+          assert.equal(querySignals[1].aborted, false, "background events cannot abort an explicit query transition");
+          holdQuery = false; releaseQuery!(); releaseQuery = undefined; await foreground;
+          await until(() => changes.length === 1, "coalesced metadata/mail events reconcile after the foreground page");
+          const buffered = pages.length; await sleep(650);
+          assert.equal(changes.length, 1); assert.equal(pages.length, buffered, "ordinary deltas cannot restart automatic prefetch");
+          assert.equal(store.getSnapshot().window!.query.folder, "Sent"); assert.equal(store.getSnapshot().error, null);
+        }
+      }
+      unsubscribe(); stop(); stop = undefined;
+      await sleep(0);
+    }
+  } finally {
+    releaseHistory?.(); releaseReverse?.(); releaseQuery?.(); stop?.(); mock.restore(); globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    for (const [key, descriptor] of globals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); }
+  }
+});
+
 test("host-service-backed bounded startup pages, lookup and search without browser inventories", async () => {
   if (process.env.INBOX_WINDOW_TEST_CHILD !== "1") {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
@@ -2762,30 +3179,31 @@ test("host-service-backed bounded startup pages, lookup and search without brows
       const headers = new Headers(init?.headers); headers.set("Authorization", `Bearer ${token}`);
       return host.fetch(new Request(url, { ...init, headers }));
     }) as typeof fetch;
-    // Finish the host's local index, independently of browser loading. This is not a browser inventory.
+    // Opening the app must not depend on a prewarmed global index.
     const query = { account: box.id, folder: "All Mail", split: "Important", search: false, query: "", filter: null };
-    let warm = await service.dispatch("/host/inbox/query", query) as import("../../shared/inbox-window").InboxWindowPage;
-    for (let attempts = 0; warm.state.indexing && attempts < 400; attempts++) {
-      await sleep(25); warm = await service.dispatch("/host/inbox/page", { queryId: warm.state.queryId, seek: "start", limit: 100 }) as typeof warm;
-    }
-    assert.equal(warm.state.indexing, false, "fictional host index is ready");
     const store = new InboxStore(); store.subscribe(() => { if (store.getSnapshot().loaded) published.push(store.getSnapshot().window?.keys.length ?? 0); }); stop = store.start();
-    await until(() => store.getSnapshot().window?.keys.length === 300, "first 300 conversations prefetched");
+    await until(() => store.getSnapshot().window?.keys.length === 200, "first 200 conversations prefetched");
     assert.equal(published[0], 100, "first 100 are usable before prefetch");
-    const prefetched = pages; await sleep(150); assert.equal(pages, prefetched, "automatic paging stops at 300");
+    const prefetched = pages; await sleep(150); assert.equal(pages, prefetched, "automatic paging stops at 200");
+    assert.equal(prefetched, 1, "only one response buffers the initial page");
     assert.equal(inventories, 0, "new host never uses the legacy browser inventory"); assert.equal(bodyReads, 0, "initial rows are body-free");
+    const initialKeys = [...store.getSnapshot().window!.keys];
     const first = store.getSnapshot().mail[0]; store.pinWindow("reader", [first.id]);
-    for (let count = 0; count < 8; count++) await store.loadMoreWindow();
+    for (let count = 0; count < 9; count++) await store.loadMoreWindow();
     assert.ok(store.getSnapshot().mail.length <= 1000); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
     assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), first, "pinned unchanged row identity survives paging");
     assert.ok(!store.getSnapshot().window!.keys.includes(first.id), "a pinned evicted reader does not inflate the active window");
+    for (let count = 0; count < 3 && store.getSnapshot().window!.hasNewer; count++) await store.loadNewerWindow();
+    assert.deepEqual(store.getSnapshot().window!.keys.slice(0, initialKeys.length), initialKeys, "reverse paging restores the initial rows after mid-page eviction without skipping a suffix");
+    assert.ok(store.getSnapshot().mail.length <= 1000); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
     await store.loadThread(first.id);
     const cached = store.getSnapshot().mail.find(mail => mail.id === first.id), reads = bodyReads;
     await store.loadThread(first.id);
     assert.equal(bodyReads, reads, "cached open performs no additional body read");
     assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), cached, "cached open preserves row identity");
     await store.setWindowQuery({ ...query, search: true, query: "subject:\"Window fixture 0000\"" });
-    await until(() => store.getSnapshot().mail.some(mail => mail.subject === "Window fixture 0000"), "host search reaches outside the old browser window");
+    for (let count = 0; count < 20 && !store.getSnapshot().mail.some(mail => mail.subject === "Window fixture 0000") && store.getSnapshot().window?.nextCursor; count++) await store.loadMoreWindow();
+    assert.ok(store.getSnapshot().mail.some(mail => mail.subject === "Window fixture 0000"), "explicit search paging reaches outside the old browser window");
     const before = [...store.getSnapshot().window!.keys]; await store.lookupWindow([first.id]);
     assert.deepEqual(store.getSnapshot().window!.keys, before, "off-view lookup never inflates active rows or totals");
     // Reader/flag work may have advanced the SDK since the last query page.

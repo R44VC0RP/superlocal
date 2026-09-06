@@ -51,6 +51,8 @@ import MailCommandDialog, { type CommandItem } from "./MailCommandDialog";
 import IssueReporter from "./IssueReporter";
 import Notices, { Notice } from "./Notices";
 import { InboxActionError, type InboxIssue } from "./inbox";
+import { InboxViewPreferencesError } from "./host";
+import { getApplicationScope } from "./application-scope";
 import { measureAction } from "./browser-logs";
 import { captureIssueReport, type IssueReport } from "./issue-reports";
 import SenderContext from "./SenderContext";
@@ -192,6 +194,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const pointerHighlight = useRef<number | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
   const [windowSelection, setWindowSelection] = useState<InboxSelection | null>(null);
+  const [selectionPreparing, setSelectionPreparing] = useState<{ viewKey: string; route: string; queryId: string; scopeState: string } | null>(null);
   const selectedCapture = useRef(new Map<string, Mail>());
   const overlayCapture = useRef(new Map<string, Mail>());
   const selectionProjection = useRef<string[] | null>(null);
@@ -265,6 +268,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const resultQuery = searchSubmitted ? query : deferredQuery;
   const listViewKey = JSON.stringify([route.account, route.folder, route.split, mailFilter,
     search ? searchSubmitted ? "results" : "suggestions" : "list", search && searchSubmitted ? resultQuery : null]);
+  const selectionViewKey = useRef(listViewKey);
+  selectionViewKey.current = listViewKey;
   const listScroll = useMemo(() => listPositions.current.get(listViewKey) ?? { current: 0 }, [listViewKey]);
   useLayoutEffect(() => {
     const positions = listPositions.current;
@@ -303,8 +308,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const windowQuery = useMemo<InboxViewQuery>(() => ({ account: route.account, folder: route.folder, split: route.split,
     search: search && searchSubmitted, query: search && searchSubmitted ? resultQuery : "", filter: mailFilter as InboxViewQuery["filter"] }),
     [route.account, route.folder, route.split, search, searchSubmitted, resultQuery, mailFilter]);
-  const activeWindow = inbox.host?.inboxWindow ? inbox.window && JSON.stringify(inbox.window.query) === JSON.stringify(windowQuery)
-    ? inbox.window : { keys: [], totals: unknownTotals } : undefined;
+  const matchingWindow = inbox.host?.inboxWindow && inbox.window && JSON.stringify(inbox.window.query) === JSON.stringify(windowQuery) ? inbox.window : null;
+  const activeWindow = inbox.host?.inboxWindow ? matchingWindow ?? { keys: [], totals: unknownTotals } : undefined;
   useEffect(() => { void store.setWindowQuery(windowQuery).catch(actionError); }, [store, windowQuery]);
   useEffect(() => {
     setThreadLookupIssue(null);
@@ -469,11 +474,11 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   }, [entries, rowHeight]);
   const pageAnchor = useRef<{ id: string; offset: number; highlighted?: string } | null>(null);
   const loadOlder = useCallback(() => {
-    if (!inbox.window?.nextCursor || inbox.window.paging) return;
+    if (!matchingWindow?.nextCursor || matchingWindow.paging) return;
     const top = list.current?.scrollTop ?? 0, entry = entries.find(entry => !entry.group && entry.top + entry.height > top);
     if (entry) pageAnchor.current = { id: entry.key, offset: top - entry.top, highlighted: visibleMail[highlight]?.id };
     void store.loadMoreWindow().catch(actionError);
-  }, [store, inbox.window, entries, visibleMail, highlight]);
+  }, [store, matchingWindow, entries, visibleMail, highlight]);
   useLayoutEffect(() => {
     const anchor = pageAnchor.current; if (!anchor || !list.current || inbox.window?.paging) return;
     const entry = entries.find(entry => entry.key === anchor.id);
@@ -482,9 +487,15 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (index >= 0) { pointerHighlight.current = index; setHighlight(index); }
     pageAnchor.current = null;
   }, [entries, inbox.window?.paging]);
+  const pageHighlight = useRef({ key: listViewKey, index: highlight });
+  // Only forward list navigation is demand, not page arrivals, route resets or restored highlights.
   useEffect(() => {
-    if (inbox.host?.inboxWindow && visibleMail.length > 0 && highlight >= visibleMail.length - 6) loadOlder();
-  }, [highlight, visibleMail.length]);
+    const previous = pageHighlight.current;
+    pageHighlight.current = { key: listViewKey, index: highlight };
+    if (previous.key !== listViewKey || highlight <= previous.index || pointerHighlight.current === highlight) return;
+    const count = visibleMail.length;
+    if (matchingWindow && !currentMail && !isDrafts && count > 0 && (count > 6 ? highlight >= count - 6 : highlight === count - 1)) loadOlder();
+  }, [highlight, listViewKey]);
   const getHighlightedMail = useCallback((index: number) => entries.find(entry => !entry.group && entry.index === index), [entries]);
   const targetIds = useMemo(() =>
     commandMode && commandMode !== "accounts" && overlayIds
@@ -794,6 +805,15 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       {inbox.host && !inbox.host.allowProviderWrites && !readOnlyDismissed && (
         <div role="status">
           <Notice quiet title="Read-only host" detail="Sending and provider changes are disabled." action={{ label: "Accounts", onClick: () => openSettings("Add Accounts") }} onDismiss={dismissReadOnly} data={{ scope: "read-only" }} />
+        </div>
+      )}
+      {selectionPreparing?.viewKey === listViewKey && selectionPreparing.route === routeUrl(route) && selectionPreparing.queryId === matchingWindow?.state.queryId && selectionPreparing.scopeState === matchingWindow?.state.scopeState && (
+        <div role="status">
+          <Notice quiet title="Preparing selection…" action={{ label: "Select all", onClick: () => {
+            const window = store.getSnapshot().window;
+            if (selectionViewKey.current === selectionPreparing.viewKey && routeUrl(readRoute()) === selectionPreparing.route &&
+              window?.state.queryId === selectionPreparing.queryId && window.state.scopeState === selectionPreparing.scopeState) void selectAllMail();
+          } }} onDismiss={() => setSelectionPreparing(null)} />
         </div>
       )}
       {notice && (
@@ -1118,12 +1138,23 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   }
   async function selectAllMail() {
     if (!inbox.host?.inboxWindow) { setSelected(visibleMail.map(mail => mail.id)); return; }
+    const window = matchingWindow, owner = getApplicationScope(), openingRoute = routeUrl(route);
+    if (!window) return;
+    const current = () => !owner.signal.aborted && selectionViewKey.current === listViewKey && routeUrl(readRoute()) === openingRoute &&
+      store.getSnapshot().window?.state.queryId === window.state.queryId && store.getSnapshot().window?.state.scopeState === window.state.scopeState;
+    if (!current()) return;
     try {
       const captured = await store.createWindowSelection();
+      if (!current()) return;
       const projection = visibleMail.map(mail => mail.id); selectionProjection.current = projection;
-      setWindowSelection(captured); setSelected(projection);
+      setSelectionPreparing(null); setWindowSelection(captured); setSelected(projection);
       setNotice({ text: captured.count === null ? "Capturing selection…" : `${captured.count.toLocaleString()} conversations selected` });
-    } catch (error) { actionError(error); }
+    } catch (error) {
+      if (!current()) return;
+      if (error instanceof InboxViewPreferencesError && error.code === "HOST_INBOX_PREPARING") {
+        setSelectionPreparing({ viewKey: listViewKey, route: openingRoute, queryId: window.state.queryId, scopeState: window.state.scopeState });
+      } else { setSelectionPreparing(null); actionError(error); }
+    }
   }
   async function capturedTargets(ids: string[]): Promise<Mail[]> {
     if (windowSelection && ids === targetIds) return store.resolveWindowSelection(windowSelection);
@@ -1845,8 +1876,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     />
   );
 
-  const sortingStatus = aiSortingStatus(inbox.ai, !!inbox.aiError);
-  const sortingWarning = (inbox.ai ? inbox.ai.settings.enabled : !!inbox.aiError) && sortingStatus.tone === "warning";
+  const sortingIssue = inbox.ai?.settings.enabled && inbox.ai.settings.mode === "apply" &&
+    (inbox.aiError || !inbox.ai.configured || inbox.ai.problemCode || inbox.ai.settings.mailboxIds?.length === 0)
+    ? aiSortingStatus(inbox.ai, !!inbox.aiError).label : null;
 
   return (
     <div
@@ -1883,9 +1915,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         <div className="rail-mobile-actions">
           <IconButton
             name="Gear"
-            title="Settings"
+            title={sortingIssue ? `Settings — ${sortingIssue}` : "Settings"}
             className={settings ? "active" : ""}
-            onClick={() => settings ? closeSettings() : openSettings()}
+            data-sorting-issue={sortingIssue ? true : undefined}
+            onClick={() => settings ? closeSettings() : openSettings(sortingIssue ? "AI triage" : undefined)}
           />
           <IconButton
             name="Eye"
@@ -2158,10 +2191,6 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                 </div>
               )}
             </header>
-            {!search && route.folder === "Inbox" && sortingWarning && <div className="ai-sorting-warning" role="status">
-              <div><p>{sortingStatus.label}</p><p className="settings-note">{sortingStatus.detail}</p></div>
-              <button type="button" className="text-button" onClick={() => openSettings("AI triage")}>Sorting details</button>
-            </div>}
             <div
               key={listViewKey}
               className="mail-list animated-mail-list"
@@ -2283,11 +2312,15 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                 />
               )}
               {inbox.host?.inboxWindow && !currentMail && <div className="mail-window-status" role="status">
-                {inbox.loading ? "Loading conversations…" : inbox.window?.state.indexing ? "Indexing conversations; totals are not ready yet." : null}
-                {inbox.window?.nextCursor && <button type="button" className="text-button" disabled={inbox.window.paging} onClick={loadOlder}>{inbox.window.paging ? "Loading older conversations…" : "Load older conversations"}</button>}
+                {inbox.loading ? "Loading conversations…" : null}
+                {!inbox.loading && matchingWindow?.keys.length === 0 && (!matchingWindow.exhausted || matchingWindow.hasNewer) && (matchingWindow.nextCursor || matchingWindow.hasNewer
+                  ? <span>No matches in the conversations checked.</span>
+                  : <><span>Could not finish loading this view.</span><button type="button" className="text-button" disabled={inbox.refreshing} onClick={() => { void store.refresh().catch(actionError); }}>Retry</button></>)}
+                {matchingWindow?.hasNewer && matchingWindow.keys.length === 0 && <button type="button" className="text-button" disabled={matchingWindow.paging} onClick={() => { void store.loadNewerWindow().catch(actionError); }}>{matchingWindow.paging ? "Loading newer conversations…" : "Load newer conversations"}</button>}
+                {matchingWindow?.nextCursor && <button type="button" className="text-button" disabled={matchingWindow.paging} onClick={loadOlder}>{matchingWindow.paging ? "Loading older conversations…" : "Load older conversations"}</button>}
               </div>}
               {rowCount === 0 &&
-                (!inbox.host?.inboxWindow || !!inbox.window?.exhausted && !inbox.window.state.indexing && inbox.window.state.catchup === "current" && inbox.window.totals.conversations === 0) &&
+                (!inbox.host?.inboxWindow || matchingWindow?.exhausted && !matchingWindow.nextCursor && !matchingWindow.hasNewer) &&
                 !holdingMail &&
                 !(search && searchResult?.key === searchKey && (searchResult.loading || searchResult.error)) &&
                 !motion.hasExits &&
@@ -2475,9 +2508,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             />
             <IconButton
               name="Gear"
-              title="Settings"
+              title={sortingIssue ? `Settings — ${sortingIssue}` : "Settings"}
               className={settings ? "active" : ""}
-              onClick={() => (settings ? closeSettings() : openSettings())}
+              data-sorting-issue={sortingIssue ? true : undefined}
+              onClick={() => (settings ? closeSettings() : openSettings(sortingIssue ? "AI triage" : undefined))}
             />
           </div>
         </footer>

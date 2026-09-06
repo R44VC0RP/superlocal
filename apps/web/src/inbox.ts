@@ -304,6 +304,7 @@ export class InboxStore {
   private windowController = new AbortController();
   private windowRows = new Map<string, InboxWindowRow>();
   private windowBoundaryCursors = new Map<string, string>();
+  private windowNewerCursor: string | null = null;
   private windowLocalRemoved = new Map<string, string>();
   private windowRemovalFences = new Map<string, { revision: number; removed: boolean }>();
   private windowPins = new Map<string, Set<string>>();
@@ -412,6 +413,8 @@ export class InboxStore {
       if (previous && previous.sourceGeneration === row.sourceGeneration && previous.revision > row.revision) continue;
       if (previous && previous.sourceGeneration !== row.sourceGeneration) {
         for (const summary of previous.summaries) this.details.delete(summary.id);
+        if (this.windowNewerCursor === this.windowBoundaryCursors.get(row.key)) this.windowNewerCursor = null;
+        this.windowBoundaryCursors.delete(row.key);
         this.bodyEpoch++;
       }
       if (this.windowDetails.get(row.key)?.contextVersion !== row.contextVersion) this.windowDetails.delete(row.key);
@@ -430,20 +433,25 @@ export class InboxStore {
     const previous = this.state.window;
     if (append && previous && (page.state.queryId !== previous.state.queryId || page.state.scopeState !== previous.state.scopeState || page.state.queryGeneration !== previous.state.queryGeneration)) throw new Error("The inbox query changed. Reload this view.");
     this.receiveWindowRows(page.rows, flagEpoch);
-    for (const row of page.rows) if (page.nextCursor) this.windowBoundaryCursors.set(row.key, page.nextCursor);
+    for (const row of page.rows) {
+      const cursor = row.pageCursor ?? page.nextCursor;
+      if (cursor && this.windowRows.get(row.key) === row) this.windowBoundaryCursors.set(row.key, cursor);
+    }
     const combined = [...new Set([...(append ? previous?.keys ?? [] : []), ...page.rows.filter(row => row.revision > (this.windowRemovalFences.get(row.key)?.revision ?? -1)).map(row => row.key)])];
-    const keys = this.trimWindow(combined);
+    const keys = this.trimWindow(combined), headEvicted = combined[0] !== keys[0];
+    if (!append) this.windowNewerCursor = null;
+    else if (headEvicted) this.windowNewerCursor = this.windowBoundaryCursors.get(keys[0]) ?? null;
     const stale = append && previous && previous.state.indexRevision > page.state.indexRevision;
     const state = stale ? previous.state : page.state, totals = stale ? previous.totals : page.totals;
     const exhausted = stale ? false : page.exhausted;
-    const usable = keys.length > 0 || exhausted && !state.indexing;
-    this.publish({ window: { query, state, keys, totals, nextCursor: page.nextCursor ?? (stale ? previous.nextCursor : null), exhausted, paging: false, residentBytes: this.windowBytes(), hasNewer: append && (previous?.hasNewer === true || combined[0] !== keys[0]) }, loading: !usable, loaded: usable, refreshing: false, error: null });
+    // A bounded response is usable even with no matches yet; its cursor is explicit demand, not a loading loop.
+    this.publish({ window: { query, state, keys, totals, nextCursor: page.nextCursor ?? (stale ? previous.nextCursor : null), exhausted, paging: false, residentBytes: this.windowBytes(), hasNewer: append && (previous?.hasNewer === true || headEvicted) }, loading: false, loaded: true, refreshing: false, error: null });
     this.rebuild(); this.resolve("snapshot");
   }
   private openWindow = (): Promise<void> => {
     const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
     this.windowController.abort(); this.windowController = new AbortController();
-    this.windowPaging = undefined; this.windowChanges = undefined; this.windowBoundaryCursors.clear(); this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
+    this.windowPaging = undefined; this.windowChanges = undefined; this.windowBoundaryCursors.clear(); this.windowNewerCursor = null; this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
     const signal = AbortSignal.any([this.windowController.signal, this.controller.signal]);
     const transport = createInboxWindowTransport(() => signal, (input, init) => this.fetch(input, init));
     this.publish({ window: null, loading: true, loaded: false, refreshing: true });
@@ -451,26 +459,23 @@ export class InboxStore {
       const flagEpoch = this.flagEpoch;
       const page = await transport.query({ ...query, limit: INBOX_FIRST_PAGE_LIMIT });
       this.windowCheck(epoch, generation); this.applyWindowPage(page, false, query, flagEpoch);
-      if (page.state.indexing) this.scheduleRefresh();
       if (this.initialThread) {
         const id = this.initialThread; this.initialThread = null;
         this.pinWindow("reader", [id]); void this.lookupWindow([id]).catch(error => this.fail(error, "load-thread"));
       }
-      // Publish the first usable page before continuing in the background. Never prefetch beyond 300.
+      // Publish the first page before requesting at most one additional buffer page.
       void this.prefetchWindow(epoch, generation).catch(error => { if (!(error instanceof DOMException && error.name === "AbortError")) this.fail(error, "refresh"); });
     })().catch(error => { if (epoch === this.windowEpoch && generation === this.generation) this.fail(error, "refresh"); throw error; })
       .finally(() => { if (this.windowLoading === work) this.windowLoading = undefined; });
     this.windowLoading = work; return work;
   };
   private async prefetchWindow(epoch: number, generation: number) {
-    while (!this.windowAutoDone && this.state.window?.nextCursor && this.state.window.keys.length < INBOX_AUTO_PREFETCH_LIMIT) {
-      this.windowCheck(epoch, generation);
-      const before = this.state.window.keys.length;
-      await this.loadMoreWindow(Math.min(INBOX_PAGE_LIMIT, INBOX_AUTO_PREFETCH_LIMIT - before));
-      if ((this.state.window?.keys.length ?? 0) <= before) break;
-    }
     this.windowCheck(epoch, generation);
-    this.windowAutoDone ||= (this.state.window?.keys.length ?? 0) >= INBOX_AUTO_PREFETCH_LIMIT;
+    if (this.windowAutoDone) return;
+    // Consume the single automatic request before awaiting it, even if it returns no matches.
+    this.windowAutoDone = true;
+    const limit = Math.min(INBOX_PAGE_LIMIT, INBOX_AUTO_PREFETCH_LIMIT - INBOX_FIRST_PAGE_LIMIT);
+    if (this.state.window?.nextCursor && limit > 0) await this.loadMoreWindow(limit);
   }
   loadMoreWindow = (limit = INBOX_PAGE_LIMIT): Promise<void> => {
     if (this.windowPaging) return this.windowPaging;
@@ -484,36 +489,67 @@ export class InboxStore {
     })().finally(() => {
       if (this.windowPaging !== work) return;
       this.windowPaging = undefined;
-      if (epoch === this.windowEpoch && this.state.window?.paging) this.publish({ window: { ...this.state.window, paging: false } });
+      if (epoch === this.windowEpoch && generation === this.generation && this.state.window?.paging) this.publish({ window: { ...this.state.window, paging: false } });
     });
     this.windowPaging = work; return work;
   };
-  seekWindow = async (seek: "start" | "end"): Promise<void> => {
+  seekWindow = (seek: "start" | "end"): Promise<void> => {
     const current = this.state.window, epoch = this.windowEpoch, generation = this.generation;
-    if (!current) return;
-    const flagEpoch = this.flagEpoch; this.windowAutoDone = true;
-    const page = await this.windowTransport.page({ queryId: current.state.queryId, seek, limit: 100 });
-    this.windowCheck(epoch, generation); this.applyWindowPage(page, false, current.query, flagEpoch);
-    if (seek === "end") this.publish({ window: { ...this.state.window!, hasNewer: !page.exhausted, exhausted: true, nextCursor: null } });
+    if (!current) return Promise.resolve();
+    this.windowAutoDone = true;
+    if (this.windowPaging) return this.windowPaging.then(() => { this.windowCheck(epoch, generation); return this.seekWindow(seek); });
+    this.publish({ window: { ...current, paging: true } });
+    const work = (async () => {
+      const flagEpoch = this.flagEpoch;
+      const page = await this.windowTransport.page({ queryId: current.state.queryId, seek, limit: INBOX_PAGE_LIMIT });
+      this.windowCheck(epoch, generation); this.applyWindowPage(page, false, current.query, flagEpoch);
+      if (seek === "end") {
+        this.windowNewerCursor = page.nextCursor;
+        this.publish({ window: { ...this.state.window!, hasNewer: !page.exhausted, exhausted: true, nextCursor: null } });
+      }
+    })().finally(() => {
+      if (this.windowPaging !== work) return;
+      this.windowPaging = undefined;
+      if (epoch === this.windowEpoch && generation === this.generation && this.state.window?.paging) this.publish({ window: { ...this.state.window, paging: false } });
+    });
+    this.windowPaging = work; return work;
   };
-  loadNewerWindow = async (): Promise<void> => {
+  loadNewerWindow = (): Promise<void> => {
+    if (this.windowPaging) return this.windowPaging;
     const current = this.state.window, epoch = this.windowEpoch, generation = this.generation;
-    if (!current?.hasNewer || current.paging) return;
-    const cursor = this.windowBoundaryCursors.get(current.keys[0]);
+    if (!current?.hasNewer) return Promise.resolve();
+    const cursor = this.windowNewerCursor ?? this.windowBoundaryCursors.get(current.keys[0]);
     if (!cursor) return this.seekWindow("start");
     this.publish({ window: { ...current, paging: true } });
-    try {
+    const work = (async () => {
       const flagEpoch = this.flagEpoch;
-      const page = await this.windowTransport.page({ queryId: current.state.queryId, cursor, direction: "newer", limit: 100 });
-      this.windowCheck(epoch, generation); this.receiveWindowRows(page.rows, flagEpoch);
-      for (const row of page.rows) if (page.nextCursor) this.windowBoundaryCursors.set(row.key, page.nextCursor);
-      const combined = [...new Set([...page.rows.map(row => row.key), ...current.keys])];
-      const keys = this.trimWindow(combined, "end");
-      this.publish({ window: { ...current, keys, state: page.state, totals: page.totals, hasNewer: !page.exhausted, paging: false,
-        nextCursor: combined.at(-1) !== keys.at(-1) ? this.windowBoundaryCursors.get(keys.at(-1)!) ?? null : current.nextCursor,
-        exhausted: combined.at(-1) === keys.at(-1) && current.exhausted } });
+      const page = await this.windowTransport.page({ queryId: current.state.queryId, cursor, direction: "newer", limit: INBOX_PAGE_LIMIT });
+      this.windowCheck(epoch, generation);
+      const latest = this.state.window;
+      if (!latest || page.state.queryId !== latest.state.queryId || page.state.scopeState !== latest.state.scopeState || page.state.queryGeneration !== latest.state.queryGeneration) throw new Error("The inbox query changed. Reload this view.");
+      this.receiveWindowRows(page.rows, flagEpoch);
+      for (const row of page.rows) {
+        const boundary = row.pageCursor ?? page.nextCursor;
+        if (boundary && this.windowRows.get(row.key) === row) this.windowBoundaryCursors.set(row.key, boundary);
+      }
+      const previousKeys = new Set(current.keys);
+      const pageKeys = page.rows.filter(row => row.revision > (this.windowRemovalFences.get(row.key)?.revision ?? -1)).map(row => row.key);
+      const combined = [...new Set([...latest.keys.filter(key => !previousKeys.has(key)), ...pageKeys, ...latest.keys])];
+      const keys = this.trimWindow(combined, "end"), tailEvicted = combined.at(-1) !== keys.at(-1);
+      const stale = latest.state.indexRevision > page.state.indexRevision;
+      // This continuation also advances through empty scans; a resident bookmark would repeat them.
+      this.windowNewerCursor = page.nextCursor;
+      this.publish({ window: { ...latest, keys, state: stale ? latest.state : page.state, totals: stale ? latest.totals : page.totals,
+        hasNewer: !page.exhausted, paging: false, residentBytes: this.windowBytes(),
+        nextCursor: tailEvicted ? this.windowBoundaryCursors.get(keys.at(-1)!) ?? null : latest.nextCursor,
+        exhausted: !tailEvicted && latest.exhausted } });
       this.rebuild();
-    } finally { if (epoch === this.windowEpoch && this.state.window) this.publish({ window: { ...this.state.window, paging: false } }); }
+    })().finally(() => {
+      if (this.windowPaging !== work) return;
+      this.windowPaging = undefined;
+      if (epoch === this.windowEpoch && generation === this.generation && this.state.window?.paging) this.publish({ window: { ...this.state.window, paging: false } });
+    });
+    this.windowPaging = work; return work;
   };
   lookupWindow = async (ids: readonly string[], account = this.windowQuery.account): Promise<Mail[]> => {
     const unique = [...new Set(ids)], epoch = this.windowEpoch, generation = this.generation;
@@ -602,6 +638,12 @@ export class InboxStore {
         this.windowCheck(epoch, generation);
         if (page.resetReason) { await this.openWindow(); return; }
         if (page.state.scopeState !== current.state.scopeState) { await this.openWindow(); return; }
+        // A giant's bounded context hash can stay unchanged when deeper cached summaries change.
+        for (const row of page.upserts) {
+          const previous = this.windowRows.get(row.key);
+          if (!row.messagesComplete && (row.counts.messages ?? 0) > 500 &&
+            (!previous || previous.sourceGeneration !== row.sourceGeneration || previous.revision <= row.revision)) this.windowDetails.delete(row.key);
+        }
         this.receiveWindowRows([...page.upserts, ...page.newHead], flagEpoch);
         const removed = new Set(page.removed.map(row => row.key));
         for (const row of page.removed) this.windowRemovalFences.set(row.key, { revision: page.throughRevision, removed: row.reason !== "not-matching" });
@@ -614,11 +656,6 @@ export class InboxStore {
         this.reconcileFlags(); this.rebuild();
         cursor = page.nextCursor ?? undefined;
       } while (cursor);
-      if (this.state.window?.state.indexing) {
-        clearTimeout(this.refreshTimer);
-        this.refreshTimer = setTimeout(() => void this.readWindowChanges().catch(error => this.fail(error, "refresh")), 500);
-      }
-      await this.prefetchWindow(epoch, generation);
     })().finally(() => {
       if (this.windowChanges !== work) return;
       this.windowChanges = undefined;
@@ -1866,8 +1903,11 @@ export class InboxStore {
     const epoch = this.windowEpoch, generation = this.generation, previous = this.windowDetails.get(id);
     const page = await this.windowTransport.messages({ account: row.mail.account, id, cursor: previous?.cursor ?? undefined, limit: 100 });
     this.windowCheck(epoch, generation);
-    if (page.contextVersion !== row.contextVersion) throw new Error("The conversation changed. Reload before loading more messages.");
-    const summaries = [...new Map([...(previous?.summaries ?? row.summaries), ...page.summaries].map(summary => [summary.id, summary])).values()];
+    const current = this.windowRows.get(id);
+    if (!current || current.sourceGeneration !== row.sourceGeneration || current.contextVersion !== row.contextVersion ||
+      (row.counts.messages ?? 0) > 500 && current.revision !== row.revision) return;
+    if (page.contextVersion !== current.contextVersion) throw new Error("The conversation changed. Reload before loading more messages.");
+    const summaries = [...new Map([...(previous?.summaries ?? current.summaries), ...page.summaries].map(summary => [summary.id, summary])).values()];
     // Long history is a moving detail window, not an accidental 100k-message graph.
     this.windowDetails.set(id, { contextVersion: page.contextVersion, summaries: summaries.slice(-500), cursor: page.nextCursor,
       exhausted: page.exhausted });
