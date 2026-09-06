@@ -2912,6 +2912,47 @@ describe('cached mailbox contacts and correspondence', () => {
     expect(JSON.stringify(all)).not.toContain(BODY_SECRET)
   })
 
+  test('correspondence envelope candidates never replace confirmed direction and use visible From/To/Cc rather than confirmed addresses', async () => {
+    const h = await fixture(), email = 'person@candidate.test', outside = participant('outside@elsewhere.test'), target = participant(email), hour = 3600000
+    const { account, box } = await h.seed('alice', 'correspondence-candidates', [
+      native('sent-from-only', { folder: 'sent', from: target, to: [outside] }),
+      native('incoming-to-only', { from: outside, to: [target] }),
+      native('incoming-cc-only', { from: outside, to: [], cc: [target] }),
+      native('sent-bcc-only', { folder: 'sent', from: outside, to: [outside], bcc: [target] }),
+      native('custom-sent-from', { folder: 'archive', folderIds: ['custom-sent'], from: target, to: [] }),
+      native('custom-sent-to', { folder: 'archive', folderIds: ['custom-sent'], from: outside, to: [target] }),
+      native('system-sent-cc', { folder: 'archive', folderIds: ['native-folder-sent'], from: outside, to: [target], cc: [target, participant(email.toUpperCase())] }),
+      native('visible-from', { from: outside, to: [] }),
+      native('visible-to', { folder: 'sent', from: outside, to: [outside] }),
+      native('domain-suffix', { from: participant('person@candidate.test.evil') }),
+      native('domain-prefix', { from: participant('person@notcandidate.test') }),
+    ])
+    box.folderRows.push({ id: 'custom-sent', name: 'Custom Sent-looking label', folder: 'sent', kind: 'label', custom: true })
+    await h.inbox.folders('alice', account.id)
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id] }, summaries = (await h.inbox.mailboxMessagePage('alice', scope)).items
+    const database = new Database(h.database)
+    // Cached optimistic headers can differ from confirmed headers; only Sent evidence uses confirmed state.
+    database.query("UPDATE sdk_messages SET visible=json_set(visible,'$.from',json(?)) WHERE id=?").run(JSON.stringify(target), summaries.find(message => message.subject === 'Subject visible-from')!.id)
+    database.query("UPDATE sdk_messages SET visible=json_set(visible,'$.to',json(?)) WHERE id=?").run(JSON.stringify([target]), summaries.find(message => message.subject === 'Subject visible-to')!.id)
+    await h.restart(database)
+    const calls = structuredClone(box.calls), before = database.query<{ total: number }, []>('SELECT total_changes() total').get()
+    database.exec('PRAGMA query_only=ON')
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    const input = { ...scope, email: ` ${email.toUpperCase()} `, since: new Date(EPOCH - hour).toISOString(), bucketMs: hour, bucketCount: 1 }
+    try {
+      for (const domain of [undefined, 'CANDIDATE.TEST']) {
+        const result = await client.mailboxCorrespondence({ ...input, ...(domain ? { domain } : {}) })
+        expect(result).toMatchObject({ received: 2, sent: 2, conversations: 4, twoWay: 0, firstMessageAt: new Date(EPOCH - 60000).toISOString(), lastSentAt: new Date(EPOCH - 60000).toISOString(),
+          periods: [{ start: input.since, received: 2, sent: 2 }] })
+        const expected = summaries.filter(message => ['Subject custom-sent-from', 'Subject system-sent-cc', 'Subject visible-from', 'Subject visible-to'].includes(message.subject)).map(message => message.threadId).toSorted()
+        expect(result.recent.map(key => key.threadId).toSorted()).toEqual(expected)
+      }
+      expect(await client.mailboxCorrespondence({ ...input, email: 'absent@candidate.test' })).toMatchObject({ received: 0, sent: 0, conversations: 0, recent: [] })
+      expect(database.query<{ total: number }, []>('SELECT total_changes() total').get()).toEqual(before)
+      expect(box.calls).toEqual(calls)
+    } finally { database.exec('PRAGMA query_only=OFF') }
+  })
+
   test('contact reads are bounded query-only metadata reads, preserve body validators and do no provider or body work after restart', async () => {
     const h = await fixture(), hour = 3600000
     const { box } = await h.seed('alice', 'contact-bounds', Array.from({ length: 120 }, (_, index) => native(`bounded-contact-${index}`, {

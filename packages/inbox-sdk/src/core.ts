@@ -646,8 +646,21 @@ export function createInbox(options: InboxOptions): Inbox {
   /** One explicit cached metadata scan, shared by the bounded contact and correspondence reads.
    * EXISTS membership checks deduplicate overlapping views before recipient expansion. Native Sent
    * evidence must be confirmed: an optimistic move or queued local draft is not correspondence. */
-  function cachedCorrespondents(owner: string, scope: ReturnType<typeof mailboxReadScope>, readAt: number) {
-    const selection = scopedReadWhere(owner, scope)
+  function cachedCorrespondents(owner: string, scope: ReturnType<typeof mailboxReadScope>, readAt: number, relevant?: { email: string; domain?: string }) {
+    const selection = scopedReadWhere(owner, scope), candidateParams: string[] = []
+    let candidate = ''
+    if (relevant) {
+      const matches = (field: string) => {
+        const address = `lower(trim(${field}))`
+        if (!relevant.domain) { candidateParams.push(relevant.email); return `${address}=?` }
+        candidateParams.push(relevant.domain, `%.${relevant.domain.replace(/[\\%_]/g, '\\$&')}`)
+        const domain = `substr(${address},instr(${address},'@')+1)`
+        return `(${domain}=? OR ${domain} LIKE ? ESCAPE '\\')`
+      }
+      // Only a necessary header filter: confirmed Sent direction and final matching still apply below.
+      // Contacts omit it so historical-name matches retain their latest cached display name.
+      candidate = `(${matches("json_extract(m.visible,'$.from.email')")} OR EXISTS(SELECT 1 FROM json_each(m.visible,'$.to') p WHERE ${matches("json_extract(p.value,'$.email')")}) OR EXISTS(SELECT 1 FROM json_each(m.visible,'$.cc') p WHERE ${matches("json_extract(p.value,'$.email')")})) AND `
+    }
     const unsent = "'draft','drafts','scheduled','outbox','unsent','queued'", excluded = `'trash','spam',${unsent}`
     const nativeRole = (column: 'visible' | 'confirmed', roles: string) => `EXISTS(SELECT 1 FROM json_each(m.${column},'$.folderIds') j
       CROSS JOIN sdk_folders f ON f.id=j.value AND f.owner=m.owner AND f.account=m.account AND f.generation=m.generation
@@ -656,7 +669,7 @@ export function createInbox(options: InboxOptions): Inbox {
       SELECT m.account source,m.id message,m.thread_id thread,CAST(round(unixepoch(m.received_at,'subsec')*1000) AS INTEGER) at,
         CASE WHEN json_extract(m.confirmed,'$.folder')='sent' OR ${nativeRole('confirmed', "'sent'")} THEN 1 ELSE 0 END sent,
         json_extract(m.visible,'$.from') sender,json_extract(m.visible,'$.to') recipients,json_extract(m.visible,'$.cc') copies
-      FROM sdk_messages m WHERE ${selection.sql} AND m.folder NOT IN (${excluded})
+      FROM sdk_messages m WHERE ${candidate}${selection.sql} AND m.folder NOT IN (${excluded})
         AND date(substr(m.received_at,1,10),'+0 days')=substr(m.received_at,1,10)
         AND coalesce(json_extract(m.confirmed,'$.folder'),'') NOT IN (${unsent})
         AND NOT ${nativeRole('visible', excluded)} AND NOT ${nativeRole('confirmed', unsent)}
@@ -666,7 +679,7 @@ export function createInbox(options: InboxOptions): Inbox {
       FROM cached c CROSS JOIN json_each(CASE WHEN c.sent=1 THEN json_array(json(c.recipients),json(c.copies))
         ELSE json_array(json_array(json(c.sender))) END) addresses CROSS JOIN json_each(addresses.value) p
       WHERE c.at<=? AND json_type(p.value,'$.email')='text' AND trim(json_extract(p.value,'$.email'))<>''
-    )`, params: [...selection.params, readAt] }
+    )`, params: [...candidateParams, ...selection.params, readAt] }
   }
 
   function liveMailboxPage(owner: string, scope: ReturnType<typeof mailboxReadScope>, cursor: string | undefined, kind: string, context: unknown) {
@@ -2300,7 +2313,7 @@ export function createInbox(options: InboxOptions): Inbox {
       if (!Number.isSafeInteger(input.bucketMs) || input.bucketMs < 3600000 || input.bucketMs > 365 * 86400000
         || !Number.isSafeInteger(input.bucketCount) || input.bucketCount < 1 || input.bucketCount > 64
         || !Number.isSafeInteger(recentLimit) || recentLimit < 1 || recentLimit > 50) throw new InboxError('VALIDATION', 'Invalid correspondence period or recent limit.')
-      const selection = cachedCorrespondents(owner, scope, now())
+      const selection = cachedCorrespondents(owner, scope, now(), { email, domain })
       const predicate = domain ? "(substr(email,instr(email,'@')+1)=? OR substr(email,instr(email,'@')+1) LIKE ? ESCAPE '\\')" : 'email=?'
       const params = domain ? [domain, `%.${domain.replace(/[\\%_]/g, '\\$&')}`] : [email]
       const aggregate = db.query<{ received: number; sent: number; conversations: number; twoWay: number; firstMessageAt: number | null; lastMessageAt: number | null; lastSentAt: number | null; bins: string; recent: string }, (string | number)[]>(`${selection.sql}, matched AS (
