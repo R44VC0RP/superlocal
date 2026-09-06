@@ -12088,6 +12088,10 @@ describe('AI triage inference and local scoring', () => {
 
   test('strict assessments require exact source grounding, preserve unknown empty input, and never synthesize relative deadlines', () => {
     expect(validateAiAssessment(request, input)).toEqual(request)
+    for (const quote of ['Please  approve the proposal', 'Please\u00a0approve the proposal', 'Please\napprove the proposal']) {
+      const grounded = validateAiAssessment({ ...request, evidence: request.evidence.map((item, i) => i === 0 ? { ...item, quote } : item) }, input)
+      expect(grounded.evidence[0]!.quote).toBe('Please approve the proposal')
+    }
     const empty = { ...input, messages: [{ ...input.messages[0]!, subject: '', text: '' }] }
     expect(validateAiAssessment(unknown, empty)).toEqual(unknown)
     for (const changed of [
@@ -12099,9 +12103,9 @@ describe('AI triage inference and local scoring', () => {
       [{ ...request.evidence[0]!, messageRef: 'another-message' }],
       [{ ...request.evidence[0]!, quote: 'Fabricated approval' }],
       [{ ...request.evidence[0]!, quote: '' }],
-      [{ ...request.evidence[0]!, quote: 'Please  approve the proposal' }],
+      [{ ...request.evidence[0]!, quote: 'Please APPROVE the proposal' }],
       [{ ...request.evidence[0]!, quote: 'Please…approve the proposal' }],
-      [{ ...request.evidence[0]!, quote: 'Please\u00a0approve the proposal' }],
+      [{ ...request.evidence[0]!, quote: 'Please approve another proposal' }],
     ]) expect(() => validateAiAssessment({ ...request, evidence }, input)).toThrow('AI_EVIDENCE_INVALID')
     for (const field of ['type', 'response', 'task', 'action', 'urgency']) {
       expect(() => validateAiAssessment({ ...request, evidence: request.evidence.filter(item => item.field !== field) }, input)).toThrow('AI_EVIDENCE_REQUIRED')
@@ -12129,7 +12133,7 @@ describe('AI triage inference and local scoring', () => {
     const campaign: AiAssessment = { ...unknown, type: 'promotion', response: 'not_needed', task: 'none', urgency: 'none', risk: 'none_observed', certainty: 'clear',
       evidence: [{ messageRef: 'message-1', quote: 'offer – save 20%\nDetails', field: 'type' }] }
     expect(validateAiAssessment(campaign, unicode)).toEqual(campaign)
-    expect(() => validateAiAssessment({ ...campaign, evidence: [{ ...campaign.evidence[0]!, quote: 'offer – save 20% Details' }] }, unicode)).toThrow('AI_EVIDENCE_INVALID')
+    expect(validateAiAssessment({ ...campaign, evidence: [{ ...campaign.evidence[0]!, quote: 'offer – save 20% Details' }] }, unicode)).toEqual(campaign)
     expect(() => validateAiAssessment(unknown, { ...input, messages: [...input.messages, ...input.messages] })).toThrow('AI_INPUT_INVALID')
   })
 
@@ -12175,7 +12179,7 @@ describe('AI triage inference and local scoring', () => {
       { data: { ...response, output: [] }, outcome: 'invalid', code: 'AI_RESPONSE_INVALID' },
       { data: { ...response, output: [{ type: 'function_call', name: 'pay' }] }, outcome: 'invalid', code: 'AI_RESPONSE_INVALID' },
       { data: { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '{}' }] }] }, outcome: 'invalid', code: 'AI_ASSESSMENT_INVALID' },
-      { data: { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify({ ...request, evidence: [{ ...request.evidence[0]!, quote: 'Please  approve the proposal' }] }) }] }] }, outcome: 'invalid', code: 'AI_EVIDENCE_INVALID' },
+      { data: { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify({ ...request, evidence: [{ ...request.evidence[0]!, quote: 'Please APPROVE the proposal' }] }) }] }] }, outcome: 'invalid', code: 'AI_EVIDENCE_INVALID' },
       { data: { ...response, status: 'failed', error: { message: configuration.apiKey } }, outcome: 'error', code: 'AI_RESPONSE_FAILED' },
     ]
     for (const variant of variants) {
@@ -12759,7 +12763,7 @@ describe('AI triage service', () => {
     expect(changed).toMatchObject({ schemaVersion: AI_TRIAGE_VERSION, inputPolicyVersion: AI_INPUT_POLICY_VERSION, override: null })
   })
 
-  test('actual v1 cache-only results reuse without a receipt while explicit uncertain-campaign refresh and changed input still infer', async () => {
+  test('explicit history upgrades obsolete cache-only results once and reuses the current assessment until input changes', async () => {
     const h = await fixture(), database = new Database(':memory:')
     const seed = native('v1-cache-only', { bodyText: 'Fictional campaign without a personal task.', receivedAt: new Date(EPOCH - 60000).toISOString() })
     const { account, box } = await h.seed('alice', 'ai-v1-cache-only', [seed])
@@ -12783,16 +12787,16 @@ describe('AI triage service', () => {
     await service.start()
     const reuse = await service.process('alice', { id: 'ai-v1-cache-only-reuse', scope: 'inbox', limit: 100 })
     await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === reuse.id)?.status === 'running') await Bun.sleep(10) })(), 'actual v1 cache-only reuse')
-    expect(calls).toBe(0)
-    expect((await service.lookup('alice', [{ sourceId: account.id, threadId: summary.threadId }])).decisions[0]).toMatchObject({ state: 'ready', inputHash: legacyHash, schemaVersion: 'triage-1', inputPolicyVersion: 'input-2', assessment: clear, override: null })
-    expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: 0, reused: 1 })
+    expect(calls).toBe(1)
+    expect((await service.lookup('alice', [{ sourceId: account.id, threadId: summary.threadId }])).decisions[0]).toMatchObject({ state: 'ready', inputHash: currentHash, schemaVersion: AI_TRIAGE_VERSION, inputPolicyVersion: AI_INPUT_POLICY_VERSION, assessment, override: null })
+    expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: 1, reused: 0 })
     // Remove the actual v1-hash receipt just produced, leaving only its cache.
     database.query('DELETE FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?').run('alice', account.id, summary.threadId)
     const cleared = await service.process('alice', { id: 'ai-v1-cache-only-cleared-reuse', scope: 'inbox', limit: 100 })
     await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === cleared.id)?.status === 'running') await Bun.sleep(10) })(), 'removed actual v1 receipt cache reuse')
-    expect(calls).toBe(0)
-    expect((await service.lookup('alice', [{ sourceId: account.id, threadId: summary.threadId }])).decisions[0]).toMatchObject({ inputHash: legacyHash, schemaVersion: 'triage-1', inputPolicyVersion: 'input-2', override: null })
-    expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: 0, reused: 2 })
+    expect(calls).toBe(1)
+    expect((await service.lookup('alice', [{ sourceId: account.id, threadId: summary.threadId }])).decisions[0]).toMatchObject({ inputHash: currentHash, schemaVersion: AI_TRIAGE_VERSION, inputPolicyVersion: AI_INPUT_POLICY_VERSION, override: null })
+    expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: 1, reused: 1 })
     const uncertain: AiAssessment = { ...clear, type: 'promotion', certainty: 'insufficient', evidence: [{ messageRef: 'm0', field: 'type', quote: 'Fictional campaign' }] }
     database.query('UPDATE local_ai_cache SET assessment=?,input_policy=? WHERE owner=? AND hash=?').run(JSON.stringify(uncertain), 'input-1', 'alice', legacyHash)
     database.query('DELETE FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?').run('alice', account.id, summary.threadId)
@@ -13353,6 +13357,8 @@ describe('AI triage service', () => {
     const cases: Array<{ id: string; change: Partial<AiAssessment>; category: 'Important' | 'Other'; clear?: boolean }> = [
       { id: 'promotion', change: {}, category: 'Other', clear: true },
       { id: 'newsletter', change: { type: 'newsletter' }, category: 'Other', clear: true },
+      { id: 'notification', change: { type: 'notification' }, category: 'Other', clear: true },
+      { id: 'receipt', change: { type: 'receipt' }, category: 'Other', clear: true },
       { id: 'cold', change: { type: 'cold_outreach' }, category: 'Other', clear: true },
       { id: 'insufficient', change: { certainty: 'insufficient' }, category: 'Important' },
       { id: 'ambiguous', change: { certainty: 'ambiguous' }, category: 'Important' },
@@ -13544,7 +13550,7 @@ describe('AI triage service', () => {
     expect((await service.results('alice')).decisions.every(item => item.holdUntil === null)).toBe(true)
   })
 
-  test('only a newly requested bounded history job refreshes affected legacy campaigns while restart and clear-cache reuse remain free', async () => {
+  test('only a newly requested bounded history job upgrades obsolete assessments while preserving manual choices and current caches', async () => {
     const h = await fixture(), database = new Database(':memory:')
     const names = ['refresh-clear', 'refresh-insufficient', 'preserve-clear', 'preserve-ambiguous', 'preserve-manual', 'preserve-unknown']
     const { account } = await h.seed('alice', 'ai-policy-migration', names.map(name => native(name, { subject: name, bodyText: 'A fictional product campaign with no personal request.' })))
@@ -13596,31 +13602,31 @@ describe('AI triage service', () => {
     const original = (await service.results('alice')).decisions
     const refresh = await service.process('alice', { id: 'ai-policy-explicit-refresh', scope: 'inbox', limit: 100 })
     await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === refresh.id)?.status === 'running') await Bun.sleep(10) })(), 'explicit legacy campaign refresh')
-    expect(calls.slice(names.length).sort()).toEqual(['refresh-clear', 'refresh-insufficient'])
-    expect((await service.state('alice')).jobs.find(item => item.id === refresh.id)).toMatchObject({ scanned: 2, completed: 2, failed: 0 })
+    expect(calls.slice(names.length).sort()).toEqual(names.filter(name => name !== 'preserve-manual').sort())
+    expect((await service.state('alice')).jobs.find(item => item.id === refresh.id)).toMatchObject({ scanned: 5, completed: 5, failed: 0 })
     const current = (await service.results('alice')).decisions
     for (const old of original) {
       const decision = current.find(item => item.threadId === old.threadId)!
-      if (!old.assessment!.reason.startsWith('refresh-')) expect(decision).toEqual(old)
+      if (old.override) expect(decision).toEqual(old)
       else {
         expect(decision.inputHash).toBe(old.inputHash)
         expect(decision).toMatchObject({ inputPolicyVersion: AI_INPUT_POLICY_VERSION, schemaVersion: AI_TRIAGE_VERSION,
-          assessment: { certainty: old.assessment!.reason === 'refresh-clear' ? 'clear' : 'insufficient' },
-          score: { category: old.assessment!.reason === 'refresh-clear' ? 'Other' : 'Important', version: AI_PREFERENCE_VERSION } })
+          assessment: { task: 'none', certainty: ['refresh-clear', 'preserve-clear'].includes(old.assessment!.reason) ? 'clear' : old.assessment!.certainty },
+          score: { category: ['refresh-clear', 'preserve-clear'].includes(old.assessment!.reason) ? 'Other' : 'Important', version: AI_PREFERENCE_VERSION } })
       }
     }
     // A real model-insufficient result under this policy must not be billed again.
     const again = await service.process('alice', { id: 'ai-policy-repeat-refresh', scope: 'inbox', limit: 100 })
     await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === again.id)?.status === 'running') await Bun.sleep(10) })(), 'repeat history skips current policy')
-    expect(calls).toHaveLength(names.length + 2)
+    expect(calls).toHaveLength(names.length + 5)
     // Clearing only a fictional saved decision forces the actual cache-hit path.
     const clear = current.find(item => item.assessment?.reason === 'preserve-clear')!
     database.query('DELETE FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?').run('alice', clear.sourceId, clear.threadId)
     const reuse = await service.process('alice', { id: 'ai-policy-clear-cache-reuse', scope: 'inbox', limit: 100 })
     await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === reuse.id)?.status === 'running') await Bun.sleep(10) })(), 'legacy clear assessment cache reuse')
-    expect(calls).toHaveLength(names.length + 2)
-    expect((await service.lookup('alice', [clear])).decisions[0]).toMatchObject({ inputHash: clear.inputHash, inputPolicyVersion: 'input-1', assessment: clear.assessment, score: { category: 'Important', score: 20, version: AI_PREFERENCE_VERSION } })
-    expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: names.length + 2, completed: names.length + 2, reused: 1 })
+    expect(calls).toHaveLength(names.length + 5)
+    expect((await service.lookup('alice', [clear])).decisions[0]).toMatchObject({ inputHash: clear.inputHash, inputPolicyVersion: AI_INPUT_POLICY_VERSION, assessment: clear.assessment, score: { category: 'Other', score: 0, version: AI_PREFERENCE_VERSION } })
+    expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: names.length + 5, completed: names.length + 5, reused: 1 })
   })
 
   test('stale context responses are not applied but retain priced usage, and model changes or job cancellation fence in-flight requests', async () => {
@@ -13672,9 +13678,15 @@ describe('AI triage service', () => {
   test('failed inference preserves billed usage and retryable failures stop after three attempts with fixed private-safe codes', async () => {
     const h = await fixture(), database = new Database(':memory:')
     await h.seed('alice', 'ai-failure', [native('invalid-assessment')])
-    let calls = 0, unavailable = false
+    let calls = 0, unavailable = false, invalidEvidence = false
     const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
-      fetcher: (async () => { calls++; return unavailable
+      fetcher: (async (_url, init) => {
+        calls++
+        if (invalidEvidence) {
+          if (calls === 6) expect(JSON.parse(String(init?.body)).instructions).toContain('Recheck evidence carefully')
+          return Response.json({ ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify({ ...assessment, evidence: [{ messageRef: 'm0', field: 'type', quote: 'Invented source evidence' }] }) }] }] })
+        }
+        return unavailable
         ? new Response(`${BODY_SECRET} dummy-ai-test-secret sender@example.test`, { status: 503 })
         : Response.json({ ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify({ ...assessment, category: 'Other' }) }] }] })
       }) as unknown as typeof fetch })
@@ -13702,6 +13714,14 @@ describe('AI triage service', () => {
     expect(diagnostics.usage).toMatchObject({ attempts: 4, failed: 4, completed: 0, unknownUsage: 3, unpriced: 3, inputTokens: 1000, outputTokens: 100 })
     expect((await service.results('alice')).decisions[0]).toMatchObject({ problemCode: 'AI_PROVIDER_UNAVAILABLE' })
     for (const privateValue of [BODY_SECRET, configuration.apiKey, 'sender@example.test', 'Subject invalid-assessment']) expect(JSON.stringify(diagnostics)).not.toContain(privateValue)
+    unavailable = false; invalidEvidence = true
+    await service.process('alice', { id: 'ai-evidence-repair', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.diagnostics('alice')).usage.attempts < 5) await Bun.sleep(10) })(), 'invalid evidence first attempt')
+    h.clock.value += 10000
+    await bounded((async () => { while ((await service.state('alice')).jobs[0]?.status === 'running') await Bun.sleep(10) })(), 'one bounded evidence correction')
+    expect(calls).toBe(6)
+    expect((await service.results('alice')).decisions[0]).toMatchObject({ state: 'failed', problemCode: 'AI_EVIDENCE_INVALID', assessment: null })
+    expect((await service.state('alice')).usage).toMatchObject({ attempts: 6, completed: 0, failed: 6 })
   })
 
   test('in-flight pause and cancel stop application without inventing free usage and an explicit new job can resume work', async () => {

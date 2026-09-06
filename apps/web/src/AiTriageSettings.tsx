@@ -301,7 +301,7 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
           }, "Could not confirm older-mail processing. Retry the same request in Sort older mail.");
         }}>{pendingHistory ? "Retry same request" : "Sort older mail"}</button>
       </div>
-      <p className="settings-note">Current assessments are reused; missing or failed assessments and older uncertain marketing assessments are processed. Cancelling stops work, never deletes emails.</p>
+      <p className="settings-note">Current assessments are reused; missing, failed, and outdated assessments are processed. Cancelling stops work, never deletes emails.</p>
       {state.jobs.length === 0 ? <p className="settings-note">No historical jobs started. Turning AI on does not mean all older mail has been processed.</p> : state.jobs.map(job => <div className="ai-job" key={job.id}>
         <div>{job.scope === "inbox" ? "Inbox" : "All mail"} · {job.status === "completed" && job.failed > 0 ? "Finished with failures" : aiLabel(job.status)} · up to {number(job.limit)}</div>
         <p className="settings-note">{number(job.completed)} assessed · {number(job.failed)} failed · {number(job.queued)} queued from {number(job.scanned)} scanned</p>

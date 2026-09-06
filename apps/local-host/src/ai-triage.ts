@@ -32,15 +32,15 @@ const emptyUsage = (): AiUsageSummary => ({ attempts: 0, completed: 0, failed: 0
 const insufficient: AiAssessment = { type: 'unknown', response: 'unknown', task: 'unknown', actions: [], urgency: 'unknown', deadline: null, topics: [], risk: 'unknown', certainty: 'insufficient', reason: 'Not enough usable cached context.', evidence: [] }
 function fail(code: string, status = 400): never { throw new InboxError(code, 'AI triage could not complete this request.', status) }
 const stamp = (time: number) => new Date(time).toISOString()
-const quietCampaign = (assessment: AiAssessment) =>
-  ['promotion', 'newsletter', 'cold_outreach'].includes(assessment.type) && assessment.response === 'not_needed' &&
+const quietInformational = (assessment: AiAssessment) =>
+  ['promotion', 'newsletter', 'cold_outreach', 'notification', 'receipt'].includes(assessment.type) && assessment.response === 'not_needed' &&
   (assessment.task === undefined || assessment.task === 'none') && assessment.actions.length === 0 && assessment.urgency === 'none' && assessment.deadline === null &&
   assessment.risk === 'none_observed' && assessment.evidence.some(item => item.field === 'type')
-const legacyCampaign = (assessment: AiAssessment | null, policy?: string) =>
-  (!policy || policy === 'input-1') && assessment?.certainty === 'insufficient' && quietCampaign(assessment)
+const outdatedAssessment = (assessment: AiAssessment | null, policy?: string) =>
+  !!assessment && policy !== AI_INPUT_POLICY_VERSION
 const reusableDecision = (decision: AiDecision, model: string, refreshLegacy: boolean) =>
   decision.state === 'ready' && decision.model === model &&
-  !(refreshLegacy && !decision.override && legacyCampaign(decision.assessment, decision.inputPolicyVersion))
+  !(refreshLegacy && !decision.override && outdatedAssessment(decision.assessment, decision.inputPolicyVersion))
 
 /** Host-owned, opt-in projection. Every mail read goes through the owner-scoped public SDK. */
 export function createAiTriageService({ database: db, inbox, configuration, configurationProblem, sessionKey, now = Date.now, fetcher }: Options) {
@@ -795,10 +795,9 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     if (cached) {
       const assessment: AiAssessment = JSON.parse(cached.assessment)
       const override: AiDecision['override'] = cacheContext === context && row ? JSON.parse(row.data).override : null
-      // Only an explicit history job refreshes affected legacy campaigns. Preserve
-      // old clear results and actual new-policy uncertainty; cache-only hits do not
-      // invent a manual-choice exemption when its captured receipt is unavailable.
-      const refresh = refreshLegacy && legacyCampaign(assessment, cached.input_policy) && override?.inputHash !== cacheContext.hash
+      // Only a newly requested history job upgrades obsolete assessments. Current
+      // assessments and captured manual choices still reuse their cached result.
+      const refresh = refreshLegacy && outdatedAssessment(assessment, cached.input_policy) && override?.inputHash !== cacheContext.hash
       if (!refresh) { transaction(() => { updateUsage(queue.owner, value => { value.reused++ }); finishDecision(queue, cacheContext, assessment, null, cached.input_policy, 'cache_reused') }); return }
     }
     if (row) transaction(() => {
@@ -811,7 +810,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     if (!permitted(queue) || controller.signal.aborted) return
     const attempt = beginAttempt(queue, value.model, context.hash)
     let result: AiInferenceResult
-    try { result = await inferAiTriage(context.input, configuration!, { model: value.model, signal: controller.signal, fetcher }) }
+    try { result = await inferAiTriage(context.input, configuration!, { model: value.model, signal: controller.signal, fetcher, retrying: queue.attempts > 0 }) }
     catch { finishAttempt(queue.owner, attempt, null); if (permitted(queue)) transaction(() => finishDecision(queue, context, null, 'AI_REQUEST_FAILED')); return }
     let current: Context | null = null
     if (permitted(queue) && !controller.signal.aborted) { try { current = await prepare(queue.owner, queue.source, queue.thread, contextSettings(settings(queue.owner))) } catch {} }
@@ -826,12 +825,12 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     }
     if (result.outcome === 'completed' && result.assessment) {
       // Complete source coverage is not required for a positively grounded, clear
-      // non-actionable campaign. Never manufacture clarity from model uncertainty.
-      const clearCampaign = result.assessment.certainty === 'clear' && quietCampaign(result.assessment)
-      const assessment = context.input.messages.some(message => message.truncated) && !clearCampaign ? { ...result.assessment, certainty: 'insufficient' as const } : result.assessment
+      // routine notification, receipt or non-actionable campaign. Never manufacture clarity from model uncertainty.
+      const clearInformational = result.assessment.certainty === 'clear' && quietInformational(result.assessment)
+      const assessment = context.input.messages.some(message => message.truncated) && !clearInformational ? { ...result.assessment, certainty: 'insufficient' as const } : result.assessment
       transaction(() => finishDecision(queue, current, assessment, null, AI_INPUT_POLICY_VERSION)); return
     }
-    if (result.retryable && queue.attempts < 2) {
+    if ((result.retryable || queue.attempts === 0 && ['AI_EVIDENCE_INVALID', 'AI_EVIDENCE_REQUIRED'].includes(result.code ?? '')) && queue.attempts < 2) {
       const delay = Math.max(1000 * 2 ** queue.attempts, Math.min(300_000, Math.max(0, result.retryAfterMs ?? 0)))
       db.query("UPDATE local_ai_queue SET status='queued',due=?,attempts=attempts+1 WHERE owner=? AND source=? AND thread=?").run(now() + delay, queue.owner, queue.source, queue.thread)
       return
