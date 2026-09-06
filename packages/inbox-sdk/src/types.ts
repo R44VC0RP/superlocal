@@ -1,13 +1,5 @@
 export type ProviderType = 'mock' | 'gmail' | 'outlook' | 'imap' | 'inbound' | (string & {})
 
-export interface MailboxProviderDescriptor {
-  id: ProviderType
-  name: string
-  connection: 'oauth' | 'credentials'
-  authProvider?: string
-  scopes?: string[]
-}
-
 export type MailFolder =
   | 'inbox'
   | 'starred'
@@ -19,30 +11,6 @@ export type MailFolder =
   | 'snoozed'
   | 'scheduled'
   | (string & {})
-
-export type ReadingMode = 'fullscreen' | 'sheet' | 'sidebar'
-export type MailSortOrder = 'newest' | 'oldest' | 'priority'
-export type InboxCategory = 'important' | 'other'
-export type InboxView = InboxCategory | 'quarantine'
-export type PersonalizationMode = 'off' | 'suggest' | 'adaptive'
-export type PrioritySectionMode = 'automatic' | 'starred' | 'needs-action' | 'off'
-export interface MailPriority {
-  score: number
-  level: 'priority' | 'important' | 'other'
-  source: 'provider' | 'manual' | 'learned' | 'protected'
-  reason: string
-  sampleCount: number
-  providerImportant: boolean
-  suggestedCategory?: InboxCategory | 'spam'
-}
-export interface PersonalizationStatus {
-  mode: PersonalizationMode
-  feedbackCount: number
-  readingCount: number
-  learnedAccounts: number
-  suggestionCount: number
-}
-export type FontFamily = 'circular' | 'system' | 'rounded' | 'serif' | 'mono'
 
 export interface Participant {
   name: string
@@ -105,22 +73,6 @@ export interface MailAccount {
   capabilities?: Readonly<ProviderCapabilities> | null
 }
 
-export interface AccountFolder {
-  id: string
-  name: string
-  folder: MailFolder
-  path?: string
-  custom?: boolean
-  unreadCount?: number
-  totalCount?: number
-}
-
-export interface AccountFoldersResponse {
-  provider: ProviderType
-  capabilities: { createFolders: boolean }
-  folders: AccountFolder[]
-}
-
 export interface MailMessage {
   id: string
   threadId: string
@@ -169,100 +121,9 @@ export interface MailThread {
   isRead: boolean
   isStarred: boolean
   isImportant?: boolean
-  priorityOverride?: InboxCategory | null
-  needsAction?: boolean
-  priority?: MailPriority
-  isQuarantined?: boolean
   folder: MailFolder
   labels: string[]
   hasAttachments: boolean
   snoozedUntil?: string | null
   scheduledAt?: string | null
-}
-
-export interface UserSettings {
-  readingMode: ReadingMode
-  remoteImages: boolean
-  readReceipts: boolean
-  keyboardShortcuts: boolean
-  density: 'comfortable' | 'compact'
-  signature: string
-  undoSendSeconds: number
-  theme: 'light' | 'dark' | 'system'
-  fontFamily: FontFamily
-  notifications: boolean
-  autoAdvance: boolean
-  showAvatars: boolean
-  personalizationMode?: PersonalizationMode
-  prioritySection?: PrioritySectionMode
-}
-
-export const DEFAULT_SETTINGS: UserSettings = {
-  readingMode: 'fullscreen',
-  remoteImages: true,
-  readReceipts: true,
-  keyboardShortcuts: true,
-  density: 'comfortable',
-  signature: '',
-  undoSendSeconds: 10,
-  theme: 'light',
-  fontFamily: 'circular',
-  notifications: true,
-  autoAdvance: true,
-  showAvatars: true,
-  personalizationMode: 'off',
-  prioritySection: 'automatic',
-}
-
-export interface ThreadListResponse {
-  threads: MailThread[]
-  nextCursor: string | null
-  counts: Partial<Record<MailFolder, number>>
-  categoryCounts?: Record<InboxCategory, number> & { quarantine?: number }
-  priorityCount?: number
-  total: number
-}
-
-export interface ComposeDraft {
-  accountId: string
-  inboxId?: string
-  to: string
-  cc: string
-  bcc: string
-  subject: string
-  body: string
-  threadId?: string
-  mode: 'compose' | 'reply' | 'replyAll' | 'forward'
-  scheduledAt?: string
-  attachments?: File[]
-}
-
-export interface SendResult extends MailThread {
-  thread: MailThread
-  message: MailMessage
-  scheduled: boolean
-  delivery: {
-    jobId: string
-    status: SendStatus['status']
-    statusUrl: string
-  }
-}
-
-export interface SendStatus {
-  messageId: string
-  jobId: string
-  status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'
-  attempts: number
-  nextAttemptAt: string | null
-  problem: {
-    code: string
-    error: string
-    status: number
-    stage: 'validation' | 'configuration' | 'dispatch' | 'recovery'
-    diagnosticId: string
-    retryable: boolean
-    action: string
-    field?: string
-    retryAfterSeconds?: number
-  } | null
 }

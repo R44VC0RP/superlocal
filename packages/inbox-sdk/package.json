@@ -43,7 +43,6 @@
     "postcss-value-parser": "4.2.0",
     "sanitize-html": "^2.14.0",
     "saxes": "6.0.0",
-    "tldts": "^7.4.11",
     "zod": "^4.0.0"
   },
   "devDependencies": {
