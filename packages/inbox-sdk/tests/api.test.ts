@@ -3,8 +3,8 @@ import { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
 import { DomUtils, parseDocument } from 'htmlparser2'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
-import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { join, relative } from 'node:path'
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib'
 import { SaxesParser } from 'saxes'
 import { createInbox } from '../src/core'
@@ -2381,7 +2381,9 @@ describe('bounded host inbox window', () => {
     await h.sync('alice', account.id)
     const providerCalls = structuredClone(box.calls), database = new Database(':memory:')
     let bodyReads = 0, inference = 0, captureRequested = false, unscopedReads = 0, conversationReads = 0
+    let correspondenceFailure: InboxError | undefined
     const guarded: Inbox = { ...h.inbox,
+      mailboxCorrespondence: (...args) => correspondenceFailure ? Promise.reject(correspondenceFailure) : h.inbox.mailboxCorrespondence(...args),
       message: async () => { bodyReads++; throw new Error('Window reads must not load message bodies') },
       mailboxMessage: async () => { bodyReads++; throw new Error('Window reads must not load mailbox bodies') },
       mailboxMessagePage: async (owner, input) => {
@@ -2414,6 +2416,14 @@ describe('bounded host inbox window', () => {
     expect(first.rows.flatMap(row => row.mail.messages).every(message => message.body === '' && message.loaded === false)).toBe(true)
     expect(JSON.stringify(first)).not.toContain(BODY_SECRET)
     expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(WindowDTO.INBOX_RESPONSE_BYTE_LIMIT)
+    const senderInput = { account: 'unified', id: first.rows[0]!.key }
+    expect((await call('sender', senderInput)).status).toBe('ready')
+    correspondenceFailure = new InboxError('READ_UNAVAILABLE', 'The cached read worker is unavailable.', 503, true)
+    expect(await call('sender', senderInput)).toMatchObject({ status: 'unknown', contact: null, activity: null, recent: [] })
+    correspondenceFailure = new InboxError('MAILBOX_SCOPE_CHANGED', 'The selected scope changed.', 409)
+    await expect(call('sender', senderInput)).rejects.toBe(correspondenceFailure)
+    correspondenceFailure = undefined
+    expect(bodyReads).toBe(0); expect(inference).toBe(0)
     expect((await call('lookup', { account: 'unified', ids: ['missing-window-thread'] })).entries).toEqual([{ id: 'missing-window-thread', status: 'absent' }])
     const ready = await call('page', { queryId: first.state.queryId })
     expect(ready.rows).toHaveLength(100)
@@ -3086,6 +3096,141 @@ describe('bounded host inbox window', () => {
 })
 
 describe('cached mailbox contacts and correspondence', () => {
+  test('memory correspondence remains inline and closing the SDK preserves a caller-owned database', async () => {
+    const database = new Database(':memory:')
+    cleanup.push(async () => database.close())
+    const h = await fixture({ database }), email = 'memory@cached.test', hour = 3600000
+    const { box } = await h.seed('alice', 'memory-correspondence', [native('received', { from: participant(email) }),
+      native('sent', { folder: 'sent', to: [participant(email)] }), native('queued', { folder: 'outbox', from: participant(email), to: [participant(email)] })])
+    const input = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id], email, since: new Date(EPOCH - hour).toISOString(), bucketMs: hour, bucketCount: 1 }
+    const calls = structuredClone(box.calls)
+    database.exec('PRAGMA query_only=ON')
+    try {
+      const result = await h.inbox.mailboxCorrespondence('alice', input)
+      expect(result).toMatchObject({ received: 1, sent: 1, conversations: 2, twoWay: 0, periods: [{ start: input.since, received: 1, sent: 1 }] })
+      expect(result.state).toBe((await h.inbox.changes('alice')).state)
+      expect(box.calls).toEqual(calls)
+      await h.inbox.close()
+      expect(database.query<{ alive: number }, []>('SELECT 1 alive').get()!.alive).toBe(1)
+      await expect(h.inbox.mailboxCorrespondence('alice', input)).rejects.toMatchObject({ code: 'CLOSED' })
+    } finally { database.exec('PRAGMA query_only=OFF') }
+  })
+
+  test('file-backed correspondence starts lazily, fails closed without an inline fallback, and can respawn on a later request', async () => {
+    const h = await fixture(), email = 'file@cached.test', hour = 3600000
+    const { box } = await h.seed('alice', 'file-correspondence', [native('received', { from: participant(email) })])
+    const scope = { mailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id] }
+    const input = { ...scope, email, since: new Date(EPOCH - hour).toISOString(), bucketMs: hour, bucketCount: 1 }
+    // Renaming the database inode invalidates open handles on macOS (SQLITE_IOERR_VNODE).
+    // Rename an owned filename alias instead: the main connection's inode stays readable.
+    const alias = join(h.directory, 'correspondence-reader.sqlite'), moved = `${alias}.worker-unavailable`
+    await symlink(h.database, alias)
+    const database = new Database(alias)
+    cleanup.push(async () => database.close())
+    await h.restart(database)
+    const calls = structuredClone(box.calls), NativeWorker = globalThis.Worker
+    const workers: Array<{ worker: Worker; exited: Promise<void> }> = []
+    // Observe real platform lifecycle events; one event-loop turn is not proof
+    // that a failed worker has exited and may safely be replaced.
+    globalThis.Worker = new Proxy(NativeWorker, { construct(target, args) {
+      const worker = Reflect.construct(target, args) as Worker, exited = deferred<void>()
+      worker.addEventListener('close', () => exited.resolve())
+      workers.push({ worker, exited: exited.promise })
+      return worker
+    } })
+    try {
+      expect((await h.inbox.mailboxContacts('alice', { ...scope, query: email })).items).toHaveLength(1)
+      await expect(h.inbox.mailboxCorrespondence('alice', { ...input, email: 'invalid' })).rejects.toMatchObject({ code: 'VALIDATION' })
+      expect(workers).toHaveLength(0)
+      await rename(alias, moved)
+      try {
+        await expect(h.inbox.mailboxCorrespondence('alice', input)).rejects.toMatchObject({ code: 'READ_UNAVAILABLE', status: 503, retryable: true, message: 'Cached correspondence is temporarily unavailable.' })
+        // A hidden blocking fallback would have succeeded on the still-readable main connection.
+        expect((await h.inbox.mailboxContacts('alice', { ...scope, query: email })).items).toHaveLength(1)
+      } finally { await rename(moved, alias) }
+      expect(workers).toHaveLength(1)
+      await bounded(workers[0]!.exited, 'failed correspondence worker exits before a fresh request')
+      expect(workers).toHaveLength(1)
+      expect(await h.inbox.mailboxCorrespondence('alice', input)).toMatchObject({ received: 1, sent: 0, conversations: 1 })
+      expect(workers).toHaveLength(2)
+      workers[1]!.worker.terminate()
+      await bounded(workers[1]!.exited, 'a later worker failure finishes without an automatic respawn')
+      expect(workers).toHaveLength(2)
+      // Success resets the consecutive-failure guard; isolated future failures
+      // do not require restarting the host, but recovery is still demand-only.
+      expect(await h.inbox.mailboxCorrespondence('alice', input)).toMatchObject({ received: 1, sent: 0, conversations: 1 })
+      expect(workers).toHaveLength(3)
+      expect(box.calls).toEqual(calls)
+      await bounded(h.inbox.close(), 'idle correspondence worker shutdown')
+    } finally { globalThis.Worker = NativeWorker }
+  })
+
+  test('50k file-backed correspondence yields to durable actions, retains snapshot catch-up, bounds admission and fences scope/store changes and shutdown', async () => {
+    const h = await fixture(), email = 'worker@cached.test', hour = 3600000, size = 50_000
+    const { account, box } = await h.seed('alice', 'worker-correspondence-50k', Array.from({ length: size }, (_, index) => native(`worker-${index}`, {
+      threadId: `worker-thread-${Math.floor(index / 2)}`, from: participant(email), bodyText: '', bodyHtml: '',
+    })))
+    const foreign = await h.seed('bob', 'worker-correspondence-foreign', [native('foreign', { from: participant(email) })])
+    const mailbox = (await h.inbox.mailboxes('alice'))[0]!, foreignMailbox = (await h.inbox.mailboxes('bob'))[0]!
+    const input = { mailboxIds: [mailbox.id], email, since: new Date(EPOCH - hour).toISOString(), bucketMs: hour, bucketCount: 1 }
+    // The injected Database has a relative filename; options.database is not a string in this SDK instance.
+    const database = new Database(relative(process.cwd(), h.database))
+    await h.restart(database)
+    const warm = await h.inbox.mailboxCorrespondence('alice', input)
+    expect(warm).toMatchObject({ received: size, sent: 0, conversations: size / 2 })
+    const target = (await h.inbox.mailboxMessagePage('alice', { mailboxIds: input.mailboxIds, limit: 1 })).items[0]!
+    let settled = false
+    const pending = h.inbox.mailboxCorrespondence('alice', input).finally(() => { settled = true })
+    await Bun.sleep(0)
+    expect(settled).toBe(false)
+    const receipt = await h.inbox.setMailboxStates('alice', { id: 'done-during-correspondence', done: true,
+      targets: [{ mailboxId: mailbox.id, messageId: target.id, revision: target.memberships[0]!.revision }] })
+    expect(receipt.states[0]!.done).toBe(true)
+    expect(settled).toBe(false)
+    box.put(native('concurrent-arrival', { from: participant(email), receivedAt: new Date(EPOCH).toISOString(), bodyText: '', bodyHtml: '' }))
+    await h.sync('alice', account.id)
+    const snapshot = await pending
+    const arrival = (await h.inbox.mailboxMessagePage('alice', { mailboxIds: input.mailboxIds, limit: 1 })).items[0]!
+    expect(arrival.subject).toBe('Subject concurrent-arrival')
+    expect([size, size + 1]).toContain(snapshot.received)
+    const delta = await h.inbox.mailboxChanges('alice', { mailboxIds: input.mailboxIds, since: snapshot.state, scopeState: snapshot.scopeState, limit: 100 })
+    expect(delta.resetRequired).toBe(false)
+    expect(snapshot.received + Number(delta.upserts.some(message => message.id === arrival.id))).toBe(size + 1)
+    const [own, other] = await Promise.all([h.inbox.mailboxCorrespondence('alice', input), h.inbox.mailboxCorrespondence('bob', { ...input, mailboxIds: [foreignMailbox.id] })])
+    expect(own.received).toBe(size + 1); expect(other.received).toBe(1)
+    expect(own.recent.every(key => key.sourceId === account.id)).toBe(true)
+    expect(other.recent.every(key => key.sourceId === foreign.account.id)).toBe(true)
+    await expect(h.inbox.mailboxCorrespondence('alice', { ...input, mailboxIds: [foreignMailbox.id] })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    const admission = await Promise.allSettled(Array.from({ length: 5 }, () => h.inbox.mailboxCorrespondence('alice', input)))
+    expect(admission.filter(result => result.status === 'fulfilled')).toHaveLength(4)
+    const rejected = admission.filter(result => result.status === 'rejected')
+    expect(rejected).toHaveLength(1)
+    expect(rejected[0]!.reason).toMatchObject({ code: 'READ_UNAVAILABLE', status: 503, retryable: true })
+    let scopeSettled = false
+    const scoped = h.inbox.mailboxCorrespondence('alice', input).then(value => ({ value, error: null }), error => ({ value: null, error })).finally(() => { scopeSettled = true })
+    await Bun.sleep(0)
+    expect(scopeSettled).toBe(false)
+    const detached = await h.inbox.updateMailbox('alice', mailbox.id, { status: 'detached' }, mailbox.revision)
+    expect((await scoped).error).toMatchObject({ code: 'MAILBOX_SCOPE_CHANGED' })
+    await h.inbox.updateMailbox('alice', mailbox.id, { status: 'paused' }, detached.revision)
+    const oldEpoch = database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='epoch'").get()!.value
+    const staleStore = h.inbox.mailboxCorrespondence('alice', input).then(value => ({ value, error: null }), error => ({ value: null, error }))
+    await Bun.sleep(0)
+    try {
+      database.query("UPDATE sdk_meta SET value=? WHERE key='epoch'").run(randomUUID())
+      expect((await staleStore).error).toMatchObject({ code: 'MAILBOX_SCOPE_CHANGED' })
+    } finally { database.query("UPDATE sdk_meta SET value=? WHERE key='epoch'").run(oldEpoch) }
+    const closingReads = Promise.allSettled(Array.from({ length: 4 }, () => h.inbox.mailboxCorrespondence('alice', input)))
+    await Bun.sleep(0)
+    await bounded(h.inbox.close(), 'active correspondence worker shutdown')
+    for (const result of await closingReads) {
+      expect(result.status).toBe('rejected')
+      if (result.status === 'rejected') expect(result.reason).toMatchObject({ code: 'CLOSED' })
+    }
+    expect(database.query<{ alive: number }, []>('SELECT 1 alive').get()!.alive).toBe(1)
+    await expect(h.inbox.mailboxCorrespondence('alice', input)).rejects.toMatchObject({ code: 'CLOSED' })
+  }, 90000)
+
   test('selected cached contacts and all-time correspondence deduplicate overlapping views, sources, recipients and exact domain boundaries', async () => {
     const h = await fixture(), day = 86400000, at = (days: number) => new Date(EPOCH + days * day).toISOString()
     const domains = ['alpha.example.test', 'beta.example.test', 'hidden.example.test']

@@ -1130,7 +1130,12 @@ export function createInboxWindowService(deps: Dependencies) {
       if (!response.ok || info.kind !== 'domain' || info.rootDomain !== domain) fail('HOST_INBOX_INVALID')
     }
     const week = 7 * 86400_000
-    const activity = await inbox.mailboxCorrespondence(owner, { mailboxIds: scope.boxes.map(box => box.id), email: contact.email.trim().toLowerCase(), ...(domain ? { domain } : {}), since: new Date(Date.now() - 12 * week).toISOString(), bucketMs: week, bucketCount: 12, recentLimit: 5 })
+    let activity: Awaited<ReturnType<Inbox['mailboxCorrespondence']>>
+    try { activity = await inbox.mailboxCorrespondence(owner, { mailboxIds: scope.boxes.map(box => box.id), email: contact.email.trim().toLowerCase(), ...(domain ? { domain } : {}), since: new Date(Date.now() - 12 * week).toISOString(), bucketMs: week, bucketCount: 12, recentLimit: 5 }) }
+    catch (error) {
+      if (!(error instanceof InboxError) || error.code !== 'READ_UNAVAILABLE') throw error
+      return { state: state(scope), status: 'unknown', contact: null, activity: null, recent: [] }
+    }
     observe(scope, activity.state, activity.scopeState)
     const recent = (await lookupRows(scope, activity.recent.map(key => mailKey(scope, key)), budget)).flatMap(entry => entry.status === 'found' ? [entry.row] : [])
     const { received, sent, conversations, twoWay } = activity, level = !received && !sent ? 0 : twoWay >= 25 ? 5 : twoWay >= 10 ? 4 : twoWay >= 3 ? 3 : twoWay ? 2 : 1

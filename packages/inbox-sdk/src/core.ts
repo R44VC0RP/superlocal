@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { chmodSync, mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { Context, Effect, Either, Fiber, Layer, ManagedRuntime, Schedule } from 'effect'
 import { createCredentialCrypto } from '../server/crypto'
 import { sanitizeEmailBody } from '../server/sanitize'
@@ -27,6 +27,8 @@ type OperationRow = { seq: number; id: string; owner: string; account: string; g
 type MutationPayload = { input: MutationInput; before: Record<string, MessageSummary>; afterRevisions?: Record<string, number>; perMessageChanges?: Record<string, Changes> }
 type MailboxInventory = { owner: string; ids: string[]; scopeHash: string; binding: string; seq: number; expires: number; limit: number; bytes: number; completed: boolean }
 type SendPayload = { draft: Draft; holdUntil: number; nativeSource?: string; nativeThread?: string; inReplyTo?: string; references?: string[]; blobs: BlobInfo[] }
+type CorrespondenceRow = { received: number; sent: number; conversations: number; twoWay: number; firstMessageAt: number | null; lastMessageAt: number | null; lastSentAt: number | null; bins: string; recent: string }
+type CorrespondenceSnapshot = { row: CorrespondenceRow; seq: number; epoch: string }
 
 class Environment extends Context.Tag('inbox/Environment')<Environment, { database: Database; now: () => number }>() {}
 
@@ -174,9 +176,133 @@ export function createInbox(options: InboxOptions): Inbox {
   let due: Promise<void> | undefined
   let polling: Promise<void> | undefined
   let background: Fiber.RuntimeFiber<unknown, unknown>[] = []
+  const correspondenceFilename = db.filename && db.filename !== ':memory:' ? resolve(db.filename) : null
+  const CORRESPONDENCE_QUEUE = 4, CORRESPONDENCE_DEADLINE = 15_000, CORRESPONDENCE_CLOSE = 1000
+  type CorrespondenceJob = { id: number; owner: string; sql: string; params: (string | number)[]; timer: ReturnType<typeof setTimeout>; validate: (value: unknown) => CorrespondenceSnapshot; resolve: (value: CorrespondenceSnapshot) => void; reject: (error: InboxError) => void }
+  type CorrespondenceWorker = Worker & { ref(): void; unref(): void }
+  type CorrespondenceReader = { worker: CorrespondenceWorker; jobs: CorrespondenceJob[]; active: boolean; dead: boolean; closing: boolean; closeSent: boolean; acknowledged: boolean; exited: boolean; finished: Promise<void>; finish: () => void }
+  let correspondenceReader: CorrespondenceReader | undefined, correspondenceStarts = 0, correspondenceJobId = 0
+  let correspondenceClosing: Promise<void> | undefined
+  const unavailableRead = () => new InboxError('READ_UNAVAILABLE', 'Cached correspondence is temporarily unavailable.', 503, true)
+  const closedRead = () => new InboxError('CLOSED', 'The inbox instance is closed.', 503)
+
+  function failCorrespondence(reader: CorrespondenceReader, error: InboxError, terminate = true) {
+    reader.dead = true
+    for (const job of reader.jobs.splice(0)) { clearTimeout(job.timer); job.reject(error) }
+    reader.active = false
+    if (terminate && !reader.exited) { try { reader.worker.terminate() } catch { /* Already exited. */ } }
+    reader.worker.unref()
+  }
+
+  function stopCorrespondence(reader: CorrespondenceReader) {
+    if (reader.closeSent || reader.dead || reader.exited) return
+    reader.closeSent = true
+    reader.worker.ref()
+    try { reader.worker.postMessage({ type: 'close' }) } catch { failCorrespondence(reader, closedRead()) }
+  }
+
+  function pumpCorrespondence(reader: CorrespondenceReader) {
+    if (reader.dead || reader.active || reader.exited) return
+    if (reader.closing) { stopCorrespondence(reader); return }
+    const job = reader.jobs[0]
+    if (!job) { reader.worker.unref(); return }
+    reader.active = true
+    reader.worker.ref()
+    try { reader.worker.postMessage({ type: 'read', id: job.id, filename: correspondenceFilename, owner: job.owner, sql: job.sql, params: job.params }) }
+    catch { failCorrespondence(reader, unavailableRead()) }
+  }
+
+  function startCorrespondence(): CorrespondenceReader {
+    // A later request may replace one failed worker; consecutive failures never loop.
+    if (correspondenceStarts >= 2) throw unavailableRead()
+    correspondenceStarts++
+    let worker: CorrespondenceWorker
+    try { worker = new Worker(Bun.resolveSync('./correspondence-worker', import.meta.dir)) as CorrespondenceWorker }
+    catch { throw unavailableRead() }
+    let finish!: () => void
+    const finished = new Promise<void>(resolve => { finish = resolve })
+    const reader: CorrespondenceReader = { worker, jobs: [], active: false, dead: false, closing: false, closeSent: false, acknowledged: false, exited: false, finished, finish }
+    worker.addEventListener('message', event => {
+      if (correspondenceReader !== reader || reader.dead) return
+      const value = event.data, job = reader.jobs[0]
+      if (value?.type === 'closed' && reader.closing && reader.closeSent && !reader.active) { reader.acknowledged = true; return }
+      if (!job || !reader.active || !value || value.id !== job.id || value.type !== 'result') { failCorrespondence(reader, stopping ? closedRead() : unavailableRead()); return }
+      let snapshot: CorrespondenceSnapshot
+      try {
+        if (Buffer.byteLength(JSON.stringify(value)) > READ_BYTES) throw unavailableRead()
+        snapshot = job.validate(value)
+      } catch { failCorrespondence(reader, unavailableRead()); return }
+      reader.jobs.shift(); reader.active = false; clearTimeout(job.timer)
+      correspondenceStarts = 1
+      job.resolve(snapshot)
+      pumpCorrespondence(reader)
+    })
+    worker.addEventListener('error', event => { event.preventDefault(); failCorrespondence(reader, stopping ? closedRead() : unavailableRead()) })
+    worker.addEventListener('messageerror', () => failCorrespondence(reader, stopping ? closedRead() : unavailableRead()))
+    worker.addEventListener('close', event => {
+      reader.exited = true
+      if (!reader.closing || !reader.acknowledged || reader.jobs.length || (event as Event & { code: number }).code !== 0) failCorrespondence(reader, stopping ? closedRead() : unavailableRead(), false)
+      reader.finish()
+    })
+    return reader
+  }
+
+  function readCorrespondence(owner: string, sql: string, params: (string | number)[], validate: (value: unknown) => CorrespondenceSnapshot): Promise<CorrespondenceSnapshot> {
+    if (closed || stopping || correspondenceClosing) return Promise.reject(closedRead())
+    const id = ++correspondenceJobId
+    if (!correspondenceFilename || Buffer.byteLength(JSON.stringify({ type: 'read', id, filename: correspondenceFilename, owner, sql, params })) > READ_BYTES) return Promise.reject(unavailableRead())
+    let reader = correspondenceReader
+    if (!reader || reader.dead && reader.exited) correspondenceReader = reader = startCorrespondence()
+    if (reader.dead || reader.closing || reader.jobs.length >= CORRESPONDENCE_QUEUE) return Promise.reject(unavailableRead())
+    const current = reader
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (current.jobs.some(job => job.id === id)) failCorrespondence(current, stopping ? closedRead() : unavailableRead())
+      }, CORRESPONDENCE_DEADLINE)
+      current.jobs.push({ id, owner, sql, params, timer, validate, resolve, reject })
+      pumpCorrespondence(current)
+    })
+  }
+
+  function checkedCorrespondence(value: unknown, bucketCount: number, recentLimit: number, sources: Set<string>): CorrespondenceSnapshot {
+    const snapshot = value as Partial<CorrespondenceSnapshot> | null, row = snapshot?.row
+    const count = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    const timestamp = (value: unknown) => value === null || typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= 8.64e15
+    if (!snapshot || !count(snapshot.seq) || typeof snapshot.epoch !== 'string' || !snapshot.epoch || snapshot.epoch.length > 512
+      || !row || typeof row !== 'object' || ![row.received, row.sent, row.conversations, row.twoWay].every(count)
+      || ![row.firstMessageAt, row.lastMessageAt, row.lastSentAt].every(timestamp)
+      || typeof row.bins !== 'string' || typeof row.recent !== 'string') throw unavailableRead()
+    try {
+      const bins = JSON.parse(row.bins), recent = JSON.parse(row.recent), seen = new Set<number>()
+      if (!Array.isArray(bins) || bins.length > bucketCount || !Array.isArray(recent) || recent.length > recentLimit) throw unavailableRead()
+      for (const bin of bins) {
+        if (!bin || !count(bin.bucket) || bin.bucket >= bucketCount || seen.has(bin.bucket) || !count(bin.received) || !count(bin.sent)) throw unavailableRead()
+        seen.add(bin.bucket)
+      }
+      const key = (value: unknown) => typeof value === 'string' && value.trim().length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value)
+      for (const item of recent) if (!item || !key(item.sourceId) || !key(item.threadId) || !sources.has(item.sourceId)) throw unavailableRead()
+    } catch { throw unavailableRead() }
+    return snapshot as CorrespondenceSnapshot
+  }
+
+  function closeCorrespondence(): Promise<void> {
+    if (correspondenceClosing) return correspondenceClosing
+    const reader = correspondenceReader
+    if (!reader || reader.exited) return correspondenceClosing = Promise.resolve()
+    reader.closing = true
+    for (const job of reader.jobs.splice(reader.active ? 1 : 0)) { clearTimeout(job.timer); job.reject(closedRead()) }
+    reader.worker.ref()
+    if (!reader.active) stopCorrespondence(reader)
+    return correspondenceClosing = new Promise(resolve => {
+      const timer = setTimeout(() => { failCorrespondence(reader, closedRead()); resolve() }, CORRESPONDENCE_CLOSE)
+      void reader.finished.then(() => { clearTimeout(timer); resolve() })
+    })
+  }
+
   const layer = Layer.scoped(Environment, Effect.acquireRelease(
     Effect.succeed({ database: db, now }),
     () => Effect.promise(async () => {
+      await closeCorrespondence()
       await Promise.allSettled([...instances.values()].map(async provider => (await provider).disconnect()))
       instances.clear()
       listeners.clear()
@@ -2294,53 +2420,72 @@ export function createInbox(options: InboxOptions): Inbox {
       if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The contact read exceeds its encoded budget.', 413)
       return result
     }).deferred()),
-    mailboxCorrespondence: (owner, input) => run(() => db.transaction(() => {
-      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['mailboxIds', 'email', 'domain', 'since', 'bucketMs', 'bucketCount', 'recentLimit'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox correspondence input.')
-      const scope = mailboxReadScope(owner, input.mailboxIds), recentLimit = input.recentLimit === undefined ? 5 : input.recentLimit
-      if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
-      const address = selector({ kind: 'address', value: input.email })
-      if (address.kind !== 'address') throw new InboxError('VALIDATION', 'Invalid correspondence address.')
-      const email = address.value.toLowerCase(), hostname = email.slice(email.lastIndexOf('@') + 1)
-      let domain: string | undefined
-      if (input.domain !== undefined) {
-        const selected = selector({ kind: 'domain', value: text(input.domain, 'Correspondence domain', 253) })
-        if (selected.kind !== 'domain' || selected.value.split('.').some(label => label.length > 63) || !(hostname === selected.value || hostname.endsWith(`.${selected.value}`))) throw new InboxError('VALIDATION', 'The correspondence domain must contain the address.')
-        domain = selected.value
+    mailboxCorrespondence: (owner, input) => run(async () => {
+      if (closed || stopping) throw closedRead()
+      const prepared = db.transaction(() => {
+        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['mailboxIds', 'email', 'domain', 'since', 'bucketMs', 'bucketCount', 'recentLimit'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox correspondence input.')
+        const scope = mailboxReadScope(owner, input.mailboxIds), recentLimit = input.recentLimit === undefined ? 5 : input.recentLimit
+        if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+        const address = selector({ kind: 'address', value: input.email })
+        if (address.kind !== 'address') throw new InboxError('VALIDATION', 'Invalid correspondence address.')
+        const email = address.value.toLowerCase(), hostname = email.slice(email.lastIndexOf('@') + 1)
+        let domain: string | undefined
+        if (input.domain !== undefined) {
+          const selected = selector({ kind: 'domain', value: text(input.domain, 'Correspondence domain', 253) })
+          if (selected.kind !== 'domain' || selected.value.split('.').some(label => label.length > 63) || !(hostname === selected.value || hostname.endsWith(`.${selected.value}`))) throw new InboxError('VALIDATION', 'The correspondence domain must contain the address.')
+          domain = selected.value
+        }
+        const since = text(input.since, 'Correspondence start', 100), start = Date.parse(since), bucketMs = input.bucketMs, bucketCount = input.bucketCount
+        if (!/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(since)
+          || !Number.isFinite(start) || new Date(`${since.slice(0, 10)}T00:00:00Z`).toISOString().slice(0, 10) !== since.slice(0, 10)) throw new InboxError('VALIDATION', 'Correspondence start must be a valid ISO timestamp.')
+        if (!Number.isSafeInteger(bucketMs) || bucketMs < 3600000 || bucketMs > 365 * 86400000
+          || !Number.isSafeInteger(bucketCount) || bucketCount < 1 || bucketCount > 64
+          || !Number.isSafeInteger(recentLimit) || recentLimit < 1 || recentLimit > 50) throw new InboxError('VALIDATION', 'Invalid correspondence period or recent limit.')
+        const selection = cachedCorrespondents(owner, scope, now(), { email, domain })
+        const predicate = domain ? "(substr(email,instr(email,'@')+1)=? OR substr(email,instr(email,'@')+1) LIKE ? ESCAPE '\\')" : 'email=?'
+        const matching = domain ? [domain, `%.${domain.replace(/[\\%_]/g, '\\$&')}`] : [email]
+        const sql = `${selection.sql}, matched AS (
+          SELECT source,message,thread,at,sent FROM correspondents WHERE ${predicate} GROUP BY source,message,sent
+        ), threads AS (
+          SELECT source,thread,MAX(sent=0) received,MAX(sent=1) sent,MAX(at) latest FROM matched GROUP BY source,thread
+        ) SELECT COALESCE(SUM(sent=0),0) received,COALESCE(SUM(sent=1),0) sent,
+          MIN(at) firstMessageAt,MAX(at) lastMessageAt,MAX(CASE WHEN sent=1 THEN at END) lastSentAt,
+          (SELECT COUNT(*) FROM threads) conversations,(SELECT COALESCE(SUM(received AND sent),0) FROM threads) twoWay,
+          (SELECT json_group_array(json_object('bucket',bucket,'received',received,'sent',sent)) FROM (
+            SELECT CAST((at-?)/? AS INTEGER) bucket,SUM(sent=0) received,SUM(sent=1) sent FROM matched WHERE at>=? AND at<? GROUP BY bucket
+          )) bins,
+          (SELECT json_group_array(json_object('sourceId',source,'threadId',thread)) FROM (
+            SELECT source,thread FROM threads ORDER BY latest DESC,source,thread LIMIT ?
+          )) recent FROM matched`
+        const params = [...selection.params, ...matching, start, bucketMs, start, start + bucketMs * bucketCount, recentLimit]
+        // Only memory/temporary databases execute inline. Never span an await with this transaction.
+        const inline = correspondenceFilename ? null : { row: db.query<CorrespondenceRow, (string | number)[]>(sql).get(...params)!, seq: sequence(owner), epoch }
+        return { scope, start, bucketMs, bucketCount, recentLimit, sql, params, inline }
+      }).deferred()
+      const { scope, start, bucketMs, bucketCount, recentLimit } = prepared
+      const snapshot = prepared.inline ?? await readCorrespondence(owner, prepared.sql, prepared.params, value => checkedCorrespondence(value, bucketCount, recentLimit, scope.sources))
+      if (!prepared.inline) {
+        if (closed || stopping) throw closedRead()
+        db.transaction(() => {
+          const currentEpoch = db.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='epoch'").get()?.value
+          if (snapshot.epoch !== epoch || currentEpoch !== epoch) throw new InboxError('MAILBOX_SCOPE_CHANGED', 'Restart the changed mailbox selection.', 409, true)
+          const currentScope = mailboxReadScope(owner, scope.ids)
+          if (!currentScope.attached || currentScope.hash !== scope.hash || currentScope.binding !== scope.binding) throw new InboxError('MAILBOX_SCOPE_CHANGED', 'Restart the changed mailbox selection.', 409, true)
+        }).deferred()
       }
-      const since = text(input.since, 'Correspondence start', 100), start = Date.parse(since)
-      if (!/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(since)
-        || !Number.isFinite(start) || new Date(`${since.slice(0, 10)}T00:00:00Z`).toISOString().slice(0, 10) !== since.slice(0, 10)) throw new InboxError('VALIDATION', 'Correspondence start must be a valid ISO timestamp.')
-      if (!Number.isSafeInteger(input.bucketMs) || input.bucketMs < 3600000 || input.bucketMs > 365 * 86400000
-        || !Number.isSafeInteger(input.bucketCount) || input.bucketCount < 1 || input.bucketCount > 64
-        || !Number.isSafeInteger(recentLimit) || recentLimit < 1 || recentLimit > 50) throw new InboxError('VALIDATION', 'Invalid correspondence period or recent limit.')
-      const selection = cachedCorrespondents(owner, scope, now(), { email, domain })
-      const predicate = domain ? "(substr(email,instr(email,'@')+1)=? OR substr(email,instr(email,'@')+1) LIKE ? ESCAPE '\\')" : 'email=?'
-      const params = domain ? [domain, `%.${domain.replace(/[\\%_]/g, '\\$&')}`] : [email]
-      const aggregate = db.query<{ received: number; sent: number; conversations: number; twoWay: number; firstMessageAt: number | null; lastMessageAt: number | null; lastSentAt: number | null; bins: string; recent: string }, (string | number)[]>(`${selection.sql}, matched AS (
-        SELECT source,message,thread,at,sent FROM correspondents WHERE ${predicate} GROUP BY source,message,sent
-      ), threads AS (
-        SELECT source,thread,MAX(sent=0) received,MAX(sent=1) sent,MAX(at) latest FROM matched GROUP BY source,thread
-      ) SELECT COALESCE(SUM(sent=0),0) received,COALESCE(SUM(sent=1),0) sent,
-        MIN(at) firstMessageAt,MAX(at) lastMessageAt,MAX(CASE WHEN sent=1 THEN at END) lastSentAt,
-        (SELECT COUNT(*) FROM threads) conversations,(SELECT COALESCE(SUM(received AND sent),0) FROM threads) twoWay,
-        (SELECT json_group_array(json_object('bucket',bucket,'received',received,'sent',sent)) FROM (
-          SELECT CAST((at-?)/? AS INTEGER) bucket,SUM(sent=0) received,SUM(sent=1) sent FROM matched WHERE at>=? AND at<? GROUP BY bucket
-        )) bins,
-        (SELECT json_group_array(json_object('sourceId',source,'threadId',thread)) FROM (
-          SELECT source,thread FROM threads ORDER BY latest DESC,source,thread LIMIT ?
-        )) recent FROM matched`).get(...selection.params, ...params, start, input.bucketMs, start, start + input.bucketMs * input.bucketCount, recentLimit)!
-      const periods = Array.from({ length: input.bucketCount }, (_, index) => ({ start: new Date(start + index * input.bucketMs).toISOString(), received: 0, sent: 0 }))
+      const aggregate = snapshot.row
+      const periods = Array.from({ length: bucketCount }, (_, index) => ({ start: new Date(start + index * bucketMs).toISOString(), received: 0, sent: 0 }))
       for (const bin of JSON.parse(aggregate.bins) as Array<{ bucket: number; received: number; sent: number }>) {
         periods[bin.bucket]!.received = bin.received; periods[bin.bucket]!.sent = bin.sent
       }
       const iso = (value: number | null) => value === null ? null : new Date(value).toISOString()
-      const result = { state: token(owner, sequence(owner)), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`),
+      const result = { state: token(owner, snapshot.seq), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`),
         received: aggregate.received, sent: aggregate.sent, conversations: aggregate.conversations, twoWay: aggregate.twoWay,
         firstMessageAt: iso(aggregate.firstMessageAt), lastMessageAt: iso(aggregate.lastMessageAt), lastSentAt: iso(aggregate.lastSentAt), periods,
         recent: JSON.parse(aggregate.recent) as MailboxThreadKey[] }
       if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The correspondence read exceeds its encoded budget.', 413)
       return result
-    }).deferred()),
+    }),
     mailboxSyncStatus: (owner, input) => run(() => db.transaction(() => {
       if (!input || Object.keys(input).some(key => key !== 'mailboxIds')) throw new InboxError('VALIDATION', 'Invalid mailbox sync status input.')
       const scope = mailboxReadScope(owner, input.mailboxIds)
@@ -2986,6 +3131,7 @@ export function createInbox(options: InboxOptions): Inbox {
     close: async () => {
       if (closed || stopping) return
       stopping = true
+      await closeCorrespondence()
       await media.close()
       for (const controller of controllers.values()) controller.abort()
       await Effect.runPromise(Fiber.interruptAll(background))
