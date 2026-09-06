@@ -8,8 +8,9 @@ import {
   writeSaved,
   writeText,
 } from "../src/storage.ts";
-import { AUTH_REQUIRED_EVENT, beginGoogleLogin, checkAuthenticationResponse, createScopedFetch, readApplicationAccess, signOutApplication } from "../src/application-auth.ts";
-import { bindApplicationScope, createApplicationScope } from "../src/application-scope.ts";
+import { AUTH_REQUIRED_EVENT, ApplicationAccessUnavailable, applicationAccessRetryDelay, beginGoogleLogin, checkAuthenticationResponse, createScopedFetch,
+  readApplicationAccess, rememberApplicationRecoveryScope, signOutApplication, takeApplicationRecoveryScope } from "../src/application-auth.ts";
+import { bindApplicationScope, createApplicationScope, getApplicationScope } from "../src/application-scope.ts";
 
 const scopeA = "a".repeat(64), scopeB = "b".repeat(64);
 
@@ -30,15 +31,122 @@ test("application access fails closed and never infers a local session from inva
     const identity = payload;
     for (const scope of [undefined, null, "", "a".repeat(63), "b".repeat(65), "G".repeat(64), "approved@example.test", {}, 42]) {
       payload = { ...identity as object, scope };
-      await assert.rejects(readApplicationAccess());
+      await assert.rejects(readApplicationAccess(), error => error instanceof Error && !(error instanceof ApplicationAccessUnavailable));
     }
     for (const invalid of [{}, null, { method: "google", authenticated: "true" }, { method: "google", authenticated: true }, { method: "google", authenticated: true, user: { email: "approved@example.test" } }]) {
       payload = invalid;
-      await assert.rejects(readApplicationAccess());
+      await assert.rejects(readApplicationAccess(), error => error instanceof Error && !(error instanceof ApplicationAccessUnavailable));
     }
     globalThis.fetch = (async () => Response.json({ method: "loopback" }, { status: 503 })) as typeof fetch;
-    await assert.rejects(readApplicationAccess());
+    await assert.rejects(readApplicationAccess(), ApplicationAccessUnavailable);
   } finally { globalThis.fetch = original; }
+});
+
+test("temporary auth transport failures remain unavailable rather than authorizing or challenging a document", async () => {
+  const originalFetch = globalThis.fetch, previousDispatch = Object.getOwnPropertyDescriptor(globalThis, "dispatchEvent");
+  const events: string[] = [];
+  Object.defineProperty(globalThis, "dispatchEvent", { configurable: true, value: (event: Event) => { events.push(event.type); return true; } });
+  try {
+    assert.ok(new ApplicationAccessUnavailable() instanceof Error);
+    assert.equal(new ApplicationAccessUnavailable().retryAfterMs, 0);
+    assert.equal(new ApplicationAccessUnavailable(2500).retryAfterMs, 2500);
+    for (const cause of [new TypeError("Proxy connection unavailable"), new DOMException("Auth deadline elapsed", "TimeoutError")]) {
+      let requests = 0;
+      globalThis.fetch = (async (input, init) => {
+        requests++; assert.equal(input, "/host/auth"); assert.equal(init?.method, "GET");
+        assert.equal(init?.credentials, "include"); assert.equal(init?.cache, "no-store");
+        throw cause;
+      }) as typeof fetch;
+      await assert.rejects(readApplicationAccess(), error => error instanceof ApplicationAccessUnavailable && error.retryAfterMs === 0);
+      assert.equal(requests, 1, "the access reader classifies failure without starting its own retry loop");
+    }
+    for (const cause of [new Error("Unexpected auth implementation failure"), new DOMException("Caller cancelled", "AbortError")]) {
+      globalThis.fetch = (async () => { throw cause; }) as typeof fetch;
+      await assert.rejects(readApplicationAccess(), error => error instanceof Error && !(error instanceof ApplicationAccessUnavailable));
+    }
+    const controller = new AbortController(), cancelled = new DOMException("Reader closed", "AbortError");
+    let rejectFetch!: (error: Error) => void;
+    globalThis.fetch = (() => new Promise<Response>((_resolve, reject) => { rejectFetch = reject; })) as typeof fetch;
+    const pending = readApplicationAccess(controller.signal);
+    controller.abort(cancelled); rejectFetch(new TypeError("Transport failed after caller cancellation"));
+    await assert.rejects(pending, error => error instanceof Error && !(error instanceof ApplicationAccessUnavailable));
+    globalThis.fetch = (async (_input, init) => { init?.signal?.throwIfAborted(); throw new TypeError("Unavailable"); }) as typeof fetch;
+    await assert.rejects(readApplicationAccess(controller.signal), error => error instanceof Error && !(error instanceof ApplicationAccessUnavailable));
+    globalThis.fetch = (async () => new Response("Deploying", { status: 503, headers: { "X-Superlocal-Auth": "required" } })) as typeof fetch;
+    await assert.rejects(readApplicationAccess(), ApplicationAccessUnavailable);
+    const binding = createApplicationScope(scopeA);
+    globalThis.fetch = (async () => { throw new TypeError("Private request disconnected"); }) as typeof fetch;
+    await assert.rejects(createScopedFetch(binding)("/host/config"), TypeError);
+    assert.equal(binding.signal.aborted, false, "a network failure cannot impersonate a host scope challenge");
+    assert.deepEqual(events, [], "network failures do not invent AUTH_REQUIRED_EVENT");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousDispatch) Object.defineProperty(globalThis, "dispatchEvent", previousDispatch); else Reflect.deleteProperty(globalThis, "dispatchEvent");
+  }
+});
+
+test("auth proxy responses classify Retry-After without retrying hard HTTP, JSON or identity errors", async () => {
+  const originalFetch = globalThis.fetch, originalNow = Date.now;
+  const now = Date.UTC(2026, 8, 6, 12, 0, 0);
+  Date.now = () => now;
+  try {
+    for (const status of [500, 502, 504, 599]) {
+      globalThis.fetch = (async () => new Response("Proxy unavailable", { status, headers: { "Content-Type": "application/json" } })) as typeof fetch;
+      await assert.rejects(readApplicationAccess(), error => error instanceof ApplicationAccessUnavailable && error.retryAfterMs === 0);
+    }
+    for (const status of [429, 503]) for (const [retryAfter, delay] of [
+      [null, 0], ["0", 0], ["3", 3000], ["120", 120000], ["999999", 120000],
+      [new Date(now + 45000).toUTCString(), 45000], [new Date(now + 300000).toUTCString(), 120000],
+      [new Date(now - 1000).toUTCString(), 0], ["not-a-date", 0],
+    ] as const) {
+      globalThis.fetch = (async () => new Response("Deploying", { status, headers: retryAfter === null ? {} : { "Retry-After": retryAfter } })) as typeof fetch;
+      await assert.rejects(readApplicationAccess(), error => error instanceof ApplicationAccessUnavailable && error.retryAfterMs === delay, `${status}: ${retryAfter}`);
+    }
+    for (const status of [400, 401, 403, 404, 408, 409, 422, 451]) {
+      globalThis.fetch = (async () => Response.json({ method: "loopback" }, { status, headers: { "Retry-After": "1" } })) as typeof fetch;
+      await assert.rejects(readApplicationAccess(), error => error instanceof Error && !(error instanceof ApplicationAccessUnavailable), `HTTP ${status} stays a hard failure`);
+    }
+    for (const contentType of ["text/html", "text/plain", null]) {
+      globalThis.fetch = (async () => new Response(contentType === null ? null : '{"method":"loopback"}', { headers: contentType ? { "Content-Type": contentType } : {} })) as typeof fetch;
+      await assert.rejects(readApplicationAccess(), ApplicationAccessUnavailable, "a non-JSON proxy success is not an authenticated identity");
+    }
+    for (const body of ['{"method":', "null", '"google"', '{"method":"google","authenticated":true,"user":{"name":"A","email":"a@example.test"},"scope":"bad"}']) {
+      globalThis.fetch = (async () => new Response(body, { headers: { "Content-Type": "application/json; charset=utf-8" } })) as typeof fetch;
+      await assert.rejects(readApplicationAccess(), error => error instanceof Error && !(error instanceof ApplicationAccessUnavailable));
+    }
+    globalThis.fetch = (async () => new Response('{"method":"loopback"}', { headers: { "Content-Type": "application/json; charset=utf-8" } })) as typeof fetch;
+    assert.deepEqual(await readApplicationAccess(), { method: "loopback" });
+  } finally { globalThis.fetch = originalFetch; Date.now = originalNow; }
+});
+
+test("application access retry delays stop after six attempts or before the strict two-minute deadline", () => {
+  const startedAt = 1000000, originalNow = Date.now;
+  try {
+    let now = startedAt;
+    for (const [attempt, expected] of [1000, 2000, 4000, 8000, 15000, 15000].entries()) {
+      assert.equal(applicationAccessRetryDelay(attempt, startedAt, now), expected);
+      now += expected;
+    }
+    for (const attempt of [-1, 0.5, 6, 7, 100, NaN, Infinity]) assert.equal(applicationAccessRetryDelay(attempt, startedAt, now), null);
+    assert.equal(applicationAccessRetryDelay(0, startedAt, startedAt, 500), 1000);
+    assert.equal(applicationAccessRetryDelay(0, startedAt, startedAt, 5000), 5000);
+    assert.equal(applicationAccessRetryDelay(4, startedAt, startedAt, 20000), 20000);
+    assert.equal(applicationAccessRetryDelay(0, startedAt, startedAt + 118999), 1000);
+    assert.equal(applicationAccessRetryDelay(0, startedAt, startedAt + 119000), null, "the next attempt cannot start exactly at the deadline");
+    assert.equal(applicationAccessRetryDelay(1, startedAt, startedAt + 118000), null);
+    assert.equal(applicationAccessRetryDelay(0, startedAt, startedAt + 109999, 10000), 10000);
+    assert.equal(applicationAccessRetryDelay(0, startedAt, startedAt + 110000, 10000), null);
+    assert.equal(applicationAccessRetryDelay(0, startedAt, startedAt, 120000), null);
+    assert.equal(applicationAccessRetryDelay(0, startedAt, startedAt + 120000), null);
+    assert.equal(applicationAccessRetryDelay(0, startedAt, startedAt + 120001), null);
+    for (const invalid of [NaN, Infinity, -Infinity]) {
+      assert.equal(applicationAccessRetryDelay(0, invalid, startedAt), null);
+      assert.equal(applicationAccessRetryDelay(0, startedAt, invalid), null);
+    }
+    for (const invalid of [NaN, Infinity]) assert.equal(applicationAccessRetryDelay(0, startedAt, startedAt, invalid), null);
+    Date.now = () => startedAt + 119000;
+    assert.equal(applicationAccessRetryDelay(0, startedAt), null, "the default clock obeys the same deadline");
+  } finally { Date.now = originalNow; }
 });
 
 test("Google login uses only the host flow and rejects unexpected destinations", async () => {
@@ -64,6 +172,21 @@ test("Google login uses only the host flow and rejects unexpected destinations",
   } finally { globalThis.fetch = original; }
 });
 
+test("a failed sign-out stays unconfirmed and never automatically repeats its POST", async () => {
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async (input, init) => {
+    requests++; assert.equal(input, "/host/auth/sign-out"); assert.equal(init?.method, "POST");
+    assert.equal(init?.credentials, "include"); assert.equal(init?.cache, "no-store");
+    throw new TypeError("Sign-out acknowledgement unavailable");
+  }) as typeof fetch;
+  try {
+    await assert.rejects(signOutApplication());
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(requests, 1, "a network rejection is not sign-out confirmation or permission to replay the action");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test("only an explicit host authentication challenge locks the application", () => {
   const previous = Object.getOwnPropertyDescriptor(globalThis, "dispatchEvent");
   const events: string[] = [];
@@ -79,6 +202,89 @@ test("only an explicit host authentication challenge locks the application", () 
   } finally {
     if (previous) Object.defineProperty(globalThis, "dispatchEvent", previous);
     else Reflect.deleteProperty(globalThis, "dispatchEvent");
+  }
+});
+
+test("deployment recovery stores only a one-use restrict-only scope without borrowing private preferences", () => {
+  const previousLocal = Object.getOwnPropertyDescriptor(globalThis, "localStorage"), previousSession = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+  const key = "superlocal:auth-recovery-scope", local = new Map<string, string>(), session = new Map<string, string>([["unrelated", "keep"]]);
+  const touched: string[] = [], writes: Array<[string, string]> = []; let localTouches = 0;
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
+    getItem: (key: string) => { localTouches++; return local.get(key) ?? null; },
+    setItem: (key: string, value: string) => { localTouches++; local.set(key, value); },
+    removeItem: (key: string) => { localTouches++; local.delete(key); },
+  } });
+  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: {
+    getItem: (name: string) => { touched.push(name); return session.get(name) ?? null; },
+    setItem: (name: string, value: string) => { touched.push(name); writes.push([name, value]); session.set(name, value); },
+    removeItem: (name: string) => { touched.push(name); session.delete(name); },
+  } });
+  try {
+    const a = createScopedStorage(scopeA), b = createScopedStorage(scopeB), binding = getApplicationScope();
+    assert.equal(a.writeSaved("preferences", { owner: "A", theme: "Dark" }), true);
+    assert.equal(b.writeSaved("preferences", { owner: "B", theme: "Light" }), true);
+    assert.equal(a.writeSessionText("read-only-notice", "A"), true);
+    assert.equal(b.writeSessionText("read-only-notice", "B"), true);
+    const originalLocal = new Map(local), originalSession = new Map(session);
+    touched.length = 0; writes.length = 0; localTouches = 0;
+    assert.equal(takeApplicationRecoveryScope(), null, "an absent handoff keeps normal boot behavior");
+    for (const scope of [scopeA, scopeB, "0123456789abcdef".repeat(4)]) {
+      assert.equal(rememberApplicationRecoveryScope(scope), true);
+      assert.deepEqual(new Map(session), new Map([...originalSession, [key, scope]]));
+      assert.equal(takeApplicationRecoveryScope(), scope);
+      assert.equal(takeApplicationRecoveryScope(), null, "a recovery hint is consumed, not durable authentication");
+      assert.deepEqual(session, originalSession);
+    }
+    assert.deepEqual(writes, [scopeA, scopeB, "0123456789abcdef".repeat(4)].map(scope => [key, scope]));
+    assert.ok(touched.every(name => name === key)); assert.equal(localTouches, 0);
+    assert.deepEqual(local, originalLocal); assert.strictEqual(getApplicationScope(), binding);
+    assert.equal(binding.signal.aborted, false, "the hint neither grants access nor changes the document owner");
+    assert.deepEqual(a.readSaved("preferences", {}), { owner: "A", theme: "Dark" });
+    assert.deepEqual(b.readSaved("preferences", {}), { owner: "B", theme: "Light" });
+    assert.equal(a.readSessionText("read-only-notice"), "A"); assert.equal(b.readSessionText("read-only-notice"), "B");
+
+    for (const invalid of ["", "a".repeat(63), "a".repeat(65), "A".repeat(64), "g".repeat(64), "a@example.test", `${scopeA}\n`, JSON.stringify({ scope: scopeA })]) {
+      const beforeWrites = writes.length;
+      assert.equal(rememberApplicationRecoveryScope(invalid), false);
+      assert.equal(writes.length, beforeWrites, "invalid input never gets written as a recovery scope");
+      session.set(key, invalid);
+      assert.equal(takeApplicationRecoveryScope(), "", "malformed stored hints require the fresh gate to clear the private old route");
+      assert.equal(takeApplicationRecoveryScope(), null); assert.deepEqual(session, originalSession);
+    }
+    assert.deepEqual(local, originalLocal);
+  } finally {
+    if (previousLocal) Object.defineProperty(globalThis, "localStorage", previousLocal); else Reflect.deleteProperty(globalThis, "localStorage");
+    if (previousSession) Object.defineProperty(globalThis, "sessionStorage", previousSession); else Reflect.deleteProperty(globalThis, "sessionStorage");
+  }
+});
+
+test("recovery handoff fails closed on unavailable storage, failed writes or mismatched readback", () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage"), key = "superlocal:auth-recovery-scope";
+  try {
+    Reflect.deleteProperty(globalThis, "sessionStorage");
+    assert.equal(rememberApplicationRecoveryScope(scopeA), false); assert.equal(takeApplicationRecoveryScope(), "");
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, get() { throw new DOMException("Storage blocked", "SecurityError"); } });
+    assert.equal(rememberApplicationRecoveryScope(scopeA), false); assert.equal(takeApplicationRecoveryScope(), "");
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: {
+      setItem() { throw new DOMException("Storage full", "QuotaExceededError"); }, getItem() { return null; }, removeItem() {},
+    } });
+    assert.equal(rememberApplicationRecoveryScope(scopeA), false);
+    const writes: Array<[string, string]> = [];
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: {
+      setItem: (name: string, value: string) => { writes.push([name, value]); }, getItem: () => scopeB, removeItem() {},
+    } });
+    assert.equal(rememberApplicationRecoveryScope(scopeA), false, "a mismatched readback cannot carry the current reader across a reload");
+    assert.deepEqual(writes, [[key, scopeA]]);
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: {
+      setItem() {}, getItem() { throw new Error("Read blocked"); }, removeItem() {},
+    } });
+    assert.equal(rememberApplicationRecoveryScope(scopeA), false); assert.equal(takeApplicationRecoveryScope(), "");
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: {
+      getItem: () => scopeA, removeItem() { throw new Error("Removal blocked"); },
+    } });
+    assert.equal(takeApplicationRecoveryScope(), "", "an unconsumed value must not be returned as a successful handoff");
+  } finally {
+    if (previous) Object.defineProperty(globalThis, "sessionStorage", previous); else Reflect.deleteProperty(globalThis, "sessionStorage");
   }
 });
 

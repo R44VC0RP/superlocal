@@ -441,13 +441,24 @@ describe('Google application authentication', () => {
     expect((await f.request('/host/config', { cookie: login.sessionCookie })).status).toBe(200)
     expect(await f.host.inbox.connections(login.owner!)).toHaveLength(0)
     const db = f.authDb()
-    try { expect(db.query('SELECT accessToken, refreshToken, idToken FROM account').get()).toEqual({ accessToken: null, refreshToken: null, idToken: null }) } finally { db.close() }
+    let persistedSession: unknown
+    try {
+      expect(db.query('SELECT accessToken, refreshToken, idToken FROM account').get()).toEqual({ accessToken: null, refreshToken: null, idToken: null })
+      persistedSession = db.query('SELECT id, userId, createdAt, expiresAt FROM session').get()
+      expect(persistedSession).not.toBeNull()
+    } finally { db.close() }
     const keyMetadata = await stat(join(f.config.dataDir, f.config.mode, 'runtime-secrets.json'))
     await f.restart()
     expect(f.ownerFor('allowed@example.test')).toBe(login.owner)
-    expect((await (await f.request('/host/auth', { cookie: login.sessionCookie })).json()).scope).toBe(login.scope)
+    expect(await (await f.request('/host/auth', { cookie: login.sessionCookie })).json()).toEqual({ method: 'google', authenticated: true,
+      user: { name: 'Allowed Person', email: 'allowed@example.test' }, scope: login.scope })
     expect((await stat(join(f.config.dataDir, f.config.mode, 'runtime-secrets.json'))).mtimeMs).toBe(keyMetadata.mtimeMs)
     expect((await f.request('/v1/accounts', { cookie: login.sessionCookie })).status).toBe(200)
+    const restartedDb = f.authDb()
+    try { expect(restartedDb.query('SELECT id, userId, createdAt, expiresAt FROM session').get()).toEqual(persistedSession) }
+    finally { restartedDb.close() }
+    expect(f.exchanges).toBe(1)
+    expect(f.jwksRequests).toBe(1)
     const mailboxStart = await f.request('/host/providers/gmail/connect', { method: 'POST', body: '{}', cookie: login.sessionCookie })
     expect(mailboxStart.status).toBe(200)
     const mailboxRedirect = await f.request((await mailboxStart.json()).authorizeUrl, { cookie: login.sessionCookie })
