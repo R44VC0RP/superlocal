@@ -2175,9 +2175,6 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
               )}
               {!selected.length && (
                 <div className="header-actions">
-                  {!search && route.folder === "Inbox" && <button type="button" className="zero-entry" disabled={!inbox.loaded || !contextMailboxIds.length || zero.busy} onClick={startZero}>
-                    {zero.scoped && zero.remainingCount !== 0 ? "Resume cleanup" : "Get me to zero"}
-                  </button>}
                   <IconButton name="Refresh" title="Refresh inbox" className="inbox-refresh"
                     aria-busy={inbox.refreshing} disabled={!activeAccount || inbox.refreshing}
                     onClick={() => { void store.sync(route.account).catch(actionError); }} />
