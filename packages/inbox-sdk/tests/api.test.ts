@@ -5601,7 +5601,8 @@ describe('local preview repair', () => {
       database.query("DELETE FROM sdk_meta WHERE key='mail-preview-v1'").run()
       await h.restart()
       await h.inbox.runDue()
-      const first = database.query<{ count: number }, []>("SELECT count(*) count FROM sdk_messages WHERE json_extract(visible,'$.preview')<>'[Logo](https://tracking.example.test/logo)'").get()!.count
+      // The 1 MiB hydration budget admits at most two 350 KB bodies per pass; preview-only fallbacks cost no body bytes.
+      const first = database.query<{ count: number }, string[]>(`SELECT count(*) count FROM sdk_messages WHERE id IN (?,?,?,?) AND json_extract(visible,'$.preview')<>'[Logo](https://tracking.example.test/logo)'`).get(...rows.slice(0, 4).map(row => row.id))!.count
       expect(first).toBeGreaterThan(0)
       expect(first).toBeLessThanOrEqual(2)
       for (let i = 0; i < 7; i++) await h.inbox.runDue()
@@ -5662,7 +5663,7 @@ describe('local preview repair', () => {
       }
       const full = JSON.parse(database.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!.value)
       expect(full.deferred).toHaveLength(128)
-      expect(full.after < full.through).toBe(true)
+      expect(full.after > full.through).toBe(true)
       expect(full.done).toBe(false)
       await h.restart()
       h.clock.value += 1001

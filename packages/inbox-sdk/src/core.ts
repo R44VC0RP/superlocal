@@ -115,12 +115,28 @@ export function createInbox(options: InboxOptions): Inbox {
   db.query('INSERT OR IGNORE INTO sdk_meta VALUES (?,?)').run('epoch', randomUUID())
   const epoch = db.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='epoch'").get()!.value
   const now = options.now ?? Date.now
-  // Capture only the existing indexed ID boundary, never bodies at startup.
-  // New ingestion already derives previews and needs no historical repair.
-  type PreviewRepair = { through: string; after: string; deferred: string[]; retryAt: number; done: boolean; fallbacks: number }
-  db.query(`INSERT OR IGNORE INTO sdk_meta(key,value) SELECT 'mail-preview-v1',
-    json_object('through',coalesce(max(id),''),'after','','deferred',json('[]'),'retryAt',0,'done',CASE WHEN max(id) IS NULL THEN json('true') ELSE json('false') END,'fallbacks',0)
-    FROM sdk_messages`).run()
+  // Capture only the existing boundary, never bodies at startup. Repair walks
+  // newest-first by (received_at, id) so the visible inbox heals before history:
+  // `after` is the last processed key and `through` the oldest key; the scan
+  // is finished once `after` <= `through`. New ingestion already derives
+  // previews and needs no historical repair.
+  type PreviewRepair = { through: string; after: string; deferred: string[]; retryAt: number; done: boolean; fallbacks: number; newestFirst?: true }
+  const PREVIEW_REPAIR_START = '~'
+  const previewRepairKey = (row: { received_at: string; id: string }) => `${row.received_at}|${row.id}`
+  const previewRepairBounds = (key: string): [string, string] => { const split = key.indexOf('|'); return split < 0 ? [key, ''] : [key.slice(0, split), key.slice(split + 1)] }
+  const freshPreviewRepair = (): PreviewRepair => {
+    const oldest = db.query<{ received_at: string; id: string }, []>('SELECT received_at,id FROM sdk_messages ORDER BY received_at ASC,id ASC LIMIT 1').get()
+    return { through: oldest ? previewRepairKey(oldest) : '', after: oldest ? PREVIEW_REPAIR_START : '', deferred: [], retryAt: 0, done: !oldest, fallbacks: 0, newestFirst: true }
+  }
+  db.transaction(() => {
+    const existing = db.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()
+    if (!existing) db.query('INSERT INTO sdk_meta(key,value) VALUES (?,?)').run('mail-preview-v1', JSON.stringify(freshPreviewRepair()))
+    else {
+      // An unfinished ID-ordered scan from an older build restarts newest-first; already repaired rows are cheap no-ops.
+      const state = JSON.parse(existing.value) as PreviewRepair
+      if (!state.done && !state.newestFirst) db.query("UPDATE sdk_meta SET value=? WHERE key='mail-preview-v1'").run(JSON.stringify(freshPreviewRepair()))
+    }
+  })()
   // Existing source IDs and encrypted envelopes remain valid; each gets one isolated grant.
   db.transaction(() => {
     const sources = db.query<AccountRow, []>('SELECT * FROM sdk_accounts').all()
@@ -1356,7 +1372,7 @@ export function createInbox(options: InboxOptions): Inbox {
   function repairPreviews(): void {
     const saved = db.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()!
     const initial = JSON.parse(saved.value) as PreviewRepair
-    if (initial.done || initial.retryAt > now() && (initial.after >= initial.through || initial.deferred.length >= 128)) return
+    if (initial.done || initial.retryAt > now() && (initial.after <= initial.through || initial.deferred.length >= 128)) return
     transaction(() => {
       // Other instances can finish a batch between our cheap check and this lock.
       if (db.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='mail-preview-v1'").get()?.value !== saved.value) return
@@ -1426,26 +1442,30 @@ export function createInbox(options: InboxOptions): Inbox {
         return 'done'
       }
       const timeLeft = () => attempts === 0 || performance.now() - started < 8
-      const retries = state.retryAt <= now() ? Math.min(state.deferred.length, state.deferred.length >= 128 || state.after >= state.through ? 16 : 4) : 0
+      const retries = state.retryAt <= now() ? Math.min(state.deferred.length, state.deferred.length >= 128 || state.after <= state.through ? 16 : 4) : 0
       for (let i = 0; i < retries && attempts < 16 && timeLeft(); i++) {
         const id = state.deferred.shift()!
         const result = attempt(id)
         if (result !== 'done') state.deferred.push(id)
         if (result === 'budget') break
       }
-      if (attempts < 16 && timeLeft() && state.deferred.length < 128 && state.after < state.through) {
-        const ids = db.query<{ id: string }, [string, string, number]>('SELECT id FROM sdk_messages WHERE id>? AND id<=? ORDER BY id LIMIT ?').all(state.after, state.through, 16 - attempts)
-        if (!ids.length) state.after = state.through
-        for (const { id } of ids) {
+      if (attempts < 16 && timeLeft() && state.deferred.length < 128 && state.after > state.through) {
+        // Newest first: the rows a user is looking at heal within seconds; history follows.
+        const [afterAt, afterId] = state.after === PREVIEW_REPAIR_START ? ['\uffff', ''] : previewRepairBounds(state.after)
+        const [throughAt, throughId] = previewRepairBounds(state.through)
+        const rows = db.query<{ id: string; received_at: string }, [string, string, string, string, number]>(`SELECT id,received_at FROM sdk_messages
+          WHERE (received_at,id)<(?,?) AND (received_at,id)>=(?,?) ORDER BY received_at DESC,id DESC LIMIT ?`).all(afterAt, afterId, throughAt, throughId, 16 - attempts)
+        if (!rows.length) state.after = state.through
+        for (const row of rows) {
           if (attempts >= 16 || !timeLeft() || state.deferred.length >= 128) break
-          const result = attempt(id)
+          const result = attempt(row.id)
           if (result === 'budget') break
-          if (result === 'defer') state.deferred.push(id)
-          state.after = id
+          if (result === 'defer') state.deferred.push(row.id)
+          state.after = previewRepairKey(row)
         }
       }
       state.retryAt = state.deferred.length ? now() + 1000 : 0
-      state.done = state.after >= state.through && state.deferred.length === 0
+      state.done = state.after <= state.through && state.deferred.length === 0
       db.query("UPDATE sdk_meta SET value=? WHERE key='mail-preview-v1' AND value=?").run(JSON.stringify(state), saved.value)
     })
   }
