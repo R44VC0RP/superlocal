@@ -66,6 +66,8 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
   const [scope, setScope] = useState<"inbox" | "all">("inbox");
   const [limit, setLimit] = useState(100);
   const [historyRequest, setHistoryRequest] = useState<{ actions: AiTriageActions; input: Parameters<AiTriageActions["process"]>[0]; confirmation: string } | null>(null);
+  const [historyConfirmation, setHistoryConfirmation] = useState<typeof historyRequest>(null);
+  const historyButton = useRef<HTMLButtonElement>(null);
   const [results, setResults] = useState<AiDecision[] | null>(null);
   const [resultCursor, setResultCursor] = useState<number>();
   const [hasMore, setHasMore] = useState(false);
@@ -96,7 +98,7 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
     stateRef.current = null;
     dirtyRef.current = false;
     busyRef.current = false;
-    setState(null); setDraft(null); setDirty(false); setBusy(false);
+    setState(null); setDraft(null); setDirty(false); setBusy(false); setHistoryConfirmation(null);
     setResults(null); setResultCursor(undefined); setHasMore(false); setDiagnostics(null);
     setLoadError(false); setSaveUncertain(false); setError(""); setNotice("");
     if (actions) void actions.state().then(next => {
@@ -265,18 +267,29 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
       <div className="ai-disclosure-body">
       <section className="ai-section">
       <p className="settings-note">Uses saved settings and only already-synced mail in your selected mailboxes, within the scope and limit below. Starting a run may incur provider charges; opening this section or turning on automatic sorting does not start one.</p>
-      <div className="ai-actions">
-        <select aria-label="Historical mail scope" value={pendingHistory?.input.scope ?? scope} disabled={busy || !!pendingHistory} onChange={event => setScope(event.target.value as "inbox" | "all")}><option value="inbox">Inbox</option><option value="all">All mail</option></select>
-        <select aria-label="Maximum conversations" value={pendingHistory?.input.limit ?? limit} disabled={busy || !!pendingHistory} onChange={event => setLimit(Number(event.target.value))}>{[100, 500, 1000, 10000].map(value => <option key={value} value={value}>Up to {number(value)}</option>)}</select>
-        <button type="button" className="settings-button" disabled={busy || saveUncertain || !pendingHistory && (loadError || !state.configured || !saved.enabled || saved.mailboxIds?.length === 0)} onClick={() => {
+      <div className="ai-actions ai-history-controls">
+        <select aria-label="Historical mail scope" value={pendingHistory?.input.scope ?? scope} disabled={busy || !!pendingHistory || !!historyConfirmation} onChange={event => setScope(event.target.value as "inbox" | "all")}><option value="inbox">Inbox</option><option value="all">All mail</option></select>
+        <select aria-label="Maximum conversations" value={pendingHistory?.input.limit ?? limit} disabled={busy || !!pendingHistory || !!historyConfirmation} onChange={event => setLimit(Number(event.target.value))}>{[100, 500, 1000, 10000].map(value => <option key={value} value={value}>Up to {number(value)}</option>)}</select>
+        <button type="button" className="settings-button" ref={historyButton} aria-expanded={!!historyConfirmation} disabled={busy || saveUncertain || !pendingHistory && (loadError || !state.configured || !saved.enabled || saved.mailboxIds?.length === 0)} onClick={() => {
           const request = pendingHistory ?? {
             actions,
             input: { id: crypto.randomUUID(), scope, limit, settingsRevision: saved.revision },
             confirmation: `Sort up to ${number(limit)} already-synced conversations from ${scope === "inbox" ? "the inbox" : "all mail"} in ${saved.mailboxIds === null ? "all active mailboxes" : "your saved selected mailboxes"}, using ${savedModel?.label || saved.model || "the saved model"}? This may incur provider charges.${saved.mode === "preview" ? " Preview results will not change your inbox." : " Results will sort mail into Important and Other."}`,
           };
-          if (!window.confirm(request.confirmation)) return;
+          setHistoryConfirmation(request);
+        }}>{pendingHistory ? "Retry same request" : "Sort older mail"}</button>
+      </div>
+      {historyConfirmation && <div className="ai-history-confirmation" role="group" aria-label="Confirm older-mail sorting" onKeyDown={event => {
+        if (event.key === "Escape" && !busy) { event.preventDefault(); event.stopPropagation(); setHistoryConfirmation(null); historyButton.current?.focus(); }
+      }}>
+        <p className="settings-note">{historyConfirmation.confirmation}</p>
+        <div className="ai-actions ai-history-controls">
+        <button type="button" className="settings-button" disabled={busy || saveUncertain || !pendingHistory && loadError} onClick={() => {
+          const request = historyConfirmation;
+          if (request.actions !== actions) { setHistoryConfirmation(null); return; }
           void run(async (api, alive) => {
             setHistoryRequest(request);
+            setHistoryConfirmation(null);
             let job;
             try {
               job = await api.process(request.input);
@@ -299,8 +312,10 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
               if (alive()) { setLoadError(true); setError("The older-mail request was accepted, but progress could not be refreshed. Refresh status before starting another run."); }
             }
           }, "Could not confirm older-mail processing. Retry the same request in Sort older mail.");
-        }}>{pendingHistory ? "Retry same request" : "Sort older mail"}</button>
-      </div>
+        }}>Confirm sorting</button>
+        <button type="button" className="settings-text-button" autoFocus disabled={busy} onClick={() => { setHistoryConfirmation(null); historyButton.current?.focus(); }}>Cancel</button>
+        </div>
+      </div>}
       <p className="settings-note">Current assessments are reused; missing, failed, and outdated assessments are processed. Cancelling stops work, never deletes emails.</p>
       {state.jobs.length === 0 ? <p className="settings-note">No historical jobs started. Turning AI on does not mean all older mail has been processed.</p> : state.jobs.map(job => <div className="ai-job" key={job.id}>
         <div>{job.scope === "inbox" ? "Inbox" : "All mail"} · {job.status === "completed" && job.failed > 0 ? "Finished with failures" : aiLabel(job.status)} · up to {number(job.limit)}</div>

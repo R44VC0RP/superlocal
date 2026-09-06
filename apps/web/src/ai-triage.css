@@ -107,6 +107,16 @@
   align-items: center;
   gap: 12px;
 }
+.ai-history-controls > select,
+.ai-history-controls > button {
+  box-sizing: border-box;
+  height: 40px;
+  margin-block: 0;
+}
+.ai-history-confirmation {
+  display: grid;
+  gap: 10px;
+}
 .ai-triage-settings select {
   min-width: 0;
   max-width: 65%;
