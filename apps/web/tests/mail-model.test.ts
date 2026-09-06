@@ -2702,6 +2702,8 @@ test("demand-driven host windows bound automatic requests and render unknown tot
   type ChangesPage = import("../../shared/inbox-window").InboxWindowChanges;
   type MessagesInput = import("../../shared/inbox-window").InboxMessagesInput;
   type MessagesPage = import("../../shared/inbox-window").InboxMessagesPage;
+  type SenderInput = import("../../shared/inbox-window").InboxSenderInput;
+  type SenderResult = import("../../shared/inbox-window").InboxSenderResult;
   const source: import("inbox-sdk/types").Account = { id: "fictional-source", providerId: "mock", email: "owner@example.test", name: "Fictional account", generation: 1,
     status: "connected", revision: 1, sync: { lastSyncAt: null, coverage: "partial", problem: null },
     features: { localDrafts: true, localLabels: true, snooze: true, scheduledSend: false, undoSend: false },
@@ -2718,7 +2720,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
     for (let attempt = 0; attempt < 300 && !check(); attempt++) await sleep(5);
     assert.ok(check(), message);
   };
-  let store: InstanceType<typeof InboxStore>, stop: (() => void) | undefined, releaseQuery: (() => void) | undefined, releaseReverse: (() => void) | undefined, releaseHistory: (() => void) | undefined, releaseChanges: (() => void) | undefined;
+  let store: InstanceType<typeof InboxStore>, stop: (() => void) | undefined, releaseQuery: (() => void) | undefined, releaseReverse: (() => void) | undefined, releaseHistory: (() => void) | undefined, releaseChanges: (() => void) | undefined, releaseReader: (() => void) | undefined;
   let renderedAi: AiTriageState | null = null, renderedAiError: string | null = "Saved sorting diagnostics are unavailable.";
   try {
     console.info = () => {}; console.warn = () => {};
@@ -2740,7 +2742,8 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       let scopeChanges: ((input: ChangesInput) => Promise<Response>) | undefined;
       let detailRead: ((input: MessagesInput) => MessagesPage | Promise<MessagesPage>) | undefined;
       let lookupRead: ((ids: string[]) => Row[]) | undefined;
-      let bodyRead: ((id: string) => import("inbox-sdk/types").Message) | undefined;
+      let bodyRead: ((id: string) => import("inbox-sdk/types").Message | Promise<import("inbox-sdk/types").Message>) | undefined;
+      let senderRead: ((input: SenderInput) => SenderResult) | undefined;
       let signedState = name === "full";
       const readCursors = new Map<string, string | undefined>();
       const state = (): Page["state"] => {
@@ -2791,7 +2794,8 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         }
         if (url.pathname === "/host/inbox/messages" && detailRead) return Response.json(await detailRead(JSON.parse(String(init?.body))));
         if (url.pathname === "/host/inbox/lookup" && lookupRead) return Response.json({ state: state(), entries: lookupRead(JSON.parse(String(init?.body)).ids).map(row => ({ key: row.key, status: "found", row })) });
-        if (url.pathname.startsWith(`/v1/mailboxes/${box.id}/messages/`) && bodyRead) return Response.json(bodyRead(decodeURIComponent(url.pathname.split("/").at(-1)!)));
+        if (url.pathname.startsWith(`/v1/mailboxes/${box.id}/messages/`) && bodyRead) return Response.json(await bodyRead(decodeURIComponent(url.pathname.split("/").at(-1)!)));
+        if (url.pathname === "/host/inbox/sender" && senderRead) return Response.json(senderRead(JSON.parse(String(init?.body))));
         if (["/host/inbox/zero/create", "/host/inbox/selection/create"].includes(url.pathname)) {
           captures.push({ path: url.pathname, ...JSON.parse(String(init?.body)) });
           return Response.json({ code: "HOST_INBOX_PREPARING", error: "Capture preparation is not ready." }, { status: 503 });
@@ -3206,6 +3210,83 @@ test("demand-driven host windows bound automatic requests and render unknown tot
             assert.equal(bodyReads.length, bodiesBefore); assert.equal(queries, queriesBefore); assert.equal(lookupReads, 1);
             scopeChanges = undefined;
           }
+
+          const senderRequests: SenderInput[] = [], requestOrder: string[] = [];
+          const senderBodyBaseline = bodyReads.length, senderQueryBaseline = queries, senderPageBaseline = pages.length;
+          const senderInput: SenderInput = { account: box.id, id: giantKey, domain: null };
+          let readerError: Error | undefined, cachedAtDispatch: readonly Mail[] | undefined;
+          bodyRead = async id => {
+            assert.ok(["giant-700", "giant-699", "giant-698", "giant-697"].includes(id));
+            bodyReads.push(id); requestOrder.push(`body:${id}`);
+            const message = summary(Number(id.slice("giant-".length))), failure = readerError;
+            await new Promise<void>(resolve => { releaseReader = resolve; });
+            if (failure) throw failure;
+            requestOrder.push(`ready:${id}`);
+            return { ...message, snoozedUntil: null, bcc: [], attachments: [], bodyFormat: "html", bodyHtml: `<p>Priority body ${id}.</p>`, bodyText: `Priority body ${id}.` };
+          };
+          senderRead = input => {
+            if (cachedAtDispatch) assert.strictEqual(store.getSnapshot().mail, cachedAtDispatch, "the cached body gate publishes no replacement mail model before sender dispatch");
+            senderRequests.push(structuredClone(input)); requestOrder.push("sender");
+            const message = summary(Number((input.selectedMessageId ?? "giant-700").slice("giant-".length)));
+            return { state: state(), status: "ready", contact: { ...message.from, messageId: message.id, role: "sender" },
+              activity: { ...senderActivity([{ ...message, mailboxIds: [box.id], outgoing: false }], message.from.email, [box.id], input.domain ?? null, Date.parse(message.receivedAt)), level: 1 },
+              recent: [giantRow()] };
+          };
+          const readerReady = store.loadThread(giantKey), senderReady = store.senderWindow(senderInput, readerReady);
+          const opening = Promise.all([readerReady, senderReady]); void opening.catch(() => {});
+          await until(() => !!releaseReader, "the actual current-reader body request is held");
+          assert.deepEqual(bodyReads.slice(senderBodyBaseline), ["giant-700"]); assert.equal(senderRequests.length, 0, "secondary statistics cannot dispatch while the reader body is pending");
+          assert.strictEqual(store.loadThread(giantKey), readerReady, "the parent reader effect shares the already-started body request");
+          releaseReader!(); releaseReader = undefined; await opening;
+          assert.deepEqual(requestOrder, ["body:giant-700", "ready:giant-700", "sender"]);
+          assert.deepEqual(senderRequests, [senderInput]);
+          assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.find(message => message.id === "giant-700")!.body, "<p>Priority body giant-700.</p>");
+          const cachedReader = store.getSnapshot().mail.find(mail => mail.id === giantKey);
+          cachedAtDispatch = store.getSnapshot().mail;
+          await store.senderWindow(senderInput, store.loadThread(giantKey));
+          cachedAtDispatch = undefined;
+          assert.equal(bodyReads.length, senderBodyBaseline + 1); assert.equal(senderRequests.length, 2);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), cachedReader);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
+
+          const clearedReader = store.loadThread(giantKey, "giant-699");
+          const clearedSender = store.senderWindow({ ...senderInput, selectedMessageId: "giant-699" }, clearedReader);
+          const cleared = Promise.all([clearedReader, assert.rejects(clearedSender, error => error instanceof DOMException && error.name === "AbortError")]); void cleared.catch(() => {});
+          await until(() => !!releaseReader, "the reader body is pending when its sidebar is cleared");
+          store.clearSenderWindow(); releaseReader!(); releaseReader = undefined; await cleared;
+          assert.equal(senderRequests.length, 2, "clearing the sidebar cancels its queued request before HTTP dispatch");
+          await store.retry(); assert.deepEqual(changes.at(-1)!.pinnedKeys, [], "a cancelled queued sidebar cannot restore sender pins");
+
+          readerError = new Error("Fictional reader body failed.");
+          const failedReader = store.loadThread(giantKey, "giant-698");
+          const failedSender = store.senderWindow({ ...senderInput, selectedMessageId: "giant-698" }, failedReader);
+          const failed = Promise.all([assert.rejects(failedReader, error => error === readerError), failedSender]); void failed.catch(() => {});
+          await until(() => !!releaseReader, "the reader failure is held before delivery");
+          assert.equal(senderRequests.length, 2, "statistics still wait until the body attempt settles");
+          releaseReader!(); releaseReader = undefined; await failed; await sleep(120);
+          assert.equal(senderRequests.length, 3, "a separately surfaced body failure does not make saved sender statistics unavailable");
+          assert.equal(bodyReads.length, senderBodyBaseline + 3, "reader failure is not swallowed or automatically retried");
+          assert.ok(store.getSnapshot().issues.some(issue => issue.scope === "thread"));
+          readerError = undefined;
+          await store.senderWindow({ ...senderInput, selectedMessageId: "giant-698" });
+          assert.equal(senderRequests.length, 4); assert.equal(bodyReads.length, senderBodyBaseline + 3, "ungated sender reads remain body-free even for an unloaded reader message");
+
+          store.clearSenderWindow();
+          const oldReader = store.loadThread(giantKey, "giant-697");
+          const oldSender = store.senderWindow({ ...senderInput, selectedMessageId: "giant-697" }, oldReader);
+          const switched = Promise.all([oldReader, assert.rejects(oldSender, error => error instanceof DOMException && error.name === "AbortError")]); void switched.catch(() => {});
+          await until(() => !!releaseReader, "an old-view reader is pending before a query change");
+          reversePage = undefined;
+          await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Sent" });
+          await until(() => !store.getSnapshot().window!.paging, "the replacement view finishes its single buffer");
+          releaseReader!(); releaseReader = undefined; await switched;
+          assert.equal(senderRequests.length, 4, "a changed window epoch rejects queued old-view statistics before dispatch");
+          await store.retry(); assert.deepEqual(changes.at(-1)!.pinnedKeys, []);
+          assert.equal(changes.at(-1)!.queryId, store.getSnapshot().window!.state.queryId); assert.equal(store.getSnapshot().error, null);
+          assert.ok(!store.getSnapshot().mail.some(mail => mail.id === giantKey));
+          assert.deepEqual(bodyReads.slice(senderBodyBaseline), ["giant-700", "giant-699", "giant-698", "giant-697"], "only the four explicitly requested message bodies were fetched");
+          assert.equal(queries, senderQueryBaseline + 1); assert.equal(pages.length, senderPageBaseline + 1, "only the explicit query switch loads another buffer");
+          assert.equal(lookupReads, 1, "reader priority introduces no lookup or inventory work");
         }
         if (name === "sparse") {
           holdQuery = true;
@@ -3231,7 +3312,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       await sleep(0);
     }
   } finally {
-    releaseChanges?.(); releaseHistory?.(); releaseReverse?.(); releaseQuery?.(); stop?.(); mock.restore(); globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    releaseReader?.(); releaseChanges?.(); releaseHistory?.(); releaseReverse?.(); releaseQuery?.(); stop?.(); mock.restore(); globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
     for (const [key, descriptor] of globals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); }
   }
 });

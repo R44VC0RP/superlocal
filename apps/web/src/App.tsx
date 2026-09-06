@@ -425,8 +425,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const contextContact = useMemo(() => currentMail && !currentMail.operationId
     ? senderContact(currentMail, inbox.senderHistory, inbox.accounts, senderSelection?.threadId === currentMail.id ? senderSelection.messageId : undefined)
     : null, [currentMail, inbox.senderHistory, inbox.accounts, senderSelection]);
-  const loadSenderActivity = useCallback((domain: string | null) => store.senderWindow({ account: route.account, id: route.thread!,
-    selectedMessageId: senderSelection && senderSelection.threadId === route.thread ? senderSelection.messageId : undefined, domain }), [store, route.account, route.thread, senderSelection]);
+  const loadSenderActivity = useCallback((domain: string | null) => {
+    const selectedMessageId = senderSelection && senderSelection.threadId === route.thread ? senderSelection.messageId : undefined;
+    return store.senderWindow({ account: route.account, id: route.thread!, selectedMessageId, domain }, store.loadThread(route.thread!, selectedMessageId));
+  }, [store, route.account, route.thread, senderSelection]);
   useEffect(() => () => store.clearSenderWindow(), [store, route.account, route.thread]);
   const loadContacts = useCallback(async (query: string) => (await store.windowTransport.contacts({ account: route.account, query, limit: 30 })).contacts, [store, route.account]);
   const contextMailboxIds = useMemo(() => isUnified ? unifiedMailboxIds : [route.account], [isUnified, unifiedMailboxIds, route.account]);

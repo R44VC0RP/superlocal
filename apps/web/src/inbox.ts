@@ -585,8 +585,14 @@ export class InboxStore {
     return unique.flatMap(id => { const mail = this.state.mail.find(mail => mail.id === id); return mail ? [mail] : []; });
   };
   clearSenderWindow = () => { this.windowSenderEpoch++; this.pinWindow("sender", []); };
-  senderWindow = async (input: InboxSenderInput) => {
+  senderWindow = async (input: InboxSenderInput, readerReady?: Promise<void>) => {
     const request = ++this.windowSenderEpoch, epoch = this.windowEpoch, generation = this.generation, flagEpoch = this.flagEpoch;
+    if (readerReady) {
+      // The reader surfaces its own error; statistics wait for settlement, not success.
+      await readerReady.catch(() => {});
+      this.windowCheck(epoch, generation);
+      if (request !== this.windowSenderEpoch) throw new DOMException("Sender changed", "AbortError");
+    }
     const result = await this.windowTransport.sender(input);
     this.windowCheck(epoch, generation);
     if (request !== this.windowSenderEpoch) throw new DOMException("Sender changed", "AbortError");
