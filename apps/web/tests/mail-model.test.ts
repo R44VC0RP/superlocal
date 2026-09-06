@@ -2818,8 +2818,8 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       const captures: Array<{ path: string; id: string; account: string; queryId?: string }> = [];
       let queries = 0, revision = 1, holdQuery = false, heldQuery = false, stream: ReadableStreamDefaultController<Uint8Array> | undefined;
       // The host count pager is resumable: unknown until its bounded passes finish, then exact.
-      const countRequests: string[] = [], countsKnownAfter = name === "sparse" ? 3 : Infinity;
-      const knownTotals: Page["totals"] = { conversations: 6, messages: 6, inbox: 7, splits: { Important: 7, Other: 2 }, folders: { Inbox: 7 }, holding: false };
+      const countRequests: string[] = [], countsKnownAfter = name === "sparse" ? 8 : Infinity;
+      const knownTotals: Page["totals"] = { conversations: 6, messages: 6, inbox: 7, splits: { Important: 7, Other: 0 }, folders: { Inbox: 7 }, holding: false };
       let reversePage: ((input: PageInput) => Page | Promise<Page>) | undefined;
       let reverseDelta: { upserts?: Row[]; newHead: Row[]; removed: Array<{ key: string; reason: "deleted" }> } | undefined;
       let scopeChanges: ((input: ChangesInput) => Promise<Response>) | undefined;
@@ -2878,7 +2878,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         }
         if (url.pathname === "/host/inbox/counts") {
           const body = JSON.parse(String(init?.body)) as { queryId: string }; countRequests.push(body.queryId);
-          return Response.json({ state: state(), totals: countRequests.length >= countsKnownAfter ? knownTotals : totals });
+          return Response.json({ state: { ...state(), queryId: body.queryId }, totals: countRequests.length >= countsKnownAfter ? knownTotals : totals, ...(name === "sparse" ? { progress: countRequests.length * 500 } : name === "empty" ? { progress: 0 } : {}) });
         }
         if (url.pathname === "/host/inbox/messages" && detailRead) return Response.json(await detailRead(JSON.parse(String(init?.body))));
         if (url.pathname === "/host/inbox/lookup" && lookupRead) return Response.json({ state: state(), entries: lookupRead(JSON.parse(String(init?.body)).ids).map(row => ({ key: row.key, status: "found", row })) });
@@ -2911,16 +2911,19 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       await sleep(650);
       assert.equal(queries, 1); assert.equal(pages.length, sizes.length > 1 ? 1 : 0, `${name}: initial response plus at most one automatic buffer`);
       assert.equal(changes.length, 0, `${name}: incomplete context does not start an index-completion poller`);
-      // One idle count fill per view open: at most five bounded requests, exact totals when complete, nothing otherwise.
-      await until(() => countRequests.length === Math.min(5, countsKnownAfter), `${name}: the count fill settles`);
-      await sleep(120); assert.equal(countRequests.length, Math.min(5, countsKnownAfter), `${name}: a one-shot fill stops at its cap or first complete answer`);
+      // Progressing passes finish beyond the old five-request cap; stalled passes stop.
+      await until(() => countRequests.length === (name === "empty" ? 1 : Number.isFinite(countsKnownAfter) ? countsKnownAfter : 5), `${name}: the count fill settles`);
+      await sleep(120); assert.equal(countRequests.length, (name === "empty" ? 1 : Number.isFinite(countsKnownAfter) ? countsKnownAfter : 5), `${name}: a fill stops at completion or lack of progress`);
       assert.ok(countRequests.every(id => id === "query-1"), "count fills address the opened view's query");
       if (name === "sparse") assert.deepEqual(store.getSnapshot().window!.totals, knownTotals, "complete totals are published without a rebuild");
       else assert.equal(store.getSnapshot().window!.totals.conversations, null, "unknown totals never become zero");
       const html = render();
       assert.doesNotMatch(html, /ai-sorting-warning|Sorting details|Indexing conversations|Loading conversations…/);
       assert.doesNotMatch(html, /…<\/span>/, "unknown counts render nothing, not an ellipsis");
-      if (name === "sparse") assert.match(html, /split-tab-count">7</, "known split totals render as exact numbers");
+      if (name === "sparse") {
+        assert.match(html, /split-tab-count">7</, "known split totals render as exact numbers");
+        assert.match(html, /split-tab-count">0</, "known zero is distinct from an unfinished count");
+      }
       else assert.doesNotMatch(html, /split-tab-count/, "unknown split totals render the tab label alone");
       if (name === "full") {
         const healthy: AiTriageState = { configured: true, provider: null, problemCode: null,

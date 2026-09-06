@@ -131,7 +131,7 @@ export type InboxWindowPage = {
 }
 export type InboxPageInput = { queryId: string; cursor?: string; limit?: number; direction?: 'older' | 'newer'; seek?: 'start' | 'end' }
 export type InboxCountsInput = { queryId: string }
-export type InboxCountsResult = { state: InboxWindowState; totals: InboxTotals }
+export type InboxCountsResult = { state: InboxWindowState; totals: InboxTotals; /** Monotonic rows visited in this count pass; continue only while it advances. */ progress?: number }
 
 /** At most 100 owned IDs, independent of active folder/search. Account still resolves
  * the receiving scope. No broadening ownership via deep links, drafts, selection or Undo.

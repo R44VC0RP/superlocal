@@ -436,16 +436,24 @@ export class InboxStore {
     if (!window || window.totals.conversations !== null || this.windowCounts?.queryId === window.state.queryId) return;
     const queryId = window.state.queryId, signal = AbortSignal.any([this.windowController.signal, this.controller.signal]);
     const transport = createInboxWindowTransport(() => signal, (input, init) => this.fetch(input, init));
-    // Wait for the first paint and an idle moment; navigation cancels the fill and wakes never restart it.
+    // Wait for first paint. Each server pass is bounded; continue a progressing
+    // count instead of abandoning larger inboxes. Navigation cancels the fill.
     const idle = new Promise<void>(resolve => { typeof requestIdleCallback === "function" ? requestIdleCallback(() => resolve(), { timeout: 2000 }) : setTimeout(resolve, 300); });
     const job = { queryId, promise: idle.then(async () => {
-      for (let attempt = 0; attempt < COUNT_REQUEST_LIMIT; attempt++) {
+      let progress = 0;
+      for (let attempt = 0; ; attempt++) {
         this.windowCheck(epoch, generation); signal.throwIfAborted();
         const result = await transport.counts({ queryId });
         this.windowCheck(epoch, generation);
         const current = this.state.window;
-        if (!current || result.state.scopeState !== current.state.scopeState) return;
-        if (result.totals.conversations === null) { await pause(50, signal); continue; }
+        if (!current || result.state.queryId !== queryId || result.state.scopeState !== current.state.scopeState) return;
+        if (result.totals.conversations === null) {
+          if (result.progress !== undefined) {
+            if (result.progress <= progress) return;
+            progress = result.progress;
+          } else if (progress > 0 || attempt + 1 >= COUNT_REQUEST_LIMIT) return;
+          await pause(50, signal); continue;
+        }
         if (JSON.stringify(result.totals) !== JSON.stringify(current.totals)) this.publish({ window: { ...current, totals: result.totals } });
         return;
       }

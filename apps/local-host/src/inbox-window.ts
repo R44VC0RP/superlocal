@@ -52,7 +52,7 @@ type ReadBaseline = { sdkState: string | null; scopeState: string; revision: num
 type Scope = { row: ScopeRow; boxes: Mailbox[]; sources: Account[]; labels: Label[]; folders: Map<string, Folder[]>; preference: string; preferences: Preferences; ai: AiTriageState; users: number; lastUsed: number; metadataAt: number; metadataDirty: boolean; seenEvents: number; read?: ReadBaseline }
 type ProjectionStamp = { preference?: string; metadata?: string; aiCursor?: number; categoryCursor?: number; contextVersion?: 3 }
 type QueryRow = { id: string; scope: string; data: string; preference: string; scanned: number; generation: number; expires: number; problem: string | null; read_state: string | null }
-type ReadMetadata = { importantSince?: string; baselines: Array<{ revision: number; token: string }>; wake?: number; changes?: { id: string; input: string; baseline: ReadBaseline; keys: string[]; head: boolean; more: boolean }; counts?: { position?: PagePosition; baseline: ReadBaseline; totals: DTO.InboxTotals; complete: boolean; wake?: number } }
+type ReadMetadata = { importantSince?: string; baselines: Array<{ revision: number; token: string }>; wake?: number; changes?: { id: string; input: string; baseline: ReadBaseline; keys: string[]; head: boolean; more: boolean }; counts?: { position?: PagePosition; progress?: number; baseline: ReadBaseline; totals: DTO.InboxTotals; complete: boolean; wake?: number } }
 type ReadBudget = { pages: number; details: number; searches: number; now: number; legacy: Map<string, string>; summaries: Map<string, MailboxMessageSummary[]>; contexts: Map<string, string>; keys: DTO.InboxThreadKey[]; proofs: Map<string, Map<string, boolean>>; unknownLocation: Set<string>; detailDeferred: Set<string> }
 type PagePosition = { cursor?: string }
 type PageCursor = { older: string; newer: string; baseline: Readonly<ReadBaseline>; direction: 'older' | 'newer' }
@@ -580,7 +580,7 @@ export function createInboxWindowService(deps: Dependencies) {
     }
     // Explicit pages, counts, captures and resident updates never wait on AI.
     // A presentation-only hold is applied solely to unseen demandChanges rows.
-    counts.inbox = Number(inbox && attention === 'Important' && recent)
+    counts.inbox = Number(inbox && (attention === 'Important' || attention === 'Unknown') && recent)
     for (const [name, matches] of splitMatches) counts[`split:${name}`] = Number(inbox && matches)
     counts.holding = Number(holding)
     for (const folder of ['Inbox', 'Starred', 'Sent', 'Done', 'Auto Archived', 'Reminders', 'Spam', 'Trash', 'All Mail']) counts[`folder:${folder}`] = Number(inFolder(mail, folder))
@@ -1413,9 +1413,8 @@ export function createInboxWindowService(deps: Dependencies) {
       const projected = await projectConversations(scope, page.items, budget)
       let consumed = 0, stopped = false
       for (const [index, row] of projected.entries()) {
-        // An unresolved category is not an exact split total, even though its row
-        // is provisionally visible in Important. Never publish a fabricated zero.
-        if (row.mail.split === 'Unknown') { stopped = true; break }
+        // Count the visible categories, including Unknown's conservative Important
+        // placement. Incomplete AI evidence must not stall all inbox counters.
         let result: Awaited<ReturnType<typeof evaluateRow>>
         try { result = await evaluateRow(scope, view, row, budget, true) }
         catch (error) { if (error !== pendingContext) throw error; stopped = true; break }
@@ -1426,7 +1425,7 @@ export function createInboxWindowService(deps: Dependencies) {
         for (const name of Object.keys(count.totals.folders)) count.totals.folders[name]! += result.counts[`folder:${name}`] ?? 0
         const wake = Math.min(row.mail.reminderAt ?? Infinity, row.mail.aiHoldUntil ?? Infinity, importantExpiry(row.mail, budget.now))
         if (Number.isFinite(wake)) count.wake = Math.min(count.wake ?? Infinity, wake)
-        count.position = { cursor: conversationCursor(page.items[index]!) }; consumed++
+        count.position = { cursor: conversationCursor(page.items[index]!) }; count.progress = (count.progress ?? 0) + 1; consumed++
       }
       if (consumed === page.items.length && !page.nextCursor) { count.complete = true; delete count.position }
       if (stopped || projected.length < page.items.length) break
@@ -1439,7 +1438,7 @@ export function createInboxWindowService(deps: Dependencies) {
       }
     }
     saved = readMetadata(query); saved.counts = count; saveReadMetadata(query, saved)
-    return { state: state(scope, query), totals: count.complete ? count.totals : unknownTotals(scope) }
+    return { state: state(scope, query), totals: count.complete ? count.totals : unknownTotals(scope), progress: count.progress ?? 0 }
   }
   async function demandChanges(input: DTO.InboxChangesInput): Promise<DTO.InboxWindowChanges> {
     const maximum = limit(input.limit), resident = ids(input.residentKeys, 1000), pinned = ids(input.pinnedKeys, 100), since = integer(input.sinceRevision)

@@ -2317,6 +2317,9 @@ describe('bounded host inbox window', () => {
     expect(other.rows).toHaveLength(0)
     expect(other.exhausted).toBe(true)
     expect(other.totals.conversations).toBeNull()
+    const counts = await service.dispatch('/host/inbox/counts', { queryId: important.state.queryId }) as WindowDTO.InboxCountsResult
+    expect(counts.totals).toMatchObject({ conversations: 1, messages: 620, inbox: 1, splits: { Important: 1, Other: 0 } })
+    expect(counts.progress).toBe(1)
     expect(unscopedReads).toBe(0)
     for (const table of ['messages', 'rows', 'matches', 'contacts']) expect(database.query<{ count: number }, []>(`SELECT COUNT(*) count FROM local_window_${table}`).get()!.count).toBe(0)
   })

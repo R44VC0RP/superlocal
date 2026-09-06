@@ -2158,7 +2158,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                       onClick={() => goFolder("Inbox", split)}
                     >
                       <span className="split-tab-label">{split}</span>
-                      {splitCounts[split] ? (
+                      {splitCounts[split] != null ? (
                         <span className="split-tab-count">{splitCounts[split]}</span>
                       ) : null}
                     </button>
