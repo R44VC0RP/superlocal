@@ -4,6 +4,7 @@ import { Hono } from 'hono'
 import { DomUtils, parseDocument } from 'htmlparser2'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib'
 import { SaxesParser } from 'saxes'
@@ -58,7 +59,7 @@ import type {
   ProviderFolder, SendInput, SendResult, SyncContext, SyncCursor, SyncOptions, SyncResult,
 } from '../server/sdk/types'
 
-const TEMP_ROOT = '/private/var/folders/2j/6mslx1715gx8frsyn66sf1sh0000gn/T/opencode'
+const TEMP_ROOT = tmpdir()
 const FULL = 'reference-mail'
 const RESTRICTED = 'reference-read-only'
 const DYNAMIC = 'unanticipated-provider-2026'
