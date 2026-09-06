@@ -13680,7 +13680,7 @@ describe('AI triage service', () => {
     await h.seed('alice', 'ai-failure', [native('invalid-assessment')])
     let calls = 0, unavailable = false, invalidEvidence = false
     const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
-      fetcher: (async (_url, init) => {
+      fetcher: (async (_url: RequestInfo | URL, init?: RequestInit) => {
         calls++
         if (invalidEvidence) {
           if (calls === 6) expect(JSON.parse(String(init?.body)).instructions).toContain('Recheck evidence carefully')
