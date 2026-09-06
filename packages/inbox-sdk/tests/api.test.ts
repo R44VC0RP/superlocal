@@ -5612,7 +5612,11 @@ describe('mail HTTP ownership and provider lifecycle', () => {
   test('an unknown registered provider works end to end, and unsupported capabilities do not disable local features', async () => {
     const h = await fixture()
     const dynamic = await h.seed('alice', 'dynamic', [native('external')], DYNAMIC)
-    const readOnly = await h.seed('alice', 'readonly', [native('readonly')], RESTRICTED)
+    const readOnly = await h.seed('alice', 'readonly', [
+      native('readonly', { threadId: 'readonly-conversation' }),
+      native('readonly-reply', { threadId: 'readonly-conversation', receivedAt: new Date(EPOCH - 30000).toISOString() }),
+      native('readonly-other', { receivedAt: new Date(EPOCH - 120000).toISOString() }),
+    ], RESTRICTED)
     const providers = await h.json<Array<{ id: string; name: string; connection: string; scopes: string[] }>>('alice', '/providers')
     expect(providers.find(provider => provider.id === DYNAMIC)).toEqual({ id: DYNAMIC, name: DYNAMIC, connection: 'credentials', scopes: ['mail'] })
     expect(dynamic.account.providerId).toBe(DYNAMIC)
@@ -5640,6 +5644,83 @@ describe('mail HTTP ownership and provider lifecycle', () => {
     expect(readOnly.box.calls.mutate).toEqual([])
     expect(readOnly.box.calls.send).toEqual([])
     expect(readOnly.box.calls.createFolder).toEqual([])
+
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    expect((await client.accounts()).find(account => account.id === readOnly.account.id)!.capabilities).toEqual(readOnly.account.capabilities)
+    expect((await client.account(readOnly.account.id)).capabilities.labels).toBe(false)
+    const mailbox = (await client.mailboxes()).find(box => box.sourceId === readOnly.account.id)!, scope = { mailboxIds: [mailbox.id] }
+    const nativeFolder = (await client.folders(readOnly.account.id)).find(folder => folder.role === 'inbox')!
+    const first = await client.mailboxConversations({ ...scope, query: { folder: 'inbox' }, limit: 1 })
+    expect(first.items[0]).toMatchObject({ sourceId: readOnly.account.id, messageCount: 2, messagesComplete: true, targetsComplete: true })
+    const second = await client.mailboxConversations({ ...scope, query: { folder: 'inbox' }, limit: 1, cursor: first.nextCursor! })
+    expect(second.items).toHaveLength(1); expect(second.items[0]!.messageCount).toBe(1); expect(second.nextCursor).toBeNull()
+    expect(second.items[0]!.sourceId).toBe(readOnly.account.id)
+    const organizing = first.items[0]!.messages.map(({ memberships: _memberships, ...summary }) => summary)
+    const ledger = new Database(h.database, { readonly: true }), database = new Database(':memory:')
+    let bodyReads = 0, feedbackBodyReads = 0
+    const guarded: Inbox = { ...h.inbox, message: async () => { bodyReads++; throw new Error('No-label demand metadata must not read bodies') },
+      mailboxMessage: async () => { bodyReads++; throw new Error('No-label demand metadata must not read bodies') } }
+    const ai = createAiTriageService({ database, inbox: guarded, configuration: null, sessionKey: KEY })
+    const categories = createAttentionOverridesStore(database, guarded, 'alice')
+    // W currently authorizes/classifies cached full messages; distinguish those reads from upstream fetches.
+    const feedback = createAttentionFeedbackStore(database, { ...guarded, mailboxMessage: async (...args) => { feedbackBodyReads++; return h.inbox.mailboxMessage(...args) } }, 'alice')
+    const service = createInboxWindowService({ database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: true,
+      inboxPreferences: createInboxViewPreferencesStore(database, guarded, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'), attentionOverrides: categories })
+    cleanup.push(async () => { await service.close(); await ai.close(); database.close(); ledger.close() })
+    const beforeOperations = ledger.query('SELECT COUNT(*) count FROM sdk_operations WHERE account=?').get(readOnly.account.id)
+    const beforeAdmission = await h.inbox.changes('alice'), beforeBodyCount = readOnly.box.calls.getMessage.length
+    await expect(client.mutate({ messageIds: [message.id], changes: { addProviderLabelIds: [nativeFolder.id] },
+      ifRevisions: { [message.id]: first.items[0]!.messages.find(value => value.id === message.id)!.revision }, idempotencyKey: 'readonly-canonical-label-denied' })).rejects.toMatchObject({ code: 'UNSUPPORTED_OPERATION', status: 409 })
+    expect(ledger.query('SELECT COUNT(*) count FROM sdk_operations WHERE account=?').get(readOnly.account.id)).toEqual(beforeOperations)
+    expect(await h.inbox.changes('alice', { since: beforeAdmission.state })).toMatchObject({ state: beforeAdmission.state, events: [] })
+    const query: WindowDTO.InboxViewQuery = { account: mailbox.id, folder: 'Inbox', split: 'Important', search: false, query: '', filter: null }
+    const page = await service.dispatch('/host/inbox/query', query) as WindowDTO.InboxWindowPage
+    expect(page.rows).toHaveLength(2)
+    expect(page.state.sources).toEqual([{ sourceId: readOnly.account.id, generation: readOnly.account.generation }])
+    const row = page.rows.find(row => row.threadId === first.items[0]!.threadId)!
+    expect(row).toMatchObject({ sourceId: readOnly.account.id, counts: { messages: 2, done: 0 }, messagesComplete: true, targetsComplete: true, actionContextComplete: true })
+    expect(row.summaries).toHaveLength(2); expect(row.targets).toHaveLength(2)
+    expect(row.mail.messages.every(message => !message.loaded && message.body === '')).toBe(true)
+    const key = { sourceId: row.sourceId, threadId: row.threadId }
+    for (const action of ['Done', 'W'] as const) {
+      const found = (await service.dispatch('/host/inbox/lookup', { account: mailbox.id, ids: [row.key] }) as WindowDTO.InboxLookupResult).entries[0]!
+      expect(found.status).toBe('found')
+      if (found.status !== 'found') throw new Error('Owned no-label conversation missing')
+      expect(found.row.actionContextComplete).toBe(true)
+      const id = randomUUID(), current = found.row
+      const receipt = action === 'Done' ? await client.setMailboxStates({ id, targets: current.targets, done: true })
+        : await feedback.record({ id, targets: current.targets.map(target => ({ ...target, sourceId: current.sourceId, messageRevision: target.messageRevision! })) })
+      expect(receipt.states).toHaveLength(2); expect(receipt.states!.every(state => state.done)).toBe(true)
+      const completed = (await client.mailboxConversations({ ...scope, keys: [key] })).items[0]!
+      expect(completed.doneMembershipCount).toBe(2)
+      expect(completed.messages.map(({ memberships: _memberships, ...summary }) => summary)).toEqual(organizing)
+      const undone = action === 'Done' ? await client.undoMailboxStates(id) : await feedback.undo(id)
+      expect(undone).toMatchObject(action === 'Done' ? { retracted: true } : { status: 'retracted' })
+      expect(undone.states!.every(state => !state.done)).toBe(true)
+    }
+    const latest = (await service.dispatch('/host/inbox/lookup', { account: mailbox.id, ids: [row.key] }) as WindowDTO.InboxLookupResult).entries[0]!
+    if (latest.status !== 'found') throw new Error('Restored no-label conversation missing')
+    expect(latest.row.targets.every(target => target.revision > row.targets.find(prior => prior.messageId === target.messageId)!.revision)).toBe(true)
+    const values = latest.row.summaries.toSorted((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.id.localeCompare(b.id))
+    const context: CategoryContext = { ...key, sourceGeneration: latest.row.sourceGeneration, mailboxIds: scope.mailboxIds, latestMessageId: values.at(-1)!.id,
+      messages: values.map(value => ({ messageId: value.id, revision: value.revision, bodyRevision: value.bodyRevision ?? null,
+        memberships: value.memberships.map(member => ({ mailboxId: member.mailboxId, revision: member.revision })) })) }
+    const prior = (await categories.lookup([key])).entries[0]!, category = await categories.classify({ id: randomUUID(), category: 'Other', targets: [{ context, ifRevision: prior.revision }] })
+    expect(category.entries[0]!.override?.category).toBe('Other')
+    expect((await service.dispatch('/host/inbox/query', { ...query, split: 'Other' }) as WindowDTO.InboxWindowPage).rows.map(row => row.key)).toContain(row.key)
+    const classified = (await client.mailboxConversations({ ...scope, keys: [key] })).items[0]!
+    expect(classified.messages.map(({ memberships: _memberships, ...summary }) => summary)).toEqual(organizing)
+    expect((await categories.undo(category.id)).retracted).toBe(true)
+    expect((await categories.lookup([key])).entries[0]!.override).toEqual(prior.override)
+    expect((await service.dispatch('/host/inbox/query', query) as WindowDTO.InboxWindowPage).rows.map(row => row.key)).toContain(row.key)
+    const restored = (await client.mailboxConversations({ ...scope, keys: [key] })).items[0]!
+    expect(restored.doneMembershipCount).toBe(0)
+    expect(restored.messages.map(({ memberships: _memberships, ...summary }) => summary)).toEqual(organizing)
+    expect(ledger.query('SELECT COUNT(*) count FROM sdk_operations WHERE account=?').get(readOnly.account.id)).toEqual(beforeOperations)
+    expect(bodyReads).toBe(0); expect(feedbackBodyReads).toBe(2)
+    expect(readOnly.box.calls.getMessage).toHaveLength(beforeBodyCount)
+    expect(readOnly.box.calls.mutate).toEqual([]); expect(readOnly.box.calls.createFolder).toEqual([])
+
     await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
     const outgoing = await h.draft('alice', dynamic.account.id, { to: [participant('recipient@example.test')], subject: 'Dynamic delivery', bodyText: 'Hello' })
     const sent = await h.submit('alice', outgoing, 'dynamic-send')
