@@ -1,4 +1,6 @@
 .mail-sync-slot {
+  container-type: inline-size;
+  container-name: mail-sync;
   flex: 0 0 auto;
   min-height: 0;
 }
@@ -85,4 +87,14 @@
 }
 @media (max-width: 700px) {
   .mail-sync-settings { min-height: 44px; }
+}
+
+@media (min-width: 701px) {
+  @container mail-sync (max-width: 390px) {
+    .mail-sync-row p {
+      flex-direction: column;
+      gap: 2px;
+    }
+    .mail-sync-name { max-width: 100%; }
+  }
 }
