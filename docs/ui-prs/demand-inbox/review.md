@@ -130,6 +130,22 @@ The expanded-reader batch passed SDK/host types, declaration build and all84 web
 
 The configured fictional visual fixture also exercised **native Other followed by exact native Undo** through individual cleanup review. The category receipt was retracted, the original null override returned, and progress went0→1→0 with all6,001 items remaining. No Done/W or native-label write occurred. The paused capture was retained; it is separate from the3,001-item Garden media pair.
 
+## Deployment login follow-up — before implementation
+
+Additional requested scope: an already-signed-in page must recover from Docker replacement without another Google sign-in. The current-app baseline is `e2c9f5c3ff0e7dcce41d4c566c079c02a232f151`, with the same `index-MtzEi-D5.js` application bundle. The existing draft PR remains the combined review; no merge or production deployment is authorized.
+
+A separate local Docker fixture uses the real host, Better Auth, its Google code/PKCE/RS256 verification path with fictional Google responses, a named `/persist` volume, trusted localhost HTTPS and the existing fictional mail seed. Cookies are issued by Better Auth, not injected; Secure, HttpOnly and SameSite=Lax were verified. Appearance remains Dark/Carbon, Superlocal, Comfortable, Super Sans Normal at1440×1000/DPR1/100%. Only the offline fixture host uses development-mode process settings because the mock provider intentionally refuses `NODE_ENV=production`; the served UI is the optimized Docker build. Production was inspected only for mount/path/environment metadata and was not restarted.
+
+| Scenario | Before | After |
+| --- | --- | --- |
+| Signed-in reader before replacement | ![Authenticated reader](auth-before-ready.png) | Pending |
+| Server healthy again, existing cookie still valid | ![Page remains blocked](auth-before-stuck.png) | Pending |
+| Container replacement and recovery | [Before recording](auth-before.mp4) | Pending |
+
+The baseline container was stopped and replaced, retaining the same volume. A normal access poll received503 without an authentication challenge. The page hid private mail, then stayed on **Couldn’t check access** after the replacement host was healthy. A separate read verified HTTP200, the same authenticated scope and zero Google code exchanges in the new container. The page performed no further automatic access checks during the observed settled interval. Native Retry returned to `/` and discarded the open-reader hash despite the unchanged identity. The recording and stills were inspected before editing the gate.
+
+Fable5.1 reviewed the proposed narrow fix: keep immediate privacy locking, add bounded re-verification only for transient failures, and reload the current URL only after the same scope is verified. Changed identities, expiry, revocation, explicit sign-out and invalid authentication responses must retain their existing fail-closed behavior. Cookie/signing-key handling and the absolute session lifetime will not change. Implementation and matching after evidence are pending in this follow-up.
+
 ## Remaining limits and release boundary
 
 1. The intermediate `900f1c0` cached-frame stall remains unexplained. Final passing samples neither erase it nor establish its cause. There is no self-approved performance exception.
@@ -138,4 +154,4 @@ The configured fictional visual fixture also exercised **native Other followed b
 4. The forced15-second worker deadline/termination fallback was not exercised. Graceful exit and external termination/recovery were verified; Bun worker termination remains experimental.
 5. The existing mobile overlap is unchanged. Authenticated Sign out/sync-footer ordering was not re-audited in the loopback fixture; its component is unchanged. The pre-existing late cleanup Resume navigation behavior remains outside this fix. Missing driver payloads leave108 paging adjacencies unverified despite705 verified pairs and no observed gap.
 
-All owned qualification runtimes and the audit browser session were stopped after export. Original installation/state, fictional recovery captures and the unrelated private README edit were preserved. The PR remains **draft**. User/designated-reviewer approval is required before merge or deployment; this review does not authorize live mail mutations or paid inference work.
+The original demand-inbox qualification runtimes and audit browser session were stopped after export; the deployment-auth follow-up above is separate. Original installation/state, fictional recovery captures and the unrelated private README edit were preserved. The PR remains **draft**. User/designated-reviewer approval is required before merge or deployment; this review does not authorize live mail mutations or paid inference work.
