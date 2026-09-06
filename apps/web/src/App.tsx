@@ -485,7 +485,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   function startZero() {
     if (!leaveSettings()) return;
     setOverlay(null); setOverlayIds(null); setCommandDraftId(null);
-    setImportantDoneAccount(route.account);
+    setImportantDoneAccount(current => current ?? route.account);
   }
   const rowCount = isDrafts ? accountDrafts.length : visibleMail.length;
   const virtualized =
@@ -2511,6 +2511,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             </div>
           )}
         </div>
+        {importantDoneAccount !== null && <ImportantDone store={store} account={importantDoneAccount} accountLabel={importantDoneAccount === UNIFIED_ACCOUNT ? "Unified inbox" : inbox.accounts.find(account => account.id === importantDoneAccount)?.email || "Selected mailbox"} onClose={() => setImportantDoneAccount(null)} onDone={(count, changed, undo, unfinished) => {
+          setImportantDoneAccount(null);
+          setNotice({ text: `${count.toLocaleString()} Important conversations marked Done.${changed ? ` ${changed.toLocaleString()} changed conversations left untouched.` : ""}${unfinished ? " Stopped before completing all mail; an unconfirmed request may still settle." : ""}`, undo: undoAction(undo) });
+        }} />}
         <MailSyncStatus client={inbox.store.client} mailboxes={inbox.mailboxes} sources={inbox.sources} enabled={inbox.loaded && !settings && !route.view} onMailboxes={() => openSettings("Mailboxes")} />
         <footer className="sidebar-footer">
           {applicationUser && onSignOut && (
@@ -2720,10 +2724,6 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           </>
         </Modal>
       )}
-      {importantDoneAccount !== null && <ImportantDone store={store} account={importantDoneAccount} onClose={() => setImportantDoneAccount(null)} onDone={(count, changed, undo, unfinished) => {
-        setImportantDoneAccount(null);
-        setNotice({ text: `${count.toLocaleString()} Important conversations marked Done.${changed ? ` ${changed.toLocaleString()} changed conversations left untouched.` : ""}${unfinished ? " Stopped before completing all mail; an unconfirmed request may still settle." : ""}`, undo: undoAction(undo) });
-      }} />}
       {reloadDraftId && (
         <Modal label="Reload saved draft" onClose={() => setReloadDraftId(null)} className="app-modal">
           <div className="simple-modal-header"><h2>Reload saved draft?</h2></div>

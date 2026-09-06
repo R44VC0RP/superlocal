@@ -3,11 +3,12 @@ import { Modal } from "./components";
 import type { InboxStore } from "./inbox";
 import { ImportantDoneRun } from "./important-done";
 
-export function ImportantDone({ store, account, onClose, onDone }: {
-  store: InboxStore; account: string; onClose: () => void;
+export function ImportantDone({ store, account, accountLabel, onClose, onDone }: {
+  store: InboxStore; account: string; accountLabel: string; onClose: () => void;
   onDone: (count: number, changed: number, undo: () => Promise<void>, unfinished?: boolean) => void;
 }) {
   const operation = useRef(new ImportantDoneRun(store, account)).current;
+  const [reviewing, setReviewing] = useState(false);
   const [ready, setReady] = useState(false), [busy, setBusy] = useState(false);
   const [error, setError] = useState(""), [attempt, setAttempt] = useState(0);
   const [, redraw] = useState(0);
@@ -27,7 +28,7 @@ export function ImportantDone({ store, account, onClose, onDone }: {
     return () => { stopped = true; clearTimeout(timer); };
   }, [operation, attempt]);
   async function confirm() {
-    setBusy(true); setError("");
+    setReviewing(false); setBusy(true); setError("");
     try {
       await operation.run(() => redraw(value => value + 1));
       onDone(operation.completed, operation.changed, () => operation.undo());
@@ -39,18 +40,28 @@ export function ImportantDone({ store, account, onClose, onDone }: {
     if (operation.hasChanges) onDone(operation.completed, operation.changed, () => operation.undo(), true);
     else onClose();
   }
-  return <Modal label="Mark Important as Done" className="app-modal" onClose={close}>
-    <div className="simple-modal-header"><h2>Get me to zero</h2></div>
-    <div className="simple-form">
-    <p>{ready ? `Mark all ${operation.selection!.count!.toLocaleString()} Important conversations as Done?` : "Preparing Important…"}</p>
-    <p>Includes read and unread mail in the current mailbox view. Other and later arrivals stay untouched. You can Undo.</p>
-    {operation.completed > 0 && <p role="status">{operation.completed.toLocaleString()} marked Done.</p>}
-    {error && <p role="alert">{error}</p>}
-    <div className="label-edit-actions">
-      {ready ? <button type="button" className="primary-button" disabled={busy || operation.selection?.count === 0} onClick={() => void confirm()}>{busy ? "Marking Done…" : error ? "Retry existing request" : "Mark all as Done"}</button>
-        : error && <button type="button" className="primary-button" onClick={() => setAttempt(value => value + 1)}>Try again</button>}
-      <button type="button" className="text-button" disabled={busy} onClick={close}>Cancel</button>
-    </div>
-    </div>
-  </Modal>;
+  return <>
+    <section className="important-done-status" aria-label="Get me to zero progress">
+      <strong>Get me to zero</strong>
+      <p className="important-done-scope">{accountLabel}</p>
+      <p role="status">{(busy || operation.completed > 0) ? `${operation.completed.toLocaleString()} marked Done${busy ? "…" : ""}` : ready ? `${operation.selection!.count!.toLocaleString()} Important conversations ready` : "Preparing Important…"}</p>
+      {error && <p role="alert">{error}</p>}
+      <div className="important-done-actions">
+        {ready && !busy ? <button type="button" className="text-button" disabled={operation.selection?.count === 0} onClick={() => setReviewing(true)}>{error ? "Review and retry" : "Review"}</button>
+          : error && !busy && <button type="button" className="text-button" onClick={() => setAttempt(value => value + 1)}>Try again</button>}
+        <button type="button" className="text-button" disabled={busy} onClick={close}>Cancel</button>
+      </div>
+    </section>
+    {reviewing && <Modal label="Mark Important as Done" className="app-modal" onClose={() => setReviewing(false)}>
+      <div className="simple-modal-header"><h2>Get me to zero</h2></div>
+      <div className="simple-form">
+        <p>Mark all {operation.selection!.count!.toLocaleString()} Important conversations as Done?</p>
+        <p>Includes read and unread mail in {accountLabel}. Other and later arrivals stay untouched. You can Undo.</p>
+        <div className="label-edit-actions">
+          <button type="button" className="primary-button" onClick={() => void confirm()}>{error ? "Retry existing request" : "Mark all as Done"}</button>
+          <button type="button" className="text-button" onClick={() => setReviewing(false)}>Back</button>
+        </div>
+      </div>
+    </Modal>}
+  </>;
 }

@@ -1873,3 +1873,20 @@ kbd {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* Explicit bulk work stays available while the inbox remains interactive. */
+.important-done-status {
+  flex: 0 0 auto;
+  padding: 12px var(--sidebar-gutter) 0;
+  font-size: var(--ui-small);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.important-done-status p { margin: 4px 0 0; color: var(--muted); }
+.important-done-status strong { font-weight: 500; }
+.important-done-actions { display: flex; gap: 16px; flex-wrap: wrap; }
+.important-done-actions button { min-height: 40px; }
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero):not(.mobile-sidebar-open) > .right-sidebar:has(.important-done-status) {
+  height: auto;
+  background: var(--sidebar);
+}
