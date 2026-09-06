@@ -2251,6 +2251,47 @@ describe('bounded host inbox window', () => {
     })(), label)
   }
 
+  test('Important expires after 45 days without hiding searchable history or reviving on outgoing mail', async () => {
+    const now = EPOCH, day = 86_400_000, at = (offset: number) => new Date(now + offset).toISOString()
+    const clock = spyOn(Date, 'now').mockReturnValue(now)
+    cleanup.push(async () => { clock.mockRestore() })
+    const h = await fixture(), database = new Database(':memory:')
+    const { account, box } = await h.seed('alice', 'important-age', [
+      native('expired', { threadId: 'expired', receivedAt: at(-46 * day) }),
+      native('boundary', { threadId: 'boundary', receivedAt: at(-45 * day) }),
+      native('expiring', { threadId: 'expiring', receivedAt: at(-45 * day + 1000) }),
+      native('deep-incoming', { threadId: 'deep', receivedAt: at(-44 * day) }),
+      ...Array.from({ length: 60 }, (_, i) => native(`sent-${i}`, { threadId: 'deep', folder: 'sent', receivedAt: at(-i * 1000) })),
+      native('old-with-reply', { threadId: 'old-replied', receivedAt: at(-46 * day) }),
+      native('outgoing-reply', { threadId: 'old-replied', folder: 'sent', receivedAt: at(-1000) }),
+    ])
+    const ai = createAiTriageService({ database, inbox: h.inbox, configuration: null, sessionKey: KEY })
+    const service = createInboxWindowService({ database, inbox: h.inbox, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: false,
+      inboxPreferences: createInboxViewPreferencesStore(database, h.inbox, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'),
+      attentionOverrides: createAttentionOverridesStore(database, h.inbox, 'alice') })
+    cleanup.push(async () => { await service.close(); await ai.close(); database.close() })
+    const view = { account: 'unified', folder: 'Inbox', split: 'Important', search: false, query: '', filter: null }
+    const query = (input = view) => service.dispatch('/host/inbox/query', input) as Promise<WindowDTO.InboxWindowPage>
+    const page = await query()
+    expect(page.rows.map(row => row.mail.subject).sort()).toEqual(['Subject deep-incoming', 'Subject expiring'])
+    const deep = page.rows.find(row => row.mail.subject === 'Subject deep-incoming')!
+    expect(deep.mail.importantReceivedAt).toBe(now - 44 * day)
+    expect(deep.counts.messages).toBe(61)
+    const search = await query({ ...view, search: true, query: 'Subject expired' })
+    expect(search.rows.some(row => row.mail.subject === 'Subject expired')).toBe(true)
+    const other = await query({ ...view, split: 'Other' })
+    expect(other.rows).toHaveLength(0)
+    clock.mockReturnValue(now + 1001)
+    const changes = await service.dispatch('/host/inbox/changes', { queryId: page.state.queryId, sinceRevision: page.state.indexRevision,
+      sinceCursor: page.state.readCursor!, residentKeys: page.rows.map(row => row.key), pinnedKeys: [] }) as WindowDTO.InboxWindowChanges
+    expect(changes.resetReason).toBeNull()
+    expect((await query()).rows.map(row => row.mail.subject)).toEqual(['Subject deep-incoming'])
+    box.put(native('new-incoming', { threadId: 'expired', receivedAt: at(1001) }))
+    h.clock.value = now + 1001
+    await h.sync('alice', account.id)
+    expect((await query()).rows.some(row => row.mail.subject === 'Subject expired')).toBe(true)
+  })
+
   test('cold giant conversations with unknown attention stay in Important review, never Other', async () => {
     const h = await fixture(), database = new Database(':memory:')
     await h.seed('alice', 'unknown-window', Array.from({ length: 620 }, (_, index) => native(`unknown-${index}`, {

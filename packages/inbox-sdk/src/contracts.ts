@@ -288,6 +288,8 @@ export interface MailboxConversation extends MailboxThreadKey {
   doneMembershipCount: number
   /** Unique primary-inbox messages with any selected !done membership whose snooze is absent or <= read time. */
   awakeInboxMessageCount: number
+  /** Latest awake primary-inbox receipt across the selected scope, including off-preview messages. */
+  latestAwakeInboxAt?: string | null
   /** Minimum future snooze among all selected memberships, including Done memberships; otherwise null. */
   earliestSnoozedUntil: string | null
   lastMessageAt: string

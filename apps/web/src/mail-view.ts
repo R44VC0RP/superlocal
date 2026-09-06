@@ -2,6 +2,7 @@ import type { InboxTotals } from "../../shared/inbox-window";
 import type { Mail, MailboxOption, Preferences } from "./data.ts";
 import { currentAiDecision, inFolder, UNIFIED_ACCOUNT } from "./mail-model.ts";
 import { compileSearch } from "./mail-search.ts";
+import { recentImportant } from "../../shared/important-window.ts";
 import { ATTENTION_VERSION, conversationAttention } from "../../shared/mail-attention.ts";
 import { attentionSplit } from "../../shared/splits.ts";
 import type { AiTriageState } from "../../shared/ai-triage.ts";
@@ -64,7 +65,7 @@ function eligibleZeroMail(mail: Mail, scope: ZeroScope, boxes: ReadonlyMap<strin
         (!state.snoozedUntil || Date.parse(state.snoozedUntil) <= now)) awake = true;
     }
   }
-  return awake && conversationAttention(mail, now) === "Important";
+  return awake && recentImportant(mail, now) && conversationAttention(mail, now) === "Important";
 }
 
 export function zeroEligible(mail: Mail, scope: ZeroScope, now = Date.now()): boolean {
@@ -204,17 +205,18 @@ export function selectMailView(
   const byId = window ? new Map(accountMail.map(mail => [mail.id, mail])) : null;
   const ordered = window ? [...window.keys.flatMap(key => byId!.has(key) ? [byId!.get(key)!] : []), ...accountMail.filter(mail => mail.operationId && !activeKeys!.has(mail.id))] : accountMail;
   for (const message of ordered) {
-    if (activeKeys) { if (activeKeys.has(message.id) || message.operationId) visibleMail.push(message); continue; }
+    if (activeKeys) { if ((activeKeys.has(message.id) || message.operationId) && (search || folder !== "Inbox" || matchers.get(split)?.category !== "Important" || recentImportant(message, now))) visibleMail.push(message); continue; }
     const inbox = inFolder(message, "Inbox");
     if (!search && folder === "Inbox" && inbox && (message.aiHoldUntil ?? 0) > now) { holdingMail = true; continue; }
     const attention = inbox || filter === "Important" ? conversationAttention(message) : undefined;
+    const recent = recentImportant(message, now);
     const matchesSplit = (name: string) => {
       const matcher = matchers.get(name)!;
-      return matcher.category ? attention === matcher.category : matcher.matches?.(message) ?? false;
+      return matcher.category ? attention === matcher.category && (matcher.category !== "Important" || recent) : matcher.matches?.(message) ?? false;
     };
     let selectedSplit = false;
     if (inbox) {
-      if (attention === "Important") inboxCount = (inboxCount ?? 0) + 1;
+      if (attention === "Important" && recent) inboxCount = (inboxCount ?? 0) + 1;
       for (const name of countedSplits) {
         const matches = matchesSplit(name);
         if (matches) splitCounts[name] = (splitCounts[name] ?? 0) + 1;

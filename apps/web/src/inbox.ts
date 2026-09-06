@@ -2,6 +2,8 @@ import { projectMailboxMail } from "../../shared/mail-projection";
 import { INBOX_FIRST_PAGE_LIMIT, INBOX_PAGE_LIMIT, INBOX_AUTO_PREFETCH_LIMIT, INBOX_WINDOW_LIMIT, INBOX_WINDOW_BYTE_LIMIT, INBOX_LOOKUP_LIMIT,
   type InboxWindowPage, type InboxWindowRow, type InboxWindowState, type InboxWindowChanges, type InboxTotals, type InboxViewQuery, type InboxSelection, type InboxActionReceiptReference, type InboxSenderInput } from "../../shared/inbox-window";
 import { createInboxWindowTransport } from "./host";
+import { importantExpiry, recentImportant } from "../../shared/important-window";
+import { attentionSplit } from "../../shared/splits";
 import { ApiError, createInboxClient, type InboxClient } from "inbox-sdk/client";
 import { measurePerformance, measureRequest, measureWork } from "./browser-logs";
 import type {
@@ -263,6 +265,8 @@ export class InboxStore {
   private feedbackEpoch = 0;
   private calendarKey?: string;
   private draftEpoch = 0;
+  private importantTimer?: ReturnType<typeof setTimeout>;
+  private importantDeadline = Infinity;
   private refreshTimer?: ReturnType<typeof setTimeout>;
   private sourceAccounts: Account[] = [];
   private boxes: Mailbox[] = [];
@@ -1142,7 +1146,33 @@ export class InboxStore {
   }
   private publish(patch: Partial<InboxSnapshot> = {}) {
     if (this.controller.signal.aborted || this.applicationScope.signal.aborted) return;
-    this.state = { ...this.state, ...patch }; this.listeners.forEach(listener => listener());
+    this.state = { ...this.state, ...patch };
+    if (patch.window !== undefined) this.scheduleImportantExpiry();
+    this.listeners.forEach(listener => listener());
+  }
+  /** One clock wake for the bounded visible window, no periodic mailbox scan. */
+  private scheduleImportantExpiry() {
+    const view = this.state.window, now = Date.now();
+    const recentView = view && !view.query.search && view.query.folder === "Inbox" &&
+      attentionSplit(this.state.splitPreferences ?? normalizeSplits({}), view.query.split) === "Important";
+    const next = recentView ? view.keys.reduce((deadline, key) => {
+      const row = this.windowRows.get(key);
+      return row ? Math.min(deadline, importantExpiry(row.mail, now)) : deadline;
+    }, Infinity) : Infinity;
+    if (next === this.importantDeadline) return;
+    clearTimeout(this.importantTimer); this.importantDeadline = next;
+    if (!Number.isFinite(next)) return;
+    this.importantTimer = setTimeout(() => {
+      this.importantDeadline = Infinity;
+      if (Date.now() < next) { this.scheduleImportantExpiry(); return; }
+      const current = this.state.window;
+      if (!current || this.controller.signal.aborted) return;
+      const keys = current.keys.filter(key => { const row = this.windowRows.get(key); return !row || recentImportant(row.mail); });
+      const totals = { ...current.totals, conversations: null, messages: null, inbox: null,
+        splits: Object.fromEntries(Object.keys(current.totals.splits).map(key => [key, null])) };
+      this.publish({ window: { ...current, keys, totals } });
+      this.scheduleRefresh();
+    }, Math.min(2_147_483_647, Math.max(1, next - now)));
   }
   private requestOptions() { return { signal: this.controller.signal }; }
   private fail(error: unknown, action: string, key?: string) {
@@ -1366,7 +1396,7 @@ export class InboxStore {
       this.started = false; this.generation++; this.controller.abort(); this.clearThreadMessagePins();
       this.retainedViews.clear(); this.windowCounts = undefined;
       this.client.clearCache();
-      clearTimeout(this.refreshTimer);
+      clearTimeout(this.refreshTimer); clearTimeout(this.importantTimer); this.importantDeadline = Infinity;
       clearTimeout(this.aiPollTimer); clearTimeout(this.aiHoldTimer); this.aiPollPromise = undefined; this.aiHolds.clear();
       clearTimeout(this.aiRebuildTimer); this.aiRebuildTimer = undefined; this.aiRebuildThreads.clear();
       for (const timer of this.saveTimers.values()) clearTimeout(timer);

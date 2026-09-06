@@ -5,7 +5,9 @@ import { InboxError, type Inbox, type Account, type Mailbox, type Label, type Fo
 import type { CategoryContext, CategoryEntry, CategoryReceipt } from '../../shared/attention-overrides'
 import * as DTO from '../../shared/inbox-window'
 import { projectMailboxMail } from '../../shared/mail-projection'
-import { classifyAttention, conversationAttention } from '../../shared/mail-attention'
+import { importantExpiry, recentImportant, IMPORTANT_WINDOW_MS, IMPORTANT_WINDOW_VERSION } from '../../shared/important-window'
+import { AI_PREFERENCE_VERSION } from '../../shared/ai-triage'
+import { ATTENTION_VERSION, classifyAttention, conversationAttention } from '../../shared/mail-attention'
 import { normalizeSplits, attentionSplit } from '../../shared/splits'
 import { currentAiDecision, currentCategoryOverride, inFolder } from '../../web/src/mail-model'
 import { compileSearch, parseSearch } from '../../web/src/mail-search'
@@ -50,7 +52,7 @@ type ReadBaseline = { sdkState: string | null; scopeState: string; revision: num
 type Scope = { row: ScopeRow; boxes: Mailbox[]; sources: Account[]; labels: Label[]; folders: Map<string, Folder[]>; preference: string; preferences: Preferences; ai: AiTriageState; users: number; lastUsed: number; metadataAt: number; metadataDirty: boolean; seenEvents: number; read?: ReadBaseline }
 type ProjectionStamp = { preference?: string; metadata?: string; aiCursor?: number; categoryCursor?: number; contextVersion?: 3 }
 type QueryRow = { id: string; scope: string; data: string; preference: string; scanned: number; generation: number; expires: number; problem: string | null; read_state: string | null }
-type ReadMetadata = { baselines: Array<{ revision: number; token: string }>; wake?: number; changes?: { id: string; input: string; baseline: ReadBaseline; keys: string[]; head: boolean; more: boolean }; counts?: { position?: PagePosition; baseline: ReadBaseline; totals: DTO.InboxTotals; complete: boolean; wake?: number } }
+type ReadMetadata = { importantSince?: string; baselines: Array<{ revision: number; token: string }>; wake?: number; changes?: { id: string; input: string; baseline: ReadBaseline; keys: string[]; head: boolean; more: boolean }; counts?: { position?: PagePosition; baseline: ReadBaseline; totals: DTO.InboxTotals; complete: boolean; wake?: number } }
 type ReadBudget = { pages: number; details: number; searches: number; now: number; legacy: Map<string, string>; summaries: Map<string, MailboxMessageSummary[]>; contexts: Map<string, string>; keys: DTO.InboxThreadKey[]; proofs: Map<string, Map<string, boolean>>; unknownLocation: Set<string>; detailDeferred: Set<string> }
 type PagePosition = { cursor?: string }
 type PageCursor = { older: string; newer: string; baseline: Readonly<ReadBaseline>; direction: 'older' | 'newer' }
@@ -177,7 +179,7 @@ export function createInboxWindowService(deps: Dependencies) {
     const selectedSources = sources.filter(source => boxes.some(box => box.sourceId === source.id))
     const identity = { account, boxes: boxes.map(box => [box.id, box.sourceId, box.revision, box.status]).sort(), sources: selectedSources.map(source => [source.id, source.generation]).sort() }
     const id = digest(identity), split = deps.splitPreferences.read() ?? { ...normalizeSplits({}), revision: 0 }
-    const preference = digest(['demand-window-1', preferences.revision, split, ai.configured, ai.settings])
+    const preference = digest(['demand-window-1', ATTENTION_VERSION, AI_PREFERENCE_VERSION, IMPORTANT_WINDOW_VERSION, preferences.revision, split, ai.configured, ai.settings])
     aiCursor ??= ai.cursor
     const categoryHead = db.query<{ head: number }, string[]>('SELECT head FROM local_category_clock WHERE owner=?').get(owner)?.head ?? 0
     categoryCursor ??= categoryHead
@@ -348,6 +350,7 @@ export function createInboxWindowService(deps: Dependencies) {
       const full = sdk.messagesComplete && values.length === sdk.messageCount
       const mail = project(scope, values).mail.find(mail => mail.account === scope.row.account)
       if (!mail) fail('HOST_INBOX_SCOPE_CHANGED', 409)
+      if (sdk.latestAwakeInboxAt !== undefined) mail!.importantReceivedAt = sdk.latestAwakeInboxAt === null ? null : Date.parse(sdk.latestAwakeInboxAt)
       mail!.subject = sdk.subject; mail!.receivedAt = Date.parse(sdk.lastMessageAt); Object.assign(mail!, displayTime(sdk.lastMessageAt))
       mail!.hasAttachments = sdk.hasAttachments; mail!.unread = !sdk.isRead; mail!.starred = sdk.isStarred
       if (!full) {
@@ -568,16 +571,16 @@ export function createInboxWindowService(deps: Dependencies) {
   }
   async function evaluateRow(scope: Scope, query: DTO.InboxViewQuery, row: DTO.InboxWindowRow, budget: ReadBudget = readBudget(), includeCounts = false) {
     const mail = row.mail, inbox = inFolder(mail, 'Inbox'), holding = inbox && (mail.aiHoldUntil ?? 0) > budget.now
-    const attention = mail.split, counts: Record<string, number> = {}
+    const attention = mail.split, recent = recentImportant(mail, budget.now), counts: Record<string, number> = {}
     if (includeCounts && budget.unknownLocation.has(row.key)) throw pendingContext
     const splitMatches = new Map<string, boolean>()
     for (const name of new Set(includeCounts ? [...scope.preferences.splits, query.split] : !query.search && query.folder === 'Inbox' ? [query.split] : [])) {
       const category = attentionSplit(scope.preferences as never, name), rule = (scope.preferences.splitRules as Record<string, string> | undefined)?.[name]
-      splitMatches.set(name, category ? attention === category || category === 'Important' && attention === 'Unknown' : typeof rule === 'string' && !!rule.trim() && await expression(scope, row, rule, false, budget))
+      splitMatches.set(name, category ? (attention === category || category === 'Important' && attention === 'Unknown') && (category !== 'Important' || recent) : typeof rule === 'string' && !!rule.trim() && await expression(scope, row, rule, false, budget))
     }
     // Explicit pages, counts, captures and resident updates never wait on AI.
     // A presentation-only hold is applied solely to unseen demandChanges rows.
-    counts.inbox = Number(inbox && attention === 'Important')
+    counts.inbox = Number(inbox && attention === 'Important' && recent)
     for (const [name, matches] of splitMatches) counts[`split:${name}`] = Number(inbox && matches)
     counts.holding = Number(holding)
     for (const folder of ['Inbox', 'Starred', 'Sent', 'Done', 'Auto Archived', 'Reminders', 'Spam', 'Trash', 'All Mail']) counts[`folder:${folder}`] = Number(inFolder(mail, folder))
@@ -727,7 +730,10 @@ export function createInboxWindowService(deps: Dependencies) {
       read = observe(scope, null, scope.row.id, query)
       return { state: state(scope, query, read), rows: [], totals: unknownTotals(scope), nextCursor: null, exhausted: true }
     }
-    const view = json<DTO.InboxViewQuery>(query.data), queryFilter = nativeQuery(scope, view), rows: PageableRow[] = []
+    const view = json<DTO.InboxViewQuery>(query.data), recentView = !view.search && view.folder === 'Inbox' && attentionSplit(scope.preferences as never, view.split) === 'Important'
+    const metadata = readMetadata(query)
+    if (recentView && !metadata.importantSince) { metadata.importantSince = new Date(budget.now - IMPORTANT_WINDOW_MS).toISOString(); saveReadMetadata(query, metadata) }
+    const queryFilter = recentView ? { ...nativeQuery(scope, view), after: metadata.importantSince } : nativeQuery(scope, view), rows: PageableRow[] = []
     let size = 65536, exhausted = false, stopped = false, wake = Infinity, firstConsumed: string | undefined, firstVisible: string | undefined
     const bookmark = (older: string, newer: string) => token(`page:${query.id}`, scope, { older, newer, baseline: { ...read! }, direction } satisfies PageCursor)
     while (budget.pages > 0 && rows.length < maximum && !stopped) {
@@ -740,7 +746,7 @@ export function createInboxWindowService(deps: Dependencies) {
       let consumed = 0
       for (const [index, row] of projected.entries()) {
         row.revision = read.revision
-        wake = Math.min(wake, row.mail.reminderAt ?? Infinity, row.mail.aiHoldUntil ?? Infinity)
+        wake = Math.min(wake, row.mail.reminderAt ?? Infinity, row.mail.aiHoldUntil ?? Infinity, recentView ? importantExpiry(row.mail, budget.now) : Infinity)
         let matches: boolean
         try { matches = (await evaluateRow(scope, view, row, budget)).matches }
         catch (error) { if (error !== pendingContext || !rows.length && !consumed) throw error; stopped = true; break }
@@ -1418,7 +1424,7 @@ export function createInboxWindowService(deps: Dependencies) {
         count.totals.holding ||= !!result.counts.holding
         for (const name of scope.preferences.splits) count.totals.splits[name]! += result.counts[`split:${name}`] ?? 0
         for (const name of Object.keys(count.totals.folders)) count.totals.folders[name]! += result.counts[`folder:${name}`] ?? 0
-        const wake = Math.min(row.mail.reminderAt ?? Infinity, row.mail.aiHoldUntil ?? Infinity)
+        const wake = Math.min(row.mail.reminderAt ?? Infinity, row.mail.aiHoldUntil ?? Infinity, importantExpiry(row.mail, budget.now))
         if (Number.isFinite(wake)) count.wake = Math.min(count.wake ?? Infinity, wake)
         count.position = { cursor: conversationCursor(page.items[index]!) }; consumed++
       }

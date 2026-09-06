@@ -83,6 +83,8 @@ export type Mail = {
   scheduled?: string;
   reminderAt?: number;
   receivedAt?: number;
+  /** Latest awake incoming inbox message across the full selected conversation. */
+  importantReceivedAt?: number | null;
   sourceId?: string;
   mailboxId?: string;
   sdkThreadId?: string;
