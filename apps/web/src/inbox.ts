@@ -27,6 +27,8 @@ import { CATEGORY_BATCH_LIMIT, CATEGORY_MEMBERSHIP_LIMIT, CATEGORY_BODY_LIMIT, c
 
 type Edit = { draft: Draft; revision: number; version: number; error?: string; errorKind?: "recipients" };
 type WindowCheckpoint = Readonly<Pick<InboxWindowState, "indexRevision" | "readCursor">>;
+type ThreadHistory = { contextVersion: string; summaries: MailboxMessageSummary[]; cursor: string | null; exhausted: boolean; truncated?: boolean; error?: string };
+type ThreadValidation = { row: InboxWindowRow; controller: AbortController; promise: Promise<{ summaries: MailboxMessageSummary[]; error?: string }> };
 class DraftRecipientError extends Error {}
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
 type Sending = { ref: SendReference; operation: Operation; draft: SdkDraft };
@@ -317,7 +319,11 @@ export class InboxStore {
   private windowChanges?: Promise<void>;
   private windowReplayCheckpoint?: WindowCheckpoint;
   private windowMetadataEvents: ChangeEvent[] = [];
-  private windowDetails = new Map<string, { contextVersion: string; summaries: MailboxMessageSummary[]; cursor: string | null; exhausted: boolean }>();
+  private windowDetails = new Map<string, ThreadHistory>();
+  private threadMessagePins = new Map<string, Map<string, string>>();
+  private threadHistoryLoads = new Map<string, { controller: AbortController; promise: Promise<void> }>();
+  private threadValidations = new Map<string, ThreadValidation>();
+  private threadValidationQueue: Promise<unknown> = Promise.resolve();
   private initialThread = new URLSearchParams(location.hash.replace(/^#\/?/, "")).get("thread");
 
   readonly ai: AiTriageActions = {
@@ -368,9 +374,107 @@ export class InboxStore {
     this.controller.signal.throwIfAborted(); this.applicationScope.signal.throwIfAborted();
     if (epoch !== this.windowEpoch || generation !== this.generation) throw new DOMException("Inbox view changed", "AbortError");
   }
+  private clearThreadMessagePins(id?: string) {
+    for (const key of id ? [id] : new Set([...this.threadMessagePins.keys(), ...this.threadValidations.keys(), ...this.threadHistoryLoads.keys()])) {
+      this.threadMessagePins.delete(key);
+      this.threadValidations.get(key)?.controller.abort(); this.threadValidations.delete(key);
+      this.threadHistoryLoads.get(key)?.controller.abort(); this.threadHistoryLoads.delete(key);
+    }
+  }
+  pinThreadMessages = (id: string, ids: readonly string[]) => {
+    if (!ids.length) { this.clearThreadMessagePins(id); return; }
+    const row = this.windowRows.get(id);
+    if (!row || this.sourceAccounts.find(source => source.id === row.sourceId)?.generation !== row.sourceGeneration) return;
+    const resident = new Map(this.threadSummaries(row).summaries.map(summary => [summary.id, summary]));
+    const boxes = new Set(row.mail.account === UNIFIED_ACCOUNT ? this.unifiedMailboxIds() : [row.mail.account]);
+    const pins = new Map<string, string>();
+    for (const key of new Set(ids)) {
+      const mailbox = resident.get(key)?.memberships.find(state => boxes.has(state.mailboxId))?.mailboxId;
+      if (mailbox) pins.set(key, mailbox);
+    }
+    if (pins.size) this.threadMessagePins.set(id, pins); else this.clearThreadMessagePins(id);
+  };
+  private threadSummaries(row: InboxWindowRow, history = this.windowDetails.get(row.key)?.summaries ?? []) {
+    if (!history.length && !this.threadMessagePins.get(row.key)?.size) return { summaries: row.summaries, truncated: false };
+    const merged = new Map<string, MailboxMessageSummary>();
+    for (const summary of [...history, ...row.summaries]) {
+      const previous = merged.get(summary.id), memberships = new Map((previous?.memberships ?? []).map(state => [state.mailboxId, state]));
+      for (const state of summary.memberships) if (state.revision >= (memberships.get(state.mailboxId)?.revision ?? 0)) memberships.set(state.mailboxId, state);
+      merged.set(summary.id, { ...(previous && previous.revision > summary.revision ? previous : summary), memberships: [...memberships.values()] });
+    }
+    const pins = this.threadMessagePins.get(row.key), anchors = new Set(row.mail.messages.map(message => message.id));
+    const ordered = [...merged.values()].sort((a, b) => a.receivedAt < b.receivedAt ? -1 : a.receivedAt > b.receivedAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    const selected = new Map<string, MailboxMessageSummary>();
+    const keep = (summary: MailboxMessageSummary) => { if (selected.size < 500) selected.set(summary.id, summary); };
+    for (const summary of ordered) if (pins?.has(summary.id)) keep(summary);
+    for (const summary of [...ordered].reverse()) if (anchors.has(summary.id) && !selected.has(summary.id)) keep(summary);
+    // Discard the newest unprotected history first, never an open card or an admitted recent anchor.
+    for (const summary of ordered) if (!selected.has(summary.id)) keep(summary);
+    return { summaries: ordered.filter(summary => selected.has(summary.id)), truncated: merged.size > selected.size || [...anchors].some(id => !selected.has(id)) };
+  }
+  private saveThreadHistory(row: InboxWindowRow, history: ThreadHistory) {
+    const previousRow = this.windowRows.get(row.key), previous = this.windowDetails.get(row.key);
+    const selected = this.threadSummaries(row, history.summaries), anchors = new Set(row.mail.messages.map(message => message.id));
+    // Raw anchors plus disposable/pinned history share one unique 500-summary budget.
+    this.windowRows.set(row.key, { ...row, summaries: selected.summaries.filter(summary => anchors.has(summary.id)) });
+    this.windowDetails.set(row.key, { ...history, summaries: selected.summaries.filter(summary => !anchors.has(summary.id)), truncated: history.truncated || selected.truncated });
+    if (this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) {
+      if (previousRow) this.windowRows.set(row.key, previousRow); else this.windowRows.delete(row.key);
+      if (previous) this.windowDetails.set(row.key, previous); else this.windowDetails.delete(row.key);
+      throw new Error("This conversation exceeds the safe detail window size.");
+    }
+  }
+  private validateThreadPins(row: InboxWindowRow): ThreadValidation {
+    const previous = this.threadValidations.get(row.key);
+    if (previous && previous.row.revision === row.revision && previous.row.sourceGeneration === row.sourceGeneration && previous.row.contextVersion === row.contextVersion) return previous;
+    previous?.controller.abort();
+    const epoch = this.windowEpoch, generation = this.generation, controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, this.windowController.signal, this.controller.signal, this.applicationScope.signal]);
+    const job: ThreadValidation = { row, controller, promise: Promise.resolve({ summaries: [] }) };
+    this.threadValidations.set(row.key, job);
+    job.promise = this.threadValidationQueue.then(async () => {
+      const summaries = new Map<string, MailboxMessageSummary>(), attempted = new Set<string>(); let error: string | undefined;
+      const check = () => {
+        this.windowCheck(epoch, generation); signal.throwIfAborted();
+        const current = this.windowRows.get(row.key);
+        if (this.threadValidations.get(row.key) !== job || !current || current.sourceGeneration !== row.sourceGeneration || current.revision > row.revision
+          || this.sourceAccounts.find(source => source.id === row.sourceId)?.generation !== row.sourceGeneration)
+          throw new DOMException("Conversation changed", "AbortError");
+      };
+      const boxes = new Set(row.mail.account === UNIFIED_ACCOUNT ? this.unifiedMailboxIds() : [row.mail.account]);
+      const worker = async () => {
+        for (;;) {
+          check();
+          const next = [...(this.threadMessagePins.get(row.key) ?? [])].find(([id]) => !attempted.has(id));
+          if (!next) return;
+          const [id, mailboxId] = next; attempted.add(id);
+          try {
+            const summary = row.summaries.find(summary => summary.id === id) ?? await this.client.mailboxMessageSummary(mailboxId, id, { signal });
+            check();
+            if (!this.threadMessagePins.get(row.key)?.has(id)) continue;
+            const memberships = summary.memberships.filter(state => boxes.has(state.mailboxId));
+            if (summary.id !== id || summary.sourceId !== row.sourceId || summary.threadId !== row.threadId || !memberships.some(state => state.mailboxId === mailboxId))
+              throw new Error("This message is no longer in the selected conversation.");
+            summaries.set(id, { ...summary, memberships });
+          } catch (cause) {
+            check();
+            if (this.threadMessagePins.get(row.key)?.has(id)) { this.threadMessagePins.get(row.key)!.delete(id); error = failureMessage(cause); }
+          }
+        }
+      };
+      const results = await Promise.allSettled(Array.from({ length: 4 }, worker));
+      const failed = results.find(result => result.status === "rejected" && !(result.reason instanceof DOMException && result.reason.name === "AbortError"));
+      if (failed?.status === "rejected") throw failed.reason;
+      return { summaries: [...summaries.values()].filter(summary => this.threadMessagePins.get(row.key)?.has(summary.id)), error };
+    });
+    // At most four metadata-only reads across all affected readers, with no automatic retry.
+    this.threadValidationQueue = job.promise.catch(() => {});
+    return job;
+  }
   private pinnedWindowKeys() { return new Set([...this.windowPins.values()].flatMap(ids => [...ids])); }
   pinWindow = (owner: string, ids: readonly string[], projections: readonly Mail[] = []) => {
     if (ids.length > INBOX_LOOKUP_LIMIT) throw new Error("Too many conversations are pinned. Finish the current action first.");
+    if (owner === "reader") for (const id of this.threadMessagePins.keys()) if (!ids.includes(id)) this.clearThreadMessagePins(id);
     if (ids.length) {
       this.windowPins.set(owner, new Set(ids));
       this.windowPinnedBytes.set(owner, new TextEncoder().encode(JSON.stringify(projections)).length * 2);
@@ -385,12 +489,13 @@ export class InboxStore {
     const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length * 2;
     const resident = new Map(this.state.mail.filter(mail => this.windowRows.has(mail.id)).map(mail => [mail.id, mail]));
     for (const row of this.windowRows.values()) if (!resident.has(row.key)) resident.set(row.key, row.mail);
-    return size([...this.windowRows.values()]) + size([...resident.values()]) + size([...this.windowDetails.values()]) + size([...this.details.values()]) + [...this.windowPinnedBytes.values()].reduce((sum, value) => sum + value, 0);
+    return size([...this.windowRows.values()]) + size([...resident.values()]) + size([...this.windowDetails.values()]) + size([...this.details.values()])
+      + size([...this.threadMessagePins].map(([id, pins]) => [id, [...pins]])) + [...this.windowPinnedBytes.values()].reduce((sum, value) => sum + value, 0);
   }
   private trimWindow(keys: string[], evict: "start" | "end" = "start"): string[] {
     const pins = this.pinnedWindowKeys();
     const active = new Set(keys);
-    for (const id of this.windowRows.keys()) if (!active.has(id) && !pins.has(id)) { this.windowRows.delete(id); this.windowDetails.delete(id); }
+    for (const id of this.windowRows.keys()) if (!active.has(id) && !pins.has(id)) { this.windowRows.delete(id); this.windowDetails.delete(id); this.clearThreadMessagePins(id); }
     // Body eviction is not metadata deletion and never drops command intent/fences.
     while (this.details.size && this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT / 2) this.details.delete(this.details.keys().next().value!);
     while (this.windowRows.size > INBOX_WINDOW_LIMIT || this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) {
@@ -398,7 +503,7 @@ export class InboxStore {
       const id = candidates.find(id => active.has(id) && this.windowRows.has(id));
       if (!id) throw new Error("Pinned conversations exceed the safe window size. Close a reader before loading more.");
       active.delete(id);
-      if (!pins.has(id)) { this.windowRows.delete(id); this.windowDetails.delete(id); }
+      if (!pins.has(id)) { this.windowRows.delete(id); this.windowDetails.delete(id); this.clearThreadMessagePins(id); }
     }
     for (const key of this.windowBoundaryCursors.keys()) if (!this.windowRows.has(key)) this.windowBoundaryCursors.delete(key);
     this.knownThreads = new Set([...this.windowRows.values()].map(row => nativeKey(row.sourceId, row.threadId)));
@@ -406,22 +511,46 @@ export class InboxStore {
     for (const key of this.aiDecisions.keys()) if (!this.knownThreads.has(key)) this.aiDecisions.delete(key);
     return keys.filter(id => active.has(id) && this.windowRows.has(id));
   }
-  private receiveWindowRows(rows: InboxWindowRow[], epoch = this.flagEpoch) {
+  private async receiveWindowRows(rows: InboxWindowRow[], epoch = this.flagEpoch, changed = new Set<string>()) {
     if (rows.length > INBOX_PAGE_LIMIT) throw new Error("The host returned an oversized inbox page.");
+    const windowEpoch = this.windowEpoch, generation = this.generation, received = new Set<string>();
     for (const row of rows) {
-      const previous = this.windowRows.get(row.key);
+      this.windowCheck(windowEpoch, generation);
+      const stamp = `${row.key}\0${row.sourceGeneration}\0${row.revision}\0${row.contextVersion}`;
+      const previous = this.windowRows.get(row.key), pending = this.threadValidations.get(row.key);
       const fence = this.windowRemovalFences.get(row.key);
       if (fence?.removed && row.revision <= fence.revision) continue;
-      if (previous && previous.sourceGeneration === row.sourceGeneration && previous.revision > row.revision) continue;
+      if (previous && previous.sourceGeneration === row.sourceGeneration && previous.revision > row.revision || pending && pending.row.sourceGeneration === row.sourceGeneration && pending.row.revision > row.revision) continue;
+      let history = this.windowDetails.get(row.key);
       if (previous && previous.sourceGeneration !== row.sourceGeneration) {
-        for (const summary of previous.summaries) this.details.delete(summary.id);
+        for (const summary of [...previous.summaries, ...(history?.summaries ?? [])]) this.details.delete(summary.id);
+        this.clearThreadMessagePins(row.key); history = undefined; this.windowDetails.delete(row.key);
         if (this.windowNewerCursor === this.windowBoundaryCursors.get(row.key)) this.windowNewerCursor = null;
         this.windowBoundaryCursors.delete(row.key);
         this.bodyEpoch++;
       }
-      if (this.windowDetails.get(row.key)?.contextVersion !== row.contextVersion) this.windowDetails.delete(row.key);
-      this.windowRows.set(row.key, row);
-      for (const summary of row.summaries) {
+      const invalid = history && history.contextVersion !== row.contextVersion || previous && previous.contextVersion !== row.contextVersion
+        || changed.has(row.key) && !received.has(stamp) && !row.messagesComplete && (row.counts.messages ?? 0) > 500;
+      if (invalid) {
+        this.threadHistoryLoads.get(row.key)?.controller.abort(); this.threadHistoryLoads.delete(row.key);
+        const hadHistory = !!history?.summaries.length || history?.truncated;
+        let refreshed: { summaries: MailboxMessageSummary[]; error?: string } = { summaries: [] };
+        if (this.threadMessagePins.get(row.key)?.size) {
+          const job = this.validateThreadPins(row);
+          refreshed = await job.promise; this.windowCheck(windowEpoch, generation);
+          if (this.threadValidations.get(row.key) !== job && this.threadMessagePins.get(row.key)?.size) continue;
+          if (this.threadValidations.get(row.key) === job) this.threadValidations.delete(row.key);
+          const current = this.windowRows.get(row.key);
+          if (current && (current.sourceGeneration !== row.sourceGeneration || current.revision > row.revision)
+            || this.sourceAccounts.find(source => source.id === row.sourceId)?.generation !== row.sourceGeneration) continue;
+        }
+        // Publish a new authority only after open identities have fresh metadata; closed history stays invalidated.
+        history = { contextVersion: row.contextVersion, summaries: refreshed.summaries, cursor: null, exhausted: row.messagesComplete,
+          truncated: hadHistory || !!refreshed.error, error: refreshed.error };
+      }
+      if (history) this.saveThreadHistory(row, history); else this.windowRows.set(row.key, row);
+      received.add(stamp);
+      for (const summary of invalid ? [...row.summaries, ...history!.summaries] : row.summaries) {
         const key = nativeKey(summary.sourceId, summary.id), old = this.messageRows.get(key);
         if (!old || summary.revision >= old.revision) this.summaryFences.set(key, { epoch, revision: summary.revision });
         for (const state of summary.memberships) {
@@ -431,13 +560,14 @@ export class InboxStore {
       }
     }
   }
-  private applyWindowPage(page: InboxWindowPage, append: boolean, query: InboxViewQuery, flagEpoch: number) {
+  private async applyWindowPage(page: InboxWindowPage, append: boolean, query: InboxViewQuery, flagEpoch: number) {
+    const epoch = this.windowEpoch, generation = this.generation, before = this.state.window;
+    if (append && before && (page.state.queryId !== before.state.queryId || page.state.scopeState !== before.state.scopeState || page.state.queryGeneration !== before.state.queryGeneration)) throw new Error("The inbox query changed. Reload this view.");
+    await this.receiveWindowRows(page.rows, flagEpoch); this.windowCheck(epoch, generation);
     const previous = this.state.window;
-    if (append && previous && (page.state.queryId !== previous.state.queryId || page.state.scopeState !== previous.state.scopeState || page.state.queryGeneration !== previous.state.queryGeneration)) throw new Error("The inbox query changed. Reload this view.");
-    this.receiveWindowRows(page.rows, flagEpoch);
     for (const row of page.rows) {
-      const cursor = row.pageCursor ?? page.nextCursor;
-      if (cursor && this.windowRows.get(row.key) === row) this.windowBoundaryCursors.set(row.key, cursor);
+      const cursor = row.pageCursor ?? page.nextCursor, current = this.windowRows.get(row.key);
+      if (cursor && current?.revision === row.revision && current.sourceGeneration === row.sourceGeneration && current.contextVersion === row.contextVersion) this.windowBoundaryCursors.set(row.key, cursor);
     }
     const combined = [...new Set([...(append ? previous?.keys ?? [] : []), ...page.rows.filter(row => row.revision > (this.windowRemovalFences.get(row.key)?.revision ?? -1)).map(row => row.key)])];
     const keys = this.trimWindow(combined), headEvicted = combined[0] !== keys[0];
@@ -459,6 +589,7 @@ export class InboxStore {
   private openWindow = (): Promise<void> => {
     const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
     this.windowController.abort(); this.windowController = new AbortController();
+    this.clearThreadMessagePins();
     this.windowPaging = undefined; this.windowChanges = undefined; this.windowReplayCheckpoint = undefined; this.windowBoundaryCursors.clear(); this.windowNewerCursor = null; this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
     const signal = AbortSignal.any([this.windowController.signal, this.controller.signal]);
     const transport = createInboxWindowTransport(() => signal, (input, init) => this.fetch(input, init));
@@ -466,7 +597,7 @@ export class InboxStore {
     const work = (async () => {
       const flagEpoch = this.flagEpoch;
       const page = await transport.query({ ...query, limit: INBOX_FIRST_PAGE_LIMIT });
-      this.windowCheck(epoch, generation); this.applyWindowPage(page, false, query, flagEpoch);
+      this.windowCheck(epoch, generation); await this.applyWindowPage(page, false, query, flagEpoch); this.windowCheck(epoch, generation);
       if (this.initialThread) {
         const id = this.initialThread; this.initialThread = null;
         this.pinWindow("reader", [id]); void this.lookupWindow([id]).catch(error => this.fail(error, "load-thread"));
@@ -493,7 +624,7 @@ export class InboxStore {
     const work = (async () => {
       const flagEpoch = this.flagEpoch;
       const page = await this.windowTransport.page({ queryId: current.state.queryId, cursor: current.nextCursor!, limit });
-      this.windowCheck(epoch, generation); this.applyWindowPage(page, true, current.query, flagEpoch);
+      this.windowCheck(epoch, generation); await this.applyWindowPage(page, true, current.query, flagEpoch);
     })().finally(() => {
       if (this.windowPaging !== work) return;
       this.windowPaging = undefined;
@@ -510,7 +641,7 @@ export class InboxStore {
     const work = (async () => {
       const flagEpoch = this.flagEpoch;
       const page = await this.windowTransport.page({ queryId: current.state.queryId, seek, limit: INBOX_PAGE_LIMIT });
-      this.windowCheck(epoch, generation); this.applyWindowPage(page, false, current.query, flagEpoch);
+      this.windowCheck(epoch, generation); await this.applyWindowPage(page, false, current.query, flagEpoch); this.windowCheck(epoch, generation);
       if (seek === "end") {
         this.windowNewerCursor = page.nextCursor;
         this.publish({ window: { ...this.state.window!, hasNewer: !page.exhausted, exhausted: true, nextCursor: null } });
@@ -533,12 +664,14 @@ export class InboxStore {
       const flagEpoch = this.flagEpoch;
       const page = await this.windowTransport.page({ queryId: current.state.queryId, cursor, direction: "newer", limit: INBOX_PAGE_LIMIT });
       this.windowCheck(epoch, generation);
+      const before = this.state.window;
+      if (!before || page.state.queryId !== before.state.queryId || page.state.scopeState !== before.state.scopeState || page.state.queryGeneration !== before.state.queryGeneration) throw new Error("The inbox query changed. Reload this view.");
+      await this.receiveWindowRows(page.rows, flagEpoch); this.windowCheck(epoch, generation);
       const latest = this.state.window;
       if (!latest || page.state.queryId !== latest.state.queryId || page.state.scopeState !== latest.state.scopeState || page.state.queryGeneration !== latest.state.queryGeneration) throw new Error("The inbox query changed. Reload this view.");
-      this.receiveWindowRows(page.rows, flagEpoch);
       for (const row of page.rows) {
-        const boundary = row.pageCursor ?? page.nextCursor;
-        if (boundary && this.windowRows.get(row.key) === row) this.windowBoundaryCursors.set(row.key, boundary);
+        const boundary = row.pageCursor ?? page.nextCursor, current = this.windowRows.get(row.key);
+        if (boundary && current?.revision === row.revision && current.sourceGeneration === row.sourceGeneration && current.contextVersion === row.contextVersion) this.windowBoundaryCursors.set(row.key, boundary);
       }
       const previousKeys = new Set(current.keys);
       const pageKeys = page.rows.filter(row => row.revision > (this.windowRemovalFences.get(row.key)?.revision ?? -1)).map(row => row.key);
@@ -574,7 +707,7 @@ export class InboxStore {
     const scope = this.state.window?.state.scopeState;
     if (scope && result.state.scopeState !== scope) throw new Error("The receiving scope changed. Reload this view.");
     if (result.entries.some(entry => entry.status === "unknown")) throw new Error("Some conversations are still being indexed. Retry when indexing finishes.");
-    this.receiveWindowRows(result.entries.flatMap(entry => entry.status === "found" ? [entry.row] : []), flagEpoch);
+    await this.receiveWindowRows(result.entries.flatMap(entry => entry.status === "found" ? [entry.row] : []), flagEpoch); this.windowCheck(epoch, generation);
     // The caller's pin controls lifetime. Lookup must not add rows to the active view.
     this.pinWindow("lookup", unique);
     try {
@@ -596,7 +729,8 @@ export class InboxStore {
     const result = await this.windowTransport.sender(input);
     this.windowCheck(epoch, generation);
     if (request !== this.windowSenderEpoch) throw new DOMException("Sender changed", "AbortError");
-    this.receiveWindowRows(result.recent, flagEpoch);
+    await this.receiveWindowRows(result.recent, flagEpoch); this.windowCheck(epoch, generation);
+    if (request !== this.windowSenderEpoch) throw new DOMException("Sender changed", "AbortError");
     this.pinWindow("sender", result.recent.map(row => row.key));
     this.windowPinnedBytes.set("sender", new TextEncoder().encode(JSON.stringify(result.recent)).length * 2);
     if (this.state.window) {
@@ -665,16 +799,12 @@ export class InboxStore {
         if (page.resetReason) { await this.openWindow(); return; }
         if (page.state.scopeState !== current.state.scopeState) { await this.openWindow(); return; }
         // A giant's bounded context hash can stay unchanged when deeper cached summaries change.
-        for (const row of page.upserts) {
-          const previous = this.windowRows.get(row.key);
-          if (!row.messagesComplete && (row.counts.messages ?? 0) > 500 &&
-            (!previous || previous.sourceGeneration !== row.sourceGeneration || previous.revision <= row.revision)) this.windowDetails.delete(row.key);
-        }
-        this.receiveWindowRows([...page.upserts, ...page.newHead], flagEpoch);
+        await this.receiveWindowRows([...page.upserts, ...page.newHead], flagEpoch, new Set(page.upserts.map(row => row.key)));
+        this.windowCheck(epoch, generation);
         const removed = new Set(page.removed.map(row => row.key));
         for (const row of page.removed) this.windowRemovalFences.set(row.key, { revision: page.throughRevision, removed: row.reason !== "not-matching" });
         while (this.windowRemovalFences.size > INBOX_WINDOW_LIMIT) this.windowRemovalFences.delete(this.windowRemovalFences.keys().next().value!);
-        for (const item of page.removed) if (item.reason === "deleted" || item.reason === "unselected") { this.windowRows.delete(item.key); this.windowDetails.delete(item.key); }
+        for (const item of page.removed) if (item.reason === "deleted" || item.reason === "unselected") { this.windowRows.delete(item.key); this.windowDetails.delete(item.key); this.clearThreadMessagePins(item.key); }
         const latest = this.state.window!;
         for (const row of page.newHead) heads.add(row.key);
         const keys = this.trimWindow([...new Set([...page.newHead.map(row => row.key), ...latest.keys.filter(key => !removed.has(key))])]);
@@ -1128,7 +1258,7 @@ export class InboxStore {
     })();
     return () => {
       window.removeEventListener("focus", onFocus);
-      this.started = false; this.generation++; this.controller.abort();
+      this.started = false; this.generation++; this.controller.abort(); this.clearThreadMessagePins();
       this.client.clearCache();
       clearTimeout(this.refreshTimer);
       clearTimeout(this.aiPollTimer); clearTimeout(this.aiHoldTimer); this.aiPollPromise = undefined; this.aiHolds.clear();
@@ -1681,17 +1811,13 @@ export class InboxStore {
   }
   private rebuildWindow() {
     const calendar = displayTimes(); this.calendarKey = calendar.key;
-    const rows = [...this.windowRows.values()];
+    const rows = [...this.windowRows.values()], retained = new Map(rows.map(row => [row.key, this.threadSummaries(row).summaries]));
     const summaries = new Map<string, MailboxMessageSummary>();
-    for (const row of rows) {
-      const expanded = this.windowDetails.get(row.key)?.summaries, retained = expanded && new Set(expanded.map(summary => summary.id));
-      // Refresh retained detail state without widening a giant's moving history window.
-      for (const summary of expanded ? [...expanded, ...row.summaries.filter(summary => retained!.has(summary.id))] : row.summaries) {
-        const key = nativeKey(summary.sourceId, summary.id), previous = summaries.get(key);
-        const memberships = new Map((previous?.memberships ?? []).map(state => [state.mailboxId, state]));
-        for (const state of summary.memberships) if (state.revision >= (memberships.get(state.mailboxId)?.revision ?? 0)) memberships.set(state.mailboxId, state);
-        summaries.set(key, { ...(previous && previous.revision > summary.revision ? previous : summary), memberships: [...memberships.values()] });
-      }
+    for (const row of rows) for (const summary of retained.get(row.key)!) {
+      const key = nativeKey(summary.sourceId, summary.id), previous = summaries.get(key);
+      const memberships = new Map((previous?.memberships ?? []).map(state => [state.mailboxId, state]));
+      for (const state of summary.memberships) if (state.revision >= (memberships.get(state.mailboxId)?.revision ?? 0)) memberships.set(state.mailboxId, state);
+      summaries.set(key, { ...(previous && previous.revision > summary.revision ? previous : summary), memberships: [...memberships.values()] });
     }
     this.messageRows = summaries;
     const attachmentIds = new Set([...this.rawDrafts.values()].flatMap(draft => draft.attachmentIds));
@@ -1711,11 +1837,13 @@ export class InboxStore {
     const byId = new Map(projected.mail.map(mail => [mail.id, mail])), previous = new Map(this.state.mail.map(mail => [mail.id, mail]));
     const mail = rows.map(row => {
       const local = byId.get(row.key), detail = this.windowDetails.get(row.key), provenance = this.rowProvenance(row);
-      if (detail?.exhausted && row.counts.messages === detail.summaries.length) { provenance.messagesComplete = true; provenance.actionContextComplete = row.targetsComplete; }
+      const ids = new Set(retained.get(row.key)!.map(summary => summary.id));
+      if (detail?.exhausted && row.counts.messages === ids.size) { provenance.messagesComplete = true; provenance.actionContextComplete = row.targetsComplete; }
       // Whole-conversation aggregate/provenance always wins over partial projected metadata.
       const time = Number.isFinite(row.mail.receivedAt) ? calendar.format(new Date(row.mail.receivedAt!).toISOString()) : { date: row.mail.date, group: row.mail.group };
-      let next: Mail = { ...row.mail, ...time, messages: local?.messages ?? row.mail.messages, window: provenance,
-        hasAttachments: row.mail.hasAttachments ?? (row.messagesComplete ? row.mail.messages.some(message => message.hasAttachments) : undefined), historyExhausted: detail?.exhausted ?? row.messagesComplete };
+      let next: Mail = { ...row.mail, ...time, messages: local?.messages.filter(message => ids.has(message.id)) ?? row.mail.messages, window: provenance,
+        hasAttachments: row.mail.hasAttachments ?? (row.messagesComplete ? row.mail.messages.some(message => message.hasAttachments) : undefined), historyExhausted: detail?.exhausted ?? row.messagesComplete,
+        historyTruncated: detail?.truncated || undefined, historyError: detail?.error };
       const overlay = row.summaries.some(summary => this.projectFlags(summary) !== summary);
       if (overlay && local) {
         if (provenance.messagesComplete) next = { ...next, unread: local.unread, starred: local.starred, folder: local.folder, locations: local.locations, reminder: local.reminder, reminderAt: local.reminderAt };
@@ -1944,23 +2072,41 @@ export class InboxStore {
     return detail.revision >= row.revision ? detail : undefined;
   }
 
-  loadMoreMessages = async (id: string): Promise<void> => {
-    const row = this.windowRows.get(id);
-    if (!row || row.messagesComplete || this.windowDetails.get(id)?.exhausted) return;
-    const epoch = this.windowEpoch, generation = this.generation, previous = this.windowDetails.get(id);
-    const page = await this.windowTransport.messages({ account: row.mail.account, id, cursor: previous?.cursor ?? undefined, limit: 100 });
-    this.windowCheck(epoch, generation);
-    const current = this.windowRows.get(id);
-    if (!current || current.sourceGeneration !== row.sourceGeneration || current.contextVersion !== row.contextVersion ||
-      (row.counts.messages ?? 0) > 500 && current.revision !== row.revision) return;
-    if (page.contextVersion !== current.contextVersion) throw new Error("The conversation changed. Reload before loading more messages.");
-    const summaries = [...new Map([...(previous?.summaries ?? current.summaries), ...page.summaries].map(summary => [summary.id, summary])).values()];
-    // Long history is a moving detail window, not an accidental 100k-message graph.
-    this.windowDetails.set(id, { contextVersion: page.contextVersion, summaries: summaries.slice(-500), cursor: page.nextCursor,
-      exhausted: page.exhausted });
-    if (this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) { this.windowDetails.delete(id); throw new Error("This conversation exceeds the safe detail window size."); }
-    this.rebuild();
-  };
+  loadMoreMessages = (id: string): Promise<void> => this.loadThreadHistory(id, false);
+  resetThreadHistory = (id: string): Promise<void> => this.loadThreadHistory(id, true);
+  private loadThreadHistory(id: string, reset: boolean): Promise<void> {
+    const pending = this.threadHistoryLoads.get(id);
+    if (pending && !reset) return pending.promise;
+    const row = this.windowRows.get(id), previous = this.windowDetails.get(id);
+    if (!row || !reset && (row.messagesComplete || previous?.exhausted)) return Promise.resolve();
+    if (this.threadValidations.has(id)) return Promise.reject(new Error("Conversation context is refreshing. Try again after it settles."));
+    const protectedIds = new Set([...(this.threadMessagePins.get(id)?.keys() ?? []), ...row.summaries.map(summary => summary.id)]);
+    if (protectedIds.size >= 500) return Promise.reject(new Error("Collapse messages to load more history."));
+    pending?.controller.abort();
+    const epoch = this.windowEpoch, generation = this.generation, controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, this.windowController.signal, this.controller.signal, this.applicationScope.signal]);
+    const transport = createInboxWindowTransport(() => signal, (input, init) => this.fetch(input, init));
+    const job = { controller, promise: Promise.resolve() }; this.threadHistoryLoads.set(id, job);
+    job.promise = (async () => {
+      this.windowCheck(epoch, generation); signal.throwIfAborted();
+      const page = await transport.messages({ account: row.mail.account, id, cursor: reset ? undefined : previous?.cursor ?? undefined, limit: 100 });
+      this.windowCheck(epoch, generation);
+      if (this.threadHistoryLoads.get(id) !== job || this.threadValidations.has(id)) return;
+      const current = this.windowRows.get(id);
+      if (!current || current.sourceGeneration !== row.sourceGeneration || current.contextVersion !== row.contextVersion ||
+        (row.counts.messages ?? 0) > 500 && current.revision !== row.revision) return;
+      if (page.contextVersion !== current.contextVersion) throw new Error("The conversation changed. Reload before loading more messages.");
+      const history = this.windowDetails.get(id), pins = this.threadMessagePins.get(id);
+      const retained = reset ? this.threadSummaries(current).summaries.filter(summary => pins?.has(summary.id)) : history?.summaries ?? [];
+      this.saveThreadHistory(current, { contextVersion: page.contextVersion, summaries: [...retained, ...page.summaries], cursor: page.nextCursor,
+        exhausted: page.exhausted, truncated: !reset && history?.truncated });
+      this.rebuild();
+    })().catch(error => {
+      if (controller.signal.aborted && epoch === this.windowEpoch && generation === this.generation) return;
+      throw error;
+    }).finally(() => { if (this.threadHistoryLoads.get(id) === job) this.threadHistoryLoads.delete(id); });
+    return job.promise;
+  }
   prepareActionContext = (mails: Mail[]) => this.completeActionContext(mails);
   private completeActionContext = async (mails: Mail[]): Promise<Mail[]> => {
     const completed: Mail[] = [];

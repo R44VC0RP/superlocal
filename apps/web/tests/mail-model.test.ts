@@ -2720,7 +2720,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
     for (let attempt = 0; attempt < 300 && !check(); attempt++) await sleep(5);
     assert.ok(check(), message);
   };
-  let store: InstanceType<typeof InboxStore>, stop: (() => void) | undefined, releaseQuery: (() => void) | undefined, releaseReverse: (() => void) | undefined, releaseHistory: (() => void) | undefined, releaseChanges: (() => void) | undefined, releaseReader: (() => void) | undefined;
+  let store: InstanceType<typeof InboxStore>, stop: (() => void) | undefined, releaseQuery: (() => void) | undefined, releaseReverse: (() => void) | undefined, releaseHistory: (() => void) | undefined, releaseChanges: (() => void) | undefined, releaseReader: (() => void) | undefined, releasePinnedReads: (() => void) | undefined;
   let renderedAi: AiTriageState | null = null, renderedAiError: string | null = "Saved sorting diagnostics are unavailable.";
   try {
     console.info = () => {}; console.warn = () => {};
@@ -2743,6 +2743,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       let detailRead: ((input: MessagesInput) => MessagesPage | Promise<MessagesPage>) | undefined;
       let lookupRead: ((ids: string[]) => Row[]) | undefined;
       let bodyRead: ((id: string) => import("inbox-sdk/types").Message | Promise<import("inbox-sdk/types").Message>) | undefined;
+      let summaryRead: ((id: string, signal: AbortSignal) => Promise<import("inbox-sdk/types").MailboxMessageSummary | Response>) | undefined;
       let senderRead: ((input: SenderInput) => SenderResult) | undefined;
       let signedState = name === "full";
       const readCursors = new Map<string, string | undefined>();
@@ -2794,6 +2795,10 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         }
         if (url.pathname === "/host/inbox/messages" && detailRead) return Response.json(await detailRead(JSON.parse(String(init?.body))));
         if (url.pathname === "/host/inbox/lookup" && lookupRead) return Response.json({ state: state(), entries: lookupRead(JSON.parse(String(init?.body)).ids).map(row => ({ key: row.key, status: "found", row })) });
+        if (url.pathname.startsWith(`/v1/mailboxes/${box.id}/messages/`) && url.pathname.endsWith("/summary") && summaryRead) {
+          const result = await summaryRead(decodeURIComponent(url.pathname.split("/").at(-2)!), init!.signal!);
+          return result instanceof Response ? result : Response.json(result);
+        }
         if (url.pathname.startsWith(`/v1/mailboxes/${box.id}/messages/`) && bodyRead) return Response.json(await bodyRead(decodeURIComponent(url.pathname.split("/").at(-1)!)));
         if (url.pathname === "/host/inbox/sender" && senderRead) return Response.json(senderRead(JSON.parse(String(init?.body))));
         if (["/host/inbox/zero/create", "/host/inbox/selection/create"].includes(url.pathname)) {
@@ -3294,8 +3299,149 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           for (let page = 0; page < 7; page++) await store.loadMoreMessages(giantKey);
           const movedHistory = store.getSnapshot().mail.find(mail => mail.id === giantKey)!;
           assert.equal(movedHistory.historyExhausted, true); assert.equal(movedHistory.messages.length, 500);
-          assert.ok(!movedHistory.messages.some(message => message.id === "giant-700"), "merging current preview flags never reintroduces evicted history identities");
+          assert.ok(movedHistory.messages.some(message => message.id === "giant-700"), "canonical anchors now share, rather than extend, the 500-summary budget");
           assert.equal(bodyReads.length, readsBeforeDeepWindow); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+
+          const deepKey = `${box.id}:deep620`, latestId = "deep620-620", oldId = "deep620-20", draftOrigin = "deep620-400";
+          let deepCount = 620, deepRowRevision = revision, oldRevision = 1, oldBodyRevision = 1, missingOld = false;
+          const deepSummary = (index: number): Summary => ({ ...summary(index, "deep620"), revision: index === 20 ? oldRevision : 1,
+            bodyRevision: index === 20 ? `deep-body-${oldBodyRevision}` : `body-deep620-${index}`,
+            isRead: index === 20 && oldRevision > 1, isStarred: index === 20 && oldRevision > 1 });
+          const deepRow = (): Row => {
+            const preview = Array.from({ length: 50 }, (_, i) => deepSummary(deepCount - 49 + i));
+            return { ...giantRow(), key: deepKey, threadId: "deep620", revision: deepRowRevision, mail: projected(preview), summaries: preview,
+              counts: { messages: deepCount, memberships: deepCount, unread: null, done: 0, snoozed: 1 }, contextVersion: `deep-context-${deepCount}`,
+              targets: Array.from({ length: 500 }, (_, i) => ({ mailboxId: box.id, messageId: `deep620-${deepCount - i}`, revision: 1, messageRevision: 1 })) };
+          };
+          const deepPages: MessagesInput[] = [], metadataReads: string[] = [], metadataSignals: AbortSignal[] = [];
+          let metadataActive = 0, metadataMax = 0, metadataGate: Promise<void> | undefined;
+          detailRead = async input => {
+            assert.equal(input.id, deepKey); assert.equal(input.limit, 100); deepPages.push(structuredClone(input));
+            const offset = input.cursor ? Number(input.cursor.slice("deep-".length)) : 0;
+            const end = deepCount - offset, start = Math.max(1, end - 99);
+            return { state: state(), key: deepKey, contextVersion: `deep-context-${deepCount}`, total: deepCount, messages: [],
+              summaries: Array.from({ length: end - start + 1 }, (_, i) => deepSummary(start + i)), nextCursor: start > 1 ? `deep-${offset + 100}` : null, exhausted: start === 1 };
+          };
+          summaryRead = async (id, signal) => {
+            assert.ok(id.startsWith("deep620-")); metadataReads.push(id); metadataSignals.push(signal);
+            metadataActive++; metadataMax = Math.max(metadataMax, metadataActive);
+            try {
+              if (metadataGate) await metadataGate;
+              return id === oldId && missingOld ? Response.json({ code: "NOT_FOUND", error: "Message is not in this mailbox." }, { status: 404 })
+                : deepSummary(Number(id.slice("deep620-".length)));
+            } finally { metadataActive--; }
+          };
+          bodyRead = id => {
+            assert.ok([latestId, oldId, draftOrigin].includes(id)); bodyReads.push(id);
+            const value = deepSummary(Number(id.slice("deep620-".length)));
+            return { ...value, bcc: [], snoozedUntil: null, attachments: [], bodyFormat: "text", bodyHtml: `<p>${id}:${value.bodyRevision}</p>`, bodyText: `${id}:${value.bodyRevision}` };
+          };
+          reversePage = () => ({ state: state(), totals, rows: [deepRow(), companionRow], nextCursor: null, exhausted: true });
+          await store.seekWindow("start"); store.pinWindow("reader", [deepKey]);
+          const deepCompanion = store.getSnapshot().mail.find(mail => mail.id === companionRow.key)!;
+          const deepMail = () => store.getSnapshot().mail.find(mail => mail.id === deepKey)!;
+          await store.loadThread(deepKey); store.pinThreadMessages(deepKey, [latestId, oldId]);
+          const latestBody = deepMail().messages.at(-1)!.body, readerBodyReads = bodyReads.length;
+          for (let page = 0; page < 7; page++) {
+            await store.loadMoreMessages(deepKey);
+            if (page === 2) store.pinThreadMessages(deepKey, [latestId, draftOrigin]);
+            assert.equal(deepMail().messages.at(-1)!.id, latestId, "metadata paging cannot switch App/SenderContext's default latest message");
+            assert.equal(deepMail().messages.at(-1)!.body, latestBody); assert.ok(deepMail().messages.length <= 500);
+            const model = store.getSnapshot().mail; await store.loadThread(deepKey);
+            assert.strictEqual(store.getSnapshot().mail, model); assert.equal(bodyReads.length, readerBodyReads);
+          }
+          assert.equal(deepPages.length, 7); assert.equal(deepMail().historyExhausted, true); assert.equal(deepMail().messages.length, 500);
+          assert.equal(deepMail().window!.messagesComplete, false); assert.equal(deepMail().window!.actionContextComplete, false);
+          assert.ok(deepMail().messages.some(message => message.id === draftOrigin)); assert.ok(!deepMail().messages.some(message => message.id === "deep620-550"));
+          assert.equal(deepMail().historyTruncated, true); assert.equal(metadataReads.length, 0, "pinning and paging alone do not fetch metadata per message");
+          await assert.rejects(store.action([deepMail()], "done"), /exceeds 500/);
+          const previousHash = location.hash; location.hash = `#/account=${box.id}&folder=Sent&split=Important&thread=${deepKey}`;
+          assert.match(render(), />Show recent messages<\/button>/); location.hash = previousHash;
+          await store.loadThread(deepKey, oldId); await store.loadThread(deepKey, draftOrigin);
+          store.pinThreadMessages(deepKey, [latestId, oldId, draftOrigin]);
+          const loadedBodies = bodyReads.length, oldBody = deepMail().messages.find(message => message.id === oldId)!.body;
+          await store.resetThreadHistory(deepKey);
+          assert.equal(deepPages.at(-1)!.cursor, undefined); assert.equal(deepMail().historyTruncated, undefined); assert.equal(deepMail().historyExhausted, false);
+          assert.ok(deepMail().messages.some(message => message.id === "deep620-550")); assert.equal(deepMail().messages.length, 102);
+          assert.equal(deepMail().messages.find(message => message.id === oldId)!.body, oldBody);
+          assert.equal(deepMail().messages.find(message => message.id === draftOrigin)!.loaded, true); assert.equal(bodyReads.length, loadedBodies);
+          location.hash = `#/account=${box.id}&folder=Sent&split=Important&thread=${deepKey}`;
+          assert.doesNotMatch(render(), />Show recent messages<\/button>/); location.hash = previousHash;
+
+          const expanded = deepMail().messages.map(message => message.id); assert.ok(expanded.length > 32);
+          store.pinThreadMessages(deepKey, expanded);
+          for (let page = 0; page < 4; page++) await store.loadMoreMessages(deepKey);
+          assert.ok(expanded.every(id => deepMail().messages.some(message => message.id === id)), "Expand all protects every resident card, not an artificial 32-pin subset");
+          assert.equal(deepMail().messages.length, 500);
+          store.pinThreadMessages(deepKey, deepMail().messages.map(message => message.id));
+          const beforeCapacity = deepPages.length, capacityMail = store.getSnapshot().mail;
+          await assert.rejects(store.loadMoreMessages(deepKey), /Collapse messages to load more history\./);
+          await assert.rejects(store.resetThreadHistory(deepKey), /Collapse messages to load more history\./);
+          assert.equal(deepPages.length, beforeCapacity); assert.strictEqual(store.getSnapshot().mail, capacityMail);
+          store.pinThreadMessages(deepKey, [latestId, oldId, draftOrigin]); await store.loadMoreMessages(deepKey);
+          assert.equal(deepPages.at(-1)!.cursor, "deep-500", "a capacity refusal consumes no older cursor");
+          await store.loadMoreMessages(deepKey); assert.equal(deepMail().historyExhausted, true); assert.equal(bodyReads.length, loadedBodies);
+
+          oldRevision = 2; deepRowRevision = revision + 1;
+          const missingPinned: string[] = [], watchPins = store.subscribe(() => {
+            const current = deepMail(); if (current) for (const id of [latestId, oldId, draftOrigin]) if (!current.messages.some(message => message.id === id)) missingPinned.push(id);
+          });
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; await store.retry(); watchPins();
+          assert.deepEqual(new Set(metadataReads), new Set([oldId, draftOrigin])); assert.deepEqual(missingPinned, []);
+          assert.equal(deepMail().messages.length, 52, "a changed giant discards closed history but atomically retains freshly validated open identities");
+          assert.equal(deepMail().messages.find(message => message.id === oldId)!.isRead, true); assert.equal(deepMail().messages.find(message => message.id === oldId)!.isStarred, true);
+          assert.equal(deepMail().messages.find(message => message.id === oldId)!.body, oldBody); assert.equal(bodyReads.length, loadedBodies);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), deepCompanion);
+
+          await store.resetThreadHistory(deepKey);
+          store.pinThreadMessages(deepKey, [latestId, oldId, draftOrigin, ...Array.from({ length: 40 }, (_, i) => `deep620-${530 + i}`)]);
+          metadataGate = new Promise<void>(resolve => { releasePinnedReads = resolve; });
+          const beforeValidation = metadataReads.length; deepRowRevision = revision + 1;
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; const validating = store.retry();
+          await until(() => metadataReads.length === beforeValidation + 4, "only four open-summary metadata reads may be in flight");
+          assert.equal(metadataActive, 4); metadataGate = undefined; releasePinnedReads!(); releasePinnedReads = undefined; await validating;
+          assert.equal(metadataReads.length - beforeValidation, 42); assert.equal(metadataMax, 4); assert.equal(bodyReads.length, loadedBodies);
+
+          store.pinThreadMessages(deepKey, [latestId, oldId, draftOrigin]);
+          oldRevision = 3; oldBodyRevision = 2; deepRowRevision = revision + 1;
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; await store.retry();
+          assert.equal(deepMail().messages.find(message => message.id === oldId)!.loaded, false, "a changed body identity never reuses the old cached body");
+          assert.equal(bodyReads.length, loadedBodies); await store.loadThread(deepKey, oldId);
+          assert.equal(bodyReads.length, loadedBodies + 1); assert.match(deepMail().messages.find(message => message.id === oldId)!.body, /deep-body-2/);
+          const cached = store.getSnapshot().mail; await store.loadThread(deepKey, oldId); await store.loadThread(deepKey);
+          assert.strictEqual(store.getSnapshot().mail, cached); assert.equal(bodyReads.length, loadedBodies + 1);
+
+          missingOld = true; deepRowRevision = revision + 1;
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; await store.retry();
+          assert.ok(!deepMail().messages.some(message => message.id === oldId)); assert.match(deepMail().historyError!, /not in this mailbox/);
+          assert.equal(deepMail().messages.at(-1)!.id, latestId);
+          const afterMissing = metadataReads.length; await store.retry(); assert.equal(metadataReads.length, afterMissing, "a failed pin is not automatically retried or restored as authority");
+          missingOld = false;
+          await store.resetThreadHistory(deepKey); for (let page = 0; page < 4; page++) await store.loadMoreMessages(deepKey);
+          store.pinThreadMessages(deepKey, deepMail().messages.map(message => message.id));
+          const fullyPinned = new Set(deepMail().messages.map(message => message.id)); assert.equal(fullyPinned.size, 500);
+          deepCount = 621; deepRowRevision = revision + 1;
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; await store.retry();
+          assert.deepEqual(new Set(deepMail().messages.map(message => message.id)), fullyPinned, "a fresh arrival cannot evict any of 500 explicitly open cards");
+          assert.equal(deepMail().messages.length, 500); assert.equal(deepMail().historyTruncated, true); assert.ok(metadataMax <= 4);
+          assert.ok(!deepMail().messages.some(message => message.id === "deep620-621")); assert.equal(bodyReads.length, loadedBodies + 1);
+          store.pinThreadMessages(deepKey, [latestId, draftOrigin]);
+          await store.resetThreadHistory(deepKey); assert.ok(deepMail().messages.some(message => message.id === "deep620-621"));
+
+          metadataGate = new Promise<void>(resolve => { releasePinnedReads = resolve; });
+          const beforeLate = metadataReads.length; deepRowRevision = revision + 1;
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; const lateValidation = store.retry();
+          await until(() => metadataReads.length > beforeLate, "old-view pinned validation is held");
+          const lateSignal = metadataSignals.at(-1)!;
+          store.pinThreadMessages(deepKey, []); store.pinWindow("reader", []); reversePage = undefined;
+          await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Trash" });
+          await until(() => !store.getSnapshot().window!.paging, "the replacement view has its bounded initial buffer");
+          const replacement = store.getSnapshot().mail, sentBeforeRelease = metadataReads.length;
+          metadataGate = undefined; releasePinnedReads!(); releasePinnedReads = undefined; await lateValidation;
+          assert.equal(lateSignal.aborted, true); assert.equal(metadataReads.length, sentBeforeRelease);
+          assert.strictEqual(store.getSnapshot().mail, replacement); assert.ok(!store.getSnapshot().mail.some(mail => mail.id === deepKey));
+          assert.equal(bodyReads.length, loadedBodies + 1); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+          store.pinWindow("reader", []);
         }
         if (name === "sparse") {
           holdQuery = true;
@@ -3321,7 +3467,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       await sleep(0);
     }
   } finally {
-    releaseReader?.(); releaseChanges?.(); releaseHistory?.(); releaseReverse?.(); releaseQuery?.(); stop?.(); mock.restore(); globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    releasePinnedReads?.(); releaseReader?.(); releaseChanges?.(); releaseHistory?.(); releaseReverse?.(); releaseQuery?.(); stop?.(); mock.restore(); globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
     for (const [key, descriptor] of globals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); }
   }
 });
@@ -3385,6 +3531,7 @@ test("host-service-backed bounded startup pages, lookup and search without brows
       localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
     });
     let inventories = 0, pages = 0, bodyReads = 0, queries = 0, lookups = 0, detailPages = 0;
+    const pinnedMetadataReads: string[] = [];
     const nativeWrites: Array<{ input: import("inbox-sdk/types").MutationInput; operation: import("inbox-sdk/types").Operation }> = [];
     const observedFlags = new Set<string>(), feedbackRequests: Array<{ id: string; targets: import("../src/host.ts").AttentionFeedbackTarget[] }> = [];
     const feedbackReplies: Array<{ status: number; code?: string }> = [];
@@ -3444,10 +3591,11 @@ test("host-service-backed bounded startup pages, lookup and search without brows
         }
       }
       if (url.pathname.includes("mailbox-snapshot") || url.pathname === "/v1/mailbox-messages") inventories++;
-      if (/\/messages\//.test(url.pathname)) bodyReads++;
+      if (/\/messages\/[^/]+$/.test(url.pathname)) bodyReads++;
       if (url.pathname === "/v1/events") return new Promise<Response>((_resolve, reject) => {
         const abort = () => reject(new DOMException("Stopped", "AbortError")); if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
       });
+      if (/^\/v1\/mailboxes\/[^/]+\/messages\/[^/]+\/summary$/.test(url.pathname)) pinnedMetadataReads.push(decodeURIComponent(url.pathname.split("/").at(-2)!));
       const headers = new Headers(init?.headers); headers.set("Authorization", `Bearer ${token}`);
       const response = await host.fetch(new Request(url, { ...init, headers }));
       if (url.pathname === "/v1/operations" && init?.method === "POST" && response.ok)
@@ -3704,7 +3852,71 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     assert.equal(restoredOlder.retracted, true); assert.equal(restoredOlder.states.filter(state => state.done).length, 119);
     assert.equal((await host.inbox.mailboxStateReceipt(host.owner, preparation.id)).retracted, false);
     assert.equal(bodyReads, loadedBodies); assert.equal(inventories, 0);
-    store.pinWindow("reader", []); store.pinWindow("draft:long-guard", []);
+    store.pinWindow("reader", []); store.pinWindow("draft:long-guard", []); store.pinWindow("draft:deep-guard", [unaffected.id]);
+
+    const deepSubject = "Deep reader retention fixture", deepAt = Date.now();
+    let deepNative: ReturnType<typeof host.store.receive> | undefined;
+    for (let index = 0; index < 620; index++) {
+      const received = host.store.receive(source, { from: "deep-retention@example.test", to: nativeBox.email, subject: deepSubject,
+        threadId: deepNative?.threadId, receivedAt: new Date(deepAt - (619 - index) * 1000).toISOString(), isRead: true,
+        text: `DEEP-RETENTION-${index + 1}` });
+      deepNative ??= received;
+    }
+    more = true; while (more) more = (await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 })).hasMore;
+    const deepSummaries: import("inbox-sdk/types").MailboxMessageSummary[] = []; let deepCursor: string | undefined;
+    do {
+      const page = await host.inbox.mailboxMessages(host.owner, { mailboxIds: [box.id], search: `subject:"${deepSubject}"`, limit: 100, cursor: deepCursor });
+      deepSummaries.push(...page.items); deepCursor = page.nextCursor ?? undefined;
+    } while (deepCursor);
+    deepSummaries.sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)); assert.equal(new Set(deepSummaries.map(summary => summary.id)).size, 620);
+    const newestDeep = deepSummaries[0], oldDeep = deepSummaries[600], replyOrigin = deepSummaries[220], missingRecent = deepSummaries[70];
+    const deepKey = `${box.id}:${newestDeep.threadId}`, deepMail = () => store.getSnapshot().mail.find(mail => mail.id === deepKey)!;
+    store.pinWindow("reader", [deepKey]);
+    await store.setWindowQuery({ ...query, search: true, query: `subject:"${deepSubject}"` });
+    await store.loadThread(deepKey); store.pinThreadMessages(deepKey, [newestDeep.id]);
+    const initialDeepPages = detailPages, loadedNewest = deepMail().messages.at(-1)!, deepBodyReads = bodyReads;
+    assert.match(loadedNewest.bodyText!, /DEEP-RETENTION-620/);
+    for (let page = 0; page < 7; page++) {
+      await store.loadMoreMessages(deepKey);
+      if (page === 2) store.pinThreadMessages(deepKey, [newestDeep.id, replyOrigin.id]);
+      assert.equal(deepMail().messages.at(-1)!.id, newestDeep.id); assert.equal(deepMail().messages.at(-1)!.body, loadedNewest.body);
+      assert.ok(deepMail().messages.length <= 500); assert.ok(deepMail().messages.some(message => message.id === newestDeep.id));
+      const current = store.getSnapshot().mail; await store.loadThread(deepKey);
+      assert.equal(bodyReads, deepBodyReads); assert.strictEqual(store.getSnapshot().mail, current);
+    }
+    assert.equal(detailPages - initialDeepPages, 7); assert.equal(deepMail().messages.length, 500); assert.equal(deepMail().historyExhausted, true);
+    assert.equal(deepMail().historyTruncated, true); assert.equal(deepMail().window!.messagesComplete, false);
+    assert.ok(deepMail().messages.some(message => message.id === oldDeep.id)); assert.ok(deepMail().messages.some(message => message.id === replyOrigin.id));
+    assert.ok(!deepMail().messages.some(message => message.id === missingRecent.id));
+    const feedbackBeforeDeep = feedbackRequests.length;
+    await assert.rejects(store.action([deepMail()], "not-important"), /exceeds 500/); assert.equal(feedbackRequests.length, feedbackBeforeDeep);
+    await store.loadThread(deepKey, oldDeep.id); await store.loadThread(deepKey, replyOrigin.id);
+    store.pinThreadMessages(deepKey, [newestDeep.id, oldDeep.id, replyOrigin.id]);
+    const loadedDeepBodies = bodyReads, oldDeepBody = deepMail().messages.find(message => message.id === oldDeep.id)!;
+    assert.match(oldDeepBody.bodyText!, /DEEP-RETENTION-20/);
+    await store.resetThreadHistory(deepKey);
+    assert.equal(detailPages - initialDeepPages, 8); assert.equal(deepMail().messages.length, 102); assert.equal(deepMail().historyTruncated, undefined);
+    assert.ok(deepMail().messages.some(message => message.id === missingRecent.id)); assert.equal(deepMail().messages.find(message => message.id === oldDeep.id)!.body, oldDeepBody.body);
+    assert.equal(deepMail().messages.find(message => message.id === replyOrigin.id)!.loaded, true); assert.equal(bodyReads, loadedDeepBodies);
+    await store.loadMoreMessages(deepKey); assert.ok(deepMail().messages.length > 102 && deepMail().messages.length <= 500);
+    assert.equal(deepMail().messages.find(message => message.id === oldDeep.id)!.body, oldDeepBody.body);
+
+    const beforePinRefresh = pinnedMetadataReads.length, beforePinPages = detailPages;
+    const deepRead = await host.inbox.mutate(host.owner, { messageIds: [oldDeep.id], viaMailboxId: box.id, changes: { isRead: false, isStarred: true },
+      ifRevisions: { [oldDeep.id]: oldDeep.revision }, idempotencyKey: "web-deep-open-flags" });
+    await host.inbox.runDue(); assert.equal((await host.inbox.operation(host.owner, deepRead.id)).status, "succeeded");
+    await store.retry();
+    const currentOld = await host.inbox.mailboxMessageSummary(host.owner, box.id, oldDeep.id), projectedOld = deepMail().messages.find(message => message.id === oldDeep.id)!;
+    assert.deepEqual(new Set(pinnedMetadataReads.slice(beforePinRefresh)), new Set([oldDeep.id, replyOrigin.id]));
+    assert.equal(pinnedMetadataReads.length - beforePinRefresh, 2); assert.equal(detailPages, beforePinPages, "deep upserts revalidate only open identities, not a full history");
+    assert.equal(projectedOld.revision, currentOld.revision); assert.equal(projectedOld.isRead, false); assert.equal(projectedOld.isStarred, true);
+    assert.equal(projectedOld.loaded, true); assert.equal(projectedOld.bodyRevision, oldDeepBody.bodyRevision); assert.equal(projectedOld.body, oldDeepBody.body);
+    assert.equal(bodyReads, loadedDeepBodies); assert.equal(deepMail().messages.at(-1)!.id, newestDeep.id);
+    const cachedDeep = store.getSnapshot().mail; await store.loadThread(deepKey, oldDeep.id); await store.loadThread(deepKey);
+    assert.strictEqual(store.getSnapshot().mail, cachedDeep); assert.equal(bodyReads, loadedDeepBodies);
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === unaffected.id), unaffected);
+    assert.equal(inventories, 0); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+    store.pinThreadMessages(deepKey, []); store.pinWindow("reader", []); store.pinWindow("draft:deep-guard", []);
     stop(); stop = undefined;
   } finally {
     releasePage?.(); releaseChanges?.(); stop?.(); await service.close(); await ai.close(); await host.close(); database.close();

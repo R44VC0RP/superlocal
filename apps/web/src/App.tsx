@@ -421,6 +421,16 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   );
   const isDrafts = route.folder === "Drafts" && !search;
   const currentMail = useMemo(() => route.thread ? accountMail.find((m) => m.id === route.thread) : undefined, [accountMail, route.thread]);
+  const readerId = currentMail?.id, readerGeneration = currentMail?.sourceGeneration, readerScope = matchingWindow?.state;
+  const pinReaderMessages = useCallback((ids: readonly string[]) => {
+    const snapshot = store.getSnapshot(), scope = snapshot.window?.state;
+    if (!readerId || !readerScope || !scope || scope.queryId !== readerScope.queryId || scope.queryGeneration !== readerScope.queryGeneration || scope.scopeState !== readerScope.scopeState
+      || snapshot.mail.find(mail => mail.id === readerId)?.sourceGeneration !== readerGeneration) return;
+    store.pinThreadMessages(readerId, ids);
+  }, [store, readerId, readerGeneration, readerScope?.queryId, readerScope?.queryGeneration, readerScope?.scopeState]);
+  const loadReaderMessage = useCallback((id: string) => readerId ? store.loadThread(readerId, id) : Promise.resolve(), [store, readerId]);
+  const loadOlderMessages = useCallback(() => readerId ? store.loadMoreMessages(readerId) : Promise.resolve(), [store, readerId]);
+  const resetReaderHistory = useCallback(() => readerId ? store.resetThreadHistory(readerId) : Promise.resolve(), [store, readerId]);
   const getSenderConversations = useCallback((keys: readonly string[]) => senderConversations(accountMail, keys), [accountMail]);
   const contextContact = useMemo(() => currentMail && !currentMail.operationId
     ? senderContact(currentMail, inbox.senderHistory, inbox.accounts, senderSelection?.threadId === currentMail.id ? senderSelection.messageId : undefined)
@@ -2000,8 +2010,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           </div>
         ) : currentMail ? (
           <ThreadView
-            onLoadMessage={id => store.loadThread(currentMail.id, id)}
-            onLoadOlder={() => store.loadMoreMessages(currentMail.id)}
+            onLoadMessage={loadReaderMessage}
+            onLoadOlder={loadOlderMessages}
+            onResetHistory={inbox.host?.inboxWindow ? resetReaderHistory : undefined}
+            onPinMessages={inbox.host?.inboxWindow ? pinReaderMessages : undefined}
             key={currentMail.id}
             mail={currentMail}
             aiDecision={currentMail.triage}
