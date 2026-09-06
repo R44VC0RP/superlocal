@@ -314,6 +314,7 @@ export class InboxStore {
   private windowAutoDone = false;
   private windowSenderEpoch = 0;
   private windowChanges?: Promise<void>;
+  private windowReplayRevision?: number;
   private windowMetadataEvents: ChangeEvent[] = [];
   private windowDetails = new Map<string, { contextVersion: string; summaries: MailboxMessageSummary[]; cursor: string | null; exhausted: boolean }>();
   private initialThread = new URLSearchParams(location.hash.replace(/^#\/?/, "")).get("thread");
@@ -451,7 +452,7 @@ export class InboxStore {
   private openWindow = (): Promise<void> => {
     const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
     this.windowController.abort(); this.windowController = new AbortController();
-    this.windowPaging = undefined; this.windowChanges = undefined; this.windowBoundaryCursors.clear(); this.windowNewerCursor = null; this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
+    this.windowPaging = undefined; this.windowChanges = undefined; this.windowReplayRevision = undefined; this.windowBoundaryCursors.clear(); this.windowNewerCursor = null; this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
     const signal = AbortSignal.any([this.windowController.signal, this.controller.signal]);
     const transport = createInboxWindowTransport(() => signal, (input, init) => this.fetch(input, init));
     this.publish({ window: null, loading: true, loaded: false, refreshing: true });
@@ -630,11 +631,14 @@ export class InboxStore {
       }
       const current = this.state.window;
       if (!current) { await this.openWindow(); return; }
+      // Continuations bind to one immutable wanted scope, including pins that can change during an await.
+      const input = { queryId: current.state.queryId, sinceRevision: this.windowReplayRevision ?? current.state.indexRevision,
+        residentKeys: [...current.keys], pinnedKeys: [...this.pinnedWindowKeys()], limit: INBOX_PAGE_LIMIT };
+      const wanted = new Set([...input.residentKeys, ...input.pinnedKeys]), heads = new Set<string>();
       let cursor: string | undefined;
       do {
         const flagEpoch = this.flagEpoch;
-        const page = await this.windowTransport.changes({ queryId: current.state.queryId, sinceRevision: current.state.indexRevision,
-          residentKeys: current.keys, pinnedKeys: [...this.pinnedWindowKeys()], cursor, limit: INBOX_PAGE_LIMIT });
+        const page = await this.windowTransport.changes({ ...input, cursor });
         this.windowCheck(epoch, generation);
         if (page.resetReason) { await this.openWindow(); return; }
         if (page.state.scopeState !== current.state.scopeState) { await this.openWindow(); return; }
@@ -650,8 +654,16 @@ export class InboxStore {
         while (this.windowRemovalFences.size > INBOX_WINDOW_LIMIT) this.windowRemovalFences.delete(this.windowRemovalFences.keys().next().value!);
         for (const item of page.removed) if (item.reason === "deleted" || item.reason === "unselected") { this.windowRows.delete(item.key); this.windowDetails.delete(item.key); }
         const latest = this.state.window!;
+        for (const row of page.newHead) heads.add(row.key);
         const keys = this.trimWindow([...new Set([...page.newHead.map(row => row.key), ...latest.keys.filter(key => !removed.has(key))])]);
-        this.publish({ window: { ...latest, keys, state: page.nextCursor ? latest.state : { ...page.state, indexRevision: page.throughRevision }, totals: page.totals },
+        // A new wanted key may have missed an earlier delta. Replay that checkpoint once in its fresh scope;
+        // removals, ordering changes and this pass's own head additions do not require another drain.
+        const replay = !page.nextCursor && ([...this.pinnedWindowKeys()].some(key => !wanted.has(key)) ||
+          keys.some(key => !wanted.has(key) && !heads.has(key)));
+        // Demand paging may publish a newer revision before the scheduled replay starts.
+        if (!page.nextCursor) this.windowReplayRevision = replay ? input.sinceRevision : undefined;
+        this.updateAgain ||= replay;
+        this.publish({ window: { ...latest, keys, state: page.nextCursor ? latest.state : { ...page.state, indexRevision: replay ? input.sinceRevision : page.throughRevision }, totals: page.totals },
           ...(keys.length ? { loading: false, loaded: true, error: null } : {}) });
         this.reconcileFlags(); this.rebuild();
         cursor = page.nextCursor ?? undefined;

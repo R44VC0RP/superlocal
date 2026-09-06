@@ -2699,6 +2699,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
   type Row = import("../../shared/inbox-window").InboxWindowRow;
   type PageInput = import("../../shared/inbox-window").InboxPageInput;
   type ChangesInput = import("../../shared/inbox-window").InboxChangesInput;
+  type ChangesPage = import("../../shared/inbox-window").InboxWindowChanges;
   type MessagesInput = import("../../shared/inbox-window").InboxMessagesInput;
   type MessagesPage = import("../../shared/inbox-window").InboxMessagesPage;
   const source: import("inbox-sdk/types").Account = { id: "fictional-source", providerId: "mock", email: "owner@example.test", name: "Fictional account", generation: 1,
@@ -2717,7 +2718,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
     for (let attempt = 0; attempt < 300 && !check(); attempt++) await sleep(5);
     assert.ok(check(), message);
   };
-  let store: InstanceType<typeof InboxStore>, stop: (() => void) | undefined, releaseQuery: (() => void) | undefined, releaseReverse: (() => void) | undefined, releaseHistory: (() => void) | undefined;
+  let store: InstanceType<typeof InboxStore>, stop: (() => void) | undefined, releaseQuery: (() => void) | undefined, releaseReverse: (() => void) | undefined, releaseHistory: (() => void) | undefined, releaseChanges: (() => void) | undefined;
   let renderedAi: AiTriageState | null = null, renderedAiError: string | null = "Saved sorting diagnostics are unavailable.";
   try {
     console.info = () => {}; console.warn = () => {};
@@ -2736,6 +2737,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       let queries = 0, revision = 1, holdQuery = false, heldQuery = false, stream: ReadableStreamDefaultController<Uint8Array> | undefined;
       let reversePage: ((input: PageInput) => Page | Promise<Page>) | undefined;
       let reverseDelta: { upserts?: Row[]; newHead: Row[]; removed: Array<{ key: string; reason: "deleted" }> } | undefined;
+      let scopeChanges: ((input: ChangesInput) => Promise<Response>) | undefined;
       let detailRead: ((input: MessagesInput) => MessagesPage | Promise<MessagesPage>) | undefined;
       let lookupRead: ((ids: string[]) => Row[]) | undefined;
       let bodyRead: ((id: string) => import("inbox-sdk/types").Message) | undefined;
@@ -2774,6 +2776,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         if (url.pathname === "/host/inbox/changes") {
           const body = JSON.parse(String(init?.body)) as ChangesInput; changes.push(body);
           assert.ok(body.residentKeys.length <= 1000); assert.equal(body.limit, 100);
+          if (scopeChanges) return scopeChanges(body);
           const delta = reverseDelta; reverseDelta = undefined;
           if (delta) revision++;
           return Response.json({ state: state(), upserts: delta?.upserts ?? [], newHead: delta?.newHead ?? [], removed: delta?.removed ?? [], totals, nextCursor: null, throughRevision: revision, resetReason: null });
@@ -3069,6 +3072,75 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           assert.strictEqual(store.getSnapshot().mail, cachedMail); assert.equal(bodyReads.length, 3);
           assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
           assert.ok(detailReads.every(input => input.limit === 100)); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+
+          const offscreen = Array.from({ length: 4 }, (_, i) => { const value = row(1500 + i); return { ...value, mail: { ...value.mail, starred: false } }; });
+          const offscreenKeys = offscreen.map(row => row.key); let lookupReads = 0;
+          lookupRead = ids => { lookupReads++; return ids.map(id => offscreen.find(row => row.key === id)!); };
+          await store.lookupWindow(offscreenKeys);
+          store.pinWindow("reader", [companionRow.key]);
+          const stableGiant = store.getSnapshot().mail.find(mail => mail.id === giantKey), bodiesBefore = bodyReads.length;
+          const queriesBefore = queries, pagesBefore = pages.length;
+          for (const expand of [true, false]) {
+            const checkpoint = store.getSnapshot().window!.state.indexRevision, requests: ChangesInput[] = [];
+            const head = row(expand ? -2 : -4), nextHead = row(-3);
+            const changed = { ...offscreen[0], revision: ++revision, mail: { ...offscreen[0].mail, starred: true } };
+            let frozen: ChangesInput | undefined, conflicts = 0;
+            const response = (patch: Partial<ChangesPage> = {}) => Response.json({ state: state(), upserts: [], newHead: [], removed: [], totals,
+              nextCursor: null, throughRevision: revision, resetReason: null, ...patch } satisfies ChangesPage);
+            scopeChanges = async input => {
+              requests.push(structuredClone(input));
+              if (!frozen) {
+                frozen = structuredClone(input);
+                await new Promise<void>(resolve => { releaseChanges = resolve; });
+                return response({ newHead: [head], removed: expand ? [] : [{ key: nextHead.key, reason: "deleted" }], nextCursor: "frozen-scope-next" });
+              }
+              if (input.cursor) {
+                if (JSON.stringify([input.queryId, input.sinceRevision, input.residentKeys, input.pinnedKeys]) !==
+                  JSON.stringify([frozen.queryId, frozen.sinceRevision, frozen.residentKeys, frozen.pinnedKeys])) {
+                  conflicts++; return Response.json({ code: "HOST_INBOX_CURSOR_INVALID", error: "The inbox cursor does not match this request." }, { status: 409 });
+                }
+                assert.equal(input.cursor, "frozen-scope-next"); return response();
+              }
+              assert.equal(expand, true, "reordering/removing pins or pinning an existing resident never schedules a scope replay");
+              assert.equal(input.sinceRevision, checkpoint, "newly pinned rows replay from the original checkpoint, not the completed pass's revision");
+              assert.deepEqual(new Set(input.pinnedKeys), new Set([giantKey, ...offscreenKeys]));
+              return response({ upserts: [changed], newHead: [nextHead], removed: [{ key: head.key, reason: "deleted" }] });
+            };
+            const draining = store.retry();
+            await until(() => !!releaseChanges, "the first change page is held before its continuation");
+            assert.equal(requests[0].sinceRevision, checkpoint, "a completed scope replay releases its older checkpoint");
+            const beforePins = store.getSnapshot().mail;
+            store.pinWindow("reader", [expand ? giantKey : companionRow.key]);
+            store.pinWindow("sender", expand ? offscreenKeys : [...offscreenKeys].reverse().slice(1));
+            await store.loadThread(giantKey, deepId); await store.loadThread(companionRow.key);
+            assert.strictEqual(store.getSnapshot().mail, beforePins, "pin changes and valid cached opens publish no replacement mail model");
+            assert.equal(bodyReads.length, bodiesBefore);
+            releaseChanges!(); releaseChanges = undefined; await draining;
+            assert.equal(conflicts, 0, "a pin change cannot invalidate a continuation's strict host scope binding");
+            assert.deepEqual(requests[1], { ...requests[0], cursor: "frozen-scope-next" });
+            assert.equal(store.getSnapshot().error, null);
+            if (expand) {
+              assert.equal(store.getSnapshot().window!.state.indexRevision, checkpoint);
+              assert.equal(store.getSnapshot().mail.find(mail => mail.id === changed.key)!.starred, false, "the old wanted set did not reconcile the newly pinned row");
+              await store.seekWindow("start");
+              assert.equal(store.getSnapshot().window!.state.indexRevision, revision, "a demand page can advance the published revision before the scheduled replay");
+              await until(() => requests.length === 3 && store.getSnapshot().mail.some(mail => mail.id === changed.key && mail.starred), "one current-scope replay reconciles the missed pin");
+              assert.ok(store.getSnapshot().window!.keys.includes(nextHead.key)); assert.ok(!store.getSnapshot().window!.keys.includes(head.key));
+            }
+            await sleep(200);
+            assert.equal(requests.length, expand ? 3 : 2, "this pass's own arrivals/removals cannot cause a replay loop");
+            assert.equal(store.getSnapshot().window!.state.indexRevision, revision);
+            assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), stableGiant);
+            assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
+          }
+          scopeChanges = undefined;
+          const settledMail = store.getSnapshot().mail, settledChanges = changes.length;
+          store.pinWindow("sender", []); store.pinWindow("reader", [giantKey]);
+          await store.loadThread(giantKey, deepId); await sleep(120);
+          assert.strictEqual(store.getSnapshot().mail, settledMail); assert.equal(changes.length, settledChanges, "pins outside a drain do not introduce a refresh or lookup");
+          assert.equal(bodyReads.length, bodiesBefore); assert.equal(lookupReads, 1, "only the explicit fixture lookup reads off-view rows");
+          assert.equal(queries, queriesBefore); assert.equal(pages.length, pagesBefore + 1, "only the explicit seek issues a demand page during reconciliation");
+          store.pinWindow("reader", []);
         }
         if (name === "sparse") {
           holdQuery = true;
@@ -3093,7 +3165,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       await sleep(0);
     }
   } finally {
-    releaseHistory?.(); releaseReverse?.(); releaseQuery?.(); stop?.(); mock.restore(); globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    releaseChanges?.(); releaseHistory?.(); releaseReverse?.(); releaseQuery?.(); stop?.(); mock.restore(); globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
     for (const [key, descriptor] of globals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); }
   }
 });
@@ -3128,7 +3200,9 @@ test("host-service-backed bounded startup pages, lookup and search without brows
   const ai = createAiTriageService({ database, inbox: host.inbox, configuration: null, sessionKey: token });
   const service = createInboxWindowService({ database, inbox: host.inbox, owner: host.owner, sessionKey: token, allowProviderWrites: false,
     inboxPreferences: preferences, splitPreferences: splits, attentionOverrides: categories, ai });
-  let stop: (() => void) | undefined;
+  type ChangesInput = import("../../shared/inbox-window").InboxChangesInput;
+  type ChangesPage = import("../../shared/inbox-window").InboxWindowChanges;
+  let stop: (() => void) | undefined, releaseChanges: (() => void) | undefined;
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
   const until = async (check: () => boolean, message: string) => {
     const deadline = Date.now() + 20000; while (!check() && Date.now() < deadline) await sleep(20); assert.ok(check(), message);
@@ -3150,8 +3224,9 @@ test("host-service-backed bounded startup pages, lookup and search without brows
       document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
       localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
     });
-    let inventories = 0, pages = 0, bodyReads = 0;
-    let holdQuery = false, heldQuery = false, releaseQuery: (() => void) | undefined;
+    let inventories = 0, pages = 0, bodyReads = 0, queries = 0, lookups = 0;
+    let holdQuery = false, heldQuery = false, releaseQuery: (() => void) | undefined, holdChanges = false, heldChanges = false;
+    const changes: ChangesInput[] = [], changeFailures: Array<{ status?: number; code?: string }> = [];
     const published: number[] = [];
     globalThis.fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
@@ -3160,16 +3235,28 @@ test("host-service-backed bounded startup pages, lookup and search without brows
       if (url.pathname.startsWith("/host/inbox/")) {
         assert.equal(init?.method, "POST"); assert.equal(init?.credentials, "include");
         if (url.pathname === "/host/inbox/page") pages++;
+        if (url.pathname === "/host/inbox/query") queries++;
+        if (url.pathname === "/host/inbox/lookup") lookups++;
         try {
           const body = JSON.parse(String(init?.body));
+          if (url.pathname === "/host/inbox/changes") changes.push(structuredClone(body));
           const result = await service.dispatch(url.pathname, body);
+          if (holdChanges && url.pathname === "/host/inbox/changes" && !body.cursor) {
+            assert.ok((result as ChangesPage).nextCursor, "a real SDK mutation produces a bound host changes continuation");
+            holdChanges = false; heldChanges = true;
+            await new Promise<void>(resolve => { releaseChanges = resolve; init?.signal?.addEventListener("abort", () => resolve(), { once: true }); });
+          }
           if (holdQuery && url.pathname === "/host/inbox/query" && body.folder === "Trash") {
             heldQuery = true;
             await new Promise<void>(resolve => { releaseQuery = resolve; init?.signal?.addEventListener("abort", () => setTimeout(resolve, 100), { once: true }); });
           }
           return Response.json(result);
         }
-        catch (cause) { const error = cause as { status?: number; code?: string; message?: string }; return Response.json({ code: error.code, error: error.message }, { status: error.status ?? 500 }); }
+        catch (cause) {
+          const error = cause as { status?: number; code?: string; message?: string };
+          if (url.pathname === "/host/inbox/changes") changeFailures.push({ status: error.status, code: error.code });
+          return Response.json({ code: error.code, error: error.message }, { status: error.status ?? 500 });
+        }
       }
       if (url.pathname.includes("mailbox-snapshot") || url.pathname === "/v1/mailbox-messages") inventories++;
       if (/\/messages\//.test(url.pathname)) bodyReads++;
@@ -3201,6 +3288,46 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     await store.loadThread(first.id);
     assert.equal(bodyReads, reads, "cached open performs no additional body read");
     assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), cached, "cached open preserves row identity");
+
+    await store.seekWindow("start"); await store.retry();
+    const outside = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [box.id], search: 'subject:"Window fixture 0000"', limit: 1 })).items[0]!;
+    const outsideKey = `${box.id}:${outside.threadId}`, resident = [...store.getSnapshot().window!.keys];
+    assert.ok(!resident.includes(outsideKey), "the changed sender conversation starts outside the resident window");
+    const [savedOutside] = await store.lookupWindow([outsideKey]);
+    const unchanged = store.getSnapshot().mail.find(mail => mail.id === first.id);
+    const checkpoint = store.getSnapshot().window!.state.indexRevision, firstChange = changes.length;
+    const queriesBefore = queries, lookupsBefore = lookups, bodiesBefore = bodyReads;
+    const changedState = await host.inbox.setMailboxStates(host.owner, { id: "held-window-pin-change", done: true,
+      targets: [{ mailboxId: box.id, messageId: outside.id, revision: outside.memberships.find(state => state.mailboxId === box.id)!.revision }] });
+    holdChanges = true;
+    const draining = store.retry();
+    await until(() => heldChanges || changeFailures.length > 0, "first real changes page is held");
+    assert.deepEqual(changeFailures, []);
+    assert.equal(changes[firstChange].pinnedKeys.length, 1);
+    const newPins = [outsideKey, ...resident.slice(2, 5)];
+    store.pinWindow("reader", [resident[1]]); store.pinWindow("sender", newPins);
+    releaseChanges!(); releaseChanges = undefined; await draining;
+    assert.deepEqual(changeFailures, [], "changing reader/sender pins never causes HOST_INBOX_CURSOR_INVALID");
+    const firstPass = changes.slice(firstChange);
+    assert.ok(firstPass.length > 1, "the strict host cursor was actually exercised");
+    for (const input of firstPass.slice(1)) assert.deepEqual(input, { ...firstPass[0], cursor: input.cursor }, "all continuations use the captured resident/pinned scope");
+    assert.equal(store.getSnapshot().window!.state.indexRevision, checkpoint, "the completed old scope cannot advance past an unreconciled new pin");
+    assert.equal(store.getSnapshot().mail.find(mail => mail.id === outsideKey)!.folder, savedOutside.folder);
+    await until(() => store.getSnapshot().mail.some(mail => mail.id === outsideKey && mail.folder === "Done"), "the scheduled current-scope replay reconciles the missed SDK receipt");
+    const replay = changes.slice(firstChange + 1).find(input => !input.cursor)!;
+    assert.ok(replay); assert.equal(replay.sinceRevision, checkpoint);
+    assert.deepEqual(new Set(replay.pinnedKeys), new Set([resident[1], ...newPins]));
+    await sleep(200);
+    assert.equal(changes.slice(firstChange).filter(input => !input.cursor).length, 2, "one scope expansion schedules one follow-up pass, not a loop");
+    assert.deepEqual(changeFailures, []); assert.equal(store.getSnapshot().error, null);
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), unchanged);
+    const settled = store.getSnapshot().mail;
+    await store.loadThread(first.id);
+    assert.strictEqual(store.getSnapshot().mail, settled);
+    assert.equal(bodyReads, bodiesBefore); assert.equal(inventories, 0); assert.equal(queries, queriesBefore); assert.equal(lookups, lookupsBefore);
+    store.pinWindow("sender", []); store.pinWindow("reader", [first.id]);
+    await host.inbox.undoMailboxStates(host.owner, changedState.id); await store.retry();
+
     await store.setWindowQuery({ ...query, search: true, query: "subject:\"Window fixture 0000\"" });
     for (let count = 0; count < 20 && !store.getSnapshot().mail.some(mail => mail.subject === "Window fixture 0000") && store.getSnapshot().window?.nextCursor; count++) await store.loadMoreWindow();
     assert.ok(store.getSnapshot().mail.some(mail => mail.subject === "Window fixture 0000"), "explicit search paging reaches outside the old browser window");
@@ -3240,7 +3367,7 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     assert.equal(store.getSnapshot().window?.query.folder, "All Mail", "late prior-view response cannot replace the active window");
     stop(); stop = undefined;
   } finally {
-    stop?.(); await service.close(); await ai.close(); await host.close(); database.close();
+    releaseChanges?.(); stop?.(); await service.close(); await ai.close(); await host.close(); database.close();
     globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
     for (const [key, descriptor] of globals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); }
     await fs.rm(root, { recursive: true, force: true });
