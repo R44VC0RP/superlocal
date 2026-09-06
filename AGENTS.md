@@ -184,3 +184,38 @@ protection; do not claim automatic remote enforcement or add CI without approval
   diff. Never include unrelated work, credentials, private configuration, runtime
   data, real email content, or private screenshots/logs. Do not push or rewrite
   history unless explicitly requested.
+
+## User-authorized project handoff (2026-09-06)
+
+- For the current Superlocal handoff, the user explicitly permits bypassing the
+  UIPR/draft-PR and separate merge/deployment approval steps, pushing verified
+  changes directly to `main`, and verifying at `https://superlocal.ryan.ceo`.
+  This overrides the conflicting workflow rules above, not the baseline,
+  correctness, performance, privacy, or preservation requirements. Do not sweep
+  unrelated local commits into a push.
+- Use the built-in Codex browser or Codex browser extension for browser QA,
+  as requested by the user, rather than Browser Control. The user has signed
+  into Superlocal in the Codex browser; verify session state before relying on it.
+- The user authorizes sending fictional test emails to `ryan@anoma.ly`,
+  `me@ryan.ceo`, and `ryan@mandarin3d.com` to verify Superlocal sending and
+  receiving. No further confirmation is needed for these test sends. Use clear
+  test subjects, minimal fictional content, and only these approved recipients
+  (including CC/BCC). This does not authorize forwarding real mail or sending
+  credentials, private logs, or other sensitive content. Avoid duplicate sends
+  after an uncertain result; verify submission and receipt first.
+
+## Current product direction
+
+- Desktop layouts are the current scope. Defer mobile/responsive redesigns until
+  the user requests that work; preserve the existing desktop appearance.
+- Important means action-needed or personally relevant/interesting mail. Show
+  only conversations with qualifying incoming mail from the last 45 days in
+  Important; older mail remains stored and searchable. Sending a reply does not
+  reset that window. Do not add UI controls for this fixed policy.
+- Compose uses one From menu containing provider-authorized sending identities
+  across configured mailboxes. Preserve the exact chosen alias. Arbitrary
+  catch-all-domain sending is deferred until sending authority is explicit.
+- Production access is `pssh superlocal.exe.xyz`, installation `/opt/superlocal`.
+  The existing `superlocal-update.timer` checks GitHub's published image every
+  five minutes. Verify the running container revision and public assets after
+  publishing; preserve its `/persist` volume, configuration and keys.
