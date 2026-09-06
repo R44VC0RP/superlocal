@@ -1022,7 +1022,7 @@ function runProviderContract(profile: ContractProfile): void {
         expect(facts).toMatchObject({ listId: true, listUnsubscribe: true })
         expect(classifyAttention({ subject: 'Weekly newsletter', preview: '', facts }).category).toBe('Other')
         expect(classifyAttention({ subject: 'Password reset', preview: '', facts }).category).toBe('Important')
-        expect(classifyAttention({ subject: 'Receipt', preview: '', facts }).category).toBe('Important')
+        expect(classifyAttention({ subject: 'Receipt', preview: '', facts }).category).toBe('Other')
         if (h.writes) expect(h.writes()).toBe(writes!)
       })
 

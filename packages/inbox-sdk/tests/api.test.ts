@@ -1043,7 +1043,7 @@ describe('Attention baseline and explicit feedback', () => {
     const rows = (await host.inbox.messages(host.owner, { accountId: scope.accountId, search: 'subject:"Attention test"' })).items
     expect(rows).toHaveLength(3)
     expect(Object.fromEntries(rows.map(message => [message.subject, classifyAttention(message).category]))).toEqual({
-      'Attention test newsletter': 'Other', 'Attention test receipt': 'Important', 'Attention test hello': 'Important',
+      'Attention test newsletter': 'Other', 'Attention test receipt': 'Other', 'Attention test hello': 'Important',
     })
     // Exercise the real HTTP output schemas/client, not just the core: additive
     // facts must not be stripped before the UI receives its body-free summaries.
@@ -1055,7 +1055,7 @@ describe('Attention baseline and explicit feedback', () => {
     for (const page of [viaMailbox, viaMessages]) {
       expect(page).toHaveLength(3)
       expect(Object.fromEntries(page.map(message => [message.subject, classifyAttention(message).category]))).toEqual({
-        'Attention test newsletter': 'Other', 'Attention test receipt': 'Important', 'Attention test hello': 'Important',
+        'Attention test newsletter': 'Other', 'Attention test receipt': 'Other', 'Attention test hello': 'Important',
       })
       expect(page.every(message => message.facts?.version === 1)).toBe(true)
     }
@@ -1076,7 +1076,7 @@ describe('Attention baseline and explicit feedback', () => {
     const before = structuredClone(box.calls)
     const summaries = (await h.inbox.messages('alice', { accountId: account.id })).items
     const decisions = Object.fromEntries(summaries.map(message => [message.subject, classifyAttention(message).category]))
-    expect(decisions).toEqual({ 'Weekly digest': 'Other', 'Your receipt': 'Important', 'Can we meet tomorrow?': 'Important', 'Re: Weekly digest': 'Important', Campaign: 'Other' })
+    expect(decisions).toEqual({ 'Weekly digest': 'Other', 'Your receipt': 'Other', 'Can we meet tomorrow?': 'Important', 'Re: Weekly digest': 'Important', Campaign: 'Other' })
     for (const message of summaries) expect(classifyAttention(await h.inbox.message('alice', message.id))).toEqual(classifyAttention(message))
     expect(JSON.stringify(summaries)).not.toContain('<p>News</p>')
     const database = new Database(h.database)
@@ -1091,8 +1091,12 @@ describe('Attention baseline and explicit feedback', () => {
     for (const provider of ['gmail', 'inbound', 'imap', 'mock']) {
       const facts = mailFacts({ headers: { 'list-id': '<news.example.test>', 'list-unsubscribe': '<mailto:leave@example.test>' } })
       expect(classifyAttention({ subject: `${provider} newsletter`, preview: '', facts }).category).toBe('Other')
-      for (const subject of ['Your password reset', 'Security alert', 'Invoice 123', 'Your order confirmation', 'Please reply today']) expect(classifyAttention({ subject, preview: '', facts }).category).toBe('Important')
+      for (const subject of ['Your password reset', 'Security alert', 'Invoice 123', 'Please reply today']) expect(classifyAttention({ subject, preview: '', facts }).category).toBe('Important')
     }
+    for (const subject of ['Your order confirmation', 'DMARC authentication report', 'Weekly usage summary', 'Payment received', 'Delivery confirmation']) {
+      expect(classifyAttention({ subject, preview: '', facts: { version: 1 } })).toMatchObject({ category: 'Other', reason: 'routine-notification' })
+    }
+    expect(classifyAttention({ subject: 'Payment received', preview: 'Please review the disputed charge.' })).toMatchObject({ category: 'Important', reason: 'actionable-notification' })
     expect(classifyAttention({ subject: 'Unsubscribe', preview: 'A lone word', facts: mailFacts({ headers: { 'auto-submitted': 'auto-generated' } }) }).category).toBe('Important')
     expect(classifyAttention({ subject: 'Discussion', preview: '', facts: mailFacts({ headers: { 'list-id': '<list>', 'list-unsubscribe': '<mailto:leave@test>', 'list-post': '<mailto:post@test>' } }) }).category).toBe('Important')
   })
@@ -12226,7 +12230,7 @@ describe('AI triage inference and local scoring', () => {
       })) as unknown as typeof fetch })
     expect(result).toMatchObject({ outcome: 'invalid', code: 'AI_ASSESSMENT_INVALID', assessment: null })
     const optional = validateAiAssessment({ ...assessment, task: 'optional' }, source)
-    expect(scoreAiTriage(optional, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 })).toMatchObject({ category: 'Other', score: -32 })
+    expect(scoreAiTriage(optional, { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 })).toMatchObject({ category: 'Other', score: 0 })
   })
 
   test('grounded required work outside email survives notification inference and negative affinity without inventing a reply', async () => {
@@ -12275,11 +12279,11 @@ describe('AI triage inference and local scoring', () => {
   test('explicit optional and absent tasks do not inherit personal-type action floors while unknown responsibility stays reviewable', () => {
     const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
     const fixtures: Array<{ type: AiAssessment['type']; task: AiAssessment['task']; response: AiAssessment['response']; quote: string; expected: number }> = [
-      { type: 'promotion', task: 'optional', response: 'not_needed', quote: 'Browse our new offers if you are interested.', expected: -48 },
-      { type: 'newsletter', task: 'optional', response: 'not_needed', quote: 'You can review this weekly digest at your leisure.', expected: -23 },
-      { type: 'notification', task: 'none', response: 'not_needed', quote: 'Morgan was assigned to review pull request #42. You are watching this repository.', expected: -8 },
-      { type: 'conversation', task: 'optional', response: 'not_needed', quote: 'You can review my notes if you would like; no action is needed.', expected: 7 },
-      { type: 'conversation', task: 'none', response: 'waiting', quote: 'Morgan will review the changes and send an update. Nothing else is needed from you.', expected: 5 },
+      { type: 'promotion', task: 'optional', response: 'not_needed', quote: 'Browse our new offers if you are interested.', expected: 0 },
+      { type: 'newsletter', task: 'optional', response: 'not_needed', quote: 'You can review this weekly digest at your leisure.', expected: 0 },
+      { type: 'notification', task: 'none', response: 'not_needed', quote: 'Morgan was assigned to review pull request #42. You are watching this repository.', expected: 0 },
+      { type: 'conversation', task: 'optional', response: 'not_needed', quote: 'You can review my notes if you would like; no action is needed.', expected: 0 },
+      { type: 'conversation', task: 'none', response: 'waiting', quote: 'Morgan will review the changes and send an update. Nothing else is needed from you.', expected: 0 },
     ]
     for (const fixture of fixtures) {
       const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional update', text: fixture.quote }] }
@@ -12295,24 +12299,24 @@ describe('AI triage inference and local scoring', () => {
     const ambiguous: AiAssessment = { ...unknown, type: 'notification', response: 'not_needed', task: 'unknown', urgency: 'routine',
       risk: 'none_observed', certainty: 'clear' }
     expect(scoreAiTriage(ambiguous, neutral)).toMatchObject({ category: 'Important', score: 20 })
-    expect(scoreAiTriage({ ...ambiguous, task: 'none' }, neutral)).toMatchObject({ category: 'Other', score: -8 })
+    expect(scoreAiTriage({ ...ambiguous, task: 'none' }, neutral)).toMatchObject({ category: 'Other', score: 0 })
     const replyOnly = validateAiAssessment({ ...request, task: 'none', actions: ['reply'], evidence: request.evidence.filter(item => item.field !== 'task') }, input)
     expect(scoreAiTriage(replyOnly, { ...neutral, explicitAffinity: -1, learnedTopicAffinity: -1 }).category).toBe('Important')
   })
 
-  test('clear task-aware mail without obligations stays Other despite type optional replies reported urgency or affinity', () => {
+  test('clear mail needs an obligation or explicit interest, never urgency or reading volume alone', () => {
     const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
     const rich: AiScoreSignals = { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 }
     const base: AiAssessment = { ...request, type: 'notification', response: 'not_needed', task: 'none', actions: [], urgency: 'routine', deadline: null }
-    const fixtures: Array<{ assessment: AiAssessment; signals: AiScoreSignals; quote: string; previousScore: number }> = [
-      { assessment: { ...base, type: 'request' }, signals: neutral, quote: 'Your request is complete. Nothing remains for you to do.', previousScore: 24 },
-      { assessment: { ...base, type: 'conversation', response: 'optional' }, signals: neutral, quote: 'Reply if you would like a summary; no response is needed.', previousScore: 23 },
-      { assessment: { ...base, urgency: 'immediate' }, signals: neutral, quote: 'Your urgent access issue is resolved. Nothing remains for you to do.', previousScore: 37 },
-      { assessment: base, signals: { ...neutral, correspondenceDays: 14 }, quote: 'A routine update; no action is needed.', previousScore: 20 },
-      { assessment: base, signals: { ...neutral, explicitAffinity: 1 }, quote: 'A routine update; no action is needed.', previousScore: 72 },
-      { assessment: base, signals: { ...neutral, interestMatches: 1 }, quote: 'A routine update; no action is needed.', previousScore: 42 },
-      { assessment: { ...base, type: 'newsletter', task: 'optional' }, signals: rich, quote: 'Browse this weekly digest if interested.', previousScore: 199 },
-      { assessment: { ...base, type: 'conversation', response: 'waiting' }, signals: rich, quote: 'Morgan will send the update. Nothing else is needed from you.', previousScore: 227 },
+    const fixtures: Array<{ assessment: AiAssessment; signals: AiScoreSignals; quote: string; expected: number }> = [
+      { assessment: { ...base, type: 'request' }, signals: neutral, quote: 'Your request is complete. Nothing remains for you to do.', expected: 0 },
+      { assessment: { ...base, type: 'conversation', response: 'optional' }, signals: neutral, quote: 'Reply if you would like a summary; no response is needed.', expected: 0 },
+      { assessment: { ...base, urgency: 'immediate' }, signals: neutral, quote: 'Your urgent access issue is resolved. Nothing remains for you to do.', expected: 0 },
+      { assessment: base, signals: { ...neutral, correspondenceDays: 14 }, quote: 'A routine update; no action is needed.', expected: 0 },
+      { assessment: base, signals: { ...neutral, explicitAffinity: 1 }, quote: 'A routine update; no action is needed.', expected: 20 },
+      { assessment: base, signals: { ...neutral, interestMatches: 1 }, quote: 'A routine update; no action is needed.', expected: 20 },
+      { assessment: { ...base, type: 'newsletter', task: 'optional' }, signals: rich, quote: 'Browse this weekly digest if interested.', expected: 20 },
+      { assessment: { ...base, type: 'conversation', response: 'waiting' }, signals: rich, quote: 'Morgan will send the update. Nothing else is needed from you.', expected: 20 },
     ]
     for (const fixture of fixtures) {
       const source: AiTriageInput = { ...input, messages: [{ ...input.messages[0]!, subject: 'Fictional update', text: fixture.quote }] }
@@ -12320,18 +12324,18 @@ describe('AI triage inference and local scoring', () => {
       if (fixture.assessment.urgency === 'immediate') evidence.push({ messageRef: 'message-1', quote: fixture.quote, field: 'urgency' })
       const assessment = validateAiAssessment({ ...fixture.assessment, evidence }, source)
       const result = scoreAiTriage(assessment, fixture.signals)
-      expect(result).toMatchObject({ category: 'Other', score: 19, version: 'preference-3' })
-      expect(result.contributions).toContainEqual({ name: 'no_obligation_gate', value: 19 - fixture.previousScore })
+      expect(result).toMatchObject({ category: fixture.expected ? 'Important' : 'Other', score: fixture.expected, version: AI_PREFERENCE_VERSION })
+      expect(result.contributions).toHaveLength(1)
       expect(result.contributions.reduce((sum, item) => sum + item.value, 0)).toBe(result.score)
       expect(result.contributions.some(item => item.name === 'actionability_gate')).toBe(false)
-      expect(scoreAiTriage(assessment, fixture.signals, { override: 'Important' })).toMatchObject({ category: 'Important', score: 19 })
+      expect(scoreAiTriage(assessment, fixture.signals, { override: 'Important' })).toMatchObject({ category: 'Important', score: fixture.expected })
     }
     const quote = 'Your submission with deadline 2026-09-15 is complete. No further action is needed.'
     const completedDeadline = validateAiAssessment({ ...base, urgency: 'deadline', deadline: '2026-09-15', evidence: [
       { messageRef: 'message-1', quote, field: 'type' }, { messageRef: 'message-1', quote, field: 'urgency' },
     ] }, { ...input, messages: [{ ...input.messages[0]!, text: quote }] })
-    expect(scoreAiTriage(completedDeadline, neutral)).toMatchObject({ category: 'Other', score: 19 })
-    expect(scoreAiTriage({ ...base, evidence: [] }, { ...neutral, readingSeconds: 1_000_000 })).toMatchObject({ category: 'Other', score: -4 })
+    expect(scoreAiTriage(completedDeadline, neutral)).toMatchObject({ category: 'Other', score: 0 })
+    expect(scoreAiTriage({ ...base, evidence: [] }, { ...neutral, readingSeconds: 1_000_000 })).toMatchObject({ category: 'Other', score: 0 })
   })
 
   test('task-aware obligations remain Important across genres while risk uncertainty and manual overrides keep precedence', () => {
@@ -12346,7 +12350,7 @@ describe('AI triage inference and local scoring', () => {
             { messageRef: 'message-1', quote, field: task === 'required' ? 'task' : 'response' },
             { messageRef: 'message-1', quote, field: 'action' },
           ] }, source)
-        expect(scoreAiTriage(assessment, disliked)).toMatchObject({ category: 'Important', score: 20, version: 'preference-3' })
+        expect(scoreAiTriage(assessment, disliked)).toMatchObject({ category: 'Important', score: 20, version: AI_PREFERENCE_VERSION })
         expect(scoreAiTriage(assessment, disliked, { override: 'Other' })).toMatchObject({ category: 'Other', score: 20 })
       }
     }
@@ -12369,13 +12373,13 @@ describe('AI triage inference and local scoring', () => {
     expect(scoreAiTriage(security, disliked)).toMatchObject({ category: 'Important', score: 20 })
   })
 
-  test('retained legacy task absence keeps its numeric scoring and evidence unchanged instead of becoming new unknown or required work', () => {
+  test('rescoring legacy task absence stays conservative without inventing task evidence', () => {
     const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
     const fixtures: Array<{ type: AiAssessment['type']; response: AiAssessment['response']; expected: number }> = [
-      { type: 'notification', response: 'not_needed', expected: -8 },
+      { type: 'notification', response: 'not_needed', expected: 20 },
       { type: 'conversation', response: 'waiting', expected: 20 },
-      { type: 'request', response: 'not_needed', expected: 32 },
-      { type: 'promotion', response: 'not_needed', expected: -48 },
+      { type: 'request', response: 'not_needed', expected: 20 },
+      { type: 'promotion', response: 'not_needed', expected: 20 },
       { type: 'notification', response: 'unknown', expected: 20 },
     ]
     for (const fixture of fixtures) {
@@ -12384,17 +12388,17 @@ describe('AI triage inference and local scoring', () => {
       legacy.evidence = legacy.evidence.filter(item => item.field !== 'task')
       const original = structuredClone(legacy)
       const score = scoreAiTriage(legacy, neutral)
-      expect(score).toMatchObject({ score: fixture.expected, category: fixture.expected >= 20 ? 'Important' : 'Other', version: 'preference-2' })
+      expect(score).toMatchObject({ score: fixture.expected, category: fixture.expected >= 20 ? 'Important' : 'Other', version: AI_PREFERENCE_VERSION })
       expect(legacy).toEqual(original)
       expect(legacy).not.toHaveProperty('task')
     }
     const legacy: AiAssessment = { ...request, type: 'promotion', response: 'not_needed', actions: [], urgency: 'routine', deadline: null }
     delete legacy.task
-    expect(scoreAiTriage(legacy, { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 })).toMatchObject({ category: 'Important', score: 174, version: 'preference-2' })
-    expect(scoreAiTriage({ ...legacy, type: 'notification', urgency: 'immediate' }, neutral)).toMatchObject({ category: 'Important', score: 37, version: 'preference-2' })
+    expect(scoreAiTriage(legacy, { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 })).toMatchObject({ category: 'Important', score: 20, version: AI_PREFERENCE_VERSION })
+    expect(scoreAiTriage({ ...legacy, type: 'notification', urgency: 'immediate' }, neutral)).toMatchObject({ category: 'Important', score: 20, version: AI_PREFERENCE_VERSION })
   })
 
-  test('deterministic scoring preserves needs-reply and uncertainty, distinguishes promotion from spam, and caps weak reading affinity', () => {
+  test('deterministic scoring preserves needs-reply and uncertainty, distinguishes promotion from spam, and ignores reading and correspondence volume', () => {
     const neutral: AiScoreSignals = { correspondenceDays: 0, readingSeconds: 0, explicitAffinity: 0, interestMatches: 0, learnedTopicAffinity: 0 }
     const rich: AiScoreSignals = { correspondenceDays: 1000, readingSeconds: 100000, explicitAffinity: 1, interestMatches: 100, learnedTopicAffinity: 1 }
     expect(scoreAiTriage(request, neutral).category).toBe('Important')
@@ -12403,11 +12407,11 @@ describe('AI triage inference and local scoring', () => {
     expect(scoreAiTriage(invoice, disliked).category).toBe('Important')
     expect(scoreAiTriage(invoice, disliked, { override: 'Other' }).category).toBe('Other')
     expect(scoreAiTriage({ ...invoice, risk: 'phishing_suspected' }, disliked).category).toBe('Other')
-    expect(scoreAiTriage({ ...request, response: 'not_needed', task: 'none', actions: [], urgency: 'immediate' }, neutral)).toMatchObject({ category: 'Other', score: 19 })
+    expect(scoreAiTriage({ ...request, response: 'not_needed', task: 'none', actions: [], urgency: 'immediate' }, neutral)).toMatchObject({ category: 'Other', score: 0 })
     expect(scoreAiTriage(unknown, neutral).category).toBe('Important')
     const promotion: AiAssessment = { ...unknown, type: 'promotion', response: 'not_needed', task: 'none', urgency: 'none', risk: 'unsolicited', certainty: 'clear' }
     expect(scoreAiTriage(promotion, neutral).category).toBe('Other')
-    expect(scoreAiTriage(promotion, rich)).toMatchObject({ category: 'Other', score: 19 })
+    expect(scoreAiTriage(promotion, rich)).toMatchObject({ category: 'Other', score: 0 })
     for (const risk of ['spam_suspected', 'phishing_suspected'] as const) {
       const assessment = { ...request, risk }, original = structuredClone(assessment)
       expect(scoreAiTriage(assessment, rich)).toMatchObject({ category: 'Other', score: -100 })
@@ -12417,9 +12421,15 @@ describe('AI triage inference and local scoring', () => {
     const read = scoreAiTriage(promotion, { ...neutral, readingSeconds: 1_000_000 })
     const correspondence = scoreAiTriage(promotion, { ...neutral, correspondenceDays: 14 })
     expect(read).toEqual(scoreAiTriage(promotion, { ...neutral, readingSeconds: 240 }))
-    expect(read.score).toBeLessThan(correspondence.score)
+    expect(read).toEqual(correspondence)
     expect(scoreAiTriage(request, neutral, { override: 'Other' }).category).toBe('Other')
     expect(scoreAiTriage(promotion, rich, { personalization: false })).toEqual(scoreAiTriage(promotion, neutral))
+    const newsletter: AiAssessment = { ...promotion, type: 'newsletter', risk: 'none_observed', topics: ['Climate science'] }
+    expect(scoreAiTriage(newsletter, neutral)).toMatchObject({ category: 'Other', score: 0 })
+    expect(scoreAiTriage(newsletter, { ...disliked, interestMatches: 1 })).toMatchObject({ category: 'Important', score: 20, contributions: [{ name: 'interests', value: 20 }] })
+    expect(scoreAiTriage(newsletter, rich, { personalization: false })).toMatchObject({ category: 'Other', score: 0 })
+    expect(scoreAiTriage(newsletter, { ...neutral, learnedTopicAffinity: 1 })).toMatchObject({ category: 'Important', score: 20, contributions: [{ name: 'topic_affinity', value: 20 }] })
+    expect(scoreAiTriage(newsletter, { ...neutral, readingSeconds: 10000, correspondenceDays: 1000 })).toMatchObject({ category: 'Other', score: 0 })
     for (const bad of [NaN, Infinity, -Infinity, -10, 1e15]) {
       const score = scoreAiTriage(unknown, { correspondenceDays: bad, readingSeconds: bad, explicitAffinity: bad, interestMatches: bad, learnedTopicAffinity: bad })
       expect(Number.isFinite(score.score)).toBe(true)
@@ -12600,12 +12610,12 @@ describe('AI triage service', () => {
       const current = changed.find(item => item.threadId === original.threadId)!
       if (index >= 100 && index <= 103) expect(current).toEqual(original)
       else {
-        expect(current).toMatchObject({ state: 'ready', assessment: original.assessment, inputHash: original.inputHash, model: original.model, schemaVersion: original.schemaVersion, inputPolicyVersion: original.inputPolicyVersion, contextVersions: original.contextVersions, score: { category: 'Other', score: 19, version: AI_PREFERENCE_VERSION } })
-        expect(current.score!.contributions).toContainEqual({ name: 'no_obligation_gate', value: -18 })
+        expect(current).toMatchObject({ state: 'ready', assessment: original.assessment, inputHash: original.inputHash, model: original.model, schemaVersion: original.schemaVersion, inputPolicyVersion: original.inputPolicyVersion, contextVersions: original.contextVersions, score: { category: 'Important', score: 20, version: AI_PREFERENCE_VERSION } })
+        expect(current.score!.contributions).toContainEqual({ name: 'interests', value: 20 })
       }
     }
     expect((await service.diagnostics('alice')).coverage?.counts.rescored).toBe(101)
-    expect((await service.diagnostics('alice')).activity?.find(item => item.reason === 'rescored')?.contributions).toContainEqual({ name: 'no_obligation_gate', value: -18 })
+    expect((await service.diagnostics('alice')).activity?.find(item => item.reason === 'rescored')?.contributions).toContainEqual({ name: 'interests', value: 20 })
     // A completed upgrade is idempotent; ordinary state/result reads do not queue it again.
     service = createAiTriageService({ database, inbox: guarded, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value, fetcher })
     await service.start(); await service.close()
@@ -12972,7 +12982,7 @@ describe('AI triage service', () => {
     expect(diagnostic.coverage?.counts).toMatchObject({ queued: 2, processing: 1, ready: 1, feedback: 1, rescored: 1, cache_reused: 1 })
     const finished = diagnostic.activity!.find(item => item.reason === 'ready')!
     expect(finished).toMatchObject({ state: 'ready', schemaVersion: AI_TRIAGE_VERSION, inputPolicyVersion: AI_INPUT_POLICY_VERSION, scorePolicyVersion: AI_PREFERENCE_VERSION, manual: false, category: 'Important', assessment: { task: 'required', response: 'not_needed', evidenceCount: 3, evidence: [{ messageRef: 'm0', field: 'task' }, { messageRef: 'm0', field: 'action' }, { messageRef: 'm0', field: 'type' }] } })
-    expect(finished.contributions?.some(item => item.name === 'requested_actions')).toBe(true)
+    expect(finished.contributions).toEqual([{ name: 'actionability_gate', value: 20 }])
     expect(diagnostic.activity!.find(item => item.reason === 'feedback')).toMatchObject({ manual: true, category: 'Other' })
     expect(diagnostic.activity!.find(item => item.reason === 'feedback')?.problemCode).toBeUndefined()
     for (const secret of ['AI_PRIVATE_UNKNOWN_CODE', 'PRIVATE-DECISION-REASON', 'PRIVATE-TOPIC', 'PRIVATE-FEEDBACK-NOTE', 'Please review', 'sender@example.test', 'Subject private-activity', configuration.apiKey, '/private-responses']) expect(JSON.stringify(diagnostic)).not.toContain(secret)
@@ -13342,8 +13352,8 @@ describe('AI triage service', () => {
         assessment: { certainty: item.clear ? 'clear' : 'insufficient', ...item.change, ...(item.clear ? {} : { certainty: 'insufficient' }) },
         score: { category: item.category, version: AI_PREFERENCE_VERSION } })
     }
-    expect(decisions.find(item => item.assessment?.reason === 'promotion')!.score).toMatchObject({ score: -53, category: 'Other' })
-    expect(decisions.find(item => item.assessment?.reason === 'insufficient')!.score?.contributions).toContainEqual({ name: 'uncertainty_gate', value: 73 })
+    expect(decisions.find(item => item.assessment?.reason === 'promotion')!.score).toMatchObject({ score: 0, category: 'Other' })
+    expect(decisions.find(item => item.assessment?.reason === 'insufficient')!.score?.contributions).toContainEqual({ name: 'uncertainty_gate', value: 20 })
     const request = decisions.find(item => item.assessment?.reason === 'personal')!
     const manual = await service.feedback('alice', { sourceId: request.sourceId, threadId: request.threadId, revision: request.revision, id: 'ai-long-manual-other', category: 'Other' })
     expect(manual).toMatchObject({ override: { category: 'Other' }, score: { category: 'Other' }, assessment: { response: 'needed', certainty: 'insufficient' } })
@@ -13430,7 +13440,7 @@ describe('AI triage service', () => {
     expect(database.query<{ ms: number }, []>('SELECT SUM(ms) ms FROM local_ai_reading').get()?.ms).toBe(600000)
     expect(database.query<{ ms: number }, []>('SELECT ms FROM local_ai_message_reading ORDER BY ms').all().map(row => row.ms)).toEqual([300000, 300000])
     await service.configure('alice', { ...(await service.state('alice')).settings })
-    expect((await service.lookup('alice', [first])).decisions[0]?.score?.contributions.find(item => item.name === 'active_reading')?.value).toBe(4)
+    expect((await service.lookup('alice', [first])).decisions[0]?.score?.contributions.some(item => item.name === 'active_reading')).toBe(false)
     const mailbox = (await h.inbox.mailboxes('alice'))[0]!
     for (const [index, target] of [first, second].entries()) {
       const message = await h.inbox.mailboxMessage('alice', mailbox.id, target.latestMessageId)
@@ -13565,7 +13575,7 @@ describe('AI triage service', () => {
     const reuse = await service.process('alice', { id: 'ai-policy-clear-cache-reuse', scope: 'inbox', limit: 100 })
     await bounded((async () => { while ((await service.state('alice')).jobs.find(item => item.id === reuse.id)?.status === 'running') await Bun.sleep(10) })(), 'legacy clear assessment cache reuse')
     expect(calls).toHaveLength(names.length + 2)
-    expect((await service.lookup('alice', [clear])).decisions[0]).toMatchObject({ inputHash: clear.inputHash, inputPolicyVersion: 'input-1', assessment: clear.assessment, score: clear.score })
+    expect((await service.lookup('alice', [clear])).decisions[0]).toMatchObject({ inputHash: clear.inputHash, inputPolicyVersion: 'input-1', assessment: clear.assessment, score: { category: 'Important', score: 20, version: AI_PREFERENCE_VERSION } })
     expect((await service.diagnostics('alice')).usage).toMatchObject({ attempts: names.length + 2, completed: names.length + 2, reused: 1 })
   })
 

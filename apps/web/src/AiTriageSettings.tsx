@@ -197,7 +197,7 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
   return <div className="ai-triage-settings" aria-busy={busy}>
     <label className="settings-checkbox-row"><span>Automatic sorting</span><input type="checkbox" checked={automatic} disabled={toggleDisabled} onChange={event => setAutomaticSorting(event.target.checked)} /></label>
     <div className="ai-explanation">
-      <p><strong>Important</strong> needs a reply or action. <strong>Other</strong> has no outstanding work.</p>
+      <p><strong>Important</strong> needs a reply or action, or matches your interests. <strong>Other</strong> is routine mail and promotions.</p>
       <p className="settings-note">Uncertain mail stays Important for review; unassessed mail uses normal inbox rules. Your manual choices always win.</p>
       <p className="settings-note">Turning this on sends selected email text and recent conversation context to {state.provider?.endpointHost || "the privately configured provider"} to sort new mail. Provider charges may apply. Personal behavior and preferences stay on the server.</p>
     </div>
@@ -249,7 +249,7 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
         <label className="settings-checkbox-row"><span>Personalize categories</span><input type="checkbox" checked={draft.personalization} onChange={event => change({ personalization: event.target.checked })} /></label>
         <label className="settings-field"><span>Local interests</span><input value={interests} maxLength={1220} placeholder="Comma-separated topics" onChange={event => { setInterests(event.target.value); change({}); }} aria-invalid={invalidInterests} /></label>
         <p className={invalidInterests ? "settings-error" : "settings-note"}>Up to 20 comma-separated terms, 60 characters each. Used locally, not sent to the model.</p>
-        <label className="settings-checkbox-row"><span>Use estimated reading activity<span className="settings-checkbox-note">Opt-in active reading time for local personalization; no text, typing, or screenshots are collected.</span></span><input type="checkbox" checked={draft.readingSignals} onChange={event => change({ readingSignals: event.target.checked })} /></label>
+        <label className="settings-checkbox-row"><span>Use estimated reading activity<span className="settings-checkbox-note">Optional reading history; it does not change Important or Other. No text, typing, or screenshots are collected.</span></span><input type="checkbox" checked={draft.readingSignals} onChange={event => change({ readingSignals: event.target.checked })} /></label>
       </fieldset>
       {dirty && <p className="settings-note">Unsaved AI changes. Status and processing still use your saved settings.</p>}
       <div className="ai-actions"><button type="submit" className="settings-button" disabled={busy || !dirty || invalidInterests || stale || saveUncertain || draft.enabled && !state.configured}>Save AI settings</button><button type="button" className="settings-text-button" disabled={busy} onClick={reset}>{dirty ? "Discard AI changes" : "Reload saved settings"}</button></div>

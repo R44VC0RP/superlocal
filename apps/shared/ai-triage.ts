@@ -1,7 +1,7 @@
 /** Application-owned triage. These are not provider flags or permission grants. */
 export const AI_TRIAGE_VERSION = "triage-2";
 export const AI_INPUT_POLICY_VERSION = "input-3";
-export const AI_PREFERENCE_VERSION = "preference-3";
+export const AI_PREFERENCE_VERSION = "preference-4";
 export const aiKinds = ["conversation", "request", "notification", "invoice", "receipt", "newsletter", "promotion", "cold_outreach", "invitation", "other", "unknown"] as const;
 export const aiResponses = ["needed", "optional", "not_needed", "waiting", "unknown"] as const;
 export const aiTasks = ["required", "optional", "none", "unknown"] as const;
