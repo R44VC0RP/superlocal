@@ -67,6 +67,9 @@ export type Mail = {
   window?: Pick<import("../../shared/inbox-window").InboxWindowRow, "counts" | "messagesComplete" | "targets" | "targetsComplete" | "actionContextComplete" | "contextVersion">;
   hasAttachments?: boolean;
   historyExhausted?: boolean;
+  /** Client-only bounded history recovery, never host action provenance. */
+  historyTruncated?: boolean;
+  historyError?: string;
   triage?: AiDecision;
   /** A validated, opted-in local decision; never a provider folder mutation. */
   attentionCategory?: AiCategory;

@@ -37,22 +37,19 @@
   outline: 2px solid var(--muted);
   outline-offset: 3px;
 }
-.ai-sorting-warning {
-  display: flex;
-  flex-shrink: 0;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px 16px;
-  padding: 8px 20px;
-  border-bottom: 1px solid var(--border);
-  font: var(--ui-small) / 1.5 var(--font);
+.icon-button[data-sorting-issue] {
+  position: relative;
 }
-.ai-sorting-warning p {
-  margin: 0;
-}
-.ai-sorting-warning button {
-  min-height: 44px;
+.icon-button[data-sorting-issue]::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  pointer-events: none;
 }
 .ai-refresh {
   justify-self: start;

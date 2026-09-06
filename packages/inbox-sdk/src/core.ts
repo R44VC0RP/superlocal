@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { chmodSync, mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { Context, Effect, Either, Fiber, Layer, ManagedRuntime, Schedule } from 'effect'
 import { createCredentialCrypto } from '../server/crypto'
 import { sanitizeEmailBody } from '../server/sanitize'
@@ -27,6 +27,8 @@ type OperationRow = { seq: number; id: string; owner: string; account: string; g
 type MutationPayload = { input: MutationInput; before: Record<string, MessageSummary>; afterRevisions?: Record<string, number>; perMessageChanges?: Record<string, Changes> }
 type MailboxInventory = { owner: string; ids: string[]; scopeHash: string; binding: string; seq: number; expires: number; limit: number; bytes: number; completed: boolean }
 type SendPayload = { draft: Draft; holdUntil: number; nativeSource?: string; nativeThread?: string; inReplyTo?: string; references?: string[]; blobs: BlobInfo[] }
+type CorrespondenceRow = { received: number; sent: number; conversations: number; twoWay: number; firstMessageAt: number | null; lastMessageAt: number | null; lastSentAt: number | null; bins: string; recent: string }
+type CorrespondenceSnapshot = { row: CorrespondenceRow; seq: number; epoch: string }
 
 class Environment extends Context.Tag('inbox/Environment')<Environment, { database: Database; now: () => number }>() {}
 
@@ -174,9 +176,133 @@ export function createInbox(options: InboxOptions): Inbox {
   let due: Promise<void> | undefined
   let polling: Promise<void> | undefined
   let background: Fiber.RuntimeFiber<unknown, unknown>[] = []
+  const correspondenceFilename = db.filename && db.filename !== ':memory:' ? resolve(db.filename) : null
+  const CORRESPONDENCE_QUEUE = 4, CORRESPONDENCE_DEADLINE = 15_000, CORRESPONDENCE_CLOSE = 1000
+  type CorrespondenceJob = { id: number; owner: string; sql: string; params: (string | number)[]; timer: ReturnType<typeof setTimeout>; validate: (value: unknown) => CorrespondenceSnapshot; resolve: (value: CorrespondenceSnapshot) => void; reject: (error: InboxError) => void }
+  type CorrespondenceWorker = Worker & { ref(): void; unref(): void }
+  type CorrespondenceReader = { worker: CorrespondenceWorker; jobs: CorrespondenceJob[]; active: boolean; dead: boolean; closing: boolean; closeSent: boolean; acknowledged: boolean; exited: boolean; finished: Promise<void>; finish: () => void }
+  let correspondenceReader: CorrespondenceReader | undefined, correspondenceStarts = 0, correspondenceJobId = 0
+  let correspondenceClosing: Promise<void> | undefined
+  const unavailableRead = () => new InboxError('READ_UNAVAILABLE', 'Cached correspondence is temporarily unavailable.', 503, true)
+  const closedRead = () => new InboxError('CLOSED', 'The inbox instance is closed.', 503)
+
+  function failCorrespondence(reader: CorrespondenceReader, error: InboxError, terminate = true) {
+    reader.dead = true
+    for (const job of reader.jobs.splice(0)) { clearTimeout(job.timer); job.reject(error) }
+    reader.active = false
+    if (terminate && !reader.exited) { try { reader.worker.terminate() } catch { /* Already exited. */ } }
+    reader.worker.unref()
+  }
+
+  function stopCorrespondence(reader: CorrespondenceReader) {
+    if (reader.closeSent || reader.dead || reader.exited) return
+    reader.closeSent = true
+    reader.worker.ref()
+    try { reader.worker.postMessage({ type: 'close' }) } catch { failCorrespondence(reader, closedRead()) }
+  }
+
+  function pumpCorrespondence(reader: CorrespondenceReader) {
+    if (reader.dead || reader.active || reader.exited) return
+    if (reader.closing) { stopCorrespondence(reader); return }
+    const job = reader.jobs[0]
+    if (!job) { reader.worker.unref(); return }
+    reader.active = true
+    reader.worker.ref()
+    try { reader.worker.postMessage({ type: 'read', id: job.id, filename: correspondenceFilename, owner: job.owner, sql: job.sql, params: job.params }) }
+    catch { failCorrespondence(reader, unavailableRead()) }
+  }
+
+  function startCorrespondence(): CorrespondenceReader {
+    // A later request may replace one failed worker; consecutive failures never loop.
+    if (correspondenceStarts >= 2) throw unavailableRead()
+    correspondenceStarts++
+    let worker: CorrespondenceWorker
+    try { worker = new Worker(Bun.resolveSync('./correspondence-worker', import.meta.dir)) as CorrespondenceWorker }
+    catch { throw unavailableRead() }
+    let finish!: () => void
+    const finished = new Promise<void>(resolve => { finish = resolve })
+    const reader: CorrespondenceReader = { worker, jobs: [], active: false, dead: false, closing: false, closeSent: false, acknowledged: false, exited: false, finished, finish }
+    worker.addEventListener('message', event => {
+      if (correspondenceReader !== reader || reader.dead) return
+      const value = event.data, job = reader.jobs[0]
+      if (value?.type === 'closed' && reader.closing && reader.closeSent && !reader.active) { reader.acknowledged = true; return }
+      if (!job || !reader.active || !value || value.id !== job.id || value.type !== 'result') { failCorrespondence(reader, stopping ? closedRead() : unavailableRead()); return }
+      let snapshot: CorrespondenceSnapshot
+      try {
+        if (Buffer.byteLength(JSON.stringify(value)) > READ_BYTES) throw unavailableRead()
+        snapshot = job.validate(value)
+      } catch { failCorrespondence(reader, unavailableRead()); return }
+      reader.jobs.shift(); reader.active = false; clearTimeout(job.timer)
+      correspondenceStarts = 1
+      job.resolve(snapshot)
+      pumpCorrespondence(reader)
+    })
+    worker.addEventListener('error', event => { event.preventDefault(); failCorrespondence(reader, stopping ? closedRead() : unavailableRead()) })
+    worker.addEventListener('messageerror', () => failCorrespondence(reader, stopping ? closedRead() : unavailableRead()))
+    worker.addEventListener('close', event => {
+      reader.exited = true
+      if (!reader.closing || !reader.acknowledged || reader.jobs.length || (event as Event & { code: number }).code !== 0) failCorrespondence(reader, stopping ? closedRead() : unavailableRead(), false)
+      reader.finish()
+    })
+    return reader
+  }
+
+  function readCorrespondence(owner: string, sql: string, params: (string | number)[], validate: (value: unknown) => CorrespondenceSnapshot): Promise<CorrespondenceSnapshot> {
+    if (closed || stopping || correspondenceClosing) return Promise.reject(closedRead())
+    const id = ++correspondenceJobId
+    if (!correspondenceFilename || Buffer.byteLength(JSON.stringify({ type: 'read', id, filename: correspondenceFilename, owner, sql, params })) > READ_BYTES) return Promise.reject(unavailableRead())
+    let reader = correspondenceReader
+    if (!reader || reader.dead && reader.exited) correspondenceReader = reader = startCorrespondence()
+    if (reader.dead || reader.closing || reader.jobs.length >= CORRESPONDENCE_QUEUE) return Promise.reject(unavailableRead())
+    const current = reader
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (current.jobs.some(job => job.id === id)) failCorrespondence(current, stopping ? closedRead() : unavailableRead())
+      }, CORRESPONDENCE_DEADLINE)
+      current.jobs.push({ id, owner, sql, params, timer, validate, resolve, reject })
+      pumpCorrespondence(current)
+    })
+  }
+
+  function checkedCorrespondence(value: unknown, bucketCount: number, recentLimit: number, sources: Set<string>): CorrespondenceSnapshot {
+    const snapshot = value as Partial<CorrespondenceSnapshot> | null, row = snapshot?.row
+    const count = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    const timestamp = (value: unknown) => value === null || typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= 8.64e15
+    if (!snapshot || !count(snapshot.seq) || typeof snapshot.epoch !== 'string' || !snapshot.epoch || snapshot.epoch.length > 512
+      || !row || typeof row !== 'object' || ![row.received, row.sent, row.conversations, row.twoWay].every(count)
+      || ![row.firstMessageAt, row.lastMessageAt, row.lastSentAt].every(timestamp)
+      || typeof row.bins !== 'string' || typeof row.recent !== 'string') throw unavailableRead()
+    try {
+      const bins = JSON.parse(row.bins), recent = JSON.parse(row.recent), seen = new Set<number>()
+      if (!Array.isArray(bins) || bins.length > bucketCount || !Array.isArray(recent) || recent.length > recentLimit) throw unavailableRead()
+      for (const bin of bins) {
+        if (!bin || !count(bin.bucket) || bin.bucket >= bucketCount || seen.has(bin.bucket) || !count(bin.received) || !count(bin.sent)) throw unavailableRead()
+        seen.add(bin.bucket)
+      }
+      const key = (value: unknown) => typeof value === 'string' && value.trim().length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value)
+      for (const item of recent) if (!item || !key(item.sourceId) || !key(item.threadId) || !sources.has(item.sourceId)) throw unavailableRead()
+    } catch { throw unavailableRead() }
+    return snapshot as CorrespondenceSnapshot
+  }
+
+  function closeCorrespondence(): Promise<void> {
+    if (correspondenceClosing) return correspondenceClosing
+    const reader = correspondenceReader
+    if (!reader || reader.exited) return correspondenceClosing = Promise.resolve()
+    reader.closing = true
+    for (const job of reader.jobs.splice(reader.active ? 1 : 0)) { clearTimeout(job.timer); job.reject(closedRead()) }
+    reader.worker.ref()
+    if (!reader.active) stopCorrespondence(reader)
+    return correspondenceClosing = new Promise(resolve => {
+      const timer = setTimeout(() => { failCorrespondence(reader, closedRead()); resolve() }, CORRESPONDENCE_CLOSE)
+      void reader.finished.then(() => { clearTimeout(timer); resolve() })
+    })
+  }
+
   const layer = Layer.scoped(Environment, Effect.acquireRelease(
     Effect.succeed({ database: db, now }),
     () => Effect.promise(async () => {
+      await closeCorrespondence()
       await Promise.allSettled([...instances.values()].map(async provider => (await provider).disconnect()))
       instances.clear()
       listeners.clear()
@@ -587,9 +713,19 @@ export function createInbox(options: InboxOptions): Inbox {
 
   function conversationQuery(input: MailboxConversationQuery | undefined): MailboxConversationQuery {
     if (input === undefined) return {}
-    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['folder', 'labelId', 'search', 'unreadOnly', 'starredOnly', 'hasAttachments', 'from', 'to', 'before', 'after', 'done', 'snoozed'].includes(key))) throw new InboxError('VALIDATION', 'Invalid conversation query.')
+    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['folder', 'labelId', 'search', 'unreadOnly', 'starredOnly', 'hasAttachments', 'from', 'to', 'before', 'after', 'done', 'snoozed', 'participant'].includes(key))) throw new InboxError('VALIDATION', 'Invalid conversation query.')
+    const { participant, ...fields } = input
+    let header: MailboxConversationQuery['participant']
+    if (participant !== undefined) {
+      if (!participant || typeof participant !== 'object' || Array.isArray(participant) || Object.keys(participant).some(key => !['field', 'match', 'value'].includes(key))
+        || !['from', 'to'].includes(participant.field) || !['address', 'domain'].includes(participant.match)
+        || typeof participant.value !== 'string' || /[\u0000-\u001f\u007f]/.test(participant.value)) throw new InboxError('VALIDATION', 'Invalid participant predicate.')
+      const selected = selector({ kind: participant.match, value: participant.value })
+      if (selected.kind === 'all') throw new InboxError('VALIDATION', 'Invalid participant selector.')
+      header = { field: participant.field, match: participant.match, value: selected.value.toLowerCase() }
+    }
     const query: Record<string, string | boolean> = {}
-    for (const [key, value] of Object.entries(input)) {
+    for (const [key, value] of Object.entries(fields)) {
       if (value === undefined) continue
       if (['unreadOnly', 'starredOnly', 'hasAttachments', 'done', 'snoozed'].includes(key)) {
         if (typeof value !== 'boolean') throw new InboxError('VALIDATION', 'Query flags must be boolean.')
@@ -602,7 +738,7 @@ export function createInbox(options: InboxOptions): Inbox {
         } else query[key] = normalized
       }
     }
-    return query
+    return { ...query, ...(header ? { participant: header } : {}) }
   }
 
   function selectedMembership(alias = 'm') {
@@ -610,7 +746,7 @@ export function createInbox(options: InboxOptions): Inbox {
   }
 
   function scopedReadWhere(owner: string, scope: ReturnType<typeof mailboxReadScope>, query: MailboxConversationQuery = {}, alias = 'm') {
-    const { done, snoozed, ...filters } = query
+    const { done, snoozed, participant, ...filters } = query
     const base = where(owner, filters, true)
     const clauses = [base.sql, 'm.account IN (SELECT value FROM json_each(?))', 'm.generation=(SELECT generation FROM sdk_accounts a WHERE a.id=m.account AND a.owner=m.owner)', selectedMembership()]
     const params: Array<string | number> = [...base.params, scope.sourceJson, scope.json]
@@ -619,7 +755,57 @@ export function createInbox(options: InboxOptions): Inbox {
       params.push(scope.json)
       if (done !== undefined) params.push(Number(done))
     }
+    if (participant) {
+      const email = participant.field === 'from' ? "lower(trim(json_extract(m.visible,'$.from.email')))" : "lower(trim(json_extract(p.value,'$.email')))"
+      let predicate = `${email}=?`
+      params.push(participant.value)
+      if (participant.match === 'domain') {
+        const domain = `substr(${email},instr(${email},'@')+1)`
+        predicate = `(instr(${email},'@')>0 AND (${domain}=? OR ${domain} LIKE ? ESCAPE '\\'))`
+        params.push(`%.${participant.value.replace(/[\\%_]/g, '\\$&')}`)
+      }
+      clauses.push(participant.field === 'from' ? predicate : `EXISTS(SELECT 1 FROM json_each(m.visible,'$.to') p WHERE ${predicate})`)
+    }
     return { sql: clauses.join(' AND ').replace(/\bm\./g, `${alias}.`), params }
+  }
+
+  /** One explicit cached metadata scan, shared by the bounded contact and correspondence reads.
+   * EXISTS membership checks deduplicate overlapping views before recipient expansion. Native Sent
+   * evidence must be confirmed: an optimistic move or queued local draft is not correspondence. */
+  function cachedCorrespondents(owner: string, scope: ReturnType<typeof mailboxReadScope>, readAt: number, relevant?: { email: string; domain?: string }) {
+    const selection = scopedReadWhere(owner, scope), candidateParams: string[] = []
+    let candidate = ''
+    if (relevant) {
+      const matches = (field: string) => {
+        const address = `lower(trim(${field}))`
+        if (!relevant.domain) { candidateParams.push(relevant.email); return `${address}=?` }
+        candidateParams.push(relevant.domain, `%.${relevant.domain.replace(/[\\%_]/g, '\\$&')}`)
+        const domain = `substr(${address},instr(${address},'@')+1)`
+        return `(${domain}=? OR ${domain} LIKE ? ESCAPE '\\')`
+      }
+      // Only a necessary header filter: confirmed Sent direction and final matching still apply below.
+      // Contacts omit it so historical-name matches retain their latest cached display name.
+      candidate = `(${matches("json_extract(m.visible,'$.from.email')")} OR EXISTS(SELECT 1 FROM json_each(m.visible,'$.to') p WHERE ${matches("json_extract(p.value,'$.email')")}) OR EXISTS(SELECT 1 FROM json_each(m.visible,'$.cc') p WHERE ${matches("json_extract(p.value,'$.email')")})) AND `
+    }
+    const unsent = "'draft','drafts','scheduled','outbox','unsent','queued'", excluded = `'trash','spam',${unsent}`
+    const nativeRole = (column: 'visible' | 'confirmed', roles: string) => `EXISTS(SELECT 1 FROM json_each(m.${column},'$.folderIds') j
+      CROSS JOIN sdk_folders f ON f.id=j.value AND f.owner=m.owner AND f.account=m.account AND f.generation=m.generation
+      WHERE json_type(f.data,'$.custom') IS NOT 'true' AND json_extract(f.data,'$.role') IN (${roles}))`
+    return { sql: `WITH cached AS (
+      SELECT m.account source,m.id message,m.thread_id thread,CAST(round(unixepoch(m.received_at,'subsec')*1000) AS INTEGER) at,
+        CASE WHEN json_extract(m.confirmed,'$.folder')='sent' OR ${nativeRole('confirmed', "'sent'")} THEN 1 ELSE 0 END sent,
+        json_extract(m.visible,'$.from') sender,json_extract(m.visible,'$.to') recipients,json_extract(m.visible,'$.cc') copies
+      FROM sdk_messages m WHERE ${candidate}${selection.sql} AND m.folder NOT IN (${excluded})
+        AND date(substr(m.received_at,1,10),'+0 days')=substr(m.received_at,1,10)
+        AND coalesce(json_extract(m.confirmed,'$.folder'),'') NOT IN (${unsent})
+        AND NOT ${nativeRole('visible', excluded)} AND NOT ${nativeRole('confirmed', unsent)}
+    ), correspondents AS (
+      SELECT c.source,c.message,c.thread,c.at,c.sent,lower(trim(json_extract(p.value,'$.email'))) email,
+        CASE WHEN json_type(p.value,'$.name')='text' THEN json_extract(p.value,'$.name') ELSE '' END name
+      FROM cached c CROSS JOIN json_each(CASE WHEN c.sent=1 THEN json_array(json(c.recipients),json(c.copies))
+        ELSE json_array(json_array(json(c.sender))) END) addresses CROSS JOIN json_each(addresses.value) p
+      WHERE c.at<=? AND json_type(p.value,'$.email')='text' AND trim(json_extract(p.value,'$.email'))<>''
+    )`, params: [...candidateParams, ...selection.params, readAt] }
   }
 
   function liveMailboxPage(owner: string, scope: ReturnType<typeof mailboxReadScope>, cursor: string | undefined, kind: string, context: unknown) {
@@ -936,12 +1122,36 @@ export function createInbox(options: InboxOptions): Inbox {
     }
   }
 
-  function folderFor(row: AccountRow, nativeId: string, role = nativeId, name = role, kind: Folder['kind'] = 'folder'): Folder {
+  function folderFor(row: AccountRow, nativeId: string, role = nativeId, name = role, kind: Folder['kind'] = 'folder', metadata?: { custom?: boolean }): Folder {
     const existing = db.query<DataRow, [string, number, string]>('SELECT * FROM sdk_folders WHERE account=? AND generation=? AND native_id=?').get(row.id, row.generation, nativeId)
-    if (existing && name === role && kind === 'folder') return JSON.parse(existing.data)
-    const result: Folder = { id: existing?.id ?? randomUUID(), accountId: row.id, name, role, kind, scope: 'provider' }
+    if (existing && !metadata && name === role && kind === 'folder') return JSON.parse(existing.data)
+    const result: Folder = { id: existing?.id ?? randomUUID(), accountId: row.id, name, role, kind, scope: 'provider',
+      ...(typeof metadata?.custom === 'boolean' ? { custom: metadata.custom } : {}) }
     db.query('INSERT INTO sdk_folders(id,owner,account,generation,native_id,data) VALUES (?,?,?,?,?,?) ON CONFLICT(account,generation,native_id) DO UPDATE SET data=excluded.data').run(result.id, row.owner, row.id, row.generation, nativeId, JSON.stringify(result))
     return result
+  }
+
+  /** Custom is an explicit provider fact, not a guess from a role/name/native-ID convention.
+   * Admission reads canonical IDs only; native IDs are selected only at actual dispatch. */
+  function providerLabelRows(row: AccountRow, changes: Changes, dispatch = false) {
+    if (changes.addProviderLabelIds === undefined && changes.removeProviderLabelIds === undefined) return []
+    for (const values of [changes.addProviderLabelIds, changes.removeProviderLabelIds]) {
+      if (values !== undefined && (!Array.isArray(values) || !values.length || values.length > 100 || new Set(values).size !== values.length
+        || values.some(id => typeof id !== 'string' || !id.trim() || id.length > 512 || /[\u0000-\u001f\u007f/\\]/.test(id)))) throw new InboxError('VALIDATION', 'Provider label changes require between 1 and 100 unique nonempty IDs per field.')
+    }
+    const added = new Set(changes.addProviderLabelIds)
+    if (changes.removeProviderLabelIds?.some(id => added.has(id))) throw new InboxError('VALIDATION', 'A provider label cannot be both added and removed.')
+    if (options.allowProviderWrites === false) throw new InboxError('PROVIDER_WRITES_DISABLED', 'Provider writes are disabled for this deployment.', 403)
+    if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account generation or connection changed.', 409)
+    if (!(JSON.parse(accountRow(row.owner, row.id, true).data) as Account).capabilities.labels) throw new InboxError('UNSUPPORTED_OPERATION', 'This account cannot modify provider labels.', 409)
+    const ids = [...changes.addProviderLabelIds ?? [], ...changes.removeProviderLabelIds ?? []]
+    if (!ids.length) return []
+    const labels = db.query<{ id: string; kind: string | null; custom: string | null; native_id?: string }, [string, string, number, string]>(`
+      SELECT id,json_extract(data,'$.kind') kind,json_type(data,'$.custom') custom${dispatch ? ',native_id' : ''} FROM sdk_folders
+      WHERE owner=? AND account=? AND generation=? AND id IN (SELECT value FROM json_each(?))`).all(row.owner, row.id, row.generation, JSON.stringify(ids))
+    if (labels.length !== ids.length) throw new InboxError('NOT_FOUND', 'Current provider label not found.', 404)
+    if (labels.some(label => label.kind !== 'label' || label.custom !== 'true')) throw new InboxError('INVALID_PROVIDER_LABEL', 'Only verified custom provider labels are supported. Refresh folders to verify unknown metadata.', 409)
+    return labels
   }
 
   function applyChanges(value: MessageSummary, changes: Changes, row: AccountRow): MessageSummary {
@@ -961,13 +1171,16 @@ export function createInbox(options: InboxOptions): Inbox {
     }
     if (changes.isArchived === true) {
       result.folder = 'archive'
-      const inbox = db.query<{ id: string }, [string, string]>('SELECT id FROM sdk_folders WHERE owner=? AND account=? AND json_extract(data,\'$.role\')=\'inbox\'').all(row.owner, row.id)
+      const inbox = db.query<{ id: string }, [string, string]>('SELECT id FROM sdk_folders WHERE owner=? AND account=? AND json_type(data,\'$.custom\') IS NOT \'true\' AND json_extract(data,\'$.role\')=\'inbox\'').all(row.owner, row.id)
       result.folderIds = result.folderIds.filter(id => !inbox.some(f => f.id === id))
       if (!result.folderIds.length) result.folderIds = [folderFor(row, 'archive').id]
     }
     if (changes.isArchived === false) {
       result.folder = 'inbox'
       result.folderIds = [...new Set([...result.folderIds, folderFor(row, 'inbox').id])]
+    }
+    if (changes.addProviderLabelIds !== undefined || changes.removeProviderLabelIds !== undefined) {
+      result.folderIds = [...new Set([...result.folderIds, ...changes.addProviderLabelIds ?? []])].filter(id => !changes.removeProviderLabelIds?.includes(id))
     }
     result.labelIds = [...new Set([...result.labelIds, ...changes.addLabelIds ?? []])].filter(id => !changes.removeLabelIds?.includes(id))
     if (changes.snoozedUntil !== undefined) result.snoozedUntil = changes.snoozedUntil
@@ -1217,7 +1430,7 @@ export function createInbox(options: InboxOptions): Inbox {
       if (value === 'all') return
       if (value === 'starred') { clauses.push('m.is_starred=1'); return }
       if (value === 'snoozed') { clauses.push("json_extract(m.visible,'$.snoozedUntil') IS NOT NULL"); return }
-      clauses.push("(m.folder=? OR EXISTS(SELECT 1 FROM json_each(m.visible,'$.folderIds') j JOIN sdk_folders f ON f.id=j.value AND f.owner=m.owner WHERE j.value=? OR json_extract(f.data,'$.role')=?))"); params.push(value, value, value)
+      clauses.push("(m.folder=? OR EXISTS(SELECT 1 FROM json_each(m.visible,'$.folderIds') j JOIN sdk_folders f ON f.id=j.value AND f.owner=m.owner WHERE j.value=? OR (json_type(f.data,'$.custom') IS NOT 'true' AND json_extract(f.data,'$.role')=?)))"); params.push(value, value, value)
       if (value === 'inbox' && !mailboxMode) clauses.push("json_extract(m.visible,'$.snoozedUntil') IS NULL")
     }
     if (query.folder) folder(query.folder)
@@ -1470,6 +1683,9 @@ export function createInbox(options: InboxOptions): Inbox {
           const change = payload.perMessageChanges?.[id] ?? payload.input.changes
           for (const label of [...change.addLabelIds ?? [], ...change.removeLabelIds ?? []]) if (!db.query('SELECT 1 FROM sdk_labels WHERE id=? AND owner=? AND account=?').get(label, row.owner, row.account)) throw new InboxError('NOT_FOUND', 'Label no longer exists.', 404)
           const stored = messageRow(row.owner, id)
+          const providerLabels = change.addProviderLabelIds !== undefined || change.removeProviderLabelIds !== undefined
+          if (providerLabels && stored.generation !== account.generation) throw new InboxError('NOT_FOUND', 'Current message not found.', 404)
+          providerLabelRows(account, change)
           const native: Changes = {}
           for (const key of ['isRead','isStarred','isArchived','folder','addLabels','removeLabels','deletePermanently'] as const) {
             if (change[key] !== undefined) Object.assign(native, { [key]: change[key] })
@@ -1479,10 +1695,25 @@ export function createInbox(options: InboxOptions): Inbox {
             if (!folder) throw new InboxError('NOT_FOUND', 'Folder not found.', 404)
             native.folder = folder.native_id
           }
-          if (Object.keys(native).length && stored.native_id.startsWith('submission:')) throw new InboxError('RECONCILIATION_PENDING', 'Wait for the provider to identify its sent copy before modifying this message.', 409)
-          if (Object.keys(native).length && options.allowProviderWrites === false) throw new InboxError('PROVIDER_WRITES_DISABLED', 'Provider writes are disabled for this deployment.', 403)
-          const result = Object.keys(native).length ? await io(account, provider => provider.mutate(stored.native_id, native)) : undefined
-          if (Object.keys(native).length) returnedMutation = { messageId: id, result, deleted: native.deletePermanently === true && result === null }
+          const nativeWork = Object.keys(native).length > 0 || Boolean(change.addProviderLabelIds?.length || change.removeProviderLabelIds?.length)
+          if (nativeWork && stored.native_id.startsWith('submission:')) throw new InboxError('RECONCILIATION_PENDING', 'Wait for the provider to identify its sent copy before modifying this message.', 409)
+          if (nativeWork && options.allowProviderWrites === false) throw new InboxError('PROVIDER_WRITES_DISABLED', 'Provider writes are disabled for this deployment.', 403)
+          const result = nativeWork ? await io(account, provider => {
+            if (!providerLabels) return provider.mutate(stored.native_id, native)
+            if (!ownsLease(row)) throw new InboxError('CONFLICT', 'Mutation ownership changed before dispatch.', 409)
+            if (!provider.capabilities.labels) throw new InboxError('UNSUPPORTED_OPERATION', 'This account cannot modify provider labels.', 409)
+            // Resolve again after credential/provider initialization, including authenticated retries.
+            const labels = providerLabelRows(account, change, true)
+            const ids = new Map(labels.map(label => [label.id, label.native_id!]))
+            const add = new Set([...native.addLabels ?? [], ...(change.addProviderLabelIds ?? []).map(id => ids.get(id)!)])
+            const remove = new Set([...native.removeLabels ?? [], ...(change.removeProviderLabelIds ?? []).map(id => ids.get(id)!)])
+            if ([...add].some(id => remove.has(id))) throw new InboxError('VALIDATION', 'Raw and canonical provider label changes conflict.')
+            const resolved = { ...native,
+              ...(native.addLabels !== undefined || change.addProviderLabelIds !== undefined ? { addLabels: [...add] } : {}),
+              ...(native.removeLabels !== undefined || change.removeProviderLabelIds !== undefined ? { removeLabels: [...remove] } : {}) }
+            return provider.mutate(stored.native_id, resolved)
+          }) : undefined
+          if (nativeWork) returnedMutation = { messageId: id, result, deleted: native.deletePermanently === true && result === null }
           transaction(() => {
             if (!ownsLease(row) || !current(account)) return
             const beforeRevision = mutationRevision(op, id)
@@ -1856,7 +2087,7 @@ export function createInbox(options: InboxOptions): Inbox {
             const removed = db.query<MessageRow, [string, number, string]>('SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id=? AND deleted=0').get(id, row.generation, nativeId)
             if (!removed || lane === 'backfill' || removed.last_mutation_seq > fence) continue
             const value: MessageSummary = JSON.parse(removed.confirmed)
-            const folderIds = db.query<{ id: string }, [string, string, string]>('SELECT id FROM sdk_folders WHERE account=? AND (native_id=? OR json_extract(data,\'$.role\')=?)').all(id, scope, scope)
+            const folderIds = db.query<{ id: string }, [string, string, string]>('SELECT id FROM sdk_folders WHERE account=? AND (native_id=? OR (json_type(data,\'$.custom\') IS NOT \'true\' AND json_extract(data,\'$.role\')=?))').all(id, scope, scope)
             value.folderIds = value.folderIds.filter(fid => !folderIds.some(folder => folder.id === fid))
             if (value.folder === scope) value.folder = 'archive'
             db.query('UPDATE sdk_messages SET confirmed=? WHERE id=?').run(JSON.stringify(value), removed.id)
@@ -2081,7 +2312,9 @@ export function createInbox(options: InboxOptions): Inbox {
       return result
     }).deferred()),
     mailboxConversations: (owner, input) => run(() => db.transaction(() => {
-      if (!input || Object.keys(input).some(key => !['mailboxIds', 'limit', 'cursor', 'keys', 'query'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox conversations input.')
+      if (!input || Object.keys(input).some(key => !['mailboxIds', 'limit', 'cursor', 'direction', 'keys', 'query'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox conversations input.')
+      if (input.direction !== undefined && !['older', 'newer'].includes(input.direction)) throw new InboxError('VALIDATION', 'Invalid conversation traversal direction.')
+      const newer = input.direction === 'newer', order = newer ? 'ASC' : 'DESC'
       const scope = mailboxReadScope(owner, input.mailboxIds), limit = input.limit ?? 100
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new InboxError('VALIDATION', 'Conversation pages contain between 1 and 100 rows.')
       const query = conversationQuery(input.query), readAt = new Date(now()).toISOString()
@@ -2096,6 +2329,8 @@ export function createInbox(options: InboxOptions): Inbox {
         }).sort((a, b) => a.sourceId.localeCompare(b.sourceId) || a.threadId.localeCompare(b.threadId))
         keys = [...new Map(keys.map(key => [JSON.stringify(key), key])).values()]
       }
+      // Direction deliberately stays outside the legacy context hash: the same attested boundary
+      // can be traversed either way without changing its starting reconciliation state.
       const page = liveMailboxPage(owner, scope, input.cursor, 'mailbox-conversations', { ids: scope.ids, limit, keys, query })
       const selection = scopedReadWhere(owner, scope)
       const matching = scopedReadWhere(owner, scope, query, 'f')
@@ -2108,8 +2343,8 @@ export function createInbox(options: InboxOptions): Inbox {
         selection.params.push(...matching.params)
       }
       if (keys) selection.sql += " AND m.thread_id=json_extract(k.value,'$.threadId') AND m.account=json_extract(k.value,'$.sourceId')"
-      if (page.position) { selection.sql += ' AND (m.received_at,m.id)<(?,?)'; selection.params.push(...page.position) }
-      const leaders = db.query<{ id: string; account: string; thread_id: string; received_at: string }, (string | number)[]>(`SELECT m.id,m.account,m.thread_id,m.received_at FROM ${keys ? 'json_each(?) k CROSS JOIN ' : ''}sdk_messages m INDEXED BY ${keys ? 'sdk_message_thread' : 'sdk_message_query'} WHERE ${selection.sql} ORDER BY m.received_at DESC,m.id DESC LIMIT ?`).all(...keys ? [JSON.stringify(keys)] : [], ...selection.params, limit + 1)
+      if (page.position) { selection.sql += ` AND (m.received_at,m.id)${newer ? '>' : '<'}(?,?)`; selection.params.push(...page.position) }
+      const leaders = db.query<{ id: string; account: string; thread_id: string; received_at: string }, (string | number)[]>(`SELECT m.id,m.account,m.thread_id,m.received_at FROM ${keys ? 'json_each(?) k CROSS JOIN ' : ''}sdk_messages m INDEXED BY ${keys ? 'sdk_message_thread' : 'sdk_message_query'} WHERE ${selection.sql} ORDER BY m.received_at ${order},m.id ${order} LIMIT ?`).all(...keys ? [JSON.stringify(keys)] : [], ...selection.params, limit + 1)
       const items: MailboxConversation[] = []
       let membershipBudget = READ_MEMBERSHIPS, bytes = 4096, last: typeof leaders[number] | undefined
       for (const leader of leaders.slice(0, limit)) {
@@ -2117,9 +2352,10 @@ export function createInbox(options: InboxOptions): Inbox {
         const selected = scopedReadWhere(owner, scope)
         selected.sql += ' AND m.thread_id=? AND m.account=?'; selected.params.push(leader.thread_id, leader.account)
         const roles = ['inbox', 'archive', 'sent', 'drafts', 'spam', 'trash'] as const
-        const nativeColumns = roles.map(role => `MAX(CASE WHEN m.folder='${role}' OR EXISTS(SELECT 1 FROM json_each(m.visible,'$.folderIds') j JOIN sdk_folders f ON f.id=j.value AND f.owner=m.owner AND f.account=m.account WHERE json_extract(f.data,'$.role')='${role}') THEN 1 ELSE 0 END) ${role}`)
+        const nativeColumns = roles.map(role => `MAX(CASE WHEN m.folder='${role}' OR EXISTS(SELECT 1 FROM json_each(m.visible,'$.folderIds') j JOIN sdk_folders f ON f.id=j.value AND f.owner=m.owner AND f.account=m.account WHERE json_type(f.data,'$.custom') IS NOT 'true' AND json_extract(f.data,'$.role')='${role}') THEN 1 ELSE 0 END) ${role}`)
+        const primaryColumns = roles.map(role => `SUM(m.folder='${role}') primary_${role}`)
         const awakeInbox = `SUM(CASE WHEN m.folder='inbox' AND EXISTS(SELECT 1 FROM sdk_memberships v INDEXED BY sdk_membership_read WHERE v.owner=m.owner AND v.source=m.account AND v.message=m.id AND v.mailbox IN (SELECT value FROM json_each(?)) AND json_extract(v.data,'$.done')=0 AND (json_extract(v.data,'$.snoozedUntil') IS NULL OR json_extract(v.data,'$.snoozedUntil')<=?)) THEN 1 ELSE 0 END)`
-        const aggregate = db.query<{ count: number; read: number; starred: number; attachments: number; awakeInboxMessageCount: number } & Record<typeof roles[number], number>, (string | number)[]>(`SELECT COUNT(*) count,MIN(m.is_read) read,MAX(m.is_starred) starred,MAX(json_extract(m.visible,'$.hasAttachments')) attachments,${awakeInbox} awakeInboxMessageCount,${nativeColumns.join(',')} FROM sdk_messages m INDEXED BY sdk_message_thread WHERE ${selected.sql}`).get(scope.json, readAt, ...selected.params)!
+        const aggregate = db.query<{ count: number; read: number; starred: number; attachments: number; awakeInboxMessageCount: number } & Record<typeof roles[number] | `primary_${typeof roles[number]}`, number>, (string | number)[]>(`SELECT COUNT(*) count,MIN(m.is_read) read,MAX(m.is_starred) starred,MAX(json_extract(m.visible,'$.hasAttachments')) attachments,${awakeInbox} awakeInboxMessageCount,${nativeColumns.join(',')},${primaryColumns.join(',')} FROM sdk_messages m INDEXED BY sdk_message_thread WHERE ${selected.sql}`).get(scope.json, readAt, ...selected.params)!
         const memberGroups = db.query<{ mailboxId: string; messageCount: number; doneCount: number; snoozedCount: number; earliestSnoozedUntil: string | null }, (string | number)[]>(`SELECT v.mailbox mailboxId,COUNT(*) messageCount,SUM(json_extract(v.data,'$.done')=1) doneCount,SUM(json_extract(v.data,'$.snoozedUntil') IS NOT NULL) snoozedCount,MIN(CASE WHEN json_extract(v.data,'$.snoozedUntil')>? THEN json_extract(v.data,'$.snoozedUntil') END) earliestSnoozedUntil FROM sdk_messages m INDEXED BY sdk_message_thread CROSS JOIN sdk_memberships v INDEXED BY sdk_membership_read ON v.owner=m.owner AND v.source=m.account AND v.message=m.id WHERE ${selected.sql} AND v.mailbox IN (SELECT value FROM json_each(?)) GROUP BY v.mailbox ORDER BY v.mailbox`).all(readAt, ...selected.params, scope.json)
         const mailboxStates = memberGroups.map(({ earliestSnoozedUntil: _earliest, ...state }) => state)
         const membershipCount = memberGroups.reduce((sum, state) => sum + state.messageCount, 0)
@@ -2135,8 +2371,9 @@ export function createInbox(options: InboxOptions): Inbox {
         let used = messages.reduce((sum, message) => sum + message.memberships.length, 0)
         const targetLimit = Math.min(500, membershipBudget - used)
         const targets = db.query<{ mailboxId: string; messageId: string; revision: number; messageRevision: number }, (string | number)[]>(`SELECT v.mailbox mailboxId,m.id messageId,json_extract(v.data,'$.revision') revision,m.revision messageRevision FROM sdk_messages m INDEXED BY sdk_message_thread CROSS JOIN sdk_memberships v INDEXED BY sdk_membership_read ON v.owner=m.owner AND v.source=m.account AND v.message=m.id WHERE ${selected.sql} AND v.mailbox IN (SELECT value FROM json_each(?)) ORDER BY m.received_at DESC,m.id DESC,v.mailbox LIMIT ?`).all(...selected.params, scope.json, targetLimit)
-        const row: MailboxConversation = { sourceId: leader.account, threadId: leader.thread_id, subject: first.subject, firstMessageId: first.id, messageCount: aggregate.count, membershipCount, doneMembershipCount,
+        const row: MailboxConversation = { sourceId: leader.account, threadId: leader.thread_id, cursor: page.next(leader.received_at, leader.id), subject: first.subject, firstMessageId: first.id, messageCount: aggregate.count, membershipCount, doneMembershipCount,
           awakeInboxMessageCount: aggregate.awakeInboxMessageCount, earliestSnoozedUntil, lastMessageAt: leader.received_at, isRead: !!aggregate.read, isStarred: !!aggregate.starred, hasAttachments: !!aggregate.attachments,
+          primaryFolderCounts: { inbox: aggregate.primary_inbox, archive: aggregate.primary_archive, sent: aggregate.primary_sent, drafts: aggregate.primary_drafts, spam: aggregate.primary_spam, trash: aggregate.primary_trash },
           nativeFolders: { inbox: !!aggregate.inbox, archive: !!aggregate.archive, sent: !!aggregate.sent, drafts: !!aggregate.drafts, spam: !!aggregate.spam, trash: !!aggregate.trash }, mailboxStates, messages, messagesComplete: messages.length === aggregate.count, targets, targetsComplete: targets.length === membershipCount }
         let size = Buffer.byteLength(JSON.stringify(row))
         // Context may shrink, but counts/state never do. Keep giant conversations visible.
@@ -2164,6 +2401,91 @@ export function createInbox(options: InboxOptions): Inbox {
       const counts = db.query<{ messages: number; conversations: number }, (string | number)[]>(`SELECT COALESCE(SUM(messageCount),0) messages,COUNT(*) conversations FROM (SELECT COUNT(*) messageCount FROM sdk_messages m WHERE ${selection.sql} GROUP BY m.account,m.thread_id)`).get(...selection.params)!
       return { ...counts, asOfState: token(owner, sequence(owner)), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`) }
     }).deferred()),
+    mailboxContacts: (owner, input) => run(() => db.transaction(() => {
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['mailboxIds', 'query', 'limit'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox contacts input.')
+      const scope = mailboxReadScope(owner, input.mailboxIds), limit = input.limit === undefined ? 20 : input.limit
+      if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+      if (typeof input.query !== 'string' || input.query.length > 256 || /[\u0000-\u001f\u007f]/.test(input.query)) throw new InboxError('VALIDATION', 'Contact queries contain at most 256 characters.')
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new InboxError('VALIDATION', 'Contact reads contain between 1 and 100 entries.')
+      const selection = cachedCorrespondents(owner, scope, now())
+      const pattern = `%${input.query.toLowerCase().replace(/[\\%_]/g, '\\$&')}%`
+      // Find addresses by any eligible cached name, then display their newest name (even if empty).
+      const items = db.query<{ name: string; email: string }, (string | number)[]>(`${selection.sql}, candidates AS (
+        SELECT DISTINCT email FROM correspondents WHERE email LIKE ? ESCAPE '\\' OR lower(name) LIKE ? ESCAPE '\\'
+      ), ranked AS (
+        SELECT email,name,at,ROW_NUMBER() OVER (PARTITION BY email ORDER BY at DESC,source,message DESC,name) ordinal
+        FROM correspondents WHERE email IN (SELECT email FROM candidates)
+      ) SELECT name,email FROM ranked WHERE ordinal=1 ORDER BY at DESC,email LIMIT ?`).all(...selection.params, pattern, pattern, limit)
+      const result = { items, state: token(owner, sequence(owner)), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`) }
+      if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The contact read exceeds its encoded budget.', 413)
+      return result
+    }).deferred()),
+    mailboxCorrespondence: (owner, input) => run(async () => {
+      if (closed || stopping) throw closedRead()
+      const prepared = db.transaction(() => {
+        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['mailboxIds', 'email', 'domain', 'since', 'bucketMs', 'bucketCount', 'recentLimit'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox correspondence input.')
+        const scope = mailboxReadScope(owner, input.mailboxIds), recentLimit = input.recentLimit === undefined ? 5 : input.recentLimit
+        if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+        const address = selector({ kind: 'address', value: input.email })
+        if (address.kind !== 'address') throw new InboxError('VALIDATION', 'Invalid correspondence address.')
+        const email = address.value.toLowerCase(), hostname = email.slice(email.lastIndexOf('@') + 1)
+        let domain: string | undefined
+        if (input.domain !== undefined) {
+          const selected = selector({ kind: 'domain', value: text(input.domain, 'Correspondence domain', 253) })
+          if (selected.kind !== 'domain' || selected.value.split('.').some(label => label.length > 63) || !(hostname === selected.value || hostname.endsWith(`.${selected.value}`))) throw new InboxError('VALIDATION', 'The correspondence domain must contain the address.')
+          domain = selected.value
+        }
+        const since = text(input.since, 'Correspondence start', 100), start = Date.parse(since), bucketMs = input.bucketMs, bucketCount = input.bucketCount
+        if (!/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(since)
+          || !Number.isFinite(start) || new Date(`${since.slice(0, 10)}T00:00:00Z`).toISOString().slice(0, 10) !== since.slice(0, 10)) throw new InboxError('VALIDATION', 'Correspondence start must be a valid ISO timestamp.')
+        if (!Number.isSafeInteger(bucketMs) || bucketMs < 3600000 || bucketMs > 365 * 86400000
+          || !Number.isSafeInteger(bucketCount) || bucketCount < 1 || bucketCount > 64
+          || !Number.isSafeInteger(recentLimit) || recentLimit < 1 || recentLimit > 50) throw new InboxError('VALIDATION', 'Invalid correspondence period or recent limit.')
+        const selection = cachedCorrespondents(owner, scope, now(), { email, domain })
+        const predicate = domain ? "(substr(email,instr(email,'@')+1)=? OR substr(email,instr(email,'@')+1) LIKE ? ESCAPE '\\')" : 'email=?'
+        const matching = domain ? [domain, `%.${domain.replace(/[\\%_]/g, '\\$&')}`] : [email]
+        const sql = `${selection.sql}, matched AS (
+          SELECT source,message,thread,at,sent FROM correspondents WHERE ${predicate} GROUP BY source,message,sent
+        ), threads AS (
+          SELECT source,thread,MAX(sent=0) received,MAX(sent=1) sent,MAX(at) latest FROM matched GROUP BY source,thread
+        ) SELECT COALESCE(SUM(sent=0),0) received,COALESCE(SUM(sent=1),0) sent,
+          MIN(at) firstMessageAt,MAX(at) lastMessageAt,MAX(CASE WHEN sent=1 THEN at END) lastSentAt,
+          (SELECT COUNT(*) FROM threads) conversations,(SELECT COALESCE(SUM(received AND sent),0) FROM threads) twoWay,
+          (SELECT json_group_array(json_object('bucket',bucket,'received',received,'sent',sent)) FROM (
+            SELECT CAST((at-?)/? AS INTEGER) bucket,SUM(sent=0) received,SUM(sent=1) sent FROM matched WHERE at>=? AND at<? GROUP BY bucket
+          )) bins,
+          (SELECT json_group_array(json_object('sourceId',source,'threadId',thread)) FROM (
+            SELECT source,thread FROM threads ORDER BY latest DESC,source,thread LIMIT ?
+          )) recent FROM matched`
+        const params = [...selection.params, ...matching, start, bucketMs, start, start + bucketMs * bucketCount, recentLimit]
+        // Only memory/temporary databases execute inline. Never span an await with this transaction.
+        const inline = correspondenceFilename ? null : { row: db.query<CorrespondenceRow, (string | number)[]>(sql).get(...params)!, seq: sequence(owner), epoch }
+        return { scope, start, bucketMs, bucketCount, recentLimit, sql, params, inline }
+      }).deferred()
+      const { scope, start, bucketMs, bucketCount, recentLimit } = prepared
+      const snapshot = prepared.inline ?? await readCorrespondence(owner, prepared.sql, prepared.params, value => checkedCorrespondence(value, bucketCount, recentLimit, scope.sources))
+      if (!prepared.inline) {
+        if (closed || stopping) throw closedRead()
+        db.transaction(() => {
+          const currentEpoch = db.query<{ value: string }, []>("SELECT value FROM sdk_meta WHERE key='epoch'").get()?.value
+          if (snapshot.epoch !== epoch || currentEpoch !== epoch) throw new InboxError('MAILBOX_SCOPE_CHANGED', 'Restart the changed mailbox selection.', 409, true)
+          const currentScope = mailboxReadScope(owner, scope.ids)
+          if (!currentScope.attached || currentScope.hash !== scope.hash || currentScope.binding !== scope.binding) throw new InboxError('MAILBOX_SCOPE_CHANGED', 'Restart the changed mailbox selection.', 409, true)
+        }).deferred()
+      }
+      const aggregate = snapshot.row
+      const periods = Array.from({ length: bucketCount }, (_, index) => ({ start: new Date(start + index * bucketMs).toISOString(), received: 0, sent: 0 }))
+      for (const bin of JSON.parse(aggregate.bins) as Array<{ bucket: number; received: number; sent: number }>) {
+        periods[bin.bucket]!.received = bin.received; periods[bin.bucket]!.sent = bin.sent
+      }
+      const iso = (value: number | null) => value === null ? null : new Date(value).toISOString()
+      const result = { state: token(owner, snapshot.seq), scopeState: token(owner, 0, `mailbox-scope:${scope.hash}:${scope.binding}`),
+        received: aggregate.received, sent: aggregate.sent, conversations: aggregate.conversations, twoWay: aggregate.twoWay,
+        firstMessageAt: iso(aggregate.firstMessageAt), lastMessageAt: iso(aggregate.lastMessageAt), lastSentAt: iso(aggregate.lastSentAt), periods,
+        recent: JSON.parse(aggregate.recent) as MailboxThreadKey[] }
+      if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The correspondence read exceeds its encoded budget.', 413)
+      return result
+    }),
     mailboxSyncStatus: (owner, input) => run(() => db.transaction(() => {
       if (!input || Object.keys(input).some(key => key !== 'mailboxIds')) throw new InboxError('VALIDATION', 'Invalid mailbox sync status input.')
       const scope = mailboxReadScope(owner, input.mailboxIds)
@@ -2401,7 +2723,7 @@ export function createInbox(options: InboxOptions): Inbox {
       const row = accountRow(owner, id, true)
       const folders = await io(row, p => p.listFolders())
       if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed.', 409)
-      return transaction(() => folders.map(folder => folderFor(row, folder.id, folder.folder, folder.name, folder.kind ?? 'folder')))
+      return transaction(() => folders.map(folder => folderFor(row, folder.id, folder.folder, folder.name, folder.kind ?? 'folder', folder)))
     }),
     cachedFolders: (owner, id) => run(() => {
       const row = accountRow(owner, id)
@@ -2414,7 +2736,7 @@ export function createInbox(options: InboxOptions): Inbox {
       if (!provider.capabilities.createFolders) throw new InboxError('UNSUPPORTED_OPERATION', 'Folder creation is unavailable.', 409)
       const folder = await io(row, p => p.createFolder(name))
       if (!current(row)) throw new InboxError('RECONNECT_REQUIRED', 'Account connection changed.', 409)
-      return transaction(() => { const result = folderFor(row, folder.id, folder.folder, folder.name, folder.kind ?? 'folder'); event(owner, 'account.updated', id, id); return result })
+      return transaction(() => { const result = folderFor(row, folder.id, folder.folder, folder.name, folder.kind ?? 'folder', folder); event(owner, 'account.updated', id, id); return result })
     }),
 
     messages: (owner, query = {}) => run(() => {
@@ -2639,7 +2961,7 @@ export function createInbox(options: InboxOptions): Inbox {
       const intent = { type: 'mutation', ...input, idempotencyKey: undefined }
       const previous = replay(owner, input.idempotencyKey, intent); if (previous) return previous
       if (!input.changes || typeof input.changes !== 'object' || !Object.keys(input.changes).length) throw new InboxError('VALIDATION', 'A mutation is required.')
-      const allowed = ['isRead','isStarred','isArchived','folder','folderId','addLabels','removeLabels','addLabelIds','removeLabelIds','snoozedUntil','deletePermanently']
+      const allowed = ['isRead','isStarred','isArchived','folder','folderId','addLabels','removeLabels','addLabelIds','removeLabelIds','addProviderLabelIds','removeProviderLabelIds','snoozedUntil','deletePermanently']
       if (Object.keys(input.changes).some(key => !allowed.includes(key))) throw new InboxError('VALIDATION', 'Unknown mutation field.')
       for (const key of ['isRead','isStarred','isArchived','deletePermanently'] as const) if (input.changes[key] !== undefined && typeof input.changes[key] !== 'boolean') throw new InboxError('VALIDATION', 'Flags must be boolean.')
       const rows = input.messageIds.map(id => messageRow(owner, id))
@@ -2651,6 +2973,8 @@ export function createInbox(options: InboxOptions): Inbox {
       if (changes.folder !== undefined && !['inbox', 'archive', 'trash', 'spam', 'sent'].includes(changes.folder)) throw new InboxError('VALIDATION', 'Use a discovered folder ID for custom destinations.')
       if (changes.folderId && !db.query('SELECT 1 FROM sdk_folders WHERE owner=? AND account=? AND id=?').get(owner, account.id, changes.folderId)) throw new InboxError('NOT_FOUND', 'Folder not found.', 404)
       for (const key of ['addLabelIds', 'removeLabelIds', 'addLabels', 'removeLabels'] as const) if (changes[key] !== undefined && (!Array.isArray(changes[key]) || changes[key]!.some(value => typeof value !== 'string'))) throw new InboxError('VALIDATION', 'Label changes must be arrays of IDs.')
+      providerLabelRows(account, changes)
+      if ((changes.addProviderLabelIds !== undefined || changes.removeProviderLabelIds !== undefined) && rows.some(row => row.generation !== account.generation)) throw new InboxError('NOT_FOUND', 'Current message not found.', 404)
       const checks = [[changes.isRead === true, capabilities.markRead], [changes.isRead === false, capabilities.markUnread],
         [changes.isStarred !== undefined, capabilities.star], [changes.isArchived !== undefined || changes.folder === 'archive', capabilities.archive],
         [changes.folder === 'trash', capabilities.trash], [changes.deletePermanently === true, capabilities.permanentDelete],
@@ -2666,6 +2990,7 @@ export function createInbox(options: InboxOptions): Inbox {
       return transaction(() => {
         const repeated = replay(owner, input.idempotencyKey, intent); if (repeated) return repeated
         if (input.ifRevisions) for (const id of input.messageIds) if (messageRow(owner, id).revision !== input.ifRevisions[id]) throw new InboxError('PRECONDITION_FAILED', 'The selection changed.', 412)
+        providerLabelRows(account, changes)
         const op = accept(owner, account, 'mutation', input.idempotencyKey, intent, { input: { ...input, changes }, before } satisfies MutationPayload, now())
         for (const row of rows) { projectMutation(op, row.id); event(owner, 'mail.changed', account.id, row.id) }
         return op
@@ -2718,13 +3043,19 @@ export function createInbox(options: InboxOptions): Inbox {
         if (change.snoozedUntil !== undefined) reverse.snoozedUntil = original.snoozedUntil
         reverse.removeLabelIds = change.addLabelIds?.filter(label => !original.labelIds.includes(label))
         reverse.addLabelIds = change.removeLabelIds?.filter(label => original.labelIds.includes(label))
+        const removeProviderLabelIds = change.addProviderLabelIds?.filter(label => !original.folderIds.includes(label))
+        const addProviderLabelIds = change.removeProviderLabelIds?.filter(label => original.folderIds.includes(label))
+        if (removeProviderLabelIds?.length) reverse.removeProviderLabelIds = removeProviderLabelIds
+        if (addProviderLabelIds?.length) reverse.addProviderLabelIds = addProviderLabelIds
         if (change.deletePermanently) throw new InboxError('CANNOT_UNDO', 'Permanent deletion cannot be undone.', 409)
         reversed[mid] = reverse
       }
       return transaction(() => {
         const repeated = replay(owner, key, intent); if (repeated) return repeated
         for (const mid of payload.input.messageIds) if (messageRow(owner, mid).revision !== payload.afterRevisions?.[mid]) throw new InboxError('CONFLICT', 'A newer edit prevents this undo.', 409)
-        const result = accept(owner, accountRow(owner, row.account, true), 'mutation', key, intent,
+        const account = accountRow(owner, row.account, true)
+        for (const change of Object.values(reversed)) providerLabelRows(account, change)
+        const result = accept(owner, account, 'mutation', key, intent,
           { input: { messageIds: payload.input.messageIds, changes: {}, idempotencyKey: key }, before, perMessageChanges: reversed } satisfies MutationPayload, now())
         for (const mid of payload.input.messageIds) { projectMutation(result, mid); event(owner, 'mail.changed', row.account, mid) }
         return result
@@ -2800,6 +3131,7 @@ export function createInbox(options: InboxOptions): Inbox {
     close: async () => {
       if (closed || stopping) return
       stopping = true
+      await closeCorrespondence()
       await media.close()
       for (const controller of controllers.values()) controller.abort()
       await Effect.runPromise(Fiber.interruptAll(background))

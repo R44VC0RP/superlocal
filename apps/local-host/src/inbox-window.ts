@@ -27,7 +27,8 @@ const fail = (code: DTO.InboxWindowErrorCode, status = 400): never => { throw ne
   HOST_INBOX_INVALID: 'Invalid inbox request.', HOST_INBOX_TOO_LARGE: 'The selected context exceeds the bounded inbox response.',
   HOST_INBOX_QUERY_EXPIRED: 'Reopen the current inbox query.', HOST_INBOX_CURSOR_INVALID: 'The inbox cursor does not match this request.',
   HOST_INBOX_SCOPE_CHANGED: 'The receiving scope changed. Reopen the inbox.', HOST_INBOX_CONTEXT_CHANGED: 'The captured conversation changed. Review it again.',
-  HOST_INBOX_UNAVAILABLE: 'The inbox index or required receipt is not available yet.', HOST_ZERO_SESSION_CONFLICT: 'The cleanup session changed. Resume it before continuing.',
+  HOST_INBOX_UNAVAILABLE: 'The inbox index or required receipt is not available yet.', HOST_INBOX_PREPARING: 'Preparing the selected conversations.',
+  HOST_ZERO_SESSION_CONFLICT: 'The cleanup session changed. Resume it before continuing.',
   HOST_ZERO_SESSION_NOT_FOUND: 'The cleanup session is no longer available.',
 } satisfies Record<DTO.InboxWindowErrorCode, string>)[code], status) }
 const text = (value: unknown, maximum = 1024): string => typeof value === 'string' && value.length > 0 && value.length <= maximum && !/[\x00-\x1f\x7f]/.test(value) ? value : fail('HOST_INBOX_INVALID')
@@ -45,13 +46,18 @@ type Dependencies = {
   senderDomains?: ReturnType<typeof createSenderDomainHost>
 }
 type ScopeRow = { id: string; account: string; data: string; cursor: string | null; baseline: string | null; sdk_state: string | null; sdk_scope: string; raw_complete: number; revision: number; generation: number; reset: string | null; checked: number }
-type Scope = { row: ScopeRow; boxes: Mailbox[]; sources: Account[]; labels: Label[]; folders: Map<string, Folder[]>; preference: string; preferences: Preferences; ai: AiTriageState; users: number; lastUsed: number; metadataAt: number; metadataDirty: boolean; seenEvents: number }
-type Prefix = { cursor: string | null; exhausted: number; indexed: number }
-type ProjectionStamp = { preference?: string; metadata?: string; aiCursor?: number; categoryCursor?: number }
-type QueryRow = { id: string; scope: string; data: string; preference: string; scanned: number; generation: number; expires: number; problem: string | null }
+type ReadBaseline = { sdkState: string | null; scopeState: string; revision: number; ai: number; category: number; at: number }
+type Scope = { row: ScopeRow; boxes: Mailbox[]; sources: Account[]; labels: Label[]; folders: Map<string, Folder[]>; preference: string; preferences: Preferences; ai: AiTriageState; users: number; lastUsed: number; metadataAt: number; metadataDirty: boolean; seenEvents: number; read?: ReadBaseline }
+type ProjectionStamp = { preference?: string; metadata?: string; aiCursor?: number; categoryCursor?: number; contextVersion?: 3 }
+type QueryRow = { id: string; scope: string; data: string; preference: string; scanned: number; generation: number; expires: number; problem: string | null; read_state: string | null }
+type ReadMetadata = { baselines: Array<{ revision: number; token: string }>; wake?: number; changes?: { id: string; input: string; baseline: ReadBaseline; keys: string[]; head: boolean; more: boolean }; counts?: { position?: PagePosition; baseline: ReadBaseline; totals: DTO.InboxTotals; complete: boolean; wake?: number } }
+type ReadBudget = { pages: number; details: number; searches: number; now: number; legacy: Map<string, string>; summaries: Map<string, MailboxMessageSummary[]>; contexts: Map<string, string>; keys: DTO.InboxThreadKey[]; proofs: Map<string, Map<string, boolean>>; unknownLocation: Set<string>; detailDeferred: Set<string> }
+type PagePosition = { cursor?: string }
+type PageCursor = { older: string; newer: string; baseline: Readonly<ReadBaseline>; direction: 'older' | 'newer' }
+type PageableRow = DTO.InboxWindowRow & { pageCursor: string }
+const readBudget = (): ReadBudget => ({ pages: 5, details: 4, searches: 32, now: Date.now(), legacy: new Map(), summaries: new Map(), contexts: new Map(), keys: [], proofs: new Map(), unknownLocation: new Set(), detailDeferred: new Set() })
 type StoredRow = { key: string; source: string; thread: string; data: string; at: number; revision: number; context: string }
 type CaptureRow = { id: string; kind: string; scope: string; data: string; input: string; cursor: number; complete: number; revision: number }
-type Aggregate = { count: number; unread: number; starred: number; trash: number; spam: number; archive: number; sent: number; awake: number; important: number; memberships: number; done: number; snoozed: number; reminder: string | null; attachments: number }
 
 /** All SQL in this service addresses its own derived local_window_* tables. SDK data
  * enters only through public body-free pages/deltas; no provider calls or AI processing.
@@ -83,13 +89,18 @@ export function createInboxWindowService(deps: Dependencies) {
     CREATE TABLE IF NOT EXISTS local_window_prefix_rows(owner TEXT NOT NULL,query_id TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(owner,query_id,key)) STRICT;
     CREATE TABLE IF NOT EXISTS local_window_zero_receipts(owner TEXT NOT NULL,receipt TEXT NOT NULL,key TEXT NOT NULL,progress TEXT NOT NULL,context TEXT NOT NULL,PRIMARY KEY(owner,receipt,key)) STRICT;
   `)
+  if (!db.query<{ name: string }, []>('PRAGMA table_info(local_window_queries)').all().some(column => column.name === 'read_state')) db.exec('ALTER TABLE local_window_queries ADD COLUMN read_state TEXT')
   let closed = false, timer: ReturnType<typeof setTimeout> | undefined, working: Promise<void> | undefined
   let activeRequests = 0, aiCursor: number | undefined, categoryCursor: number | undefined, watched = false
   let workingScope: Scope | undefined, watchedVersion = 0, projectionWork: Promise<void> | undefined
   const requests = new AsyncLocalStorage<Set<Scope>>()
   const scopes = new Map<string, Scope>()
-  const pendingContext = new InboxError('HOST_INBOX_UNAVAILABLE', 'Conversation context is still preparing.', 503)
-  const unwatch = inbox.subscribe(owner, () => { watched = true; watchedVersion++; for (const scope of scopes.values()) scope.metadataDirty = true; schedule(0) })
+  // Only an explicit selection/Zero creation can lease the dormant capture index.
+  // Rejected preparation requests have no accepted ID and cannot capture later arrivals.
+  const preparations = new Map<string, { until: number; queries: Set<string> }>()
+  const pruning = new Set<string>()
+  const pendingContext = new InboxError('HOST_INBOX_UNAVAILABLE', 'This conversation needs more complete cached context.', 503)
+  const unwatch = inbox.subscribe(owner, () => { watched = true; watchedVersion++; for (const scope of scopes.values()) scope.metadataDirty = true })
   const getScopeRow = (id: string) => db.query<ScopeRow, [string, string]>('SELECT * FROM local_window_scopes WHERE owner=? AND id=?').get(owner, id)!
   const getQuery = (id: string) => db.query<QueryRow, [string, string]>('SELECT * FROM local_window_queries WHERE owner=? AND id=?').get(owner, id)
   const queryPending = (query: QueryRow) => !!db.query('SELECT 1 FROM local_window_query_pending WHERE owner=? AND query_id=? LIMIT 1').get(owner, query.id)
@@ -139,6 +150,7 @@ export function createInboxWindowService(deps: Dependencies) {
       const [ai, categories] = await Promise.all([deps.ai.changes(owner, afterAi), deps.attentionOverrides.changes(afterCategory)])
       const nextAi = ai.resetRequired ? (await deps.ai.state(owner)).cursor : ai.cursor
       for (const scope of scopes.values()) {
+        if (!preparations.has(scope.row.id)) continue
         if (ai.resetRequired || categories.resetRequired) invalidateProjection(scope)
         else for (const key of [...ai.decisions, ...ai.removed, ...categories.entries]) if (scope.sources.some(source => source.id === key.sourceId)) dirty(scope.row.id, key.sourceId, key.threadId)
         stamp(scope, { aiCursor: nextAi, categoryCursor: categories.cursor })
@@ -153,7 +165,7 @@ export function createInboxWindowService(deps: Dependencies) {
     for (const source of scope.sources) folders.set(source.id, await inbox.cachedFolders(owner, source.id))
     const hash = digest([labels, [...folders]]), prior = json<{ projection?: ProjectionStamp }>(scope.row.data).projection
     scope.labels = labels; scope.folders = folders; scope.metadataAt = Date.now(); scope.metadataDirty = false
-    if (prior?.metadata !== hash) { invalidateProjection(scope); stamp(scope, { metadata: hash }) }
+    if (prior?.metadata !== hash && preparations.has(scope.row.id)) { invalidateProjection(scope); stamp(scope, { metadata: hash }) }
   }
   async function resolve(account: string): Promise<Scope> {
     text(account)
@@ -165,14 +177,14 @@ export function createInboxWindowService(deps: Dependencies) {
     const selectedSources = sources.filter(source => boxes.some(box => box.sourceId === source.id))
     const identity = { account, boxes: boxes.map(box => [box.id, box.sourceId, box.revision, box.status]).sort(), sources: selectedSources.map(source => [source.id, source.generation]).sort() }
     const id = digest(identity), split = deps.splitPreferences.read() ?? { ...normalizeSplits({}), revision: 0 }
-    const preference = digest(['bounded-window-2', preferences.revision, split, ai.configured, ai.settings])
+    const preference = digest(['demand-window-1', preferences.revision, split, ai.configured, ai.settings])
     aiCursor ??= ai.cursor
     const categoryHead = db.query<{ head: number }, string[]>('SELECT head FROM local_category_clock WHERE owner=?').get(owner)?.head ?? 0
     categoryCursor ??= categoryHead
     let scope = scopes.get(id)
     if (!scope) {
       if (scopes.size >= MAX_ACTIVE) {
-        const oldest = [...scopes.values()].filter(value => !value.users && value !== workingScope).sort((a, b) => a.lastUsed - b.lastUsed)[0]
+        const oldest = [...scopes.values()].filter(value => !value.users && value !== workingScope && !preparations.has(value.row.id) && !pruning.has(value.row.id) && !captureLocked(value)).sort((a, b) => a.lastUsed - b.lastUsed)[0]
         if (!oldest) fail('HOST_INBOX_UNAVAILABLE', 429)
         // Eviction removes metadata memory only. Indexes and frozen/paused queues stay durable.
         scopes.delete(oldest!.row.id)
@@ -180,19 +192,19 @@ export function createInboxWindowService(deps: Dependencies) {
       db.query('INSERT OR IGNORE INTO local_window_scopes(owner,id,account,data) VALUES (?,?,?,?)').run(owner, id, account, JSON.stringify(identity))
       scope = { row: getScopeRow(id), boxes, sources: selectedSources, labels: [], folders: new Map(), preference, preferences: split as unknown as Preferences, ai, users: 0, lastUsed: Date.now(), metadataAt: 0, metadataDirty: true, seenEvents: -1 }
       scopes.set(id, scope)
-      const saved = json<{ projection?: ProjectionStamp }>(scope.row.data).projection
-      if (saved?.preference !== preference || saved.aiCursor !== ai.cursor || saved.categoryCursor !== categoryCursor) invalidateProjection(scope)
-      stamp(scope, { preference, aiCursor: ai.cursor, categoryCursor })
-      if (!boxes.length) db.query('UPDATE local_window_scopes SET raw_complete=1,checked=? WHERE owner=? AND id=?').run(Date.now(), owner, id)
+      // Existing capture data remains durable, but resolving an ordinary view neither
+      // reads that copy as live mail nor resumes its materialization.
     }
     const uses = requests.getStore()
     if (uses && !uses.has(scope)) { uses.add(scope); scope.users++ }
     scope.lastUsed = Date.now()
-    if (scope.preference !== preference) { scope.preference = preference; invalidateProjection(scope); stamp(scope, { preference }) }
+    if (scope.preference !== preference) {
+      scope.preference = preference
+      if (preparations.has(scope.row.id)) { invalidateProjection(scope); stamp(scope, { preference }) }
+    }
     scope.boxes = boxes; scope.sources = selectedSources; scope.ai = ai; scope.preferences = split as unknown as Preferences
-    if (ai.cursor !== aiCursor || categoryHead !== categoryCursor) await updateSavedProjections()
     await refreshMetadata(scope)
-    refresh(scope); schedule(0)
+    refresh(scope)
     return scope
   }
   function project(scope: Scope, summaries: MailboxMessageSummary[]) {
@@ -201,7 +213,6 @@ export function createInboxWindowService(deps: Dependencies) {
   }
   function storeMessages(scope: Scope, messages: MailboxMessageSummary[]) {
     const put = db.query('INSERT INTO local_window_messages VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(owner,scope,source,id) DO UPDATE SET thread=excluded.thread,at=excluded.at,folder=excluded.folder,attention=excluded.attention,data=excluded.data')
-    const contact = db.query('INSERT OR REPLACE INTO local_window_contacts VALUES (?,?,?,?,?,?,?,?,?,?)')
     db.transaction(() => {
       for (let message of messages) {
         const previous = db.query<{ thread: string; data: string }, [string, string, string, string]>('SELECT thread,data FROM local_window_messages WHERE owner=? AND scope=? AND source=? AND id=?').get(owner, scope.row.id, message.sourceId, message.id)
@@ -215,9 +226,6 @@ export function createInboxWindowService(deps: Dependencies) {
         }
         put.run(owner, scope.row.id, message.sourceId, message.id, message.threadId, message.receivedAt, message.folder, classifyAttention(message).category, JSON.stringify(message))
         dirty(scope.row.id, message.sourceId, message.threadId)
-        db.query('DELETE FROM local_window_contacts WHERE owner=? AND scope=? AND source=? AND message=?').run(owner, scope.row.id, message.sourceId, message.id)
-        const outgoing = message.folder === 'sent', people = outgoing ? [...message.to, ...message.cc] : [message.from]
-        for (const person of people) contact.run(owner, scope.row.id, message.sourceId, message.id, message.threadId, person.email.trim().toLowerCase(), person.name, outgoing ? 'sent' : 'received', Date.parse(message.receivedAt), message.folder)
       }
     }).immediate()
   }
@@ -232,141 +240,253 @@ export function createInboxWindowService(deps: Dependencies) {
     }
     return values
   }
-  function aggregate(scope: Scope, source: string, thread: string): Aggregate {
-    const now = new Date().toISOString()
-    const result = db.query<Aggregate, string[]>(`SELECT COUNT(*) count,COALESCE(SUM(json_extract(data,'$.isRead')=0),0) unread,COALESCE(MAX(json_extract(data,'$.isStarred')),0) starred,
-      COALESCE(SUM(folder='trash'),0) trash,COALESCE(SUM(folder='spam'),0) spam,COALESCE(SUM(folder='archive'),0) archive,COALESCE(SUM(folder='sent'),0) sent,
-      COALESCE(SUM(folder='inbox' AND EXISTS(SELECT 1 FROM json_each(data,'$.memberships') j WHERE json_extract(j.value,'$.done')=0 AND (json_extract(j.value,'$.snoozedUntil') IS NULL OR json_extract(j.value,'$.snoozedUntil')<=?))),0) awake,
-      COALESCE(SUM(folder='inbox' AND attention='Important' AND EXISTS(SELECT 1 FROM json_each(data,'$.memberships') j WHERE json_extract(j.value,'$.done')=0 AND (json_extract(j.value,'$.snoozedUntil') IS NULL OR json_extract(j.value,'$.snoozedUntil')<=?))),0) important,
-      COALESCE(SUM(json_array_length(data,'$.memberships')),0) memberships,COALESCE(SUM((SELECT COUNT(*) FROM json_each(data,'$.memberships') j WHERE json_extract(j.value,'$.done')=1)),0) done,
-      COALESCE(SUM((SELECT COUNT(*) FROM json_each(data,'$.memberships') j WHERE json_extract(j.value,'$.snoozedUntil')>?)),0) snoozed,
-      MIN((SELECT MIN(json_extract(j.value,'$.snoozedUntil')) FROM json_each(data,'$.memberships') j WHERE json_extract(j.value,'$.snoozedUntil')>?)) reminder,
-      COALESCE(MAX(json_extract(data,'$.hasAttachments')),0) attachments FROM local_window_messages WHERE owner=? AND scope=? AND source=? AND thread=?`).get(now, now, now, now, owner, scope.row.id, source, thread)!
-    return result
-  }
-  async function contextFingerprint(scope: Scope, source: string, thread: string) {
-    const hash = createHash('sha256').update(scope.row.id)
-    let after = ''
-    while (!closed) {
-      let count = 0
-      const statement = db.query<{ id: string; context: string }, string[]>(`SELECT id,json_object('id',id,'body',COALESCE(json_extract(data,'$.bodyRevision'),json_extract(data,'$.revision')),'folder',folder,'memberships',(SELECT json_group_array(json_array(json_extract(j.value,'$.mailboxId'),json_extract(j.value,'$.done'),json_extract(j.value,'$.snoozedUntil'))) FROM json_each(data,'$.memberships') j)) context FROM local_window_messages INDEXED BY local_window_message_thread WHERE owner=? AND scope=? AND source=? AND thread=? AND id>? ORDER BY id LIMIT 500`)
-      for (const item of statement.iterate(owner, scope.row.id, source, thread, after)) { hash.update(item.context).update('\n'); after = item.id; count++ }
-      if (count < 500) break
-      await wait()
+  const threadKey = (key: DTO.InboxThreadKey) => `${key.sourceId}\0${key.threadId}`
+  const mailKey = (scope: Scope, key: DTO.InboxThreadKey) => scope.row.account === 'unified' ? `unified:${key.sourceId}:${key.threadId}` : `${scope.row.account}:${key.threadId}`
+  function ownedKey(scope: Scope, id: string): DTO.InboxThreadKey | null {
+    if (scope.row.account === 'unified') {
+      const source = [...scope.sources].sort((a, b) => b.id.length - a.id.length).find(source => id.startsWith(`unified:${source.id}:`))
+      const threadId = source && id.slice(`unified:${source.id}:`.length)
+      return source && threadId && threadId.length <= 512 ? { sourceId: source.id, threadId } : null
     }
+    const threadId = id.startsWith(`${scope.row.account}:`) && id.slice(scope.row.account.length + 1)
+    return scope.boxes[0] && threadId && threadId.length <= 512 ? { sourceId: scope.boxes[0].sourceId, threadId } : null
+  }
+  const awake = (message: MailboxMessageSummary, now: number) => message.folder === 'inbox' && message.memberships.some(state => !state.done && (!state.snoozedUntil || Date.parse(state.snoozedUntil) <= now))
+  const completeContext = (sdk: MailboxConversation, values: MailboxMessageSummary[]) => values.length === sdk.messageCount
+    && values.reduce((sum, value) => sum + value.memberships.length, 0) === sdk.membershipCount
+    && values.reduce((sum, value) => sum + value.memberships.filter(state => state.done).length, 0) === sdk.doneMembershipCount
+    && values.every(value => value.isRead) === sdk.isRead && values.some(value => value.isStarred) === sdk.isStarred
+    && values.some(value => value.hasAttachments) === sdk.hasAttachments && values.some(value => value.id === sdk.firstMessageId && value.subject === sdk.subject)
+  // SQLite's BINARY tie order, including non-ASCII IDs, not locale collation.
+  const binary = (left: string, right: string) => Buffer.compare(Buffer.from(left), Buffer.from(right))
+  const newestMessages = (values: MailboxMessageSummary[]) => [...values].sort((a, b) => binary(b.receivedAt, a.receivedAt) || binary(b.id, a.id))
+  function summaryTargets(values: MailboxMessageSummary[]): MailboxStateTarget[] {
+    const targets: MailboxStateTarget[] = []
+    for (const value of newestMessages(values)) for (const state of [...value.memberships].sort((a, b) => binary(a.mailboxId, b.mailboxId))) {
+      targets.push({ mailboxId: state.mailboxId, messageId: value.id, revision: state.revision, messageRevision: value.revision })
+      if (targets.length === 500) return targets
+    }
+    return targets
+  }
+  /** A read-path-independent identity, not permission to act on partial context.
+   * Full capture review/receipt evidence and the separate completeness gates remain
+   * mandatory. Expanding messages must not change an otherwise identical row hash.
+   */
+  function contextFingerprint(scope: Scope, sdk: MailboxConversation, values: MailboxMessageSummary[]) {
+    const canonical = newestMessages(values).slice(0, 50), selectedTargets = sdk.targets.slice(0, 500)
+    if (canonical.length !== Math.min(50, sdk.messageCount) || selectedTargets.length !== Math.min(500, sdk.membershipCount)) throw pendingContext
+    const messages = [...canonical].sort((a, b) => binary(a.id, b.id)).map(value => [value.id, value.bodyRevision ?? value.revision, value.folder,
+      [...value.memberships].sort((a, b) => binary(a.mailboxId, b.mailboxId)).map(state => [state.mailboxId, state.done, state.snoozedUntil])])
+    const bodies = new Map(canonical.map(value => [value.id, value.bodyRevision]))
+    const targets = selectedTargets.sort((a, b) => binary(a.messageId, b.messageId) || binary(a.mailboxId, b.mailboxId)).map(target => [target.mailboxId, target.messageId, target.revision, bodies.get(target.messageId) ? null : target.messageRevision ?? null])
+    const evidence = ['conversation-context-3', scope.row.id, sdk.sourceId, sdk.threadId, scope.sources.find(source => source.id === sdk.sourceId)?.generation,
+      sdk.subject, sdk.firstMessageId, sdk.messageCount, sdk.membershipCount, sdk.doneMembershipCount, sdk.awakeInboxMessageCount, sdk.earliestSnoozedUntil,
+      // Keep the frozen evidence layout (messages=12, targets=13). Coverage describes
+      // the canonical caps, never whether this particular read expanded all messages.
+      messages, targets, sdk.messageCount <= 50, sdk.membershipCount <= 500]
+    return { hash: digest(evidence), evidence: JSON.stringify(evidence) }
+  }
+  function legacyContextFingerprint(scope: Scope, values: MailboxMessageSummary[]) {
+    const hash = createHash('sha256').update(scope.row.id)
+    for (const value of [...values].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) hash.update(JSON.stringify({ id: value.id, body: value.bodyRevision ?? value.revision, folder: value.folder,
+      memberships: JSON.stringify(value.memberships.map(state => [state.mailboxId, Number(state.done), state.snoozedUntil])) })).update('\n')
     return hash.digest('hex')
   }
-  async function buildRows(scope: Scope, inputKeys: DTO.InboxThreadKey[], live?: ReadonlyMap<string, MailboxConversation>) {
-    const keys = inputKeys.map(({ sourceId, threadId }) => ({ sourceId, threadId }))
-    if (!keys.length) return
-    const [categories, assessments] = await Promise.all([deps.attentionOverrides.lookup(keys), deps.ai.lookup(owner, keys)])
-    if (captureLocked(scope)) return
-    const decisions = new Map<string, AiDecision>(assessments.decisions.map(value => [`${value.sourceId}\0${value.threadId}`, value]))
-    const choices = new Map(categories.entries.map(value => [`${value.sourceId}\0${value.threadId}`, value]))
-    for (const key of keys) {
-      const sdk = live?.get(`${key.sourceId}\0${key.threadId}`)
-      const values = sdk && !sdk.messagesComplete ? sdk.messages : summaries(scope, key.sourceId, key.threadId, 500)
-      const partial = !!sdk && !sdk.messagesComplete
-      const roles = sdk?.nativeFolders
-      const totals: Aggregate = partial ? {
-        count: sdk.messageCount, memberships: sdk.membershipCount, done: sdk.doneMembershipCount, unread: Number(!sdk.isRead), starred: Number(sdk.isStarred), attachments: Number(sdk.hasAttachments),
-        awake: sdk.awakeInboxMessageCount, important: 0, reminder: sdk.earliestSnoozedUntil, snoozed: Number(!!sdk.earliestSnoozedUntil),
-        trash: roles!.trash && !roles!.inbox && !roles!.archive && !roles!.sent && !roles!.spam && !roles!.drafts ? sdk.messageCount : 0,
-        spam: roles!.spam && !roles!.inbox && !roles!.archive && !roles!.sent && !roles!.trash && !roles!.drafts ? sdk.messageCount : 0,
-        archive: Number(roles!.archive), sent: Number(roles!.sent),
-      } : aggregate(scope, key.sourceId, key.threadId)
-      if (!totals.count) {
-        const prior = db.query<{ key: string }, string[]>('SELECT key FROM local_window_rows WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, key.sourceId, key.threadId)
-        if (prior) {
-          db.query('DELETE FROM local_window_rows WHERE owner=? AND scope=? AND key=?').run(owner, scope.row.id, prior.key)
-          db.query('DELETE FROM local_window_matches WHERE owner=? AND key=? AND query_id IN (SELECT id FROM local_window_queries WHERE owner=? AND scope=?)').run(owner, prior.key, owner, scope.row.id)
-          db.query('DELETE FROM local_window_counts WHERE owner=? AND key=? AND query_id IN (SELECT id FROM local_window_queries WHERE owner=? AND scope=?)').run(owner, prior.key, owner, scope.row.id)
-          db.query('DELETE FROM local_window_query_pending WHERE owner=? AND key=? AND query_id IN (SELECT id FROM local_window_queries WHERE owner=? AND scope=?)').run(owner, prior.key, owner, scope.row.id)
-          bump(scope)
+  async function projectConversations(scope: Scope, items: MailboxConversation[], budget: ReadBudget, fullContext = false, captured = false) {
+    if (!items.length) return []
+    const keys = items.map(({ sourceId, threadId }) => ({ sourceId, threadId }))
+    budget.keys = keys
+    const [categoryPages, assessments] = await Promise.all([
+      Promise.all(Array.from({ length: Math.ceil(keys.length / BATCH) }, (_, index) => deps.attentionOverrides.lookup(keys.slice(index * BATCH, (index + 1) * BATCH)))),
+      deps.ai.lookup(owner, keys),
+    ])
+    const decisions = new Map<string, AiDecision>(assessments.decisions.map(value => [threadKey(value), value]))
+    const choices = new Map(categoryPages.flatMap(page => page.entries).map(value => [threadKey(value), value]))
+    const rows: DTO.InboxWindowRow[] = []
+    for (const original of items) {
+      let sdk = original, values = sdk.messages
+      const identity = threadKey(sdk), choice = choices.get(identity), savedDecision = decisions.get(identity)
+      const needsEvidence = !!choice?.override || !!savedDecision?.contextVersions.some(context => !values.some(value => value.id === context.messageId))
+      if (captured && scope.row.raw_complete) {
+        const all = summaries(scope, sdk.sourceId, sdk.threadId, 500)
+        if (completeContext(sdk, all)) {
+          values = all
+          const targets = summaryTargets(values)
+          sdk = { ...sdk, messages: values, messagesComplete: true, targets, targetsComplete: targets.length === sdk.membershipCount }
         }
-        db.query('DELETE FROM local_window_dirty WHERE owner=? AND scope=? AND source=? AND thread=?').run(owner, scope.row.id, key.sourceId, key.threadId); continue
       }
-      if (!values.length) fail('HOST_INBOX_TOO_LARGE', 413)
-      const projected = project(scope, values), mail = projected.mail.find(mail => mail.account === scope.row.account)!
+      const clipped = () => values.length < Math.min(50, sdk.messageCount) || sdk.targets.length < Math.min(500, sdk.membershipCount)
+      const repairCanonical = clipped()
+      if (repairCanonical || !sdk.messagesComplete && sdk.messageCount <= 500 && (fullContext || needsEvidence || values.filter(value => awake(value, budget.now)).length !== sdk.awakeInboxMessageCount)) {
+        if (budget.details > 0) {
+          const fetched: MailboxMessageSummary[] = []
+          let cursor: string | undefined
+          do {
+            budget.details--
+            const page = await inbox.mailboxMessagePage(owner, { mailboxIds: scope.boxes.map(box => box.id), sourceId: sdk.sourceId, threadId: sdk.threadId, limit: 500 - fetched.length, ...(cursor ? { cursor } : {}) })
+            fetched.push(...page.items)
+            const complete = !page.nextCursor && completeContext(sdk, fetched), targets = summaryTargets(fetched)
+            if (complete || repairCanonical && fetched.length >= Math.min(50, sdk.messageCount) && targets.length >= Math.min(500, sdk.membershipCount)) {
+              values = fetched
+              sdk = { ...sdk, messages: values, messagesComplete: complete, targets, targetsComplete: complete && targets.length === sdk.membershipCount }
+              break
+            }
+            cursor = page.nextCursor ?? undefined
+            // Only clipped canonical evidence needs continuation. Never drain a
+            // giant thread for action context, or read more than 500 summaries.
+          } while (repairCanonical && cursor && budget.details > 0 && fetched.length < 500)
+        } else {
+          // A full-context or canonical read was deferred, not proved absent.
+          // Captured pages stop before this identity and retry with a fresh budget.
+          budget.detailDeferred.add(mailKey(scope, sdk))
+        }
+      }
+      if (clipped()) {
+        budget.detailDeferred.add(mailKey(scope, sdk))
+        break // Preserve the SDK ordinal prefix; never publish a clipped hash.
+      }
+      const full = sdk.messagesComplete && values.length === sdk.messageCount
+      const mail = project(scope, values).mail.find(mail => mail.account === scope.row.account)
       if (!mail) fail('HOST_INBOX_SCOPE_CHANGED', 409)
-      mail.hasAttachments = !!totals.attachments
-      const full = !partial && values.length === totals.count
+      mail!.subject = sdk.subject; mail!.receivedAt = Date.parse(sdk.lastMessageAt); Object.assign(mail!, displayTime(sdk.lastMessageAt))
+      mail!.hasAttachments = sdk.hasAttachments; mail!.unread = !sdk.isRead; mail!.starred = sdk.isStarred
       if (!full) {
-        const first = db.query<{ data: string }, string[]>('SELECT data FROM local_window_messages WHERE owner=? AND scope=? AND source=? AND thread=? ORDER BY at,id LIMIT 1').get(owner, scope.row.id, key.sourceId, key.threadId)!
-        mail.subject = sdk?.subject ?? json<MailboxMessageSummary>(first.data).subject
-        const hidden = totals.trash === totals.count ? 'Trash' : totals.spam === totals.count ? 'Spam' : undefined
-        const locations = hidden ? [hidden] : [totals.awake ? 'Inbox' : '', totals.sent ? 'Sent' : '', totals.done === totals.memberships ? 'Done' : '', totals.snoozed ? 'Reminders' : '', (partial ? roles!.archive && !roles!.inbox && !roles!.trash && !roles!.spam && !roles!.drafts : totals.archive && totals.archive + totals.sent === totals.count) ? 'Auto Archived' : ''].filter(Boolean)
-        mail.locations = locations; mail.folder = hidden ?? (locations.includes('Inbox') ? 'Inbox' : locations.includes('Done') ? 'Done' : locations.includes('Reminders') ? 'Reminders' : locations[0] ?? 'Auto Archived')
-        mail.unread = totals.unread > 0; mail.starred = !!totals.starred; mail.reminder = totals.reminder ?? undefined; mail.reminderAt = totals.reminder ? Date.parse(totals.reminder) : undefined
-        // Full indexed history supplies labels. A prefix-only giant remains explicitly unresolved.
-        if (!partial) {
-          const labelIds = db.query<{ id: string }, string[]>(`SELECT DISTINCT j.value id FROM local_window_messages m,json_each(m.data,'$.labelIds') j WHERE m.owner=? AND m.scope=? AND m.source=? AND m.thread=? LIMIT 5001`).all(owner, scope.row.id, key.sourceId, key.threadId)
-          const folderIds = db.query<{ id: string }, string[]>(`SELECT DISTINCT j.value id FROM local_window_messages m,json_each(m.data,'$.folderIds') j WHERE m.owner=? AND m.scope=? AND m.source=? AND m.thread=? LIMIT 5001`).all(owner, scope.row.id, key.sourceId, key.threadId)
-          if (labelIds.length > 5000 || folderIds.length > 5000) fail('HOST_INBOX_TOO_LARGE', 413)
-          const wantedLabels = new Set(labelIds.map(value => value.id)), wantedFolders = new Set(folderIds.map(value => value.id))
-          mail.labels = [...new Set([...scope.labels.filter(label => label.accountId === key.sourceId && wantedLabels.has(label.id)).map(label => label.name), ...(scope.folders.get(key.sourceId) ?? []).filter(folder => folder.kind === 'label' && wantedFolders.has(folder.id)).map(folder => folder.name)])]
+        const primary = sdk.primaryFolderCounts, roles = sdk.nativeFolders
+        // Match the full projection: only uniformly primary Trash or Spam is
+        // hidden. Mixed Trash/Spam and custom folders remain visible in All Mail.
+        // Older SDKs lack this proof; keep their conservative preview fallback.
+        const hidden = primary?.trash === sdk.messageCount ? 'Trash' : primary?.spam === sdk.messageCount ? 'Spam' : undefined
+        const unknownLocation = !primary && !sdk.awakeInboxMessageCount && (values.every(value => value.folder === 'trash') || values.every(value => value.folder === 'spam'))
+        if (unknownLocation) budget.unknownLocation.add(mail!.id)
+        const sent = primary ? primary.sent > 0 : roles.sent
+        const archived = primary ? primary.archive > 0 && primary.archive + primary.sent === sdk.messageCount : roles.archive && !roles.inbox && !roles.trash && !roles.spam && !roles.drafts
+        const locations = hidden ? [hidden] : unknownLocation ? [] : [sdk.awakeInboxMessageCount ? 'Inbox' : '', sent ? 'Sent' : '', sdk.doneMembershipCount === sdk.membershipCount ? 'Done' : '',
+          sdk.earliestSnoozedUntil ? 'Reminders' : '', archived ? 'Auto Archived' : ''].filter(Boolean)
+        mail!.locations = locations; mail!.folder = hidden ?? (unknownLocation ? 'Unknown' : locations.includes('Inbox') ? 'Inbox' : locations.includes('Done') ? 'Done' : locations.includes('Reminders') ? 'Reminders' : locations[0] ?? 'Auto Archived')
+        mail!.reminder = sdk.earliestSnoozedUntil ?? undefined; mail!.reminderAt = sdk.earliestSnoozedUntil ? Date.parse(sdk.earliestSnoozedUntil) : undefined
+        // Whole receiving scope comes from aggregates, not whichever copies fit a preview.
+        if (scope.row.account === 'unified') {
+          mail!.mailboxIds = [...new Set([...(mail!.mailboxIds ?? []), ...sdk.mailboxStates.map(value => value.mailboxId)])]
+          mail!.mailboxNames = mail!.mailboxIds.map(id => scope.boxes.find(box => box.id === id)?.name ?? 'Mailbox')
         }
       }
-      const identity = `${key.sourceId}\0${key.threadId}`, choice = choices.get(identity)
-      if (scope.sources.find(source => source.id === key.sourceId)?.status === 'connected' && full && currentCategoryOverride(mail, choice?.override)) mail.attentionOverride = choice
+      if (full && scope.sources.find(source => source.id === sdk.sourceId)?.status === 'connected' && currentCategoryOverride(mail!, choice?.override)) mail!.attentionOverride = choice
       if (scope.ai.configured && scope.ai.settings.enabled) {
-        let decision = currentAiDecision(mail, decisions.get(identity), scope.ai.settings.model)
+        let decision = currentAiDecision(mail!, savedDecision, scope.ai.settings.model)
         if (decision?.state === 'ready' && decision.contextVersions.some(context => {
-          const message = values.find(value => value.id === context.messageId)
-          const saved = message || partial ? undefined : db.query<{ data: string }, string[]>('SELECT data FROM local_window_messages WHERE owner=? AND scope=? AND source=? AND id=?').get(owner, scope.row.id, key.sourceId, context.messageId)
-          const actual = message ?? (saved ? json<MailboxMessageSummary>(saved.data) : undefined)
+          const actual = values.find(value => value.id === context.messageId)
           return !actual || context.bodyRevision === null || actual.bodyRevision !== context.bodyRevision
         })) decision = { ...decision, state: 'stale', score: null, override: null }
-        if (decision) { mail.triage = decision; if (scope.ai.settings.mode === 'apply' && decision.state === 'ready' && decision.score) mail.attentionCategory = decision.score.category }
-        if (scope.ai.settings.mode === 'apply' && decision?.state !== 'ready' && decision?.holdUntil && Date.parse(decision.holdUntil) > Date.now()) mail.aiHoldUntil = Date.parse(decision.holdUntil)
+        if (decision) { mail!.triage = decision; if (scope.ai.settings.mode === 'apply' && decision.state === 'ready' && decision.score) mail!.attentionCategory = decision.score.category }
+        if (scope.ai.settings.mode === 'apply' && decision?.state !== 'ready' && decision?.holdUntil && Date.parse(decision.holdUntil) > budget.now) mail!.aiHoldUntil = Date.parse(decision.holdUntil)
       }
-      if (mail.attentionOverride?.override) mail.aiHoldUntil = undefined
-      // Unknown is an explicit provisional row, not an inferred Important/Other decision.
-      mail.split = full ? conversationAttention(mail) : partial ? 'Unknown'
-        : !totals.awake ? 'Important' : mail.attentionCategory ?? (totals.important ? 'Important' : 'Other')
-      const targets = sdk?.targets ?? values.flatMap(value => value.memberships.map(state => ({ mailboxId: state.mailboxId, messageId: value.id, revision: state.revision, messageRevision: value.revision }))).slice(0, 500)
-      // Partial contexts never authorize whole-conversation actions or pretend to contain all content.
-      const context = partial ? digest([scope.row.id, sdk.subject, sdk.firstMessageId, sdk.messageCount, sdk.membershipCount, sdk.doneMembershipCount, sdk.earliestSnoozedUntil,
-        values.map(value => [value.id, value.bodyRevision ?? value.revision, value.folder, value.memberships.map(state => [state.mailboxId, state.done, state.snoozedUntil])])]) : await contextFingerprint(scope, key.sourceId, key.threadId)
-      const preview = values.slice(0, 50), previewIds = new Set(preview.map(value => value.id))
-      const row: DTO.InboxWindowRow = { ...key, key: mail.id, sourceGeneration: mail.sourceGeneration!, revision: scope.row.revision + 1,
-        mail: { ...mail, messages: mail.messages.filter(message => previewIds.has(message.id)) }, summaries: preview, messagesComplete: preview.length === totals.count,
-        counts: { messages: totals.count, memberships: totals.memberships, unread: partial ? null : totals.unread, done: totals.done, snoozed: partial ? null : totals.snoozed },
-        targets, targetsComplete: (sdk ? sdk.targetsComplete : full) && targets.length === totals.memberships, actionContextComplete: full && targets.length === totals.memberships && preview.length === totals.count, contextVersion: context }
+      if (mail!.attentionOverride?.override) mail!.aiHoldUntil = undefined
+      const attentionComplete = values.filter(value => awake(value, budget.now)).length === sdk.awakeInboxMessageCount && (!needsEvidence || full)
+      mail!.split = attentionComplete ? conversationAttention(mail!, budget.now) : 'Unknown'
+      const preview = newestMessages(values).slice(0, 50)
+      const previewIds = new Set(preview.map(value => value.id)), targetsComplete = sdk.targetsComplete && sdk.targets.length === sdk.membershipCount
+      const context = contextFingerprint(scope, sdk, values)
+      const row: DTO.InboxWindowRow = { sourceId: sdk.sourceId, threadId: sdk.threadId, key: mail!.id, sourceGeneration: mail!.sourceGeneration!, revision: scope.read?.revision ?? scope.row.revision,
+        mail: { ...mail!, messages: mail!.messages.filter(message => previewIds.has(message.id)) }, summaries: preview, messagesComplete: full && preview.length === sdk.messageCount,
+        counts: { messages: sdk.messageCount, memberships: sdk.membershipCount, unread: full ? values.filter(value => !value.isRead).length : sdk.isRead ? 0 : null, done: sdk.doneMembershipCount,
+          snoozed: full ? values.reduce((sum, value) => sum + value.memberships.filter(state => !!state.snoozedUntil && Date.parse(state.snoozedUntil) > budget.now).length, 0) : sdk.earliestSnoozedUntil ? null : 0 },
+        targets: sdk.targets, targetsComplete, actionContextComplete: full && targetsComplete && preview.length === sdk.messageCount, contextVersion: context.hash }
       while (bytes(row) > 512 * 1024 && row.summaries.length > 1) {
         const removed = row.summaries.pop()!; row.mail.messages = row.mail.messages.filter(message => message.id !== removed.id); row.messagesComplete = false; row.actionContextComplete = false
       }
       if (bytes(row) > DTO.INBOX_RESPONSE_BYTE_LIMIT - 65536) fail('HOST_INBOX_TOO_LARGE', 413)
-      const previous = record(scope, row.key)
-      if (!previous || digest({ ...json<DTO.InboxWindowRow>(previous.data), revision: 0 }) !== digest({ ...row, revision: 0 })) {
-        row.revision = bump(scope)
-        db.query('INSERT INTO local_window_rows VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner,scope,key) DO UPDATE SET at=excluded.at,revision=excluded.revision,context=excluded.context,data=excluded.data,wake=excluded.wake').run(owner, scope.row.id, row.key, key.sourceId, key.threadId, mail.receivedAt ?? 0, row.revision, context, JSON.stringify(row), Math.min(mail.reminderAt ?? Infinity, mail.aiHoldUntil ?? Infinity) === Infinity ? null : Math.min(mail.reminderAt ?? Infinity, mail.aiHoldUntil ?? Infinity))
+      budget.summaries.set(row.key, values); budget.contexts.set(row.key, context.evidence)
+      if (full) budget.legacy.set(row.key, legacyContextFingerprint(scope, values))
+      rows.push(row)
+    }
+    return rows
+  }
+  /** Capture-only materialization. No query/page/lookup/change/sender read calls it. */
+  async function buildRows(scope: Scope, inputKeys: DTO.InboxThreadKey[], live?: ReadonlyMap<string, MailboxConversation>) {
+    if (!inputKeys.length || captureLocked(scope)) return
+    const keys = inputKeys.map(({ sourceId, threadId }) => ({ sourceId, threadId }))
+    const page = live ? null : await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), keys, limit: 100 })
+    if (page?.nextCursor) throw pendingContext
+    const items = live ? keys.flatMap(key => { const item = live.get(threadKey(key)); return item ? [item] : [] }) : page!.items
+    const budget = readBudget(), rows = await projectConversations(scope, items, budget, true, !page || page.state === scope.row.baseline)
+    const found = new Set(rows.map(row => threadKey(row)))
+    for (const key of keys) {
+      const row = rows.find(row => threadKey(row) === threadKey(key))
+      // A clipped projection is still present. Leave it dirty for explicit
+      // preparation's next bounded pass rather than deleting frozen source rows.
+      if (!row && items.some(item => threadKey(item) === threadKey(key))) continue
+      if (!found.has(threadKey(key))) {
+        const id = mailKey(scope, key)
+        if (record(scope, id)) {
+          db.query('DELETE FROM local_window_rows WHERE owner=? AND scope=? AND key=?').run(owner, scope.row.id, id)
+          for (const table of ['matches', 'counts', 'query_pending']) db.query(`DELETE FROM local_window_${table} WHERE owner=? AND key=? AND query_id IN (SELECT id FROM local_window_queries WHERE owner=? AND scope=?)`).run(owner, id, owner, scope.row.id)
+          bump(scope)
+        }
+      } else {
+        const previous = record(scope, row!.key)
+        const saved = { ...row!, contextEvidence: budget.contexts.get(row!.key), folderContextComplete: !budget.unknownLocation.has(row!.key) }
+        if (!previous || digest({ ...json<DTO.InboxWindowRow>(previous.data), revision: 0 }) !== digest({ ...saved, revision: 0 })) {
+          row!.revision = bump(scope); saved.revision = row!.revision
+          const wake = Math.min(row!.mail.reminderAt ?? Infinity, row!.mail.aiHoldUntil ?? Infinity)
+          db.query('INSERT INTO local_window_rows VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner,scope,key) DO UPDATE SET at=excluded.at,revision=excluded.revision,context=excluded.context,data=excluded.data,wake=excluded.wake').run(owner, scope.row.id, row!.key, key.sourceId, key.threadId, row!.mail.receivedAt ?? 0, row!.revision, row!.contextVersion, JSON.stringify(saved), Number.isFinite(wake) ? wake : null)
+        }
       }
       db.query('DELETE FROM local_window_dirty WHERE owner=? AND scope=? AND source=? AND thread=?').run(owner, scope.row.id, key.sourceId, key.threadId)
     }
   }
 
-  function state(scope: Scope, query?: QueryRow): DTO.InboxWindowState {
-    const ready = current(scope) && (!query || query.scanned >= scope.row.revision && !queryPending(query))
+  const categoryHead = () => db.query<{ head: number }, string[]>('SELECT head FROM local_category_clock WHERE owner=?').get(owner)?.head ?? 0
+  const readMetadata = (query: QueryRow): ReadMetadata => { const saved = getQuery(query.id)?.read_state; return saved ? json(saved) : { baselines: [] } }
+  function saveReadMetadata(query: QueryRow, value: ReadMetadata) {
+    query.read_state = JSON.stringify(value)
+    db.query('UPDATE local_window_queries SET read_state=? WHERE owner=? AND id=?').run(query.read_state, owner, query.id)
+  }
+  function baseline(scope: Scope, query: QueryRow, revision?: number) {
+    const values = readMetadata(query).baselines, saved = revision === undefined ? values.at(-1) : values.find(value => value.revision === revision)
+    return saved ? untoken<ReadBaseline>(saved.token, `read:${query.id}`, scope) : undefined
+  }
+  function observe(scope: Scope, sdkState: string | null, scopeState: string, query?: QueryRow, clocks?: Pick<ReadBaseline, 'ai' | 'category' | 'at'>): ReadBaseline {
+    const ai = clocks?.ai ?? scope.ai.cursor, category = clocks?.category ?? categoryHead()
+    const previous = query ? baseline(scope, query) : scope.read
+    if (previous?.sdkState === sdkState && previous.scopeState === scopeState && previous.ai === ai && previous.category === category && !clocks) { scope.read = previous; return previous }
+    const value: ReadBaseline = { sdkState, scopeState, ai, category, at: clocks?.at ?? Date.now(), revision: bump(scope) }
+    scope.read = value
+    if (query) {
+      const saved = readMetadata(query)
+      saved.baselines = [...saved.baselines, { revision: value.revision, token: token(`read:${query.id}`, scope, value) }].slice(-16)
+      if (saved.counts && (saved.counts.baseline.sdkState !== sdkState || saved.counts.baseline.ai !== ai || saved.counts.baseline.category !== category)) delete saved.counts
+      saveReadMetadata(query, saved)
+    }
+    return value
+  }
+  function state(scope: Scope, query?: QueryRow, read = query ? baseline(scope, query) : scope.read): DTO.InboxWindowState {
     return { queryId: query?.id ?? `scope:${scope.row.id}`, queryGeneration: query?.generation ?? scope.row.generation,
-      indexRevision: query ? Math.min(query.scanned, scope.row.revision) : scope.row.revision, scopeState: scope.row.sdk_scope || scope.row.id, preferenceRevision: scope.preference,
-      sources: scope.sources.map(source => ({ sourceId: source.id, generation: source.generation })), sdkState: scope.row.sdk_state,
-      indexing: !ready, catchup: scope.row.reset || query?.problem ? 'blocked' : ready ? 'current' : scope.row.raw_complete ? 'catching-up' : 'pending' }
+      indexRevision: read?.revision ?? scope.row.revision, scopeState: read?.scopeState ?? scope.row.id, preferenceRevision: scope.preference,
+      sources: scope.sources.map(source => ({ sourceId: source.id, generation: source.generation })), sdkState: read?.sdkState ?? null,
+      ...(query && read ? { readCursor: token(`read:${query.id}`, scope, read) } : {}),
+      // Current means this bounded cached SDK read, not upstream history completion.
+      // The dormant capture index is deliberately not a source of ordinary read state.
+      indexing: false, catchup: query?.problem ? 'blocked' : 'current' }
   }
   function unknownTotals(scope: Scope): DTO.InboxTotals {
     return { conversations: null, messages: null, inbox: null, splits: Object.fromEntries(scope.preferences.splits.map(name => [name, null])), folders: {}, holding: null }
   }
   function totals(scope: Scope, query: QueryRow): DTO.InboxTotals {
-    if (!current(scope) || query.scanned < scope.row.revision || query.problem || queryPending(query)) return unknownTotals(scope)
-    const match = db.query<{ conversations: number; messages: number }, string[]>('SELECT COUNT(*) conversations,COALESCE(SUM(messages),0) messages FROM local_window_matches WHERE owner=? AND query_id=?').get(owner, query.id)!
-    const sums = db.query<{ name: string; count: number }, string[]>(`SELECT j.key name,SUM(j.value) count FROM local_window_counts c,json_each(c.data) j WHERE c.owner=? AND c.query_id=? GROUP BY j.key LIMIT 1000`).all(owner, query.id)
-    const map = new Map(sums.map(item => [item.name, item.count]))
-    return { ...match, inbox: map.get('inbox') ?? 0, splits: Object.fromEntries(scope.preferences.splits.map(name => [name, map.get(`split:${name}`) ?? 0])),
-      folders: Object.fromEntries(sums.filter(item => item.name.startsWith('folder:')).map(item => [item.name.slice(7), item.count])), holding: !!map.get('holding') }
+    const count = readMetadata(query).counts, read = baseline(scope, query)
+    return count?.complete && read && count.baseline.sdkState === read.sdkState && count.baseline.scopeState === read.scopeState
+      && count.baseline.ai === scope.ai.cursor && count.baseline.category === categoryHead() && (!count.wake || count.wake > Date.now()) ? count.totals : unknownTotals(scope)
   }
   const parsedSearch = new Map<string, ReturnType<typeof parseSearch>>()
   const searchTerms = new Map<string, ReturnType<typeof compileSearch>>()
-  async function expression(scope: Scope, row: DTO.InboxWindowRow, query: string, bodies: boolean): Promise<boolean> {
+  function participantQuery(key: string, value: string): Parameters<Inbox['mailboxConversations']>[1]['query'] {
+    if (key !== 'from' && key !== 'to') return undefined
+    const normalized = value.trim().toLowerCase()
+    if (normalized.length > 320 || /[\x00-\x1f\x7f]/.test(normalized)) return undefined
+    if (/^[^\s<>@]+@[^\s<>@]+$/.test(normalized)) return { participant: { field: key, match: 'address', value: normalized } }
+    if (key === 'from' && /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(normalized)) return { participant: { field: key, match: 'domain', value: normalized } }
+    return undefined // Display-name/free-text from/to syntax keeps its legacy meaning.
+  }
+  async function expression(scope: Scope, row: DTO.InboxWindowRow, query: string, bodies: boolean, budget: ReadBudget = readBudget()): Promise<boolean> {
     if (!parsedSearch.has(query)) {
       if (parsedSearch.size >= 256) parsedSearch.delete(parsedSearch.keys().next().value!)
       parsedSearch.set(query, parseSearch(query))
@@ -386,26 +506,58 @@ export function createInboxWindowService(deps: Dependencies) {
         if (searchTerms.size >= 512) searchTerms.delete(searchTerms.keys().next().value!)
         searchTerms.set(term, compileSearch(term, false))
       }
-      const matches = searchTerms.get(term)!
-      let yes = term === 'has:attachment' ? !!row.mail.hasAttachments : matches(row.mail)
-      if (!yes && row.counts.unread === null && (/^(?:from:|to:|label:)/.test(term) || !bodies && !term.includes(':'))) return null
-      // Per-term OR over bounded message chunks preserves Boolean conversation semantics.
-      if (!yes && !row.messagesComplete && /^(?:from:|to:|has:|[^:]+$)/.test(term)) {
-        let after: [string, string] | undefined
+      const matches = searchTerms.get(term)!, values = budget.summaries.get(row.key) ?? row.summaries
+      const complete = values.length === row.counts.messages
+      const projected = values.length === row.summaries.length ? row.mail : { ...row.mail, messages: project(scope, values).mail.find(mail => mail.account === scope.row.account)!.messages }
+      let yes = term === 'has:attachment' ? !!row.mail.hasAttachments : matches(projected)
+      const colon = term.indexOf(':'), key = colon < 0 ? '' : term.slice(0, colon), value = colon < 0 ? term : term.slice(colon + 1).replaceAll('"', '').toLowerCase()
+      if (colon >= 0 && (!value || !['from', 'to', 'subject', 'in', 'label', 'is', 'has', 'before', 'after', 'older_than', 'newer_than'].includes(key))) fail('HOST_INBOX_INVALID')
+      if (key === 'is' && !['read', 'unread', 'starred'].includes(value) || key === 'has' && value !== 'attachment') fail('HOST_INBOX_INVALID')
+      const keyed = async (query: Parameters<Inbox['mailboxConversations']>[1]['query']) => {
+        const hash = digest(query), identity = threadKey(row), proof = budget.proofs.get(hash) ?? new Map<string, boolean>()
+        budget.proofs.set(hash, proof)
+        if (proof.has(identity)) return proof.get(identity)!
+        const index = budget.keys.findIndex(key => threadKey(key) === identity)
+        const keys = index < 0 ? [{ sourceId: row.sourceId, threadId: row.threadId }] : budget.keys.slice(Math.floor(index / 50) * 50, Math.floor(index / 50) * 50 + 50)
+        let cursor: string | undefined
         do {
-          const values = summaries(scope, row.sourceId, row.threadId, 500, after)
-          if (!values.length) break
-          const mail = project(scope, values).mail.find(mail => mail.account === scope.row.account)!
-          if (matches({ ...row.mail, messages: mail.messages })) { yes = true; break }
-          const last = values.at(-1)!; after = [last.receivedAt, last.id]
-          await wait()
-        } while (!closed)
+          if (budget.searches <= 0 || budget.pages <= 0) throw pendingContext
+          budget.searches--; budget.pages--
+          const found = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), keys, query, limit: 100, ...(cursor ? { cursor } : {}) })
+          for (const item of found.items) proof.set(threadKey(item), true)
+          cursor = found.nextCursor ?? undefined
+          if (!cursor) for (const key of keys) if (!proof.has(threadKey(key))) proof.set(threadKey(key), false)
+        } while (cursor && budget.pages > 0)
+        if (!proof.has(identity)) throw pendingContext
+        return proof.get(identity)!
       }
-      if (!yes && bodies && term.includes(':') && !/^(?:from|to|subject|in|label|is|has|before|after|older_than|newer_than):/.test(term)) fail('HOST_INBOX_INVALID')
-      if (!yes && bodies && !term.includes(':')) {
+      const nativeParticipant = participantQuery(key, value), participant = nativeParticipant?.participant
+      if (participant) {
+        // Read real header addresses, never formatted display names or Cc/Bcc.
+        // A preview hit is exact; a miss needs the complete keyed SDK proof.
+        yes = values.some(summary => (participant.field === 'from' ? [summary.from] : summary.to).some(person => {
+          const email = person.email.trim().replace(/[A-Z]/g, letter => letter.toLowerCase())
+          if (participant.match === 'address') return email === participant.value
+          const at = email.indexOf('@'), domain = email.slice(at + 1)
+          return at >= 0 && (domain === participant.value || domain.endsWith(`.${participant.value}`))
+        }))
+        if (!yes && !complete) yes = await keyed(nativeParticipant)
+      } else if (!yes && !complete && ['from', 'to'].includes(key)) {
+        // Legacy substring candidates still cannot prove an unseen header match.
+        const candidate = await keyed({ [key]: value })
+        if (candidate) return null
+      }
+      if (!yes && !complete && (key === 'label' || key === 'in')) {
+        const normalize = (name: string) => key === 'in' ? name.toLowerCase().replaceAll(/\s/g, '') : name.toLowerCase()
+        const wanted = normalize(value), matchName = (name: string) => key === 'in' ? normalize(name) === wanted : normalize(name).includes(wanted)
+        const labels = scope.labels.filter(label => label.accountId === row.sourceId && matchName(label.name))
+        const folders = (scope.folders.get(row.sourceId) ?? []).filter(folder => folder.kind === 'label' && matchName(folder.name))
+        for (const label of labels) if (await keyed({ labelId: label.id })) { yes = true; break }
+        if (!yes) for (const folder of folders) if (await keyed({ folder: folder.id })) { yes = true; break }
+      }
+      if (!yes && bodies && colon < 0) {
         if (term.length > 2000) fail('HOST_INBOX_TOO_LARGE', 413)
-        const found = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), keys: [{ sourceId: row.sourceId, threadId: row.threadId }], query: { search: term }, limit: 1 })
-        yes = found.items.length > 0
+        yes = await keyed({ search: term })
       }
       return negative ? !yes : yes
     }
@@ -414,18 +566,19 @@ export function createInboxWindowService(deps: Dependencies) {
     if (result === null) throw pendingContext
     return result!
   }
-  async function evaluateRow(scope: Scope, query: DTO.InboxViewQuery, row: DTO.InboxWindowRow) {
-    const mail = row.mail, inbox = inFolder(mail, 'Inbox'), holding = inbox && (mail.aiHoldUntil ?? 0) > Date.now()
+  async function evaluateRow(scope: Scope, query: DTO.InboxViewQuery, row: DTO.InboxWindowRow, budget: ReadBudget = readBudget(), includeCounts = false) {
+    const mail = row.mail, inbox = inFolder(mail, 'Inbox'), holding = inbox && (mail.aiHoldUntil ?? 0) > budget.now
     const attention = mail.split, counts: Record<string, number> = {}
+    if (includeCounts && budget.unknownLocation.has(row.key)) throw pendingContext
     const splitMatches = new Map<string, boolean>()
-    for (const name of new Set([...scope.preferences.splits, query.split])) {
+    for (const name of new Set(includeCounts ? [...scope.preferences.splits, query.split] : !query.search && query.folder === 'Inbox' ? [query.split] : [])) {
       const category = attentionSplit(scope.preferences as never, name), rule = (scope.preferences.splitRules as Record<string, string> | undefined)?.[name]
-      splitMatches.set(name, category ? attention === category || category === 'Important' && attention === 'Unknown' : typeof rule === 'string' && !!rule.trim() && await expression(scope, row, rule, false))
+      splitMatches.set(name, category ? attention === category || category === 'Important' && attention === 'Unknown' : typeof rule === 'string' && !!rule.trim() && await expression(scope, row, rule, false, budget))
     }
-    if (!(holding && !query.search && query.folder === 'Inbox')) {
-      counts.inbox = Number(inbox && attention === 'Important')
-      for (const [name, matches] of splitMatches) counts[`split:${name}`] = Number(inbox && matches)
-    }
+    // Explicit pages, counts, captures and resident updates never wait on AI.
+    // A presentation-only hold is applied solely to unseen demandChanges rows.
+    counts.inbox = Number(inbox && attention === 'Important')
+    for (const [name, matches] of splitMatches) counts[`split:${name}`] = Number(inbox && matches)
     counts.holding = Number(holding)
     for (const folder of ['Inbox', 'Starred', 'Sent', 'Done', 'Auto Archived', 'Reminders', 'Spam', 'Trash', 'All Mail']) counts[`folder:${folder}`] = Number(inFolder(mail, folder))
     const assessment = mail.triage?.state === 'ready' ? mail.triage.assessment : null
@@ -433,8 +586,12 @@ export function createInboxWindowService(deps: Dependencies) {
       || query.filter === 'No reply' && !mail.messages.at(-1)?.outgoing || query.filter === 'Needs reply' && assessment?.response !== 'needed'
       || query.filter === 'Action requested' && !assessment?.actions.length || query.filter === 'Time-sensitive' && !['immediate', 'deadline'].includes(assessment?.urgency ?? '')
       || query.filter === 'Suspicious' && !['spam_suspected', 'phishing_suspected'].includes(assessment?.risk ?? '') || query.filter === 'Unassessed' && !!assessment)
-    if (matches) matches = query.search ? (!(mail.folder === 'Trash' || mail.folder === 'Spam') || /in:(trash|spam)/i.test(query.query)) && await expression(scope, row, query.query, true)
-      : query.folder === 'Inbox' ? inbox && !holding && !!splitMatches.get(query.split) : inFolder(mail, query.folder)
+    if (matches && budget.unknownLocation.has(row.key)) {
+      if (!query.search && query.folder === 'Inbox' && !inbox) matches = false // SDK awake count proves this exclusion.
+      else throw pendingContext
+    }
+    if (matches) matches = query.search ? (!(mail.folder === 'Trash' || mail.folder === 'Spam') || /in:(trash|spam)/i.test(query.query)) && await expression(scope, row, query.query, true, budget)
+      : query.folder === 'Inbox' ? inbox && !!splitMatches.get(query.split) : await expression(scope, row, `in:"${query.folder.replaceAll('"', '')}"`, false, budget)
     return { matches, counts }
   }
   async function scanQuery(scope: Scope, query: QueryRow, count = BATCH) {
@@ -508,10 +665,14 @@ export function createInboxWindowService(deps: Dependencies) {
   async function indexQueryRows(scope: Scope, query: QueryRow, records: StoredRow[]) {
     if (captureLocked(scope)) return false
     let complete = true
+    const budget = readBudget()
+    budget.keys = records.map(row => ({ sourceId: row.source, threadId: row.thread }))
     for (const stored of records) {
       const row = json<DTO.InboxWindowRow>(stored.data)
+      if (scope.row.raw_complete) budget.summaries.set(row.key, summaries(scope, row.sourceId, row.threadId, 500))
+      if (json<{ folderContextComplete?: boolean }>(stored.data).folderContextComplete === false) budget.unknownLocation.add(row.key)
       let result: Awaited<ReturnType<typeof evaluateRow>>
-      try { result = await evaluateRow(scope, json(query.data), row) }
+      try { result = await evaluateRow(scope, json(query.data), row, budget) }
       catch (error) {
         if (error !== pendingContext) throw error
         db.query('INSERT OR IGNORE INTO local_window_query_pending VALUES (?,?,?)').run(owner, query.id, row.key)
@@ -521,71 +682,97 @@ export function createInboxWindowService(deps: Dependencies) {
       db.query('DELETE FROM local_window_query_pending WHERE owner=? AND query_id=? AND key=?').run(owner, query.id, row.key)
       if (result.matches) db.query('INSERT OR REPLACE INTO local_window_matches VALUES (?,?,?,?,?)').run(owner, query.id, row.key, stored.at, row.counts.messages ?? 0)
       else db.query('DELETE FROM local_window_matches WHERE owner=? AND query_id=? AND key=?').run(owner, query.id, row.key)
-      db.query('INSERT OR REPLACE INTO local_window_counts VALUES (?,?,?,?)').run(owner, query.id, row.key, JSON.stringify(result.counts))
     }
     return complete
   }
-  /** Request-driven recent conversation discovery is independent of the raw metadata
-   * backfill. Three bounded SDK pages per request; no automatic corpus drain here.
+  function nativeQuery(scope: Scope, view: DTO.InboxViewQuery): Parameters<Inbox['mailboxConversations']>[1]['query'] {
+    // A query's native fields match one member. Combining independent conversation
+    // predicates here would lose, for example, a read inbox message + unread reply
+    // in Archive. Push only a necessary predicate and evaluate whole aggregates below.
+    const folder = (name: string) => ({ Inbox: { folder: 'inbox', done: false }, Sent: { folder: 'sent' }, Starred: { starredOnly: true },
+      Trash: { folder: 'trash' }, Spam: { folder: 'spam' }, Done: { done: true }, Reminders: { snoozed: true }, 'Auto Archived': { folder: 'archive' } } as Record<string, Parameters<Inbox['mailboxConversations']>[1]['query']>)[name]
+    if (!view.search && folder(view.folder)) return folder(view.folder)
+    const expression = view.search ? parseSearch(view.query) : null
+    function necessary(node: NonNullable<ReturnType<typeof parseSearch>>): Parameters<Inbox['mailboxConversations']>[1]['query'] {
+      if ('not' in node || 'op' in node && node.op === 'or') return undefined
+      if ('op' in node) return necessary(node.left) ?? necessary(node.right)
+      if (node.term.startsWith('-')) return undefined
+      const colon = node.term.indexOf(':'), key = colon < 0 ? '' : node.term.slice(0, colon), value = colon < 0 ? node.term : node.term.slice(colon + 1).replaceAll('"', '')
+      if (colon < 0 && node.term.length <= 2000) return { search: node.term }
+      if (['from', 'to'].includes(key) && value.length <= 512) return participantQuery(key, value) ?? { [key]: value }
+      if (key === 'subject' && node.term.length <= 2000) return { search: node.term }
+      if (key === 'is' && value === 'unread') return { unreadOnly: true }
+      if (key === 'is' && value === 'starred') return { starredOnly: true }
+      if (key === 'has' && value === 'attachment') return { hasAttachments: true }
+      if (['before', 'after'].includes(key) && Number.isFinite(Date.parse(value))) return { [key]: new Date(value).toISOString() }
+      if (key === 'in') return folder(Object.keys({ Inbox: 1, Sent: 1, Starred: 1, Trash: 1, Spam: 1, Done: 1, Reminders: 1, 'Auto Archived': 1 }).find(name => name.toLowerCase().replaceAll(/\s/g, '') === value.toLowerCase().replaceAll(/\s/g, '')) ?? '')
+      return undefined
+    }
+    return expression && necessary(expression) || (view.filter === 'Unread' ? { unreadOnly: true } : view.filter === 'Starred' ? { starredOnly: true } : undefined)
+  }
+  const conversationCursor = (item: MailboxConversation): string => typeof item.cursor === 'string' && item.cursor.length > 0 && item.cursor.length <= 4096 ? item.cursor : fail('HOST_INBOX_UNAVAILABLE', 503)
+  /** No row, message, matching-ID, prefix or count-table writes: five SDK leader
+   * pages maximum, in either direction. Only consumed leaders advance the cursor;
+   * an unreturned match is never skipped, including at an SDK page's terminal edge.
    */
-  async function fillPrefix(scope: Scope, query: QueryRow, maximum: number, after?: [number, string]) {
-    if (captureLocked(scope) || !scope.boxes.length || queryPending(query) && !scope.row.raw_complete || current(scope) && query.scanned >= scope.row.revision && !queryPending(query)) return
-    db.query('INSERT OR IGNORE INTO local_window_prefix(owner,query_id) VALUES (?,?)').run(owner, query.id)
-    const extra = { remaining: 4 }
-    for (let batch = 0; batch < 3; batch++) {
-      const available = db.query<{ count: number }, (string | number)[]>(`SELECT COUNT(*) count FROM (SELECT m.key FROM local_window_matches m JOIN local_window_prefix_rows p ON p.owner=m.owner AND p.query_id=m.query_id AND p.key=m.key WHERE m.owner=? AND m.query_id=? ${after ? 'AND (m.at<? OR (m.at=? AND m.key>?))' : ''} LIMIT ?)`).get(owner, query.id, ...after ? [after[0], after[0], after[1]] : [], maximum + 1)!.count
-      const prefix = db.query<Prefix, string[]>('SELECT cursor,exhausted,indexed FROM local_window_prefix WHERE owner=? AND query_id=?').get(owner, query.id)!
-      if (available >= maximum + 1 || prefix.exhausted || prefix.indexed) break
-      const page = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 100, ...(prefix.cursor ? { cursor: prefix.cursor } : {}) })
-      await materializeConversations(scope, page.items, extra, page.state)
-      const rows: StoredRow[] = []
-      for (const item of page.items) {
-        const row = db.query<StoredRow, string[]>('SELECT * FROM local_window_rows WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, item.sourceId, item.threadId)
-        if (!row) fail('HOST_INBOX_UNAVAILABLE', 503)
-        rows.push(row!); db.query('INSERT OR IGNORE INTO local_window_prefix_rows VALUES (?,?,?)').run(owner, query.id, row!.key)
+  async function preparePage(scope: Scope, query: QueryRow, maximum: number, cursor?: PageCursor, reverse = false, budget = readBudget()): Promise<DTO.InboxWindowPage> {
+    if (cursor && (typeof cursor.older !== 'string' || typeof cursor.newer !== 'string' || !['older', 'newer'].includes(cursor.direction)
+      || !cursor.baseline || typeof cursor.baseline.scopeState !== 'string' || typeof cursor.baseline.sdkState !== 'string'
+      || ![cursor.baseline.revision, cursor.baseline.ai, cursor.baseline.category, cursor.baseline.at].every(value => Number.isSafeInteger(value) && value >= 0))) fail('HOST_INBOX_CURSOR_INVALID')
+    const direction = reverse ? 'newer' : 'older'
+    // The authenticated page bookmark owns its immutable starting read. Numeric
+    // change baselines may retire without expiring still-valid SDK keyset history.
+    let position = cursor ? cursor[direction] : undefined, read = cursor?.baseline
+    if (!scope.boxes.length) {
+      read = observe(scope, null, scope.row.id, query)
+      return { state: state(scope, query, read), rows: [], totals: unknownTotals(scope), nextCursor: null, exhausted: true }
+    }
+    const view = json<DTO.InboxViewQuery>(query.data), queryFilter = nativeQuery(scope, view), rows: PageableRow[] = []
+    let size = 65536, exhausted = false, stopped = false, wake = Infinity, firstConsumed: string | undefined, firstVisible: string | undefined
+    const bookmark = (older: string, newer: string) => token(`page:${query.id}`, scope, { older, newer, baseline: { ...read! }, direction } satisfies PageCursor)
+    while (budget.pages > 0 && rows.length < maximum && !stopped) {
+      budget.pages--
+      const page = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 100, direction, query: queryFilter, ...(position ? { cursor: position } : {}) })
+      read ??= observe(scope, page.state, page.scopeState, query)
+      if (page.scopeState !== read.scopeState || page.state !== read.sdkState) fail('HOST_INBOX_QUERY_EXPIRED', 409)
+      if (queryFilter) budget.proofs.set(digest(queryFilter), new Map(page.items.map(item => [threadKey(item), true])))
+      const projected = await projectConversations(scope, page.items, budget)
+      let consumed = 0
+      for (const [index, row] of projected.entries()) {
+        row.revision = read.revision
+        wake = Math.min(wake, row.mail.reminderAt ?? Infinity, row.mail.aiHoldUntil ?? Infinity)
+        let matches: boolean
+        try { matches = (await evaluateRow(scope, view, row, budget)).matches }
+        catch (error) { if (error !== pendingContext || !rows.length && !consumed) throw error; stopped = true; break }
+        const at = conversationCursor(page.items[index]!)
+        if (matches) {
+          // Per-row bookmarks are necessary when the browser evicts only part of
+          // this response. A page-first bookmark would skip the evicted prefix.
+          const result: PageableRow = { ...row, pageCursor: bookmark(at, at) }, cost = bytes(result)
+          if (size + cost > DTO.INBOX_RESPONSE_BYTE_LIMIT) { stopped = true; break }
+          rows.push(result); size += cost; firstVisible ??= at
+        }
+        firstConsumed ??= at; position = at; consumed++
+        if (rows.length >= maximum) { stopped = true; break }
       }
-      if (!await indexQueryRows(scope, query, rows)) return
-      db.query('UPDATE local_window_prefix SET cursor=?,exhausted=? WHERE owner=? AND query_id=?').run(page.nextCursor, Number(!page.nextCursor), owner, query.id)
-      db.query('UPDATE local_window_scopes SET baseline=COALESCE(baseline,?),sdk_state=?,sdk_scope=? WHERE owner=? AND id=?').run(page.state, page.state, page.scopeState, owner, scope.row.id)
-      refresh(scope); await wait()
+      if (consumed === page.items.length && !page.nextCursor) { exhausted = true; break }
+      if (projected.length < page.items.length) stopped = true
     }
-  }
-  async function preparePage(scope: Scope, query: QueryRow, maximum: number, after?: [number, string], reverse = false) {
-    if (!reverse) await fillPrefix(scope, query, maximum, after)
-    if (!captureLocked(scope)) {
-      const rows = pageResult(scope, query, maximum, after, reverse, true).rows
-      const stale = rows.filter(row => db.query('SELECT 1 FROM local_window_dirty WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, row.sourceId, row.threadId))
-      if (stale.length) { await refreshRows(scope, stale.map(({ sourceId, threadId }) => ({ sourceId, threadId }))); await indexQueryRows(scope, query, stale.flatMap(row => { const value = record(scope, row.key); return value ? [value] : [] })) }
-    }
-    return pageResult(scope, query, maximum, after, reverse)
-  }
-  function pageResult(scope: Scope, query: QueryRow, maximum: number, after?: [number, string], reverse = false, allowDirty = false): DTO.InboxWindowPage {
-    const ready = current(scope) && query.scanned >= scope.row.revision && !queryPending(query)
-    // Do not page past an unresolved conversation's position, even if older rows match.
-    const boundary = db.query<{ at: number; key: string }, string[]>('SELECT r.at,r.key FROM local_window_query_pending p JOIN local_window_rows r ON r.owner=p.owner AND r.scope=? AND r.key=p.key WHERE p.owner=? AND p.query_id=? ORDER BY r.at DESC,r.key LIMIT 1').get(scope.row.id, owner, query.id)
-    const previousCoverage = db.query<{ indexed: number }, string[]>('SELECT indexed FROM local_window_prefix WHERE owner=? AND query_id=?').get(owner, query.id)?.indexed
-    if (ready && !previousCoverage) db.query('INSERT INTO local_window_prefix(owner,query_id,indexed) VALUES (?,?,1) ON CONFLICT(owner,query_id) DO UPDATE SET indexed=1').run(owner, query.id)
-    const indexed = ready || !!previousCoverage
-    const selected = db.query<StoredRow, (string | number)[]>(`SELECT r.* FROM local_window_matches m JOIN local_window_rows r ON r.owner=m.owner AND r.scope=? AND r.key=m.key WHERE m.owner=? AND m.query_id=? ${indexed ? '' : 'AND EXISTS(SELECT 1 FROM local_window_prefix_rows p WHERE p.owner=m.owner AND p.query_id=m.query_id AND p.key=m.key)'} ${boundary ? 'AND (m.at>? OR (m.at=? AND m.key<?))' : ''} ${after ? reverse ? 'AND (m.at>? OR (m.at=? AND m.key<?))' : 'AND (m.at<? OR (m.at=? AND m.key>?))' : ''} ORDER BY m.at ${reverse ? 'ASC' : 'DESC'},m.key ${reverse ? 'DESC' : 'ASC'} LIMIT ?`).all(scope.row.id, owner, query.id, ...boundary ? [boundary.at, boundary.at, boundary.key] : [], ...after ? [after[0], after[0], after[1]] : [], maximum + 1)
-    const rows: DTO.InboxWindowRow[] = []; let size = 65536, pendingDirty = false
-    for (const stored of selected.slice(0, maximum)) {
-      if (!allowDirty && db.query('SELECT 1 FROM local_window_dirty WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, stored.source, stored.thread)) { pendingDirty = true; break }
-      const row = json<DTO.InboxWindowRow>(stored.data), cost = bytes(row)
-      if (size + cost > DTO.INBOX_RESPONSE_BYTE_LIMIT) break
-      rows.push(row); size += cost
-    }
-    if (!rows.length && selected.length && !pendingDirty) fail('HOST_INBOX_TOO_LARGE', 413)
-    if (!rows.length && scope.row.reset === 'unavailable') fail('HOST_INBOX_UNAVAILABLE', 503)
-    const hasMore = selected.length > rows.length
-    if (reverse) rows.reverse()
-    const first = rows[0], last = rows.at(-1)
-    return { state: state(scope, query), rows, totals: totals(scope, query), exhausted: ready && !hasMore,
-      nextCursor: hasMore || !ready || reverse ? token(`page:${query.id}`, scope, { older: last ? [last.mail.receivedAt ?? 0, last.key] : after ?? null, newer: first ? [first.mail.receivedAt ?? 0, first.key] : after ?? null }) : null }
+    if (!position && budget.detailDeferred.size) fail('HOST_INBOX_TOO_LARGE', 413)
+    if (!read || !exhausted && !position) fail('HOST_INBOX_UNAVAILABLE', 503)
+    const saved = readMetadata(query)
+    if (Number.isFinite(wake)) { saved.wake = Math.min(saved.wake ?? Infinity, wake); saveReadMetadata(query, saved) }
+    const opposite = firstVisible ?? firstConsumed ?? position
+    if (reverse) rows.reverse() // SDK traverses oldest-to-newest; the UI always displays newest first.
+    return { state: state(scope, query, read), rows, totals: totals(scope, query), exhausted,
+      nextCursor: exhausted ? null : reverse ? bookmark(opposite!, position!) : bookmark(position!, opposite!) }
   }
 
   async function maintain(scope: Scope) {
+    if (!preparations.has(scope.row.id)) return
     refresh(scope)
-    // A capture freezes this derived index, not SDK commands or their durable receipts.
+    // This materialization exists only during an explicit, expiring capture lease.
+    // A capture freezes it, not SDK commands or their durable receipts.
     if (captureLocked(scope)) return
     await refreshMetadata(scope)
     if (!scope.boxes.length) { scope.seenEvents = watchedVersion; scope.row.checked = Date.now(); db.query('UPDATE local_window_scopes SET checked=? WHERE owner=? AND id=?').run(scope.row.checked, owner, scope.row.id); return }
@@ -609,8 +796,8 @@ export function createInboxWindowService(deps: Dependencies) {
       const affected = page.affectedThreads.slice(0, 50)
       await refreshRows(scope, affected)
       const records = affected.flatMap(key => { const row = db.query<StoredRow, string[]>('SELECT * FROM local_window_rows WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, key.sourceId, key.threadId); return row ? [row] : [] })
-      const views = db.query<QueryRow, (string | number)[]>('SELECT * FROM local_window_queries WHERE owner=? AND scope=? AND expires>? AND preference=? AND generation=? ORDER BY expires DESC LIMIT 8').all(owner, scope.row.id, Date.now(), scope.preference, scope.row.generation)
-      for (const view of views) { await indexQueryRows(scope, view, records); for (const row of records) db.query('INSERT OR IGNORE INTO local_window_prefix_rows VALUES (?,?,?)').run(owner, view.id, row.key) }
+      const views = [...preparations.get(scope.row.id)!.queries].flatMap(id => { const query = getQuery(id); return query ? [query] : [] })
+      for (const view of views) await indexQueryRows(scope, view, records)
     }
     if (activeRequests || closed) return
     if (!scope.row.raw_complete) {
@@ -629,65 +816,93 @@ export function createInboxWindowService(deps: Dependencies) {
   function reset(scope: Scope, reason: string) {
     db.transaction(() => {
       for (const table of ['messages', 'contacts', 'dirty', 'rows']) db.query(`DELETE FROM local_window_${table} WHERE owner=? AND scope=?`).run(owner, scope.row.id)
-      db.query("UPDATE local_window_captures SET complete=1,revision=revision+1,data=CASE WHEN kind='zero' THEN json_set(data,'$.session.status','invalidated') ELSE data END WHERE owner=? AND scope=?").run(owner, scope.row.id)
-      for (const table of ['prefix', 'prefix_rows', 'query_pending']) db.query(`DELETE FROM local_window_${table} WHERE owner=? AND query_id IN (SELECT id FROM local_window_queries WHERE owner=? AND scope=?)`).run(owner, owner, scope.row.id)
-      db.query('UPDATE local_window_scopes SET cursor=NULL,baseline=NULL,sdk_state=NULL,sdk_scope=\'\',raw_complete=0,generation=generation+1,revision=revision+1,reset=?,checked=0 WHERE owner=? AND id=?').run(reason, owner, scope.row.id)
+      // A retention reset restarts only this unaccepted preparation. Completed
+      // captures and historical Undo proofs do not depend on retained SDK events.
+      for (const table of ['matches', 'counts', 'prefix', 'prefix_rows', 'query_pending']) db.query(`DELETE FROM local_window_${table} WHERE owner=? AND query_id IN (SELECT id FROM local_window_queries WHERE owner=? AND scope=?)`).run(owner, owner, scope.row.id)
+      db.query('UPDATE local_window_queries SET scanned=0 WHERE owner=? AND scope=?').run(owner, scope.row.id)
+      db.query('UPDATE local_window_scopes SET cursor=NULL,baseline=NULL,sdk_state=NULL,sdk_scope=\'\',raw_complete=0,revision=revision+1,reset=?,checked=0 WHERE owner=? AND id=?').run(reason, owner, scope.row.id)
     }).immediate()
     refresh(scope)
   }
   function resetReadFailure(scope: Scope, error: unknown) {
-    if (!(error instanceof InboxError) || !['INVALID_CURSOR', 'STALE_CURSOR', 'SNAPSHOT_SCOPE_CHANGED', 'MAILBOX_SCOPE_CHANGED', 'HISTORY_EXPIRED'].includes(error.code)) return false
+    if (!(error instanceof InboxError) || !['INVALID_CURSOR', 'STALE_CURSOR', 'SNAPSHOT_SCOPE_CHANGED', 'MAILBOX_SCOPE_CHANGED', 'HISTORY_EXPIRED', 'MAILBOX_HISTORY_EXPIRED'].includes(error.code)) return false
     const scopeChanged = ['SNAPSHOT_SCOPE_CHANGED', 'MAILBOX_SCOPE_CHANGED'].includes(error.code)
     reset(scope, scopeChanged ? 'scope' : 'history')
     if (scopeChanged) scopes.delete(scope.row.id)
     return true
   }
-  async function scopedRead<T>(scope: Scope, work: () => Promise<T>): Promise<T> {
+  async function scopedRead<T>(_scope: Scope, work: () => Promise<T>): Promise<T> {
     try { return await work() }
-    catch (error) { if (resetReadFailure(scope, error)) fail('HOST_INBOX_QUERY_EXPIRED', 409); throw error }
+    catch (error) {
+      // An ordinary expired read cannot invalidate an accepted capture or start a
+      // replacement inventory. The caller explicitly reopens only its bounded view.
+      if (error instanceof InboxError && ['INVALID_CURSOR', 'STALE_CURSOR', 'SNAPSHOT_SCOPE_CHANGED', 'MAILBOX_SCOPE_CHANGED', 'HISTORY_EXPIRED', 'MAILBOX_HISTORY_EXPIRED'].includes(error.code)) fail('HOST_INBOX_QUERY_EXPIRED', 409)
+      throw error
+    }
   }
+  function captureWorkPending() { return preparations.size > 0 || pruning.size > 0 || [...scopes.values()].some(scope => captureLocked(scope)) }
   function schedule(delay = 10) {
     if (delay === 0 && timer) { clearTimeout(timer); timer = undefined }
-    if (closed || timer || working) return
+    if (closed || timer || working || !captureWorkPending()) return
     timer = setTimeout(() => { timer = undefined; working = work().catch(() => {}).finally(() => {
       working = undefined
-      const pending = watched || [...scopes.values()].some(scope => !scope.row.raw_complete || hasDirty(scope))
-        || !!db.query('SELECT 1 FROM local_window_queries q JOIN local_window_scopes s ON s.owner=q.owner AND s.id=q.scope WHERE q.owner=? AND q.scanned<s.revision AND q.expires>? AND q.problem IS NULL LIMIT 1').get(owner, Date.now())
-        || !!db.query('SELECT 1 FROM local_window_query_pending WHERE owner=? LIMIT 1').get(owner)
-        || !!db.query('SELECT 1 FROM local_window_captures WHERE owner=? AND complete=0 LIMIT 1').get(owner)
-      schedule(pending ? 25 : 2000)
+      if (captureWorkPending()) schedule([...scopes.values()].some(scope => preparations.has(scope.row.id) && !current(scope) || captureLocked(scope)) || pruning.size ? 25 : 1000)
     }) }, delay)
     timer.unref?.()
   }
+  function pruneCaptureIndex(scope: Scope) {
+    if (captureLocked(scope) || preparations.has(scope.row.id)) return
+    // Persist invalidity before the first deletion, not after the last chunk.
+    // A restart must never accept rows whose frozen summary copy was half-pruned.
+    if (refresh(scope).row.reset !== 'pruning') {
+      db.query("UPDATE local_window_scopes SET cursor=NULL,baseline=NULL,raw_complete=0,checked=0,reset='pruning' WHERE owner=? AND id=?").run(owner, scope.row.id)
+      refresh(scope)
+    }
+    // Only disposable materialization is removed, in bounded chunks. Frozen items,
+    // progress receipts, Undo and category/user data are never part of this cleanup.
+    for (const table of ['messages', 'contacts', 'dirty', 'rows']) {
+      const removed = db.query(`DELETE FROM local_window_${table} WHERE rowid IN (SELECT rowid FROM local_window_${table} WHERE owner=? AND scope=? LIMIT 500)`).run(owner, scope.row.id)
+      if (removed.changes) return
+    }
+    for (const table of ['matches', 'counts', 'prefix', 'prefix_rows', 'query_pending']) {
+      const removed = db.query(`DELETE FROM local_window_${table} WHERE rowid IN (SELECT rowid FROM local_window_${table} WHERE owner=? AND query_id IN (SELECT id FROM local_window_queries WHERE owner=? AND scope=?) LIMIT 500)`).run(owner, owner, scope.row.id)
+      if (removed.changes) return
+    }
+    db.query("UPDATE local_window_scopes SET cursor=NULL,baseline=NULL,raw_complete=0,checked=0,reset=NULL WHERE owner=? AND id=?").run(owner, scope.row.id)
+    db.query('UPDATE local_window_queries SET scanned=0 WHERE owner=? AND scope=?').run(owner, scope.row.id)
+    refresh(scope); pruning.delete(scope.row.id)
+  }
   async function work() {
     if (closed || activeRequests) return
+    for (const [id, preparation] of preparations) if (preparation.until <= Date.now()) { preparations.delete(id); pruning.add(id) }
     const observed = watchedVersion
-    for (const scope of [...scopes.values()].sort((a, b) => b.lastUsed - a.lastUsed)) {
+    if (preparations.size) await updateSavedProjections()
+    for (const scope of [...scopes.values()].filter(scope => preparations.has(scope.row.id) || pruning.has(scope.row.id) || captureLocked(scope)).sort((a, b) => b.lastUsed - a.lastUsed)) {
       if (closed || activeRequests) break
-      if (scopes.get(scope.row.id) !== scope) continue
       workingScope = scope
       try {
+        const wasCapturing = captureLocked(scope)
         await captures(scope)
-        await maintain(scope)
-        if (scope.row.raw_complete && !hasDirty(scope) && scope.row.reset) { db.query('UPDATE local_window_scopes SET reset=NULL WHERE owner=? AND id=?').run(owner, scope.row.id); refresh(scope) }
-        const queries = db.query<QueryRow, (string | number)[]>(`SELECT * FROM local_window_queries q WHERE owner=? AND scope=? AND expires>? AND problem IS NULL AND (scanned<? OR EXISTS(SELECT 1 FROM local_window_query_pending p WHERE p.owner=q.owner AND p.query_id=q.id)) ORDER BY expires DESC LIMIT 8`).all(owner, scope.row.id, Date.now(), scope.row.revision)
-        for (const query of queries) if (query.preference === scope.preference && query.generation === scope.row.generation) {
-          try { await scanQuery(scope, query) } catch (error) { if (resetReadFailure(scope, error)) break; if (error !== pendingContext) db.query("UPDATE local_window_queries SET problem='HOST_INBOX_UNAVAILABLE' WHERE owner=? AND id=?").run(owner, query.id) }
-          if (closed || activeRequests) break
+        if (wasCapturing && !captureLocked(scope)) { preparations.delete(scope.row.id); pruning.add(scope.row.id) }
+        if (preparations.has(scope.row.id)) {
+          await maintain(scope)
+          if (scope.row.raw_complete && !hasDirty(scope) && scope.row.reset) { db.query('UPDATE local_window_scopes SET reset=NULL WHERE owner=? AND id=?').run(owner, scope.row.id); refresh(scope) }
+          for (const id of preparations.get(scope.row.id)!.queries) {
+            const query = getQuery(id)
+            if (query && query.preference === scope.preference && query.generation === scope.row.generation && (query.scanned < scope.row.revision || queryPending(query))) await scanQuery(scope, query)
+            if (closed || activeRequests) break
+          }
         }
+        if (pruning.has(scope.row.id)) pruneCaptureIndex(scope)
       } catch (error) {
         if (!resetReadFailure(scope, error)) { db.query("UPDATE local_window_scopes SET reset='unavailable',checked=0 WHERE owner=? AND id=?").run(owner, scope.row.id); refresh(scope) }
       } finally { workingScope = undefined }
       await wait()
     }
     watched = observed !== watchedVersion
-    if (closed || activeRequests || aiCursor === undefined || categoryCursor === undefined) return
-    await updateSavedProjections()
-    const expired = db.query<{ id: string }, (string | number)[]>("SELECT q.id FROM local_window_queries q WHERE q.owner=? AND q.expires<? AND NOT EXISTS(SELECT 1 FROM local_window_captures c WHERE c.owner=q.owner AND c.complete=0 AND json_extract(c.data,'$.queryId')=q.id) LIMIT 8").all(owner, Date.now())
-    for (const query of expired) { for (const table of ['matches', 'counts', 'prefix', 'prefix_rows', 'query_pending']) db.query(`DELETE FROM local_window_${table} WHERE owner=? AND query_id=?`).run(owner, query.id); db.query('DELETE FROM local_window_queries WHERE owner=? AND id=?').run(owner, query.id) }
   }
 
-  type CaptureMeta = { account: string; queryId: string; snapshotRevision?: number; scopeGeneration: number; preference: string; explicitIds?: string[]; session?: DTO.InboxZeroSession; invalidated?: boolean }
+  type CaptureMeta = { account: string; queryId: string; snapshotRevision?: number; scopeGeneration: number; preference: string; contextVersion?: 1 | 2 | 3; explicitIds?: string[]; session?: DTO.InboxZeroSession; invalidated?: boolean }
   const captureRow = (id: string) => db.query<CaptureRow, string[]>('SELECT * FROM local_window_captures WHERE owner=? AND id=?').get(owner, id)
   function selection(capture: CaptureRow): DTO.InboxSelection {
     return { id: capture.id, account: json<CaptureMeta>(capture.data).account, scopeKey: capture.scope, revision: capture.revision,
@@ -696,15 +911,16 @@ export function createInboxWindowService(deps: Dependencies) {
   function zeroSession(capture: CaptureRow): DTO.InboxZeroSession {
     const meta = json<CaptureMeta>(capture.data), session = meta.session!
     const counts = db.query<{ initial: number; remaining: number; decided: number; ineligible: number }, string[]>(`SELECT COUNT(*) initial,COALESCE(SUM(status='remaining'),0) remaining,COALESCE(SUM(status='decided'),0) decided,COALESCE(SUM(status='ineligible'),0) ineligible FROM local_window_capture_items WHERE owner=? AND capture=?`).get(owner, capture.id)!
-    const unknown = db.query<{ count: number }, string[]>(`SELECT COUNT(*) count FROM local_window_capture_items i LEFT JOIN local_window_rows r ON r.owner=i.owner AND r.scope=? AND r.key=i.key WHERE i.owner=? AND i.capture=? AND i.status='remaining' AND (r.key IS NULL OR r.context<>i.context)`).get(capture.scope, owner, capture.id)!.count
     return { ...session, revision: capture.revision, status: session.status === 'invalidated' ? 'invalidated' : !capture.complete ? 'capturing' : !counts.remaining ? 'complete' : 'ready', progress: {
       initialCount: capture.complete ? counts.initial : null, remainingCount: capture.complete ? counts.remaining : null, decidedCount: counts.decided,
-      ineligibleCount: counts.ineligible, unknownCount: capture.complete ? unknown : null, captureComplete: !!capture.complete } }
+      ineligibleCount: counts.ineligible, unknownCount: null, captureComplete: !!capture.complete } }
   }
   function invalidateCapture(capture: CaptureRow, meta: CaptureMeta) {
     meta.invalidated = true
     if (meta.session) meta.session.status = 'invalidated'
     db.query('UPDATE local_window_captures SET data=?,complete=1,revision=revision+1 WHERE owner=? AND id=?').run(JSON.stringify(meta), owner, capture.id)
+    const scope = scopes.get(capture.scope)
+    if (scope && !captureLocked(scope)) { preparations.delete(capture.scope); pruning.add(capture.scope); schedule(0) }
   }
   async function checkedCapture(id: string, kind: string) {
     const capture = captureRow(text(id))
@@ -714,17 +930,41 @@ export function createInboxWindowService(deps: Dependencies) {
       if (!meta.invalidated) invalidateCapture(capture!, meta)
       fail('HOST_INBOX_SCOPE_CHANGED', 409)
     }
+    // Only explicit capture use resumes interrupted disposal; ordinary view
+    // resolution leaves any old copies inert and does no mailbox-sized cleanup.
+    if (scope.row.reset === 'pruning') { pruning.add(scope.row.id); schedule(0) }
     return { capture: capture!, meta, scope }
   }
-  async function newQuery(input: DTO.InboxQueryInput, scope: Scope): Promise<QueryRow> {
+  async function newQuery(input: DTO.InboxQueryInput, scope: Scope, reuse = true): Promise<QueryRow> {
     const { limit: _, ...query } = input
     text(query.account); text(query.folder, 128); text(query.split, 128)
     if (typeof query.search !== 'boolean' || typeof query.query !== 'string' || query.query.length > 4096 || query.filter !== null && !['Unread', 'Starred', 'Important', 'No reply', 'Needs reply', 'Action requested', 'Time-sensitive', 'Suspicious', 'Unassessed'].includes(query.filter)) fail('HOST_INBOX_INVALID')
     try { parseSearch(query.query) } catch { fail('HOST_INBOX_INVALID') }
     const serialized = JSON.stringify(query)
-    const prior = db.query<QueryRow, (string | number)[]>('SELECT * FROM local_window_queries WHERE owner=? AND scope=? AND preference=? AND generation=? AND data=? AND expires>? AND problem IS NULL LIMIT 1').get(owner, scope.row.id, scope.preference, scope.row.generation, serialized, Date.now())
+    const preparing = JSON.stringify([...preparations.values()].flatMap(value => [...value.queries]))
+    // Unfinished captures still consult their query. Completed queues and Undo use
+    // frozen capture items instead; never remove those items or materialized refs.
+    const disposable = `NOT EXISTS(SELECT 1 FROM local_window_captures c WHERE c.owner=q.owner AND c.complete=0 AND json_extract(c.data,'$.queryId')=q.id)
+      AND NOT EXISTS(SELECT 1 FROM local_window_matches m WHERE m.owner=q.owner AND m.query_id=q.id)
+      AND NOT EXISTS(SELECT 1 FROM local_window_query_pending p WHERE p.owner=q.owner AND p.query_id=q.id)
+      AND NOT EXISTS(SELECT 1 FROM local_window_counts c WHERE c.owner=q.owner AND c.query_id=q.id)
+      AND NOT EXISTS(SELECT 1 FROM local_window_prefix p WHERE p.owner=q.owner AND p.query_id=q.id)
+      AND NOT EXISTS(SELECT 1 FROM local_window_prefix_rows p WHERE p.owner=q.owner AND p.query_id=q.id)
+      AND q.id NOT IN (SELECT value FROM json_each(?))`
+    const expired = db.query<{ id: string }, (string | number)[]>(`SELECT q.id FROM local_window_queries q WHERE q.owner=? AND q.expires<? AND ${disposable} LIMIT 8`).all(owner, Date.now(), preparing)
+    for (const value of expired) db.query('DELETE FROM local_window_queries WHERE owner=? AND id=?').run(owner, value.id)
+    const prior = reuse ? db.query<QueryRow, (string | number)[]>('SELECT * FROM local_window_queries WHERE owner=? AND scope=? AND preference=? AND generation=? AND data=? AND expires>? AND problem IS NULL LIMIT 1').get(owner, scope.row.id, scope.preference, scope.row.generation, serialized, Date.now()) : null
     if (prior) return prior
-    const count = db.query<{ count: number }, (string | number)[]>('SELECT COUNT(*) count FROM local_window_queries WHERE owner=? AND scope=? AND expires>?').get(owner, scope.row.id, Date.now())!.count
+    const active = db.query<{ count: number }, (string | number)[]>('SELECT COUNT(*) count FROM local_window_queries WHERE owner=? AND scope=? AND expires>?')
+    let count = active.get(owner, scope.row.id, Date.now())!.count
+    if (count >= 128) {
+      // TTL renewal already records recency. Reclaim one atomic bounded batch,
+      // keeping independent public IDs and every capture/preparation safety fence.
+      db.query(`DELETE FROM local_window_queries WHERE owner=? AND scope=? AND id IN (
+        SELECT q.id FROM local_window_queries q WHERE q.owner=? AND q.scope=? AND q.expires>? AND ${disposable}
+        ORDER BY q.expires,q.id LIMIT 32)`).run(owner, scope.row.id, owner, scope.row.id, Date.now(), preparing)
+      count = active.get(owner, scope.row.id, Date.now())!.count
+    }
     if (count >= 128) fail('HOST_INBOX_UNAVAILABLE', 429)
     const id = crypto.randomUUID()
     db.query('INSERT INTO local_window_queries(owner,id,scope,data,preference,generation,expires) VALUES (?,?,?,?,?,?,?)').run(owner, id, scope.row.id, serialized, scope.preference, scope.row.generation, Date.now() + QUERY_TTL)
@@ -752,9 +992,33 @@ export function createInboxWindowService(deps: Dependencies) {
       if ('ids' in input && input.ids) explicitIds = ids(input.ids)
       query = await newQuery({ account: input.account, folder: 'All Mail', split: 'Important', search: false, query: '', filter: null }, scope)
     }
-    if (!current(scope) || 'allMatching' in input && input.allMatching === true && query.scanned < scope.row.revision || captureLocked(scope) || scope.users > 1 || workingScope === scope) fail('HOST_INBOX_UNAVAILABLE', 503)
+    if (scope.row.reset === 'pruning') pruning.add(scope.row.id)
+    const live = scope.boxes.length && current(scope) ? await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 1 }) : null
+    const caughtUp = !scope.boxes.length || !!live && live.state === scope.row.baseline && live.scopeState === scope.row.sdk_scope
+    const canonicalProjection = json<{ projection?: ProjectionStamp }>(scope.row.data).projection?.contextVersion === 3
+    if (!current(scope) || !caughtUp || !canonicalProjection || 'allMatching' in input && input.allMatching === true && (query.scanned < scope.row.revision || queryPending(query)) || captureLocked(scope) || scope.users > 1 || workingScope === scope || pruning.has(scope.row.id)) {
+      if (!pruning.has(scope.row.id) && !captureLocked(scope)) {
+        let preparation = preparations.get(scope.row.id)
+        if (!preparation) {
+          if (preparations.size >= 4) fail('HOST_INBOX_UNAVAILABLE', 429)
+          preparation = { until: Date.now() + 5 * 60_000, queries: new Set() }; preparations.set(scope.row.id, preparation)
+          const saved = json<{ projection?: ProjectionStamp }>(scope.row.data).projection
+          if (saved?.preference !== scope.preference || saved.aiCursor !== scope.ai.cursor || saved.categoryCursor !== categoryHead() || saved.contextVersion !== 3) invalidateProjection(scope)
+          // Only new explicit preparation upgrades dormant rows. Accepted captures
+          // retain their original evidence/version and are never silently rebased.
+          stamp(scope, { preference: scope.preference, aiCursor: scope.ai.cursor, categoryCursor: categoryHead(), contextVersion: 3 })
+          if (!caughtUp) { db.query('UPDATE local_window_scopes SET checked=0 WHERE owner=? AND id=?').run(owner, scope.row.id); refresh(scope) }
+          if (!scope.boxes.length) { db.query('UPDATE local_window_scopes SET raw_complete=1,checked=? WHERE owner=? AND id=?').run(Date.now(), owner, scope.row.id); scope.seenEvents = watchedVersion; refresh(scope) }
+        }
+        if (preparation.queries.size >= 8 && !preparation.queries.has(query.id)) fail('HOST_INBOX_UNAVAILABLE', 429)
+        preparation.until = Date.now() + 5 * 60_000
+        preparation.queries.add(query.id)
+      }
+      schedule(0)
+      fail('HOST_INBOX_PREPARING', 503)
+    }
     // Acceptance is the snapshot boundary. No awaiting, deferred readiness, or later arrivals.
-    const meta: CaptureMeta = { account: input.account, queryId: query.id, snapshotRevision: scope.row.revision, scopeGeneration: scope.row.generation, preference: scope.preference, ...(explicitIds ? { explicitIds } : {}) }
+    const meta: CaptureMeta = { account: input.account, queryId: query.id, snapshotRevision: scope.row.revision, scopeGeneration: scope.row.generation, preference: scope.preference, contextVersion: 3, ...(explicitIds ? { explicitIds } : {}) }
     if (kind === 'zero') meta.session = { version: 2, id: input.id, account: input.account, scopeKey: scope.row.id, revision: 1, startedAt: Date.now(), phase: 'batches', paused: false, currentId: null,
       status: 'capturing', progress: { initialCount: null, remainingCount: null, decidedCount: 0, ineligibleCount: 0, unknownCount: null, captureComplete: false } }
     db.query('INSERT INTO local_window_captures(owner,id,kind,scope,data,input) VALUES (?,?,?,?,?,?)').run(owner, input.id, kind, scope.row.id, JSON.stringify(meta), fingerprint)
@@ -799,7 +1063,7 @@ export function createInboxWindowService(deps: Dependencies) {
         const opaqueReview = reviewToken(capture.id, review)
         const item: DTO.InboxZeroItem = { id: row.key, eligibility: eligibility ? 'eligible' : 'ineligible', reviewVersion: opaqueReview,
           batchEligibility: candidate ? 'eligible' : 'ineligible', batchCandidate: candidate ? { ...candidate, reviewVersion: opaqueReview } : null }
-        db.query('INSERT OR IGNORE INTO local_window_capture_items VALUES (?,?,?,?,?,?,?,?)').run(owner, capture.id, ++ordinal, row.key, stored.context, review, JSON.stringify({ item, targets: row.targets, contextComplete: row.targetsComplete, categoryRevision: db.query<{ revision: number }, string[]>('SELECT revision FROM local_category_overrides WHERE owner=? AND source=? AND thread=?').get(owner, row.sourceId, row.threadId)?.revision ?? 0 }), 'remaining')
+        db.query('INSERT OR IGNORE INTO local_window_capture_items VALUES (?,?,?,?,?,?,?,?)').run(owner, capture.id, ++ordinal, row.key, stored.context, review, JSON.stringify({ item, targets: row.targets, contextComplete: row.targetsComplete && row.counts.messages === fullValues.length && row.counts.memberships === fullValues.reduce((sum, value) => sum + value.memberships.length, 0), contextEvidence: json<{ contextEvidence?: string }>(stored.data).contextEvidence, categoryRevision: db.query<{ revision: number }, string[]>('SELECT revision FROM local_category_overrides WHERE owner=? AND source=? AND thread=?').get(owner, row.sourceId, row.threadId)?.revision ?? 0 }), 'remaining')
       }
       if (records.length < 100 && meta.explicitIds) for (const id of meta.explicitIds) {
         if (!db.query('SELECT 1 FROM local_window_capture_items WHERE owner=? AND capture=? AND key=?').get(owner, capture.id, id)) {
@@ -810,43 +1074,53 @@ export function createInboxWindowService(deps: Dependencies) {
       db.query('UPDATE local_window_captures SET cursor=?,complete=?,revision=revision+1 WHERE owner=? AND id=?').run(capture.cursor, Number(records.length < 100), owner, capture.id)
     }
   }
-  async function lookupRows(scope: Scope, requested: string[]): Promise<DTO.InboxLookupEntry[]> {
-    const outdated = requested.flatMap(id => { const row = record(scope, id); return row && db.query('SELECT 1 FROM local_window_dirty WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, row.source, row.thread) ? [{ sourceId: row.source, threadId: row.thread }] : [] })
-    await refreshRows(scope, outdated)
-    const missing = requested.filter(id => !record(scope, id))
-    if (missing.length && scope.boxes.length && !db.query("SELECT 1 FROM local_window_captures WHERE owner=? AND scope=? AND complete=0 AND json_extract(data,'$.snapshotRevision') IS NOT NULL LIMIT 1").get(owner, scope.row.id)) {
-      const keys: DTO.InboxThreadKey[] = []
-      for (const id of missing) {
-        if (scope.row.account === 'unified') {
-          const source = scope.sources.find(source => id.startsWith(`unified:${source.id}:`))
-          if (source) keys.push({ sourceId: source.id, threadId: id.slice(`unified:${source.id}:`.length) })
-        } else if (id.startsWith(`${scope.row.account}:`)) keys.push({ sourceId: scope.boxes[0]!.sourceId, threadId: id.slice(scope.row.account.length + 1) })
+  async function lookupRows(scope: Scope, requested: string[], budget = readBudget(), fullContext = false): Promise<DTO.InboxLookupEntry[]> {
+    const found = new Map<string, DTO.InboxWindowRow>(), absent = new Set<string>()
+    const keys = requested.flatMap(id => { const key = ownedKey(scope, id); if (!key) absent.add(id); return key ? [key] : [] })
+    if (!scope.boxes.length) { observe(scope, null, scope.row.id); return requested.map(id => ({ id, status: 'absent' })) }
+    for (let offset = 0; offset < keys.length && budget.pages > 0; offset += 50) {
+      const wanted = keys.slice(offset, offset + 50), items = new Map<string, MailboxConversation>()
+      let cursor: string | undefined, read: ReadBaseline
+      do {
+        budget.pages--
+        const page = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), keys: wanted, limit: 100, ...(cursor ? { cursor } : {}) })
+        read = observe(scope, page.state, page.scopeState)
+        for (const item of page.items) items.set(threadKey(item), item)
+        cursor = page.nextCursor ?? undefined
+      } while (cursor && budget.pages > 0)
+      // Spend scarce detail reads in requested/capture ordinal order, not SDK
+      // chronological order. Otherwise an early captured item can starve forever.
+      const ordered = wanted.flatMap(key => { const item = items.get(threadKey(key)); return item ? [item] : [] })
+      for (const row of await projectConversations(scope, ordered, budget, fullContext)) {
+        if (!budget.unknownLocation.has(row.key)) { row.revision = read!.revision; found.set(row.key, row) }
       }
-      for (let offset = 0; offset < keys.length; offset += 50) {
-        const found = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), keys: keys.slice(offset, offset + 50), limit: 50 })
-        await materializeConversations(scope, found.items, { remaining: 4 }, found.state)
-        db.query('UPDATE local_window_scopes SET baseline=COALESCE(baseline,?),sdk_state=?,sdk_scope=? WHERE owner=? AND id=?').run(found.state, found.state, found.scopeState, owner, scope.row.id)
-        refresh(scope)
-      }
+      // Only an exhausted keyed SDK read proves absence. Deferred projection or
+      // an insufficient detail budget never turns a present identity into absent.
+      if (!cursor) for (const key of wanted) if (!items.has(threadKey(key))) absent.add(mailKey(scope, key))
     }
-    return requested.map(id => {
-      const found = record(scope, id)
-      if (found && db.query('SELECT 1 FROM local_window_dirty WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, found.source, found.thread)) return { id, status: 'unknown' }
-      return found ? { id, status: 'found', row: json<DTO.InboxWindowRow>(found.data) } : { id, status: current(scope) ? 'absent' : 'unknown' }
-    })
+    return requested.map(id => found.has(id) ? { id, status: 'found', row: found.get(id)! } : { id, status: absent.has(id) ? 'absent' : 'unknown' })
   }
   async function sender(input: DTO.InboxSenderInput): Promise<DTO.InboxSenderResult> {
-    const scope = await resolve(input.account), entry = (await lookupRows(scope, [text(input.id)]))[0]!
+    const scope = await resolve(input.account), budget = readBudget(), entry = (await lookupRows(scope, [text(input.id)], budget, true))[0]!
     if (entry.status !== 'found') return { state: state(scope), status: entry.status, contact: null, activity: null, recent: [] }
-    const row = entry.row, values = summaries(scope, row.sourceId, row.threadId, 500)
+    const row = entry.row, values = [...budget.summaries.get(row.key) ?? row.summaries]
     if (input.selectedMessageId && !values.some(value => value.id === input.selectedMessageId)) {
-      const selected = db.query<{ data: string }, string[]>('SELECT data FROM local_window_messages WHERE owner=? AND scope=? AND source=? AND thread=? AND id=?').get(owner, scope.row.id, row.sourceId, row.threadId, text(input.selectedMessageId))
-      if (selected) values.push(json(selected.data))
+      const id = text(input.selectedMessageId, 512)
+      for (const box of scope.boxes.filter(box => box.sourceId === row.sourceId)) {
+        if (budget.details <= 0) break
+        budget.details--
+        try {
+          const selected = await inbox.mailboxMessageSummary(owner, box.id, id)
+          if (selected.sourceId !== row.sourceId || selected.threadId !== row.threadId) fail('HOST_INBOX_INVALID')
+          values.push(selected); break
+        } catch (error) { if (!(error instanceof InboxError) || error.status !== 404) throw error }
+      }
+      if (!values.some(value => value.id === id)) return { state: state(scope), status: 'unknown', contact: null, activity: null, recent: [] }
     }
-    const history: SenderHistoryMessage[] = values.map(value => ({ ...value, threadId: value.threadId, outgoing: value.folder === 'sent', mailboxIds: value.memberships.map(state => state.mailboxId) }))
+    if (!input.selectedMessageId && values.length !== row.counts.messages && values.every(value => value.folder === 'sent')) return { state: state(scope), status: 'unknown', contact: null, activity: null, recent: [] }
+    const history: SenderHistoryMessage[] = values.map(value => ({ ...value, outgoing: value.folder === 'sent', mailboxIds: value.memberships.map(state => state.mailboxId) }))
     const projection = project(scope, values), mail = projection.mail.find(mail => mail.account === scope.row.account)!
     const contact = senderContact(mail, history, projection.accounts, input.selectedMessageId)
-    if (!current(scope)) return { state: state(scope), status: 'unknown', contact, activity: null, recent: [] }
     const domain = input.domain ? text(input.domain, 253).toLowerCase() : null, hostname = senderHostname(contact.email)
     if (domain && (!hostname || senderHostname(`root@${domain}`) !== domain || !(hostname === domain || hostname.endsWith(`.${domain}`)))) fail('HOST_INBOX_INVALID')
     if (domain) {
@@ -855,27 +1129,24 @@ export function createInboxWindowService(deps: Dependencies) {
       const info = await response.json() as SenderDomainInfo
       if (!response.ok || info.kind !== 'domain' || info.rootDomain !== domain) fail('HOST_INBOX_INVALID')
     }
-    const predicate = domain ? "(substr(email,instr(email,'@')+1)=? OR substr(email,instr(email,'@')+1) LIKE ? ESCAPE '\\')" : 'email=?'
-    const params = domain ? [domain, `%.${domain.replace(/[\\%_]/g, value => `\\${value}`)}`] : [contact.email.trim().toLowerCase()]
-    const where = `owner=? AND scope=? AND ${predicate} AND folder NOT IN ('trash','spam','scheduled','draft','drafts') AND at<=?`
-    const common = [owner, scope.row.id, ...params, Date.now()]
-    // Domain grouping deduplicates messages addressed to multiple people at that domain.
-    const base = `SELECT source,message,thread,direction,at FROM local_window_contacts WHERE ${where} GROUP BY source,message,direction`
-    const total = db.query<{ received: number; sent: number; firstMessage: number | null; lastMessage: number | null; lastSent: number | null }, (string | number)[]>(`SELECT COALESCE(SUM(direction='received'),0) received,COALESCE(SUM(direction='sent'),0) sent,MIN(at) firstMessage,MAX(at) lastMessage,MAX(CASE WHEN direction='sent' THEN at END) lastSent FROM (${base})`).get(...common)!
-    const threadSql = `SELECT source,thread,MAX(direction='received') received,MAX(direction='sent') sent,MAX(at) latest FROM (${base}) GROUP BY source,thread`
-    const threadCounts = db.query<{ conversations: number; twoWay: number }, (string | number)[]>(`SELECT COUNT(*) conversations,COALESCE(SUM(received AND sent),0) twoWay FROM (${threadSql})`).get(...common)!
-    const week = 7 * 86400_000, since = Date.now() - 12 * week
-    const weeks = Array.from({ length: 12 }, (_, index) => ({ start: since + index * week, received: 0, sent: 0 }))
-    const bins = db.query<{ week: number; received: number; sent: number }, (string | number)[]>(`SELECT CAST((at-?)/? AS INTEGER) week,SUM(direction='received') received,SUM(direction='sent') sent FROM (${base}) WHERE at>=? GROUP BY week LIMIT 12`).all(since, week, ...common, since)
-    for (const bin of bins) if (weeks[bin.week]) { weeks[bin.week]!.received = bin.received; weeks[bin.week]!.sent = bin.sent }
-    const recentKeys = db.query<{ source: string; thread: string }, (string | number)[]>(`${threadSql} ORDER BY latest DESC LIMIT 5`).all(...common)
-    const recent = recentKeys.flatMap(key => { const row = db.query<{ data: string }, string[]>('SELECT data FROM local_window_rows WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, key.source, key.thread); return row ? [json<DTO.InboxWindowRow>(row.data)] : [] })
-    const { twoWay } = threadCounts, level = !total.received && !total.sent ? 0 : twoWay >= 25 ? 5 : twoWay >= 10 ? 4 : twoWay >= 3 ? 3 : twoWay ? 2 : 1
-    return { state: state(scope), status: 'ready', contact, activity: { ...total, ...threadCounts, weeks, level }, recent }
+    const week = 7 * 86400_000
+    let activity: Awaited<ReturnType<Inbox['mailboxCorrespondence']>>
+    try { activity = await inbox.mailboxCorrespondence(owner, { mailboxIds: scope.boxes.map(box => box.id), email: contact.email.trim().toLowerCase(), ...(domain ? { domain } : {}), since: new Date(Date.now() - 12 * week).toISOString(), bucketMs: week, bucketCount: 12, recentLimit: 5 }) }
+    catch (error) {
+      if (!(error instanceof InboxError) || error.code !== 'READ_UNAVAILABLE') throw error
+      return { state: state(scope), status: 'unknown', contact: null, activity: null, recent: [] }
+    }
+    observe(scope, activity.state, activity.scopeState)
+    const recent = (await lookupRows(scope, activity.recent.map(key => mailKey(scope, key)), budget)).flatMap(entry => entry.status === 'found' ? [entry.row] : [])
+    const { received, sent, conversations, twoWay } = activity, level = !received && !sent ? 0 : twoWay >= 25 ? 5 : twoWay >= 10 ? 4 : twoWay >= 3 ? 3 : twoWay ? 2 : 1
+    const timestamp = (value: string | null) => value === null ? null : Date.parse(value)
+    return { state: state(scope), status: 'ready', contact, activity: { received, sent, conversations, twoWay, level,
+      firstMessage: timestamp(activity.firstMessageAt), lastMessage: timestamp(activity.lastMessageAt), lastSent: timestamp(activity.lastSentAt),
+      weeks: activity.periods.map(period => ({ ...period, start: Date.parse(period.start) })) }, recent }
   }
 
   type ZeroItemRow = { key: string; context: string; review: string; data: string; status: string }
-  type ZeroItemData = { item: DTO.InboxZeroItem; targets: MailboxStateTarget[]; contextComplete: boolean; categoryRevision?: number; reviewOnly?: boolean; latestProgress?: string; credit?: string; batchOffer?: { version: string; categoryRevision: number } }
+  type ZeroItemData = { item: DTO.InboxZeroItem; targets: MailboxStateTarget[]; contextComplete: boolean; contextEvidence?: string; categoryRevision?: number; reviewOnly?: boolean; latestProgress?: string; credit?: string; batchOffer?: { version: string; categoryRevision: number } }
   type ZeroProof = { id: string; context: string; decision: DTO.InboxZeroDecisionInput['decision']; sourceId: string; threadId: string;
     before: MailboxMembership[]; states: MailboxMembership[]; receipts: DTO.InboxActionReceiptReference[];
     category?: { id: string; revision: number; before: CategoryEntry }; undoneBy?: string }
@@ -917,8 +1188,8 @@ export function createInboxWindowService(deps: Dependencies) {
     const ai = await deps.ai.state(owner)
     for (let offset = 0; offset < items.length; offset += BATCH) {
       const batch = items.slice(offset, offset + BATCH).flatMap(item => {
-        const saved = json<ZeroItemData>(item.data), row = record(scope, item.key)
-        return saved.reviewOnly || !saved.contextComplete || !row ? [] : [{ item, saved, key: { sourceId: row.source, threadId: row.thread } }]
+        const saved = json<ZeroItemData>(item.data), key = ownedKey(scope, item.key)
+        return saved.reviewOnly || !saved.contextComplete || !key ? [] : [{ item, saved, key }]
       })
       if (!batch.length) continue
       const keys = batch.map(value => value.key)
@@ -1111,102 +1382,205 @@ export function createInboxWindowService(deps: Dependencies) {
   }
   const receiptFailure = (error: unknown): 'pending' | 'rejected' => error === rejectedReceipt || error instanceof InboxError && error.status >= 400 && error.status < 500 ? 'rejected' : 'pending'
 
+  async function requestedCounts(scope: Scope, query: QueryRow): Promise<DTO.InboxCountsResult> {
+    let saved = readMetadata(query), count = saved.counts
+    if (count?.complete && totals(scope, query).conversations !== null) return { state: state(scope, query), totals: count.totals }
+    const empty = (): DTO.InboxTotals => ({ conversations: 0, messages: 0, inbox: 0, splits: Object.fromEntries(scope.preferences.splits.map(name => [name, 0])),
+      folders: Object.fromEntries(['Inbox', 'Starred', 'Sent', 'Done', 'Auto Archived', 'Reminders', 'Spam', 'Trash', 'All Mail'].map(name => [name, 0])), holding: false })
+    if (!count) {
+      // SDK counts are exact for the cached receiving scope. App folder/category
+      // conjunctions are not message predicates; do not mislabel matching-message
+      // counts as whole-conversation message totals.
+      const cached = scope.boxes.length ? await inbox.mailboxCounts(owner, { mailboxIds: scope.boxes.map(box => box.id) }) : null
+      const read = observe(scope, cached?.asOfState ?? null, cached?.scopeState ?? scope.row.id, query)
+      count = { baseline: read, totals: empty(), complete: !cached || cached.conversations === 0 }
+    }
+    const budget = readBudget(), view = json<DTO.InboxViewQuery>(query.data)
+    while (!count.complete && budget.pages > 0) {
+      const position = count.position ?? {}
+      budget.pages--
+      const page = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 100, ...(position.cursor ? { cursor: position.cursor } : {}) })
+      if (page.state !== count.baseline.sdkState || page.scopeState !== count.baseline.scopeState) {
+        saved = readMetadata(query); delete saved.counts; saveReadMetadata(query, saved)
+        return { state: state(scope, query), totals: unknownTotals(scope) }
+      }
+      const projected = await projectConversations(scope, page.items, budget)
+      let consumed = 0, stopped = false
+      for (const [index, row] of projected.entries()) {
+        // An unresolved category is not an exact split total, even though its row
+        // is provisionally visible in Important. Never publish a fabricated zero.
+        if (row.mail.split === 'Unknown') { stopped = true; break }
+        let result: Awaited<ReturnType<typeof evaluateRow>>
+        try { result = await evaluateRow(scope, view, row, budget, true) }
+        catch (error) { if (error !== pendingContext) throw error; stopped = true; break }
+        if (result.matches) { count.totals.conversations!++; count.totals.messages! += row.counts.messages! }
+        count.totals.inbox! += result.counts.inbox ?? 0
+        count.totals.holding ||= !!result.counts.holding
+        for (const name of scope.preferences.splits) count.totals.splits[name]! += result.counts[`split:${name}`] ?? 0
+        for (const name of Object.keys(count.totals.folders)) count.totals.folders[name]! += result.counts[`folder:${name}`] ?? 0
+        const wake = Math.min(row.mail.reminderAt ?? Infinity, row.mail.aiHoldUntil ?? Infinity)
+        if (Number.isFinite(wake)) count.wake = Math.min(count.wake ?? Infinity, wake)
+        count.position = { cursor: conversationCursor(page.items[index]!) }; consumed++
+      }
+      if (consumed === page.items.length && !page.nextCursor) { count.complete = true; delete count.position }
+      if (stopped || projected.length < page.items.length) break
+    }
+    if (count.complete && count.baseline.sdkState) {
+      const live = await inbox.mailboxChanges(owner, { mailboxIds: scope.boxes.map(box => box.id), since: count.baseline.sdkState, scopeState: count.baseline.scopeState, limit: 1 })
+      if (live.resetRequired || live.state !== count.baseline.sdkState || count.baseline.ai !== (await deps.ai.state(owner)).cursor || count.baseline.category !== categoryHead() || count.wake && count.wake <= Date.now()) {
+        saved = readMetadata(query); delete saved.counts; saveReadMetadata(query, saved)
+        return { state: state(scope, query), totals: unknownTotals(scope) }
+      }
+    }
+    saved = readMetadata(query); saved.counts = count; saveReadMetadata(query, saved)
+    return { state: state(scope, query), totals: count.complete ? count.totals : unknownTotals(scope) }
+  }
+  async function demandChanges(input: DTO.InboxChangesInput): Promise<DTO.InboxWindowChanges> {
+    const maximum = limit(input.limit), resident = ids(input.residentKeys, 1000), pinned = ids(input.pinnedKeys, 100), since = integer(input.sinceRevision)
+    const query = getQuery(text(input.queryId))
+    if (!query || query.expires < Date.now()) fail('HOST_INBOX_QUERY_EXPIRED', 410)
+    const scope = await resolve(json<DTO.InboxViewQuery>(query!.data).account)
+    const resetReason = scope.row.id !== query!.scope ? 'scope' : scope.row.generation !== query!.generation ? 'history' : scope.preference !== query!.preference ? 'query' : null
+    const reset = (reason: NonNullable<DTO.InboxWindowChanges['resetReason']>): DTO.InboxWindowChanges => ({ state: state(scope), upserts: [], newHead: [], removed: [], totals: unknownTotals(scope), nextCursor: null, throughRevision: scope.row.revision, resetReason: reason })
+    if (resetReason) return reset(resetReason)
+    let attested: ReadBaseline | undefined
+    if (input.sinceCursor !== undefined) {
+      try { attested = untoken<ReadBaseline>(input.sinceCursor, `read:${query!.id}`, scope) }
+      catch { fail('HOST_INBOX_CURSOR_INVALID', 409) }
+      if (!attested || typeof attested !== 'object' || Array.isArray(attested)
+        || Object.keys(attested).some(key => !['sdkState', 'scopeState', 'revision', 'ai', 'category', 'at'].includes(key))
+        || attested.sdkState !== null && (typeof attested.sdkState !== 'string' || !attested.sdkState.length)
+        || typeof attested.scopeState !== 'string' || !attested.scopeState.length
+        || ![attested.revision, attested.ai, attested.category, attested.at].every(value => Number.isSafeInteger(value) && value >= 0)
+        || attested.revision !== since) fail('HOST_INBOX_CURSOR_INVALID', 409)
+    }
+    // Preserve the legacy three-part pass identity when no attestation is supplied.
+    const wanted = [...new Set([...resident, ...pinned])], pinnedSet = new Set(pinned)
+    const inputHash = digest(input.sinceCursor === undefined ? [since, resident, pinned] : [since, resident, pinned, input.sinceCursor])
+    if (wanted.length > 1000) fail('HOST_INBOX_TOO_LARGE', 413)
+    const cursor = input.cursor ? untoken<{ id: string; offset: number; stage: 'rows' | 'head' | 'next' }>(input.cursor, `changes:${query!.id}`, scope) : undefined
+    let saved = readMetadata(query!), pass = cursor ? saved.changes : undefined
+    if (cursor && (!pass || pass.id !== cursor.id || pass.input !== inputHash)) fail('HOST_INBOX_CURSOR_INVALID', 409)
+    if (!pass || cursor?.stage === 'next') {
+      // A signed old page can outlive the numeric cache, but never the underlying
+      // SDK/AI/category history and scope checks performed below.
+      const before = pass?.baseline ?? attested ?? baseline(scope, query!, since)
+      if (!before) return reset('history')
+      const delta = before.sdkState && scope.boxes.length ? await inbox.mailboxChanges(owner, { mailboxIds: scope.boxes.map(box => box.id), since: before.sdkState, scopeState: before.scopeState, limit: 100 }) : null
+      if (delta?.resetRequired) return reset(delta.resetReason ?? 'history')
+      const [ai, categories] = await Promise.all([
+        before.ai !== scope.ai.cursor ? deps.ai.changes(owner, before.ai) : Promise.resolve({ decisions: [], removed: [], cursor: before.ai, hasMore: false, resetRequired: false }),
+        before.category !== categoryHead() ? deps.attentionOverrides.changes(before.category) : Promise.resolve({ entries: [], cursor: before.category, hasMore: false, resetRequired: false }),
+      ])
+      const metadataChanged = !!delta?.events.some(event => ['label.updated', 'account.updated', 'mailbox.updated'].includes(event.type))
+      if (metadataChanged) await refreshMetadata(scope, true)
+      const due = (saved.wake ?? Infinity) <= Date.now()
+      const affected = new Set([...(delta?.affectedThreads ?? []), ...ai.decisions, ...ai.removed, ...categories.entries].map(threadKey))
+      const allResident = metadataChanged || due || ai.resetRequired || categories.resetRequired
+      const keys = wanted.filter(id => { const key = ownedKey(scope, id); return allResident || !!key && affected.has(threadKey(key)) })
+      const next = observe(scope, delta?.state ?? before.sdkState, before.scopeState, query!, { ai: ai.cursor, category: categories.cursor, at: Date.now() })
+      pass = { id: crypto.randomUUID(), input: inputHash, baseline: next, keys,
+        head: metadataChanged || due || !!delta?.events.length || !!ai.decisions.length || !!ai.removed.length || !!categories.entries.length || ai.resetRequired || categories.resetRequired,
+        more: !!delta?.hasMore || ai.hasMore || categories.hasMore }
+      saved = readMetadata(query!); saved.changes = pass; if (due) delete saved.wake; saveReadMetadata(query!, saved)
+    }
+    const budget = readBudget(), upserts: DTO.InboxWindowRow[] = [], removed: DTO.InboxWindowChanges['removed'] = [], newHead: DTO.InboxWindowRow[] = []
+    const offset = cursor?.stage === 'rows' ? integer(cursor.offset) : 0
+    if (offset > pass.keys.length) fail('HOST_INBOX_CURSOR_INVALID')
+    const headStage = cursor?.stage === 'head', entries = headStage ? [] : pass.keys.slice(offset, offset + maximum)
+    let consumed = 0, size = 65536
+    for (const entry of await lookupRows(scope, entries, budget)) {
+      if (entry.status === 'unknown') break
+      if (entry.status === 'absent') removed.push({ key: entry.id, reason: 'deleted' })
+      else {
+        const matches = pinnedSet.has(entry.id) || (await evaluateRow(scope, json(query!.data), entry.row, budget)).matches
+        if (!matches) removed.push({ key: entry.id, reason: 'not-matching' })
+        else {
+          const cost = bytes(entry.row)
+          if (size + cost > DTO.INBOX_RESPONSE_BYTE_LIMIT) break
+          entry.row.revision = pass.baseline.revision; upserts.push(entry.row); size += cost
+        }
+      }
+      consumed++
+    }
+    if (!consumed && entries.length) throw pendingContext
+    const nextOffset = offset + consumed
+    if (headStage) {
+      const view = json<DTO.InboxViewQuery>(query!.data), head = await preparePage(scope, query!, maximum, undefined, false, budget)
+      for (const row of head.rows) {
+        if (wanted.includes(row.key)) continue
+        // preparePage records the hold's wake even when this unseen arrival is
+        // withheld. A later bounded changes pass retries it without another event.
+        if (!view.search && view.folder === 'Inbox' && (row.mail.aiHoldUntil ?? 0) > budget.now) continue
+        const cost = bytes(row)
+        if (size + cost > DTO.INBOX_RESPONSE_BYTE_LIMIT) break
+        row.revision = pass.baseline.revision; newHead.push(row); size += cost
+      }
+    }
+    const stage = !headStage && nextOffset < pass.keys.length ? 'rows' : !headStage && pass.head ? 'head' : pass.more ? 'next' : null
+    if (!stage) { saved = readMetadata(query!); delete saved.changes; saveReadMetadata(query!, saved) }
+    return { state: state(scope, query!, pass.baseline), upserts, newHead, removed, totals: totals(scope, query!),
+      nextCursor: stage ? token(`changes:${query!.id}`, scope, { id: pass.id, offset: stage === 'rows' ? nextOffset : 0, stage }) : null,
+      throughRevision: pass.baseline.revision, resetReason: null }
+  }
   const transport: DTO.InboxWindowTransport = {
     async query(input) {
       const maximum = limit(input.limit), scope = await resolve(input.account)
-      const query = await newQuery(input, scope)
+      // Public openings own independent reconciliation passes; internal capture
+      // preparation keeps the default reuse so explicit retries retain their work.
+      const query = await newQuery(input, scope, false)
       return scopedRead(scope, () => preparePage(scope, query, maximum))
     },
     async page(input) {
       const maximum = limit(input.limit), { scope, query } = await queryScope(input.queryId)
       if (input.direction !== undefined && !['older', 'newer'].includes(input.direction) || input.seek !== undefined && !['start', 'end'].includes(input.seek)) fail('HOST_INBOX_INVALID')
-      if (input.seek === 'end' && (!current(scope) || query.scanned < scope.row.revision)) fail('HOST_INBOX_UNAVAILABLE', 503)
-      const cursor = input.cursor ? untoken<{ older: [number, string] | null; newer: [number, string] | null }>(input.cursor, `page:${query.id}`, scope) : null
-      const reverse = input.seek === 'end' || input.direction === 'newer'
-      const after = input.seek ? undefined : (reverse ? cursor?.newer : cursor?.older) ?? undefined
-      return scopedRead(scope, () => preparePage(scope, query, maximum, after, reverse))
+      const cursor = !input.seek && input.cursor ? untoken<PageCursor>(input.cursor, `page:${query.id}`, scope) : undefined
+      const reverse = input.seek ? input.seek === 'end' : input.direction === 'newer'
+      return scopedRead(scope, () => preparePage(scope, query, maximum, cursor, reverse))
     },
-    async counts(input) { const { scope, query } = await queryScope(input.queryId); return { state: state(scope, query), totals: totals(scope, query) } },
-    async lookup(input) { const scope = await resolve(input.account), entries = await scopedRead(scope, () => lookupRows(scope, ids(input.ids))); return { state: state(scope), entries } },
-    async changes(input) {
-      const maximum = limit(input.limit), resident = ids(input.residentKeys, 1000), pinned = ids(input.pinnedKeys, 100), since = integer(input.sinceRevision)
-      const query = getQuery(text(input.queryId))
-      if (!query || query.expires < Date.now()) fail('HOST_INBOX_QUERY_EXPIRED', 410)
-      if (query!.problem) fail('HOST_INBOX_UNAVAILABLE', 503)
-      const scope = await resolve(json<DTO.InboxViewQuery>(query!.data).account)
-      const resetReason = scope.row.id !== query!.scope ? 'scope' : scope.row.generation !== query!.generation ? 'history' : scope.preference !== query!.preference ? 'query' : null
-      if (resetReason) return { state: state(scope, query!), upserts: [], newHead: [], removed: [], totals: unknownTotals(scope), nextCursor: null, throughRevision: scope.row.revision, resetReason }
-      if (scope.seenEvents !== watchedVersion || watched || Date.now() - scope.row.checked >= 2000) await scopedRead(scope, () => maintain(scope))
-      const wanted = [...new Set([...resident, ...pinned])]
-      if (wanted.length > 1000) fail('HOST_INBOX_TOO_LARGE', 413)
-      const cursorKind = `changes:${query!.id}:${digest([since, wanted])}`
-      const cursor = input.cursor ? untoken<{ offset: number; through: number }>(input.cursor, cursorKind, scope) : { offset: 0, through: Math.max(since, Math.min(query!.scanned, scope.row.revision)) }
-      const offset = cursor.offset, through = cursor.through
-      if (since > scope.row.revision) fail('HOST_INBOX_CURSOR_INVALID', 409)
-      const entries = wanted.slice(offset, offset + maximum), upserts: DTO.InboxWindowRow[] = [], removed: DTO.InboxWindowChanges['removed'] = []
-      const records = entries.flatMap(key => { const row = record(scope, key); return row ? [row] : [] })
-      const dirtyRows = records.filter(row => db.query('SELECT 1 FROM local_window_dirty WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, row.source, row.thread))
-      await scopedRead(scope, () => refreshRows(scope, dirtyRows.map(row => ({ sourceId: row.source, threadId: row.thread }))))
-      await indexQueryRows(scope, query!, entries.flatMap(key => { const row = record(scope, key); return row ? [row] : [] }))
-      let consumed = 0, size = 65536
-      for (const key of entries) {
-        if (db.query('SELECT 1 FROM local_window_query_pending WHERE owner=? AND query_id=? AND key=?').get(owner, query!.id, key)) { consumed++; continue }
-        const stored = record(scope, key)
-        if (!stored) { if (current(scope)) removed.push({ key, reason: 'deleted' }) }
-        else {
-          const matches = db.query('SELECT 1 FROM local_window_matches WHERE owner=? AND query_id=? AND key=?').get(owner, query!.id, key)
-          if (!matches && !pinned.includes(key)) removed.push({ key, reason: 'not-matching' })
-          else if (stored.revision > since) { const row = json<DTO.InboxWindowRow>(stored.data); if (size + bytes(row) > DTO.INBOX_RESPONSE_BYTE_LIMIT) break; upserts.push(row); size += bytes(row) }
-        }
-        consumed++
-      }
-      if (!consumed && entries.length) fail('HOST_INBOX_TOO_LARGE', 413)
-      const next = offset + consumed, newHead: DTO.InboxWindowRow[] = []
-      // A separate final head page cannot be crowded out by 100 resident updates.
-      const headPage = offset >= wanted.length
-      if (headPage) {
-        const head = pageResult(scope, query!, maximum)
-        for (const row of head.rows) if (!wanted.includes(row.key) && row.revision > since && size + bytes(row) <= DTO.INBOX_RESPONSE_BYTE_LIMIT) { newHead.push(row); size += bytes(row) }
-      }
-      return { state: state(scope, query!), upserts, newHead, removed, totals: totals(scope, query!),
-        nextCursor: !headPage ? token(cursorKind, scope, { offset: next, through }) : null,
-        throughRevision: through, resetReason: null }
-    },
+    async counts(input) { const { scope, query } = await queryScope(input.queryId); return scopedRead(scope, () => requestedCounts(scope, query)) },
+    async lookup(input) { const scope = await resolve(input.account), entries = await scopedRead(scope, () => lookupRows(scope, ids(input.ids), readBudget(), true)); return { state: state(scope), entries } },
+    changes: demandChanges,
     async messages(input) {
-      const maximum = limit(input.limit), scope = await resolve(input.account), entry = (await lookupRows(scope, [text(input.id)]))[0]!
+      const maximum = limit(input.limit), scope = await resolve(input.account), budget = readBudget()
+      budget.details-- // Reserve the requested detail page within the four-read cap.
+      const entry = (await lookupRows(scope, [text(input.id)], budget, true))[0]!
       if (entry.status !== 'found') fail('HOST_INBOX_UNAVAILABLE', 503)
-      const row = (entry as Extract<DTO.InboxLookupEntry, { status: 'found' }>).row
-      const cursor = input.cursor ? untoken<{ context: string; cursor: string }>(input.cursor, `messages:${row.key}`, scope) : undefined
-      if (cursor && cursor.context !== row.contextVersion) fail('HOST_INBOX_CONTEXT_CHANGED', 409)
+      const row = (entry as Extract<DTO.InboxLookupEntry, { status: 'found' }>).row, read = scope.read!
+      const cursor = input.cursor ? untoken<{ context: string; cursor: string; state: string | null; preference: string }>(input.cursor, `messages:${row.key}`, scope) : undefined
+      if (cursor && (cursor.context !== row.contextVersion || cursor.state !== read.sdkState || cursor.preference !== scope.preference)) fail('HOST_INBOX_CONTEXT_CHANGED', 409)
       const page = await inbox.mailboxMessagePage(owner, { mailboxIds: scope.boxes.map(box => box.id), sourceId: row.sourceId, threadId: row.threadId, limit: maximum, ...(cursor ? { cursor: cursor.cursor } : {}) })
-      if (page.state !== scope.row.sdk_state || page.scopeState !== scope.row.sdk_scope || db.query('SELECT 1 FROM local_window_dirty WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, row.sourceId, row.threadId)) fail('HOST_INBOX_CONTEXT_CHANGED', 409)
+      if (page.state !== read.sdkState || page.scopeState !== read.scopeState) fail('HOST_INBOX_CONTEXT_CHANGED', 409)
       const projected = project(scope, page.items).mail.find(mail => mail.account === scope.row.account)
       return { state: state(scope), key: row.key, contextVersion: row.contextVersion, summaries: page.items, messages: projected?.messages ?? [], total: row.counts.messages,
-        nextCursor: page.nextCursor ? token(`messages:${row.key}`, scope, { context: row.contextVersion, cursor: page.nextCursor }) : null, exhausted: !page.nextCursor }
+        nextCursor: page.nextCursor ? token(`messages:${row.key}`, scope, { context: row.contextVersion, cursor: page.nextCursor, state: read.sdkState, preference: scope.preference }) : null, exhausted: !page.nextCursor }
     },
     sender,
     async contacts(input) {
       const scope = await resolve(input.account), maximum = limit(input.limit)
       if (typeof input.query !== 'string' || input.query.length > 256) fail('HOST_INBOX_INVALID')
-      const pattern = `%${input.query.trim().toLowerCase().replace(/[\\%_]/g, value => `\\${value}`)}%`
-      const found = db.query<{ name: string; email: string }, (string | number)[]>(`SELECT email,MAX(name) name FROM local_window_contacts WHERE owner=? AND scope=? AND (email LIKE ? ESCAPE '\\' OR lower(name) LIKE ? ESCAPE '\\') AND folder NOT IN ('trash','spam','scheduled','draft','drafts') GROUP BY email ORDER BY MAX(at) DESC,email LIMIT ?`).all(owner, scope.row.id, pattern, pattern, maximum)
-      return { state: state(scope), contacts: found.map(value => ({ ...value, messageId: null, role: 'recipient' as const })), complete: current(scope) }
+      if (!scope.boxes.length) { observe(scope, null, scope.row.id); return { state: state(scope), contacts: [], complete: true } }
+      const found = await inbox.mailboxContacts(owner, { mailboxIds: scope.boxes.map(box => box.id), query: input.query, limit: maximum })
+      observe(scope, found.state, found.scopeState)
+      return { state: state(scope), contacts: found.items.map(value => ({ ...value, messageId: null, role: 'recipient' as const })), complete: true }
     },
     async selectionCreate(input) { return selection(await createCapture(input, 'selection')) },
     async selectionPage(input) {
-      const maximum = limit(input.limit), { capture, scope } = await checkedCapture(input.selectionId, 'selection')
+      const maximum = limit(input.limit), { capture, scope, meta } = await checkedCapture(input.selectionId, 'selection')
       const after = input.cursor ? untoken<number>(input.cursor, `selection:${capture.id}`, scope) : 0
-      const live = scope.boxes.length ? await inbox.mailboxMessagePage(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 1 }) : null
-      const caughtUp = !live || live.state === scope.row.sdk_state && live.scopeState === scope.row.sdk_scope
-      const stored = db.query<{ key: string; context: string; ordinal: number }, (string | number)[]>('SELECT key,context,ordinal FROM local_window_capture_items WHERE owner=? AND capture=? AND ordinal>? ORDER BY ordinal LIMIT ?').all(owner, capture.id, after, maximum + 1)
+      const stored = db.query<{ key: string; context: string; ordinal: number; data: string }, (string | number)[]>('SELECT key,context,ordinal,data FROM local_window_capture_items WHERE owner=? AND capture=? AND ordinal>? ORDER BY ordinal LIMIT ?').all(owner, capture.id, after, maximum + 1)
+      const budget = readBudget(), live = await lookupRows(scope, stored.slice(0, maximum).map(item => item.key), budget, true)
       const entries: DTO.InboxSelectionPage['entries'] = []; let size = 65536, last = after
       for (const item of stored.slice(0, maximum)) {
-        const row = record(scope, item.key)
-        const pending = !caughtUp || !!row && !!db.query('SELECT 1 FROM local_window_dirty WHERE owner=? AND scope=? AND source=? AND thread=?').get(owner, scope.row.id, row.source, row.thread)
-        const entry: DTO.InboxSelectionPage['entries'][number] = pending ? { id: item.key, status: 'unknown' } : !row ? { id: item.key, status: current(scope) ? 'absent' : 'unknown' } : row.context !== item.context ? { id: item.key, status: 'changed' } : { id: item.key, status: 'found', row: json(row.data) }
+        if (budget.detailDeferred.has(item.key)) break
+        const found = live.find(entry => entry.id === item.key)!
+        const complete = found.status === 'found' && found.row.targetsComplete && budget.legacy.has(item.key) && json<ZeroItemData>(item.data).contextComplete
+        const matches = found.status === 'found' && (found.row.contextVersion === item.context || (meta.contextVersion ?? 1) === 1 && budget.legacy.get(item.key) === item.context)
+        const entry: DTO.InboxSelectionPage['entries'][number] = found.status !== 'found' ? found : !complete ? { id: item.key, status: 'unknown' } : !matches ? { id: item.key, status: 'changed' } : found
         if (size + bytes(entry) > DTO.INBOX_RESPONSE_BYTE_LIMIT) break
         entries.push(entry); size += bytes(entry); last = item.ordinal
       }
+      if (!capture.complete) schedule(0)
       return { selection: selection(capture), entries, nextCursor: stored.length > entries.length || !capture.complete ? token(`selection:${capture.id}`, scope, last) : null,
         exhausted: !!capture.complete && stored.length <= entries.length }
     },
@@ -1216,25 +1590,32 @@ export function createInboxWindowService(deps: Dependencies) {
       const capture = captureRow(input.sessionId)
       if (!capture || capture.kind !== 'zero' || json<CaptureMeta>(capture.data).account !== input.account) return { status: 'absent' }
       try { await checkedCapture(input.sessionId, 'zero') } catch (error) { if (!(error instanceof InboxError) || error.code !== 'HOST_INBOX_SCOPE_CHANGED') throw error }
+      if (!capture.complete) schedule(0)
       return { status: 'found', session: zeroSession(captureRow(input.sessionId)!) }
     },
     zeroPage(input) { return serialZero(async () => {
-      const maximum = limit(input.limit), { capture, scope } = await checkedCapture(input.sessionId, 'zero')
+      const maximum = limit(input.limit), { capture, scope, meta } = await checkedCapture(input.sessionId, 'zero')
       const after = input.cursor ? untoken<number>(input.cursor, `zero:${capture.id}`, scope) : 0
       const stored = db.query<{ key: string; data: string; context: string; review: string; ordinal: number }, (string | number)[]>("SELECT key,data,context,review,ordinal FROM local_window_capture_items WHERE owner=? AND capture=? AND ordinal>? AND status='remaining' ORDER BY ordinal LIMIT ?").all(owner, capture.id, after, maximum + 1)
-      const batches = capture.complete ? await freshBatchCandidates(scope, capture, stored.slice(0, maximum)) : new Map()
-      const items = stored.slice(0, maximum).map(value => {
+      const budget = readBudget(), live = await lookupRows(scope, stored.slice(0, maximum).map(item => item.key), budget, true)
+      const deferred = stored.findIndex(value => budget.detailDeferred.has(value.key))
+      const prefix = stored.slice(0, deferred < 0 ? maximum : Math.min(maximum, deferred))
+      const batches = capture.complete ? await freshBatchCandidates(scope, capture, prefix) : new Map()
+      const items = prefix.map(value => {
         const saved = json<ZeroItemData>(value.data), opaqueReview = value.review ? reviewToken(capture.id, value.review) : null
         const batch = batches.get(value.key)
         const item: DTO.InboxZeroItem = { ...saved.item, reviewVersion: opaqueReview, batchEligibility: batch ? 'eligible' : 'ineligible', batchCandidate: batch?.candidate ?? null }
-        const currentRow = record(scope, value.key)
-        if (!currentRow || currentRow.context !== value.context) return { ...item, eligibility: 'unknown' as const, batchEligibility: 'unknown' as const, batchCandidate: null }
+        const currentRow = live.find(entry => entry.id === value.key)
+        const matches = currentRow?.status === 'found' && (currentRow.row.contextVersion === value.context || (meta.contextVersion ?? 1) === 1 && budget.legacy.get(value.key) === value.context)
+        const complete = currentRow?.status === 'found' && currentRow.row.targetsComplete && budget.legacy.has(value.key) && saved.contextComplete
+        if (!matches || !complete) return { ...item, eligibility: 'unknown' as const, batchEligibility: 'unknown' as const, batchCandidate: null }
         if (batch) db.query("UPDATE local_window_capture_items SET data=json_set(data,'$.batchOffer',json(?)) WHERE owner=? AND capture=? AND key=?").run(JSON.stringify(batch.offer), owner, capture.id, value.key)
         return item
       })
-      const last = stored[Math.min(maximum, stored.length) - 1]?.ordinal ?? after
-      return { session: zeroSession(capture), items, nextCursor: stored.length > maximum || !capture.complete ? token(`zero:${capture.id}`, scope, last) : null,
-        exhausted: !!capture.complete && stored.length <= maximum && items.every(item => item.eligibility !== 'unknown') }
+      const last = prefix.at(-1)?.ordinal ?? after
+      if (!capture.complete) schedule(0)
+      return { session: zeroSession(capture), items, nextCursor: stored.length > items.length || !capture.complete ? token(`zero:${capture.id}`, scope, last) : null,
+        exhausted: !!capture.complete && stored.length <= items.length && items.every(item => item.eligibility !== 'unknown') }
     }) },
     zeroProgress(input) { return serialZero(async () => {
       text(input.id, 128); integer(input.ifRevision)
@@ -1341,7 +1722,22 @@ export function createInboxWindowService(deps: Dependencies) {
           saved.targets = saved.targets.map(target => ({ ...target, revision: states.find(state => memberKey(state) === memberKey(target))!.revision }))
           if (categoryRevision !== undefined) saved.categoryRevision = categoryRevision
           delete saved.credit; saved.latestProgress = `undo:${input.id}`; proof.undoneBy = input.id
-          db.query("UPDATE local_window_capture_items SET status='remaining',data=? WHERE owner=? AND capture=? AND key=?").run(JSON.stringify(saved), owner, capture.id, proof.id)
+          let context = item.context
+          if (saved.contextEvidence) {
+            const evidence = json<unknown[]>(saved.contextEvidence)
+            if (!['conversation-context-2', 'conversation-context-3'].includes(String(evidence[0])) || evidence.length !== 16 || !Array.isArray(evidence[12])
+              || !Array.isArray(evidence[13]) || evidence[13].length !== saved.targets.length || digest(evidence) !== item.context) fail('HOST_INBOX_CONTEXT_CHANGED', 409)
+            // Keep either frozen format intact. Only the inverse's proven captured
+            // revision references advance; no current inventory, new IDs or replies.
+            evidence[13] = (evidence[13] as unknown[][]).map(target => {
+              if (!Array.isArray(target) || target.length !== 4) fail('HOST_INBOX_CONTEXT_CHANGED', 409)
+              const state = states.find(state => state.mailboxId === target[0] && state.messageId === target[1])
+              if (!state) fail('HOST_INBOX_CONTEXT_CHANGED', 409)
+              return [target[0], target[1], state!.revision, target[3]]
+            })
+            saved.contextEvidence = JSON.stringify(evidence); context = digest(evidence)
+          }
+          db.query("UPDATE local_window_capture_items SET status='remaining',data=?,context=? WHERE owner=? AND capture=? AND key=?").run(JSON.stringify(saved), context, owner, capture.id, proof.id)
         }
         if (restored.length) db.query('UPDATE local_window_captures SET revision=revision+1 WHERE owner=? AND id=?').run(owner, capture.id)
         const result: DTO.InboxZeroUndoResult = { session: zeroSession(captureRow(capture.id)!), status: outcomes.includes('pending') ? 'pending' : !outcomes.length || outcomes.includes('rejected') ? 'rejected' : 'accepted' }
@@ -1358,7 +1754,7 @@ export function createInboxWindowService(deps: Dependencies) {
       if (!name) fail('HOST_INBOX_INVALID', 404)
       const fields: Record<keyof DTO.InboxWindowTransport, string[]> = {
         query: ['account', 'folder', 'split', 'search', 'query', 'filter', 'limit'], page: ['queryId', 'cursor', 'limit', 'direction', 'seek'], counts: ['queryId'],
-        lookup: ['account', 'ids'], changes: ['queryId', 'sinceRevision', 'residentKeys', 'pinnedKeys', 'cursor', 'limit'], messages: ['account', 'id', 'cursor', 'limit'],
+        lookup: ['account', 'ids'], changes: ['queryId', 'sinceRevision', 'sinceCursor', 'residentKeys', 'pinnedKeys', 'cursor', 'limit'], messages: ['account', 'id', 'cursor', 'limit'],
         sender: ['account', 'id', 'selectedMessageId', 'domain'], contacts: ['account', 'query', 'limit'], selectionCreate: ['id', 'account', 'queryId', 'allMatching', 'ids'], selectionPage: ['selectionId', 'cursor', 'limit'],
         zeroCreate: ['id', 'account'], zeroResume: ['sessionId', 'account'], zeroPage: ['sessionId', 'cursor', 'limit'], zeroProgress: ['sessionId', 'id', 'ifRevision', 'decisions', 'currentId', 'reviewOnlyIds', 'phase', 'paused'], zeroUndo: ['id', 'reference', 'receipts'],
       }
@@ -1376,7 +1772,7 @@ export function createInboxWindowService(deps: Dependencies) {
             db.query('UPDATE local_window_queries SET expires=? WHERE owner=? AND id=?').run(Date.now() + QUERY_TTL, owner, query.id)
           }
           return result
-        } finally { for (const scope of uses) scope.users--; activeRequests--; schedule(0) }
+        } finally { for (const scope of uses) scope.users--; activeRequests-- }
       })
     },
     async close() { closed = true; unwatch(); clearTimeout(timer); await Promise.all([working, zeroWrites, projectionWork]); scopes.clear() },

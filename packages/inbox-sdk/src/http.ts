@@ -30,6 +30,8 @@ type RouteDoc = {
 }
 
 const JSON_LIMIT = 1024 * 1024
+const CONTACT_READ_JSON_LIMIT = 64 * 1024
+const CONTACT_READ_PATHS = ['/v1/mailbox-contacts', '/v1/mailbox-correspondence']
 const FILE_LIMIT = 25 * 1024 * 1024
 const STREAM_PAGE_SIZE = 100
 const STREAM_LIFETIME_MS = 5 * 60 * 1000
@@ -81,6 +83,8 @@ const changesInput = z.strictObject({
   folder: name.optional(), folderId: id.optional(),
   addLabels: z.array(name).max(1000).optional(), removeLabels: z.array(name).max(1000).optional(),
   addLabelIds: z.array(id).max(1000).optional(), removeLabelIds: z.array(id).max(1000).optional(),
+  addProviderLabelIds: z.array(id).min(1).max(100).refine(values => new Set(values).size === values.length).optional(),
+  removeProviderLabelIds: z.array(id).min(1).max(100).refine(values => new Set(values).size === values.length).optional(),
   snoozedUntil: date.nullable().optional(), deletePermanently: z.boolean().optional(),
 }).refine((value) => Object.keys(value).length > 0)
 const policy = z.strictObject({ remoteImages: z.boolean(), undoSendSeconds: z.number().int().min(0).max(120) })
@@ -118,10 +122,14 @@ const mailboxMessageSummary = messageSummary.omit({ snoozedUntil: true }).extend
 const mailboxReadInput = z.strictObject({ mailboxIds: z.array(id).min(1).max(1000), limit: z.number().int().min(1).max(500).optional() })
 const mailboxSnapshotPage = z.object({ items: z.array(mailboxMessageSummary).max(500), nextCursor: opaque.nullable(), state: opaque, total: revision, scopeState: opaque, expiresAt: date })
 const mailboxThreadKey = z.strictObject({ sourceId: id, threadId: id })
-const mailboxConversationQuery = mailboxQuery.omit({ mailboxIds: true, limit: true, cursor: true, sort: true })
+const mailboxConversationQuery = mailboxQuery.omit({ mailboxIds: true, limit: true, cursor: true, sort: true }).extend({
+  participant: z.strictObject({ field: z.enum(['from', 'to']), match: z.enum(['address', 'domain']),
+    value: z.string().min(1).max(320).regex(/^[^\u0000-\u001f\u007f]+$/) }).optional(),
+})
 const mailboxConversation = mailboxThreadKey.extend({
-  subject: z.string(), firstMessageId: id, messageCount: revision, membershipCount: revision, doneMembershipCount: revision,
+  cursor: opaque.optional(), subject: z.string(), firstMessageId: id, messageCount: revision, membershipCount: revision, doneMembershipCount: revision,
   awakeInboxMessageCount: revision, earliestSnoozedUntil: date.nullable(), lastMessageAt: date, isRead: z.boolean(), isStarred: z.boolean(), hasAttachments: z.boolean(),
+  primaryFolderCounts: z.strictObject({ inbox: revision, archive: revision, sent: revision, drafts: revision, spam: revision, trash: revision }).optional(),
   nativeFolders: z.object({ inbox: z.boolean(), archive: z.boolean(), sent: z.boolean(), drafts: z.boolean(), spam: z.boolean(), trash: z.boolean() }),
   mailboxStates: z.array(z.object({ mailboxId: id, messageCount: revision, doneCount: revision, snoozedCount: revision })).max(1000),
   messages: z.array(mailboxMessageSummary).max(50), messagesComplete: z.boolean(),
@@ -185,10 +193,18 @@ const schemas = {
   MailboxMessagePage: z.object({ items: z.array(mailboxMessageSummary), nextCursor: opaque.nullable(), state: opaque, total: revision }),
   MailboxMessagePageInput: mailboxReadInput.extend({ cursor: opaque.optional(), sourceId: id.optional(), threadId: id.optional() }),
   MailboxLiveMessagePage: z.object({ items: z.array(mailboxMessageSummary).max(500), nextCursor: opaque.nullable(), state: opaque, scopeState: opaque }),
-  MailboxConversationsInput: mailboxReadInput.extend({ limit: limit.optional(), cursor: opaque.optional(), keys: z.array(mailboxThreadKey).min(1).max(50).optional(), query: mailboxConversationQuery.optional() }),
+  MailboxConversationsInput: mailboxReadInput.extend({ limit: limit.optional(), cursor: opaque.optional(), direction: z.enum(['older', 'newer']).optional(), keys: z.array(mailboxThreadKey).min(1).max(50).optional(), query: mailboxConversationQuery.optional() }),
   MailboxConversationsPage: z.object({ items: z.array(mailboxConversation).max(100), nextCursor: opaque.nullable(), state: opaque, scopeState: opaque }),
   MailboxCountsInput: mailboxReadInput.pick({ mailboxIds: true }).extend({ query: mailboxConversationQuery.optional() }),
   MailboxCounts: z.object({ messages: revision, conversations: revision, asOfState: opaque, scopeState: opaque }),
+  MailboxContactsInput: mailboxReadInput.pick({ mailboxIds: true }).extend({ query: z.string().max(256).regex(/^[^\u0000-\u001f\u007f]*$/), limit: limit.optional() }),
+  MailboxContacts: z.strictObject({ items: z.array(z.strictObject({ name: z.string(), email: z.string().min(1) })).max(100), state: opaque, scopeState: opaque }),
+  MailboxCorrespondenceInput: mailboxReadInput.pick({ mailboxIds: true }).extend({ email: z.string().min(1).max(320), domain: z.string().min(1).max(253).optional(),
+    since: date.describe('ISO timestamp with seconds, up to millisecond precision, and an explicit timezone. Anchors bins only, not all-time totals.'),
+    bucketMs: z.number().int().min(3600000).max(365 * 86400000), bucketCount: z.number().int().min(1).max(64), recentLimit: z.number().int().min(1).max(50).optional() }),
+  MailboxCorrespondence: z.strictObject({ state: opaque, scopeState: opaque, received: revision, sent: revision, conversations: revision, twoWay: revision,
+    firstMessageAt: date.nullable(), lastMessageAt: date.nullable(), lastSentAt: date.nullable(),
+    periods: z.array(z.strictObject({ start: date, received: revision, sent: revision })).min(1).max(64), recent: z.array(mailboxThreadKey).max(50) }),
   MailboxSyncStatusInput: mailboxReadInput.pick({ mailboxIds: true }),
   MailboxSyncStatus: z.strictObject({ sourceId: id, scopeKey: opaque,
     state: z.enum(['syncing', 'waiting', 'error', 'paused', 'idle']), activeLanes: z.array(z.enum(['latest', 'backfill'])).max(2),
@@ -213,7 +229,7 @@ const schemas = {
   SyncRequest: z.strictObject({ folder: name.optional(), lane: z.enum(['latest', 'backfill']).optional(), reset: z.boolean().optional(), limit: limit.optional() }),
   SyncResult: z.object({ synchronized: revision, hasMore: z.boolean(), state: opaque }),
   Name: z.strictObject({ name: name.max(255) }),
-  Folder: z.object({ id, accountId: id, name: z.string(), role: z.string(), kind: z.enum(['folder', 'label']), scope: z.literal('provider') }),
+  Folder: z.object({ id, accountId: id, name: z.string(), role: z.string(), kind: z.enum(['folder', 'label']), scope: z.literal('provider'), custom: z.boolean().optional() }),
   LabelInput: z.strictObject({ accountId: id, name: name.max(255) }),
   Label: label,
   BlobInfo: blobInfo,
@@ -391,6 +407,7 @@ export function createInboxApi(options: InboxApiOptions) {
 
   app.use('*', async (c, next) => {
     c.header('Cache-Control', 'no-store')
+    if (CONTACT_READ_PATHS.some(path => c.req.path.endsWith(path))) c.header('Referrer-Policy', 'no-referrer')
     c.header('X-Content-Type-Options', 'nosniff')
     c.header('Vary', 'Origin, Authorization, Cookie')
     const origin = c.req.header('origin')
@@ -425,7 +442,8 @@ export function createInboxApi(options: InboxApiOptions) {
       if (c.req.header('cookie') && (!origin || origin !== new URL(c.req.url).origin && !origins.has(origin))) {
         throw new InboxError('ORIGIN_FORBIDDEN', 'A trusted Origin is required for cookie-authenticated mutations', 403)
       }
-      const maximum = c.req.path.endsWith('/v1/blobs') && c.req.method === 'POST' ? FILE_LIMIT + JSON_LIMIT : JSON_LIMIT
+      const maximum = c.req.path.endsWith('/v1/blobs') && c.req.method === 'POST' ? FILE_LIMIT + JSON_LIMIT
+        : CONTACT_READ_PATHS.some(path => c.req.path.endsWith(path)) ? CONTACT_READ_JSON_LIMIT : JSON_LIMIT
       c.set('body', await boundedBody(c.req.raw, maximum))
     }
     await next()
@@ -642,9 +660,23 @@ export function createInboxApi(options: InboxApiOptions) {
   route('post', '/v1/mailbox-message-page', { summary: 'Read a live keyset page of cached selected messages', input: 'MailboxMessagePageInput', output: 'MailboxLiveMessagePage',
     description: 'Read-only, body-free POST. Descending receivedAt/id keyset, maximum 500 summaries, 5000 memberships and 4 MiB. State remains the starting reconciliation baseline; reconcile concurrent changes through mailbox-changes after paging. History expiry or selection/generation change explicitly fails continuation. No fixed inventory or total-size cap.' }, async c => json(c, validate(schemas.MailboxLiveMessagePage, await inbox.mailboxMessagePage(c.get('owner'), body(c, schemas.MailboxMessagePageInput)))))
   route('post', '/v1/mailbox-conversations', { summary: 'Read bounded conversations with complete cached aggregates', input: 'MailboxConversationsInput', output: 'MailboxConversationsPage',
-    description: 'Read-only POST. Live chronological keyset over exact source/thread identities. Generic filters qualify a conversation if any selected member matches; aggregates still span all selected members. Previews and conditional-action targets are bounded independently and explicitly report completeness. Direct keys remain mailbox-scoped. Reconcile from the starting state using mailbox-changes; this is not a frozen snapshot.' }, async c => json(c, validate(schemas.MailboxConversationsPage, await inbox.mailboxConversations(c.get('owner'), body(c, schemas.MailboxConversationsInput)))))
+    description: 'Read-only POST. Live chronological keyset over exact source/thread identities. direction defaults to older (latest selected leader receivedAt/id DESC); newer is ASC and starts at the oldest leaders without a cursor. Each row includes an attested cursor at that leader, even on terminal pages. Row cursors and nextCursor are bidirectional, strictly exclusive boundaries: direction is not part of their binding, but owner, store, scope/generation, query, limit, keys and first reconciliation state remain bound. nextCursor follows only the last returned leader when more remain in that traversal direction. Generic filters qualify a conversation if one selected member satisfies the entire conjunction; aggregates still span all selected members. participant is an exact cached From or To header predicate: address trims and folds ASCII case; domain matches exactly or at a dot-subdomain boundary. To excludes Cc/Bcc; legacy from/to substring filters are unchanged. primaryFolderCounts always reports complete exact primary-folder counts for inbox/archive/sent/drafts/spam/trash, with messageCount as denominator; other primary folders remain outside this map. nativeFolders retains primary-folder or system-role presence semantics. Previews and conditional-action targets are bounded independently and explicitly report completeness. Direct keys remain mailbox-scoped. At most 100 rows, 5000 membership references and 4 MiB including row cursors and counts; no startup inventory or provider/body access. Reconcile from the starting state using mailbox-changes; this is not a frozen snapshot.' }, async c => json(c, validate(schemas.MailboxConversationsPage, await inbox.mailboxConversations(c.get('owner'), body(c, schemas.MailboxConversationsInput)))))
   route('post', '/v1/mailbox-counts', { summary: 'Count exact cached matching messages and conversations', input: 'MailboxCountsInput', output: 'MailboxCounts',
-    description: 'Read-only POST. Deduplicates overlapping mailboxes; conversations are distinct source/thread identities with at least one matching selected message. May scan cached metadata; returns its asOfState separately from startup pages.' }, async c => json(c, validate(schemas.MailboxCounts, await inbox.mailboxCounts(c.get('owner'), body(c, schemas.MailboxCountsInput)))))
+    description: 'Read-only, body/provider-free POST. Deduplicates overlapping mailboxes; conversations are distinct source/thread identities with at least one selected message satisfying the entire query conjunction. Uses the same exact From/To participant address/domain predicate as mailbox-conversations, not Cc/Bcc; legacy substring filters remain unchanged. May scan cached metadata; returns its asOfState separately from startup pages.' }, async c => json(c, validate(schemas.MailboxCounts, await inbox.mailboxCounts(c.get('owner'), body(c, schemas.MailboxCountsInput)))))
+  route('post', '/v1/mailbox-contacts', { summary: 'Find bounded contacts in selected cached mail', input: 'MailboxContactsInput', output: 'MailboxContacts', noStore: true,
+    description: 'Read-only POST. The 1–1000 attached owned mailbox ID count and 64 KiB encoded JSON byte limit apply independently; maximum-length IDs can exceed the byte budget before the count limit. Literal address/name substring, at most 256 characters, using SQLite ASCII case folding, not full Unicode case folding; default 20 results, maximum 100. Matches any eligible cached name or address, then returns each matching address with its most recent cached display name, ordered by recency then address. Excludes trash, spam, unsent and invalid/future mail. Native confirmed Sent mail contributes To/CC; other eligible mail contributes From. May scan cached metadata; this is not a provider-complete address book. No body/provider access, persistent contact index or cursor. Response budget: 4 MiB.' }, async c => {
+    const result = validate(schemas.MailboxContacts, await inbox.mailboxContacts(c.get('owner'), body(c, schemas.MailboxContactsInput)))
+    const text = JSON.stringify(result)
+    if (encoder.encode(text).byteLength > SNAPSHOT_PAGE_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The contact read exceeds its encoded budget', 413)
+    return c.newResponse(text, 200, { 'Content-Type': 'application/json; charset=utf-8' })
+  })
+  route('post', '/v1/mailbox-correspondence', { summary: 'Aggregate selected cached correspondence without loading mail bodies', input: 'MailboxCorrespondenceInput', output: 'MailboxCorrespondence', noStore: true,
+    description: 'Read-only POST. The 1–1000 mailbox ID count and 64 KiB encoded JSON byte limit apply independently; both must fit. Same owned attached selection and 4 MiB response budget as contacts. All-time metrics cover selected cached history only, never provider completeness. Exact email matching uses SQLite ASCII case folding, not full Unicode case folding, or its validated domain including exact-boundary child domains. Received is From; sent is To/CC on confirmed Sent mail, not queued work. Deduplicates selected memberships and matching recipients per source/message/direction; conversations and recent keys use source/thread identity. Excludes trash, spam, unsent and invalid/future timestamps. since is an ISO timestamp anchoring 1–64 half-open bins; bucketMs is an integer from one hour through 365 days. Future bins remain empty; recentLimit defaults to 5 and is at most 50. Does not fetch providers, bodies or inference, write state, or create a contact inventory.' }, async c => {
+    const result = validate(schemas.MailboxCorrespondence, await inbox.mailboxCorrespondence(c.get('owner'), body(c, schemas.MailboxCorrespondenceInput)))
+    const text = JSON.stringify(result)
+    if (encoder.encode(text).byteLength > SNAPSHOT_PAGE_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The correspondence read exceeds its encoded budget', 413)
+    return c.newResponse(text, 200, { 'Content-Type': 'application/json; charset=utf-8' })
+  })
   route('post', '/v1/mailbox-changes', { summary: 'Reconcile a scoped body-free mailbox view from owner change history', input: 'MailboxChangesInput', output: 'MailboxChangesPage',
     description: 'Read-only POST; scopeState comes from mailbox-snapshot, mailbox-message-page, mailbox-conversations or mailbox-counts. At most 500 event-prefix entries are consumed, with current upserts and scoped removals; state advances only through that prefix when hasMore. Current rows may be newer than their events: merge canonical and membership revisions independently and apply deltas in order after initial inventory paging. Metadata events permit targeted metadata refresh. Scope/history resets contain no rows; start a new authorized inventory. Each response has encoded-byte and membership-row budgets.' }, async c => json(c, validate(schemas.MailboxChangesPage, await inbox.mailboxChanges(c.get('owner'), body(c, schemas.MailboxChangesInput)))))
   route('get', '/v1/mailboxes/:id/messages/:messageId/summary', { summary: 'Read cached metadata in an owned mailbox without accessing its body', output: 'MailboxMessageSummary',

@@ -2,10 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import App from "./App";
 import { bindApplicationScope, type ApplicationScope } from "./application-scope";
-import { AUTH_REQUIRED_EVENT, beginGoogleLogin, readApplicationAccess, signOutApplication, type ApplicationAccess } from "./application-auth";
+import { AUTH_REQUIRED_EVENT, ApplicationAccessUnavailable, applicationAccessRetryDelay, beginGoogleLogin, readApplicationAccess, rememberApplicationRecoveryScope, signOutApplication, takeApplicationRecoveryScope, type ApplicationAccess } from "./application-auth";
 import "./application-auth.css";
 
-type GateState = "checking" | "ready" | "required" | "error" | "signing-in" | "signing-out" | "sign-out-error";
+type GateState = "checking" | "ready" | "required" | "reconnecting" | "error" | "signing-in" | "signing-out" | "sign-out-error";
+type LockReason = "auth" | "transient" | "invalid" | "owner" | "channel" | "signout";
 
 export default function ApplicationGate() {
   const [access, setAccess] = useState<ApplicationAccess | null>(null);
@@ -17,8 +18,20 @@ export default function ApplicationGate() {
   const current = useRef<ApplicationAccess | null>(null);
   const binding = useRef<ApplicationScope | null>(null);
   const announced = useRef(false);
+  const lockReason = useRef<LockReason | null>(null);
+  const recovery = useRef<{ startedAt: number; attempt: number; nextAt: number } | null>(null);
+  const recoveryScope = useRef<string | null | undefined>(undefined);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const lock = useCallback((detail = "Your session ended. Sign in again.") => {
+  const cancelRetry = useCallback(() => {
+    if (retryTimer.current !== null) clearTimeout(retryTimer.current);
+    retryTimer.current = null;
+  }, []);
+
+  const lock = useCallback((detail = "Your session ended. Sign in again.", reason: LockReason = "auth") => {
+    cancelRetry();
+    lockReason.current = reason;
+    if (reason !== "transient") recovery.current = null;
     sequence.current++;
     request.current?.abort();
     binding.current?.lock();
@@ -29,33 +42,60 @@ export default function ApplicationGate() {
       setState("required");
       setMessage(detail);
     });
-  }, []);
+  }, [cancelRetry]);
 
-  const refresh = useCallback(async (initial = false) => {
+  const refresh = useCallback(async function refresh(initial = false): Promise<void> {
+    // An old focus callback or transport failure must not undo explicit logout.
+    if (lockReason.current === "signout" || lockReason.current === "channel" || lockReason.current === "owner") return;
+    cancelRetry();
     const version = ++sequence.current;
     request.current?.abort();
     const controller = new AbortController();
     request.current = controller;
-    if (initial) setState("checking");
+    if (initial) {
+      recovery.current = null;
+      if (recoveryScope.current === undefined) recoveryScope.current = takeApplicationRecoveryScope();
+      setState("checking");
+    }
     try {
       const next = await readApplicationAccess(controller.signal);
       if (controller.signal.aborted || version !== sequence.current) return;
       const ready = next.method === "loopback" || next.authenticated;
       if (!ready) {
         current.current = next;
+        recovery.current = null;
         if (binding.current) lock();
-        else { setAccess(null); setState("required"); }
+        else { lockReason.current = "auth"; setAccess(null); setState("required"); }
         return;
       }
       const scope = next.method === "google" ? next.scope : null;
+      const changedDuringReload = recoveryScope.current !== undefined && recoveryScope.current !== null && recoveryScope.current !== scope;
+      recoveryScope.current = null;
+      if (changedDuringReload && (location.pathname !== "/" || location.search || location.hash)) {
+        lock("Your account changed. Opening your inbox…", "owner");
+        location.replace("/");
+        return;
+      }
       if (binding.current && (binding.current.signal.aborted || binding.current.scope !== scope)) {
-        lock("Your account changed. Opening your inbox…");
+        if (scope !== null && binding.current.scope === scope && (lockReason.current === "transient" || lockReason.current === "auth")) {
+          // Never revive the aborted runtime. A restrict-only handoff checks the
+          // identity again after reload before retaining this thread/draft URL.
+          const preserveRoute = rememberApplicationRecoveryScope(scope);
+          if (controller.signal.aborted || version !== sequence.current) return;
+          recovery.current = null;
+          if (preserveRoute) location.reload();
+          else location.replace("/");
+          return;
+        }
+        lock("Your account changed. Opening your inbox…", "owner");
         // Cookies are shared across tabs; JS closures are not. Never mount B in
         // A's runtime, and discard A's thread/draft route on the way out.
         location.replace("/");
         return;
       }
       binding.current = bindApplicationScope(scope);
+      lockReason.current = null;
+      recovery.current = null;
       current.current = next;
       setAccess(previous => previous?.method === "google" && next.method === "google" && previous.authenticated && next.authenticated
         && previous.scope === next.scope && previous.user.name === next.user.name && previous.user.email === next.user.email ? previous : next);
@@ -64,13 +104,34 @@ export default function ApplicationGate() {
         announced.current = true;
         channel.current?.postMessage({ type: "signed-in", scope: next.scope });
       }
-    } catch {
+    } catch (error) {
       if (controller.signal.aborted || version !== sequence.current) return;
-      // Never leave private UI visible when the current session cannot be checked.
-      lock("");
-      setState("error");
+      // Temporary downtime hides private UI too, but does not claim logout or
+      // discard a still-valid Google cookie. Only transient failures retry.
+      if (error instanceof ApplicationAccessUnavailable && (lockReason.current === null || lockReason.current === "transient")) {
+        const attempt = recovery.current ?? { startedAt: Date.now(), attempt: 0, nextAt: 0 };
+        lock("", "transient");
+        recovery.current = attempt;
+        const delay = applicationAccessRetryDelay(attempt.attempt, attempt.startedAt, Date.now(), error.retryAfterMs);
+        if (delay !== null) {
+          attempt.attempt++;
+          attempt.nextAt = Date.now() + delay;
+          setState("reconnecting");
+          retryTimer.current = setTimeout(() => {
+            retryTimer.current = null;
+            if (recovery.current !== attempt || lockReason.current !== "transient") return;
+            if (Date.now() >= attempt.startedAt + 120_000) { setState("error"); return; }
+            if (document.visibilityState === "visible") void refresh();
+          }, delay);
+        } else setState("error");
+      } else {
+        lock("", error instanceof ApplicationAccessUnavailable ? lockReason.current ?? "invalid" : "invalid");
+        setState("error");
+      }
+    } finally {
+      if (request.current === controller) request.current = null;
     }
-  }, [lock]);
+  }, [cancelRetry, lock]);
 
   useEffect(() => {
     const url = new URL(location.href);
@@ -83,7 +144,7 @@ export default function ApplicationGate() {
     }
     void refresh(true);
     const required = () => {
-      if (current.current?.method !== "google") return;
+      if (current.current?.method !== "google" || lockReason.current === "signout" || lockReason.current === "channel" || lockReason.current === "owner") return;
       lock();
       void refresh();
     };
@@ -91,8 +152,8 @@ export default function ApplicationGate() {
     try {
       channel.current = new BroadcastChannel("superlocal:application-auth");
       channel.current.onmessage = event => {
-        if (current.current?.method !== "google") return;
-        if (event.data === "signed-out") lock();
+        if (current.current?.method !== "google" || lockReason.current === "signout") return;
+        if (event.data === "signed-out") lock(undefined, "channel");
         else if (event.data?.type === "signed-in" && (binding.current?.signal.aborted || binding.current?.scope !== event.data.scope)) {
           lock();
           void refresh();
@@ -102,30 +163,45 @@ export default function ApplicationGate() {
     return () => {
       sequence.current++;
       request.current?.abort();
+      cancelRetry();
+      recovery.current = null;
       removeEventListener(AUTH_REQUIRED_EVENT, required);
       channel.current?.close();
       channel.current = null;
     };
-  }, [lock, refresh]);
+  }, [cancelRetry, lock, refresh]);
 
   useEffect(() => {
-    if (state !== "ready" || access?.method !== "google") return;
-    const visible = () => { if (document.visibilityState === "visible") void refresh(); };
-    const timer = setInterval(visible, 15_000);
+    if ((state !== "ready" || access?.method !== "google") && state !== "reconnecting") return;
+    const visible = () => {
+      if (document.visibilityState !== "visible" || request.current) return;
+      if (state === "reconnecting") {
+        const attempt = recovery.current;
+        if (!attempt || lockReason.current !== "transient") return;
+        if (Date.now() >= attempt.startedAt + 120_000) { cancelRetry(); setState("error"); return; }
+        // Focus resumes a due check; it never bypasses backoff or Retry-After.
+        if (Date.now() < attempt.nextAt) return;
+      }
+      void refresh();
+    };
+    const timer = state === "ready" ? setInterval(visible, 15_000) : null;
     addEventListener("focus", visible);
     document.addEventListener("visibilitychange", visible);
-    return () => { clearInterval(timer); removeEventListener("focus", visible); document.removeEventListener("visibilitychange", visible); };
-  }, [state, access?.method, refresh]);
+    return () => { if (timer !== null) clearInterval(timer); removeEventListener("focus", visible); document.removeEventListener("visibilitychange", visible); };
+  }, [state, access?.method, cancelRetry, refresh]);
 
   useEffect(() => {
     if (state === "ready") return;
-    document.title = "Sign in - Superlocal";
+    document.title = state === "reconnecting" ? "Reconnecting - Superlocal" : "Sign in - Superlocal";
     // An unauthenticated document must not inspect legacy private preferences.
     document.documentElement.dataset.theme ||= "dark";
     document.documentElement.dataset.style ||= "Superlocal";
   }, [state]);
 
   async function signIn() {
+    cancelRetry();
+    recovery.current = null;
+    lockReason.current = null;
     const version = ++sequence.current;
     request.current?.abort();
     const controller = new AbortController();
@@ -143,7 +219,7 @@ export default function ApplicationGate() {
   }
 
   async function signOut() {
-    lock("");
+    lock("", "signout");
     setState("signing-out");
     channel.current?.postMessage("signed-out");
     const version = ++sequence.current;
@@ -166,16 +242,17 @@ export default function ApplicationGate() {
   }
   if (state === "checking") return <div className="application-auth-loading" aria-label="Checking access" />;
 
-  const checkingFailed = state === "error";
+  const reconnecting = state === "reconnecting";
+  const checkingFailed = state === "error" || reconnecting;
   const signingOut = state === "signing-out" || state === "sign-out-error";
   const busy = state === "signing-in" || state === "signing-out";
   return (
-    <main className="application-auth" aria-busy={busy}>
+    <main className="application-auth" aria-busy={busy || reconnecting}>
       <div className="application-auth-content">
-        <h1>{checkingFailed ? "Couldn’t check access" : signingOut ? "Sign out of Superlocal" : "Sign in to Superlocal"}</h1>
-        <p>{checkingFailed ? "The server couldn’t confirm your session. Try again." : signingOut ? "Your inbox is hidden while your session ends." : "Use an approved Google account."}</p>
+        <h1>{reconnecting ? "Reconnecting to Superlocal" : checkingFailed ? "Couldn’t check access" : signingOut ? "Sign out of Superlocal" : "Sign in to Superlocal"}</h1>
+        <p>{reconnecting ? "The server is temporarily unavailable. Retrying your session check." : checkingFailed ? "The server couldn’t confirm your session. Try again." : signingOut ? "Your inbox is hidden while your session ends." : "Use an approved Google account."}</p>
         <button className="application-auth-button" type="button" disabled={busy} onClick={() => { if (checkingFailed) void refresh(true); else if (signingOut) void signOut(); else void signIn(); }}>
-          {checkingFailed ? "Retry" : signingOut ? busy ? "Signing out…" : "Retry sign out" : busy ? "Opening Google…" : "Continue with Google"}
+          {reconnecting ? "Retry now" : checkingFailed ? "Retry" : signingOut ? busy ? "Signing out…" : "Retry sign out" : busy ? "Opening Google…" : "Continue with Google"}
         </button>
         {message && <p className="application-auth-message" role="alert">{message}</p>}
       </div>

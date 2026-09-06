@@ -80,6 +80,8 @@ type ThreadViewProps = {
   loadContacts?: (query: string) => Promise<Array<{ name: string; email: string }>>;
   onLoadMessage?: (id: string) => Promise<void>;
   onLoadOlder?: () => Promise<void>;
+  onResetHistory?: () => Promise<void>;
+  onPinMessages?: (ids: readonly string[]) => void;
   onBack: () => void;
   onNavigate: (delta: number) => void;
   onAction: (action: string) => void;
@@ -115,6 +117,8 @@ export default function ThreadView({
   loadContacts,
   onLoadMessage,
   onLoadOlder,
+  onResetHistory,
+  onPinMessages,
   onBack,
   onNavigate,
   onAction,
@@ -156,6 +160,7 @@ export default function ThreadView({
   const scroller = useRef<HTMLDivElement>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
+  const historyRequest = useRef(0);
   const messageCount = mail.window ? mail.window.counts.messages : mail.messages.length;
   useEffect(() => {
     if (!mail.window || !onLoadMessage || !scroller.current) return;
@@ -321,6 +326,13 @@ export default function ThreadView({
     const node = scroller.current?.querySelector<HTMLElement>(`[data-thread-message="${CSS.escape(replyResult.id)}"]`);
     node?.scrollIntoView({ block: "end", behavior: "auto" });
   }, [replyFocusKey, replyResult?.id, draft?.id]);
+
+  useLayoutEffect(() => {
+    historyRequest.current++;
+    setHistoryLoading(false); setHistoryError("");
+    return () => { historyRequest.current++; onPinMessages?.([]); };
+  }, [mail.id, onPinMessages]);
+  useLayoutEffect(() => { reportMessagePins(); }, [mail.messages, expanded, draft?.sourceMessageId, onPinMessages]);
 
   useEffect(() => {
     if (draft && !popOut) reply.current?.scrollIntoView({ block: "nearest" });
@@ -510,6 +522,23 @@ export default function ThreadView({
     if (forwarded.defaultPrevented) event.preventDefault();
   }
 
+  function reportMessagePins() {
+    const keys = new Set([...expanded, activeMessage.current]);
+    onPinMessages?.(mail.messages.filter(message => keys.has(messageKey(message)) || message.id === draft?.sourceMessageId).map(message => message.id));
+  }
+
+  function loadHistory(reset = false) {
+    const load = reset ? onResetHistory : onLoadOlder;
+    if (!load) return;
+    reportMessagePins(); // Include focus/expansion from this event before the request captures its scope.
+    const request = ++historyRequest.current;
+    setHistoryLoading(true); setHistoryError("");
+    void load().catch(error => {
+      if (request === historyRequest.current && !(error instanceof DOMException && error.name === "AbortError"))
+        setHistoryError(error instanceof Error ? error.message : "Could not load conversation history.");
+    }).finally(() => { if (request === historyRequest.current) setHistoryLoading(false); });
+  }
+
   function revealMessage(id: string) {
     const key = messageKey(mail.messages.find(message => message.id === id));
     activeMessage.current = key;
@@ -682,12 +711,10 @@ export default function ThreadView({
               {mail.operationId && <button type="button" className="text-button" onClick={() => onAction("cancel")}>Cancel send</button>}
             </div>
           )}
-          {mail.window && !mail.window.messagesComplete && !mail.historyExhausted && onLoadOlder && <div role="status">
-            <button type="button" className="text-button" disabled={historyLoading} onClick={() => {
-              setHistoryLoading(true); setHistoryError("");
-              void onLoadOlder().catch(error => setHistoryError(error instanceof Error ? error.message : "Could not load conversation history.")).finally(() => setHistoryLoading(false));
-            }}>{historyLoading ? "Loading history…" : "Load more messages"}</button>
-            {historyError && <span role="alert">{historyError}</span>}
+          {mail.window && (!mail.window.messagesComplete && !mail.historyExhausted && onLoadOlder || mail.historyTruncated && onResetHistory || historyError || mail.historyError) && <div role="status">
+            {!mail.window.messagesComplete && !mail.historyExhausted && onLoadOlder && <button type="button" className="text-button" disabled={historyLoading} onClick={() => loadHistory()}>{historyLoading ? "Loading history…" : "Load more messages"}</button>}
+            {mail.historyTruncated && onResetHistory && <> <button type="button" className="text-button" disabled={historyLoading} onClick={() => loadHistory(true)}>Show recent messages</button></>}
+            {(historyError || mail.historyError) && <span role="alert">{historyError || mail.historyError}</span>}
           </div>}
           {(messageCount === null || messageCount > 1) && (
             <div className="thread-conversation-controls">
@@ -723,10 +750,10 @@ export default function ThreadView({
                 style={canvas ? messageCanvasStyle(canvas) : undefined}
                 tabIndex={-1}
                 onFocusCapture={() => {
-                  activeMessage.current = key;
+                  activeMessage.current = key; reportMessagePins();
                 }}
                 onPointerDownCapture={() => {
-                  activeMessage.current = key;
+                  activeMessage.current = key; reportMessagePins();
                 }}
                 className={`thread-message ${open ? "is-expanded" : "is-collapsed"} ${index === mail.messages.length - 1 ? "is-final" : ""}`}
                 aria-label={`Message from ${message.from}`}
@@ -872,7 +899,7 @@ export default function ThreadView({
                         text={message.bodyText}
                         format={message.bodyFormat}
                         fontSize={preferences.fontSize}
-                        onActivate={() => { activeMessage.current = key; }}
+                        onActivate={() => { activeMessage.current = key; reportMessagePins(); }}
                         onKeyboard={event => bodyKeyboard(event, message.id)}
                         onImageSettings={onImageSettings}
                         onCanvasColor={color => setMessageCanvases(all => {

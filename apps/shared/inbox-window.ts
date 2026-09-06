@@ -6,7 +6,7 @@ import type { ZeroBatchCandidate, ZeroDecision } from '../web/src/mail-view'
 /** Transport/cache bounds, not limits on the server's indexed corpus or Zero capture. */
 export const INBOX_FIRST_PAGE_LIMIT = 100
 export const INBOX_PAGE_LIMIT = 100
-export const INBOX_AUTO_PREFETCH_LIMIT = 300
+export const INBOX_AUTO_PREFETCH_LIMIT = 200
 export const INBOX_WINDOW_LIMIT = 1000
 export const INBOX_WINDOW_BYTE_LIMIT = 32 * 1024 * 1024
 export const INBOX_RESPONSE_BYTE_LIMIT = 4 * 1024 * 1024
@@ -69,6 +69,8 @@ export type InboxWindowState = {
   preferenceRevision: string
   sources: Array<{ sourceId: string; generation: number }>
   sdkState: string | null
+  /** Attested reconciliation checkpoint; remains usable while underlying scoped histories are retained. */
+  readCursor?: string
   indexing: boolean
   catchup: 'pending' | 'catching-up' | 'current' | 'blocked'
 }
@@ -95,6 +97,8 @@ export type InboxWindowRow = InboxThreadKey & {
   key: string
   sourceGeneration: number
   revision: number
+  /** Host-signed boundary at this row, usable in either direction after resident-page eviction. */
+  pageCursor?: string
   /** App projection, with only body-free preview messages (body: '', loaded: false).
    * Whole-conversation flags/folder/attention come from the host, not this preview.
    */
@@ -122,7 +126,7 @@ export type InboxWindowPage = {
   rows: InboxWindowRow[]
   totals: InboxTotals
   nextCursor: string | null
-  /** True only after complete indexed matching coverage; an empty indexing page is not exhaustion. */
+  /** True only when this scoped query traversal is exhausted; an empty bounded scan with a cursor is not exhaustion. */
   exhausted: boolean
 }
 export type InboxPageInput = { queryId: string; cursor?: string; limit?: number; direction?: 'older' | 'newer'; seek?: 'start' | 'end' }
@@ -146,11 +150,13 @@ export type InboxLookupResult = {
 /** The resident and pinned sets together stay within the window/byte budget.
  * Keep only a bounded set of selected projections pinned; larger selections live as
  * captured server references, never silently dropped or broadened on page eviction.
- * Auto-prefetch stops at 300 combined conversations; subsequent paging is demand-driven.
+ * Auto-prefetch stops after one buffer response (at most 200 combined conversations); subsequent paging is demand-driven.
  */
 export type InboxChangesInput = {
   queryId: string
   sinceRevision: number
+  /** Matching state.readCursor. Older clients may still use the bounded numeric checkpoint cache. */
+  sinceCursor?: string
   residentKeys: string[]
   pinnedKeys: string[]
   cursor?: string
@@ -351,5 +357,5 @@ export type InboxWindowTransport = {
  */
 export type InboxWindowErrorCode = 'HOST_INBOX_INVALID' | 'HOST_INBOX_TOO_LARGE'
   | 'HOST_INBOX_QUERY_EXPIRED' | 'HOST_INBOX_CURSOR_INVALID' | 'HOST_INBOX_SCOPE_CHANGED'
-  | 'HOST_INBOX_CONTEXT_CHANGED' | 'HOST_INBOX_UNAVAILABLE' | 'HOST_ZERO_SESSION_CONFLICT'
+  | 'HOST_INBOX_CONTEXT_CHANGED' | 'HOST_INBOX_UNAVAILABLE' | 'HOST_INBOX_PREPARING' | 'HOST_ZERO_SESSION_CONFLICT'
   | 'HOST_ZERO_SESSION_NOT_FOUND'

@@ -218,9 +218,18 @@ export interface MailboxThreadKey { sourceId: string; threadId: string }
 export interface MailboxMessagePageInput { mailboxIds: string[]; limit?: number; cursor?: string; sourceId?: string; threadId?: string }
 /** Live descending receivedAt/id keyset. Reconcile from the first state after paging; not a frozen inventory. */
 export interface MailboxMessagePage { items: MailboxMessageSummary[]; nextCursor: string | null; state: string; scopeState: string }
-export type MailboxConversationQuery = Omit<MailboxQuery, 'mailboxIds' | 'cursor' | 'limit' | 'sort'>
-export interface MailboxConversationsInput { mailboxIds: string[]; limit?: number; cursor?: string; keys?: MailboxThreadKey[]; query?: MailboxConversationQuery }
+export type MailboxConversationQuery = Omit<MailboxQuery, 'mailboxIds' | 'cursor' | 'limit' | 'sort'> & {
+  /** Exact cached header predicate, distinct from legacy substring from/to. To excludes Cc/Bcc.
+   * Address matching trims and folds ASCII case; domains include exact-boundary subdomains. */
+  participant?: { field: 'from' | 'to'; match: 'address' | 'domain'; value: string }
+}
+/** Cursors are bidirectional leader boundaries, bound to the same selection/query/limit and first state.
+ * Default older traverses DESC; a fresh newer read starts at the oldest latest-message leaders, ASC. */
+export interface MailboxConversationsInput { mailboxIds: string[]; limit?: number; cursor?: string; direction?: 'older' | 'newer'; keys?: MailboxThreadKey[]; query?: MailboxConversationQuery }
 export interface MailboxConversation extends MailboxThreadKey {
+  /** Attested boundary at this row's latest selected leader, reusable in either direction.
+   * New SDK responses always include it, even on terminal pages; optional for older servers. */
+  cursor?: string
   /** Oldest selected message's subject/identity, ordered by receivedAt ASC then id ASC. */
   subject: string
   firstMessageId: string
@@ -236,6 +245,10 @@ export interface MailboxConversation extends MailboxThreadKey {
   isRead: boolean
   isStarred: boolean
   hasAttachments: boolean
+  /** Complete selected-message counts by exact primary folder, not role/label presence.
+   * Other primary folders remain outside this map; messageCount is the denominator.
+   * New SDK responses always include these counts; optional for older servers. */
+  primaryFolderCounts?: { inbox: number; archive: number; sent: number; drafts: number; spam: number; trash: number }
   /** Native primary folder or native folder-role presence, across the complete selected conversation. */
   nativeFolders: { inbox: boolean; archive: boolean; sent: boolean; drafts: boolean; spam: boolean; trash: boolean }
   mailboxStates: Array<{ mailboxId: string; messageCount: number; doneCount: number; snoozedCount: number }>
@@ -250,6 +263,41 @@ export interface MailboxConversationsPage { items: MailboxConversation[]; nextCu
 export interface MailboxCountsInput { mailboxIds: string[]; query?: MailboxConversationQuery }
 /** Exact cached matching messages and distinct matching source/thread keys; overlapping mailboxes are deduplicated. */
 export interface MailboxCounts { messages: number; conversations: number; asOfState: string; scopeState: string }
+
+export interface MailboxContactsInput { mailboxIds: string[]; query: string; limit?: number }
+/** Top cached correspondents, not a provider-complete address book. Literal address/name substring;
+ * default 20, maximum 100. Addresses are case-insensitive and use their most recent cached name. */
+export interface MailboxContacts { items: Array<{ name: string; email: string }>; state: string; scopeState: string }
+export interface MailboxCorrespondenceInput {
+  mailboxIds: string[]
+  email: string
+  /** Optional exact domain or parent of the email's hostname; includes that domain's children. */
+  domain?: string
+  /** ISO timestamp anchoring the period bins, not a filter on all-time cached metrics. */
+  since: string
+  /** Integer milliseconds, between one hour and 365 days. */
+  bucketMs: number
+  /** Between 1 and 64 bins. */
+  bucketCount: number
+  /** Default 5, maximum 50 distinct source/thread keys. */
+  recentLimit?: number
+}
+/** Selected cached history only, never provider-complete. Excludes trash, spam, unsent, invalid
+ * and future messages. Received means From; sent means To/CC on confirmed Sent mail, not queued work.
+ * Overlapping mailboxes and multiple matching recipients contribute once per message/direction. */
+export interface MailboxCorrespondence {
+  state: string
+  scopeState: string
+  received: number
+  sent: number
+  conversations: number
+  twoWay: number
+  firstMessageAt: string | null
+  lastMessageAt: string | null
+  lastSentAt: string | null
+  periods: Array<{ start: string; received: number; sent: number }>
+  recent: MailboxThreadKey[]
+}
 
 export interface MailboxSnapshotInput { mailboxIds: string[]; cursor?: string; limit?: number }
 /** Stable ID inventory, live rows: finish paging, then catch up from the fixed state baseline. */
@@ -385,6 +433,8 @@ export interface Folder {
   role: string
   kind: 'folder' | 'label'
   scope: 'provider'
+  /** Provider-attested custom resource. Missing legacy metadata is not proof of a user label. */
+  custom?: boolean
 }
 
 export interface Label {
@@ -420,8 +470,13 @@ export interface Draft extends Required<Omit<DraftInput, 'sourceMessageId' | 'ma
 }
 
 export interface Changes extends MessageMutation {
+  /** SDK-local labels, never forwarded to a provider. */
   addLabelIds?: string[]
   removeLabelIds?: string[]
+  /** Canonical SDK Folder IDs for current, owned kind=label/custom=true resources; at most 100 unique IDs.
+   * Unlike the legacy raw addLabels/removeLabels fields, these are resolved inside provider dispatch. */
+  addProviderLabelIds?: string[]
+  removeProviderLabelIds?: string[]
   folderId?: string
 }
 
@@ -499,6 +554,10 @@ export interface Inbox {
   mailboxMessagePage(owner: string, input: MailboxMessagePageInput): Promise<MailboxMessagePage>
   mailboxConversations(owner: string, input: MailboxConversationsInput): Promise<MailboxConversationsPage>
   mailboxCounts(owner: string, input: MailboxCountsInput): Promise<MailboxCounts>
+  /** Read-only top-N contacts from selected cached metadata; never loads bodies or calls a provider. */
+  mailboxContacts(owner: string, input: MailboxContactsInput): Promise<MailboxContacts>
+  /** Read-only correspondence aggregates over selected cached metadata, independent of app labels/settings. */
+  mailboxCorrespondence(owner: string, input: MailboxCorrespondenceInput): Promise<MailboxCorrespondence>
   /** Read-only primary-inbox activity, grouped by source; excludes detached mailbox selections. */
   mailboxSyncStatus(owner: string, input: { mailboxIds: string[] }): Promise<MailboxSyncStatus[]>
   mailboxSnapshot(owner: string, input: MailboxSnapshotInput): Promise<MailboxSnapshotPage>

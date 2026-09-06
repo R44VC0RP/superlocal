@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { captureActionMail, type Mail } from "./data";
 import type { InboxActionReceiptReference, InboxZeroSession, InboxZeroItem, InboxZeroProgressInput, InboxZeroProgressResult, InboxZeroUndoInput, InboxZeroUndoResult, InboxWindowTransport } from "../../shared/inbox-window";
-import { createCategoryTransport } from "./host";
+import { createCategoryTransport, InboxViewPreferencesError } from "./host";
 import { createScopedFetch } from "./application-auth";
 import { getApplicationScope } from "./application-scope";
 import { InboxClassificationError, validInboxCommandRecovery, type InboxCommandRecovery, type InboxRecoverySink, type InboxSnapshot, type InboxStore, type InboxUndo } from "./inbox";
@@ -601,7 +601,7 @@ function useGuidedZeroLegacy(options: Options) {
       const reviewOnly = new Set(current.reviewOnlyIds ?? []);
       if (selected) reviewOnly.delete(id); else reviewOnly.add(id);
       save({ ...current, reviewOnlyIds: [...reviewOnly] });
-    }, confirming, setConfirming, moveBatch, busy, error, retry,
+    }, confirming, setConfirming, moveBatch, busy, preparing: false, error, retry,
     undo: undo?.sessionId === session?.id ? undoLast : null, undoBlocked: !!retry, storageError, remainingNow, handling, currentOutside,
     browse: (delta: number) => {
       const current = sessionRef.current;
@@ -640,6 +640,7 @@ function useGuidedZeroWindow(options: Options) {
   const [offers, setOffers] = useState<Offer[]>([]);
   const [checked, setChecked] = useState<string[]>([]);
   const [busy, setBusy] = useState(false), busyRef = useRef(false);
+  const [preparing, setPreparing] = useState(false);
   const [error, setError] = useState("");
   const [storageError, setStorageError] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -655,7 +656,7 @@ function useGuidedZeroWindow(options: Options) {
   const later = useRef<Offer | null>(null);
   const generation = useRef(0);
   const scoped = !!session && session.account === account && session.status !== "invalidated";
-  const active = visible && scoped && !session!.paused;
+  const active = visible && scoped && !session!.paused && !preparing;
   const save = (next: InboxZeroSession, preservePause = false, replace = false) => {
     const matching = current.current?.id === next.id && current.current.scopeKey === next.scopeKey && live.current.account === next.account;
     const saved = readSaved<InboxZeroSession | null>(`get-to-zero:v2:${next.account}`, null);
@@ -738,13 +739,15 @@ function useGuidedZeroWindow(options: Options) {
   }
   useEffect(() => {
     const epoch = ++generation.current;
+    const stop = () => { generation.current++; };
     setSession(null); current.current = null; setOffers([]); setItems([]); setUndo(null); setRetry(null);
+    setPreparing(false); busyRef.current = false; setBusy(false);
     reservation.current = null; pageCursor.current = undefined;
-    if (!inbox.host?.inboxWindow) return;
+    if (!inbox.host?.inboxWindow) return stop;
     const saved = readSaved<InboxZeroSession | null>(key, null);
-    if (!saved || saved.version !== 2 || typeof saved.id !== "string" || saved.account !== account) return;
+    if (!saved || saved.version !== 2 || typeof saved.id !== "string" || saved.account !== account) return stop;
     void store.windowTransport.zeroResume({ sessionId: saved.id, account }).then(result => {
-      if (epoch !== generation.current) return;
+      if (owner.signal.aborted || epoch !== generation.current || account !== live.current.account) return;
       if (result.status === "found") {
         save({ ...result.session, paused: true });
         showRecovery(existingRecovery(result.session));
@@ -757,8 +760,13 @@ function useGuidedZeroWindow(options: Options) {
           setError("The saved batch exclusions still need acknowledgement. Retry their existing request before making a decision.");
         }
       } else { save({ ...saved, paused: true }); setError("The saved session is not available yet. Its reference has been preserved."); }
-    }).catch(cause => { if (epoch === generation.current) { save({ ...saved, paused: true }); setError(cause instanceof Error ? cause.message : "Could not resume cleanup."); } });
+    }).catch(cause => { if (!owner.signal.aborted && epoch === generation.current && account === live.current.account) { save({ ...saved, paused: true }); setError(cause instanceof Error ? cause.message : "Could not resume cleanup."); } });
+    return stop;
   }, [account, inbox.host?.inboxWindow]);
+  useEffect(() => {
+    if (visible || !preparing) return;
+    generation.current++; setPreparing(false); busyRef.current = false; setBusy(false);
+  }, [visible]);
   const persistProgress = async (input: InboxZeroProgressInput) => {
     const result = await store.windowTransport.zeroProgress(input);
     if (current.current?.id === input.sessionId) save(result.session, true);
@@ -806,29 +814,33 @@ function useGuidedZeroWindow(options: Options) {
     }
   }
   async function run(work: () => Promise<void>) {
-    if (busyRef.current) return;
+    if (owner.signal.aborted || account !== live.current.account || busyRef.current) return;
     const epoch = generation.current;
     busyRef.current = true; setBusy(true); setError("");
     try { await work(); } catch (cause) {
-      if (epoch === generation.current) setError(cause instanceof Error ? cause.message : "The cleanup request could not be confirmed.");
+      if (!owner.signal.aborted && epoch === generation.current && account === live.current.account) setError(cause instanceof Error ? cause.message : "The cleanup request could not be confirmed.");
     }
-    finally { busyRef.current = false; setBusy(false); }
+    finally { if (!owner.signal.aborted && epoch === generation.current && account === live.current.account) { busyRef.current = false; setBusy(false); } }
   }
   function start(fresh = false) {
-    if (!inbox.host?.inboxWindow || !inbox.loaded || busyRef.current) return;
-    const openingEpoch = generation.current;
+    if (owner.signal.aborted || !inbox.host?.inboxWindow || !inbox.loaded || busyRef.current) return;
+    const openingEpoch = generation.current, openingScope = zeroScope(account, options.mailboxIds, inbox.accounts);
+    const openingCurrent = () => !owner.signal.aborted && openingEpoch === generation.current && account === live.current.account &&
+      sameZeroScope(openingScope, zeroScope(live.current.account, live.current.mailboxIds, live.current.inbox.accounts));
+    if (!openingCurrent()) return;
     void run(async () => {
       const recovery = current.current && existingRecovery(current.current);
       if ((fresh || !scoped) && (recovery?.blocked || reservation.current)) throw new Error("Resolve the existing cleanup request in its captured scope before starting a new session.");
       let next = !fresh && scoped ? current.current : null;
       if (next) {
         const result = await store.windowTransport.zeroResume({ sessionId: next.id, account });
+        if (!openingCurrent()) return;
         if (result.status !== "found" || result.session.status === "invalidated") throw new Error("The saved session is not available in this scope. Its recovery has been preserved.");
         next = result.session;
+        if (next.account !== account) return;
         const record = existingRecovery(next);
         if (record?.blocked || reservation.current) {
           save({ ...next, paused: false });
-          if (openingEpoch !== generation.current || next.account !== live.current.account) return;
           live.current.onOpen(); showRecovery(record);
           if (reservation.current) { setRetry(() => () => run(confirmReservation)); return; }
           const credited = new Set(record!.journal.attempts.flatMap(acceptedIds));
@@ -836,25 +848,43 @@ function useGuidedZeroWindow(options: Options) {
           if (id) {
             store.pinWindow("zero", [id]);
             const rows = await store.lookupWindow([id], next.account);
-            if (current.current?.id === next.id && rows[0]) live.current.onOpen(rows[0]);
+            if (openingCurrent() && current.current?.id === next.id && rows[0]) live.current.onOpen(rows[0]);
           }
           return;
         }
         const progress = await persistProgress({ sessionId: next.id, id: crypto.randomUUID(), ifRevision: next.revision, decisions: [], paused: false }); next = progress.session;
       } else {
+        // Preparation has no captured IDs. Enter the existing workspace, but retry creation only on another click.
+        if (!openingCurrent()) return;
+        setPreparing(true); live.current.onOpen();
         try { next = await store.windowTransport.zeroCreate({ id: crypto.randomUUID(), account }); }
         catch (cause) {
-          if (cause && typeof cause === "object" && "status" in cause && cause.status === 503) throw new Error("Cleanup is not ready yet. No new session was started; retry when the inbox index is ready.");
-          throw cause;
+          if (!openingCurrent()) return;
+          if (cause instanceof InboxViewPreferencesError && cause.code === "HOST_INBOX_PREPARING") { setPreparing(true); return; }
+          setPreparing(false); throw cause;
+        }
+        if (!openingCurrent()) {
+          // Creation may have been accepted before Back or an account switch.
+          // Keep that owned receipt resumable without replacing an older session
+          // or navigating away from the reader the user chose meanwhile.
+          const retained = readSaved<InboxZeroSession | null>(`get-to-zero:v2:${account}`, null);
+          if (next.account === account && (!retained || retained.id === next.id))
+            save({ ...(retained && retained.revision > next.revision ? retained : next), paused: true });
+          return;
         }
         pageCursor.current = undefined;
       }
-      save({ ...next, paused: false }, false, true);
-      if (openingEpoch !== generation.current || next.account !== live.current.account) return;
+      if (!openingCurrent() || next.account !== account) return;
+      setPreparing(false); save({ ...next, paused: false }, false, true);
       live.current.onOpen(); await page(next, pageCursor.current);
     });
   }
   function pause() {
+    if (owner.signal.aborted || account !== live.current.account) return;
+    if (preparing) {
+      generation.current++; setPreparing(false); busyRef.current = false; setBusy(false);
+      setConfirming(false); live.current.onPause(); return;
+    }
     if (busyRef.current) return;
     const next = current.current;
     if (next) {
@@ -951,7 +981,7 @@ function useGuidedZeroWindow(options: Options) {
     if (mail) live.current.onOpen(mail);
   }, [active, busy, currentMail?.id, session?.phase, session?.currentId]);
   const currentOutside = active && !!currentMail && items.find(item => item.id === currentMail.id)?.eligibility === "ineligible";
-  return { session, scoped, active, start, pause, review, decide, captureLater, remind, offers, checked, confirming, setConfirming, busy, error, retry, storageError,
+  return { session, scoped, active, start, pause, review, decide, captureLater, remind, offers, checked, confirming, setConfirming, busy, preparing, error, retry, storageError,
     remainingCount: session?.progress.remainingCount ?? null, decidedCount: session?.progress.decidedCount ?? 0, initialCount: session?.progress.initialCount ?? null, overflowCount: 0,
     remainingNow: !retry && !reservation.current && session?.status === "complete" && session.progress.captureComplete && session.progress.unknownCount === 0 ? inbox.window?.totals.inbox ?? null : null,
     hasNextPage: !!cursor.current,
@@ -982,10 +1012,10 @@ function useGuidedZeroWindow(options: Options) {
 
 export function useGuidedZero(options: Options) {
   const window = useGuidedZeroWindow(options);
-  const legacy = useGuidedZeroLegacy({ ...options, visible: options.visible && !window.session });
+  const legacy = useGuidedZeroLegacy({ ...options, visible: options.visible && !window.session && !window.preparing });
   if (!options.inbox.host?.inboxWindow) return legacy;
   // Keep the original V1 storage and explicitly resume its captured IDs without inventory.
-  if (!window.session && legacy.session?.remainingIds.length) return { ...legacy, start: (fresh = false) => fresh ? window.start(true) : legacy.start() };
+  if (!window.session && !window.preparing && legacy.session?.remainingIds.length) return { ...legacy, start: (fresh = false) => fresh ? window.start(true) : legacy.start() };
   return window;
 }
 
@@ -1003,15 +1033,15 @@ export function GuidedZero({ state, currentMail, onHandle, onLater }: {
       </div>
       <div className="zero-header-actions">
         {state.undo && <button type="button" className="text-button" disabled={busy || state.undoBlocked} onClick={() => void state.undo?.()}>Undo</button>}
-        <button type="button" className="text-button" disabled={busy} onClick={state.pause}>{active ? "Pause" : "Back to inbox"}</button>
+        <button type="button" className="text-button" disabled={busy && !state.preparing} onClick={state.pause}>{active ? "Pause" : "Back to inbox"}</button>
       </div>
     </header>
     {state.storageError && <p className="zero-error" role="alert">Progress could not be saved in this browser. Your mail decisions are still saved.</p>}
     {state.error && <div className="zero-error" role="alert"><p>{state.error}</p>
       {state.retry && <button type="button" className="text-button" disabled={busy} onClick={() => void state.retry?.()}>Retry existing request</button>}
     </div>}
-    {!active ? <div className="zero-body"><p>Work through unhandled Important conversations, including already-read mail.</p>
-      <button type="button" className="settings-button" disabled={busy} onClick={() => state.start()}>{state.scoped && (state.remainingCount !== 0 || state.retry) ? "Resume session" : "Start session"}</button>
+    {!active ? <div className="zero-body"><p>{state.preparing ? "Preparing cleanup. You can return to your inbox while it gets ready." : "Work through unhandled Important conversations, including already-read mail."}</p>
+      <button type="button" className="settings-button" disabled={busy} onClick={() => state.start(state.preparing)}>{!state.preparing && state.scoped && (state.remainingCount !== 0 || state.retry) ? "Resume session" : "Start session"}</button>
     </div> : state.remainingNow !== null ? <div className="zero-body">
       <h2>This session is complete</h2>
       {state.remainingNow > 0 && <><p>{state.remainingNow.toLocaleString()} Important conversations remain, including any new or changed mail.</p>

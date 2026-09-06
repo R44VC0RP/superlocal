@@ -108,7 +108,7 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     const target = url(path)
     const method = (init.method ?? 'GET').toUpperCase()
     binary ||= method === 'GET' && /\/v1\/blobs\//.test(target)
-    const readPost = method === 'POST' && ['/v1/mailbox-snapshot', '/v1/mailbox-message-page', '/v1/mailbox-conversations', '/v1/mailbox-counts', '/v1/mailbox-changes', '/v1/mailbox-sync/status'].some(path => target.endsWith(path))
+    const readPost = method === 'POST' && ['/v1/mailbox-snapshot', '/v1/mailbox-message-page', '/v1/mailbox-conversations', '/v1/mailbox-counts', '/v1/mailbox-contacts', '/v1/mailbox-correspondence', '/v1/mailbox-changes', '/v1/mailbox-sync/status'].some(path => target.endsWith(path))
     const mutation = !readPost && !['GET', 'HEAD', 'OPTIONS'].includes(method)
     if (mutation) clearCache()
     const version = credentialsVersion
@@ -533,6 +533,8 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     mailboxMessagePage: (input: Parameters<Inbox['mailboxMessagePage']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxMessagePage'>>('/mailbox-message-page', 'POST', input, requestOptions),
     mailboxConversations: (input: Parameters<Inbox['mailboxConversations']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxConversations'>>('/mailbox-conversations', 'POST', input, requestOptions),
     mailboxCounts: (input: Parameters<Inbox['mailboxCounts']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxCounts'>>('/mailbox-counts', 'POST', input, requestOptions),
+    mailboxContacts: (input: Parameters<Inbox['mailboxContacts']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxContacts'>>('/mailbox-contacts', 'POST', input, requestOptions),
+    mailboxCorrespondence: (input: Parameters<Inbox['mailboxCorrespondence']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxCorrespondence'>>('/mailbox-correspondence', 'POST', input, requestOptions),
     mailboxSnapshot: (input: Parameters<Inbox['mailboxSnapshot']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxSnapshot'>>('/mailbox-snapshot', 'POST', input, requestOptions),
     mailboxSnapshotPages,
     mailboxChanges: (input: Parameters<Inbox['mailboxChanges']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxChanges'>>('/mailbox-changes', 'POST', input, requestOptions),
