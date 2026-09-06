@@ -4369,3 +4369,66 @@ test("sender host extraction normalizes IDNs without accepting URLs, extra addre
     assert.equal(senderHostname(address), null, address);
   }
 });
+
+test("Important bulk Done freezes its own unfiltered query, pages beyond 500 rows, and preserves changed mail and Undo", async () => {
+  const { ImportantDoneRun } = await import("../src/important-done.ts");
+  const total = 1002, acted: string[] = [], undone: string[] = [];
+  let capturedQuery: unknown, captures = 0;
+  const selection = { id: "frozen", account: "unified", scopeKey: "scope", revision: 1, count: total, captureComplete: true };
+  const run = new ImportantDoneRun({
+    windowTransport: {
+      query: async (input: unknown) => { capturedQuery = input; return { state: { queryId: "important-only" } }; },
+      selectionCreate: async (input: { queryId: string }) => { captures++; assert.equal(input.queryId, "important-only"); return selection; },
+      selectionPage: async ({ cursor, limit }: { cursor?: string; limit: number }) => {
+        assert.equal(limit, 1); const n = Number(cursor ?? 0);
+        return { selection, entries: n === 500 ? [{ id: String(n), status: "changed" }] : [{ id: String(n), status: "found", row: {
+          mail: { ...seedMail[0], id: String(n) }, counts: {}, messagesComplete: false,
+          targets: [{ mailboxId: "box", messageId: `message-${n}`, revision: 7 }], targetsComplete: true,
+          actionContextComplete: false, contextVersion: "captured",
+        } }], nextCursor: n + 1 < total ? String(n + 1) : null, exhausted: n + 1 === total };
+      },
+    },
+    action: async (mails: Mail[], action: string) => { assert.equal(action, "done"); assert.equal(mails.length, 1); assert.equal(mails[0].window?.targets[0].revision, 7); acted.push(mails[0].id); return async () => { undone.push(mails[0].id); }; },
+  } as never, "unified");
+  assert.equal(await run.prepare(), true); assert.equal(acted.length, 0);
+  assert.deepEqual(capturedQuery, { account: "unified", folder: "Inbox", split: "Important", search: false, query: "", filter: null, limit: 1 });
+  await run.run(() => {}); assert.equal(captures, 1); assert.equal(run.completed, 1001); assert.equal(run.changed, 1);
+  assert.equal(acted.includes("500"), false); assert.equal(run.finished, true);
+  await run.undo(); assert.deepEqual(undone, [...acted].reverse());
+});
+
+test("Important bulk Done retries the original uncertain receipt without recapturing or crediting pending work", async () => {
+  const { ImportantDoneRun } = await import("../src/important-done.ts");
+  const selection = { id: "frozen", account: "box", scopeKey: "scope", revision: 1, count: 1, captureComplete: true };
+  const plan = { kind: "mailbox-state", status: "uncertain", input: { id: "same-command" } };
+  let pages = 0, actions = 0, replayed = 0, undos = 0;
+  const run = new ImportantDoneRun({
+    windowTransport: {
+      query: async () => ({ state: { queryId: "query" } }), selectionCreate: async () => selection,
+      selectionPage: async () => { pages++; return { selection, exhausted: true, nextCursor: null, entries: [{ status: "found", row: { mail: seedMail[0], targets: [], targetsComplete: true } }] }; },
+    },
+    action: async (_m: unknown, _a: unknown, _v: unknown, sink: (p: unknown) => void) => { actions++; sink(plan); throw new Error("Lost acknowledgement"); },
+    replayCommand: async (saved: unknown) => { assert.strictEqual(saved, plan); replayed++; return async () => { undos++; }; },
+  } as never, "box");
+  await run.prepare(); await assert.rejects(run.run(() => {}), /Lost acknowledgement/);
+  assert.equal(run.completed, 0); assert.equal(run.finished, false);
+  await run.run(() => {}); assert.equal(actions, 1); assert.equal(replayed, 1); assert.equal(pages, 1); assert.equal(run.completed, 1);
+  await run.undo(); assert.equal(undos, 1);
+});
+
+test("Important bulk Done keeps the same query and capture ID while the host prepares", async () => {
+  const { ImportantDoneRun } = await import("../src/important-done.ts");
+  let queries = 0; const captures: any[] = [];
+  const run = new ImportantDoneRun({ windowTransport: {
+    query: async () => { queries++; return { state: { queryId: "fixed-query" } }; },
+    selectionCreate: async (input: any) => {
+      captures.push(input);
+      if (captures.length === 1) throw Object.assign(new Error("Preparing"), { code: "HOST_INBOX_PREPARING" });
+      return { id: input.id, count: 0, captureComplete: true };
+    },
+  } } as never, "unified");
+  assert.equal(await run.prepare(), false);
+  assert.equal(await run.prepare(), true);
+  assert.equal(queries, 1);
+  assert.deepEqual(captures[0], captures[1]);
+});

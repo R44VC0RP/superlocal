@@ -95,7 +95,6 @@ export function Settings({
   aiActions,
   onStartZero,
   zeroReady = false,
-  zeroResumable = false,
   aiMailboxes = [],
 }: SettingsProps) {
   const [entry, setEntry] = useState("");
@@ -1157,9 +1156,9 @@ export function Settings({
     case "Get Me To Zero":
       content = (
         <>
-          <p className="settings-note">Work through all unhandled Important conversations, including already-read mail. Review routine groups first, then handle, snooze or move the rest. No AI scan is required.</p>
+          <p className="settings-note">Mark all conversations currently in Important as Done, including already-read mail. Review the count before confirming. You can Undo.</p>
           <button type="button" className="settings-button zero-settings-entry" disabled={!zeroReady || !onStartZero} onClick={onStartZero}>
-            {zeroResumable ? "Resume cleanup" : "Get me to zero"}
+            Get me to zero
           </button>
         </>
       );

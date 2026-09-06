@@ -32,6 +32,7 @@ import Composer from "./Composer";
 import ThreadView from "./ThreadView";
 import Settings from "./Settings";
 import { GuidedZero, useGuidedZero } from "./GuidedZero";
+import { ImportantDone } from "./ImportantDone";
 import CalendarView from "./CalendarView";
 import Snippets from "./Snippets";
 import { useMailMotion } from "./mail-motion";
@@ -193,6 +194,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const [highlight, setHighlight] = useState(0);
   const pointerHighlight = useRef<number | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
+  const [importantDoneAccount, setImportantDoneAccount] = useState<string | null>(null);
   const [windowSelection, setWindowSelection] = useState<InboxSelection | null>(null);
   const [selectionPreparing, setSelectionPreparing] = useState<{ viewKey: string; route: string; queryId: string; scopeState: string } | null>(null);
   const selectedCapture = useRef(new Map<string, Mail>());
@@ -483,7 +485,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   function startZero() {
     if (!leaveSettings()) return;
     setOverlay(null); setOverlayIds(null); setCommandDraftId(null);
-    zero.start();
+    setImportantDoneAccount(route.account);
   }
   const rowCount = isDrafts ? accountDrafts.length : visibleMail.length;
   const virtualized =
@@ -1541,7 +1543,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       label: `Filter: ${name}`, detail: "Use saved AI assessments in the current view", key: "", icon: "Search",
       run: () => { setOverlay(null); setMailFilter(value => value === name ? null : name); setHighlight(0); },
     })) : []),
-    { label: "Get me to zero", detail: "Work through unhandled Important conversations", key: "", icon: "Check", run: startZero },
+    { label: "Get me to zero", detail: "Mark everything in Important as Done", key: "", icon: "Check", run: startZero },
     { label: "AI triage", detail: "Assessment settings, historical processing and costs", key: "", icon: "Gear", run: () => openSettings("AI triage") },
     {
       label: "Settings",
@@ -2718,6 +2720,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           </>
         </Modal>
       )}
+      {importantDoneAccount !== null && <ImportantDone store={store} account={importantDoneAccount} onClose={() => setImportantDoneAccount(null)} onDone={(count, changed, undo, unfinished) => {
+        setImportantDoneAccount(null);
+        setNotice({ text: `${count.toLocaleString()} Important conversations marked Done.${changed ? ` ${changed.toLocaleString()} changed conversations left untouched.` : ""}${unfinished ? " Stopped before completing all mail; an unconfirmed request may still settle." : ""}`, undo: undoAction(undo) });
+      }} />}
       {reloadDraftId && (
         <Modal label="Reload saved draft" onClose={() => setReloadDraftId(null)} className="app-modal">
           <div className="simple-modal-header"><h2>Reload saved draft?</h2></div>
