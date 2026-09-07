@@ -14073,7 +14073,12 @@ describe('AI triage service', () => {
     const before = (await service.lookup('alice', [{ sourceId: account.id, threadId: alert.threadId }])).decisions[0]!
     expect(before).toMatchObject({ state: 'ready', override: null })
     await expect(service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-1', note: '   ' })).rejects.toMatchObject({ code: 'AI_INVALID_FEEDBACK' })
+    const fenceBefore = database.query("SELECT revision FROM local_ai_settings_fence WHERE owner='alice'").get()
     const taught = await service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-1', note: 'Do not mark these as important anymore' })
+    // A rule never fences saved decisions: nothing turns stale, so no conversation falls back to normal inbox rules while the re-sort runs.
+    expect(database.query("SELECT revision FROM local_ai_settings_fence WHERE owner='alice'").get()).toEqual(fenceBefore)
+    expect(database.query<{ n: number }, []>("SELECT COUNT(*) n FROM local_ai_decisions WHERE json_extract(data,'$.state')='stale'").get()!.n).toBe(0)
+    expect((await service.results('alice')).decisions.every(item => item.state === 'ready')).toBe(true)
     // The rule request carries the note plus content-light context only: no message text, addresses, or names.
     const ruleRequest = requests.find(request => request.schema === 'triage_rule_v1')!
     expect(ruleRequest.content).toEqual({ note: 'Do not mark these as important anymore', conversation: expect.objectContaining({ subjects: [seeds[0]!.subject], type: 'other', currentCategory: expect.any(String) }) })
@@ -14098,6 +14103,13 @@ describe('AI triage service', () => {
     const ruleRequests = requests.filter(request => request.schema === 'triage_rule_v1').length
     expect((await service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-1', note: 'Do not mark these as important anymore' })).rule).toEqual(taught.rule)
     expect(requests.filter(request => request.schema === 'triage_rule_v1')).toHaveLength(ruleRequests)
+    // A correction supersedes the rule it contradicts instead of coexisting with it.
+    ruleResponse.output[0]!.content[0]!.text = JSON.stringify({ text: 'Fixture vendor account alerts are important after all.', category: 'Important', supersedes: ['ai-taught-rule-1'] })
+    const corrected = await service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-2', note: 'Actually these matter' })
+    expect(requests.filter(request => request.schema === 'triage_rule_v1').at(-1)!.content).toMatchObject({ existingRules: [{ id: 'ai-taught-rule-1', text: 'Fixture vendor account alerts are not important.' }] })
+    expect(corrected.superseded.map(rule => rule.id)).toEqual(['ai-taught-rule-1'])
+    expect(corrected.state.settings.rules!.map(rule => rule.id)).toEqual(['ai-taught-rule-2'])
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(job => job.id === 'ai-taught-rule-2:resort')?.status !== 'completed') await Bun.sleep(10) })(), 'corrected re-sort')
     // Removing the rule through settings drops it from the prompt again.
     const cleared = await service.configure('alice', { ...(await service.state('alice')).settings, rules: [] })
     expect(cleared.settings.rules).toEqual([])

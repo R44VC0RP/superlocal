@@ -1405,7 +1405,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     try {
       const result = await store.ai.teach({ sourceId: target.sourceId, threadId: target.sdkThreadId, id: `teach-${crypto.randomUUID()}`, note });
       setOverlay(null);
-      setNotice({ text: `Rule saved: ${result.rule.text}` });
+      setNotice({ text: `Rule saved: ${result.rule.text}${result.superseded.length ? ` (replaced ${result.superseded.length === 1 ? "an earlier rule" : `${result.superseded.length} earlier rules`})` : ""}` });
     } catch (error) {
       setTeachError(error instanceof Error && error.message ? error.message : "The rule could not be saved. Try rephrasing.");
     } finally { setTeachBusy(false); }

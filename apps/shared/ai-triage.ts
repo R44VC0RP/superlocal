@@ -101,7 +101,7 @@ export const aiAutoLabels: Partial<Record<AiAssessment["type"], string>> = {
 /** One durable rule generalized from the user's own feedback. Text is the user's data, never provider output executed as instructions. */
 export type AiRule = { id: string; text: string; category: AiCategory | null; createdAt: string };
 export type AiTeachInput = AiThreadKey & { id: string; note: string };
-export type AiTeachResult = { rule: AiRule; state: AiTriageState; decision: AiDecision | null };
+export type AiTeachResult = { rule: AiRule; state: AiTriageState; decision: AiDecision | null; /** Existing rules the new one replaced (contradicted or refined). */ superseded: AiRule[] };
 export type AiScoreSignals = {
   correspondenceDays: number;
   readingSeconds: number;
@@ -130,6 +130,8 @@ export type AiDecision = AiThreadKey & {
   schemaVersion: string;
   /** Policy used for the saved inference; absent on legacy or uninferred decisions. */
   inputPolicyVersion?: string;
+  /** Digest of the user rules in force when this assessment was inferred; a decision under older rules stays in effect but is re-inferred by the next inbox pass. */
+  rulesDigest?: string;
   updatedAt: string;
   /** Only new-arrival presentation may wait until this deadline, never startup. */
   holdUntil: string | null;

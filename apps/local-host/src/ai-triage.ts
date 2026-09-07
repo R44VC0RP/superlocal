@@ -159,6 +159,8 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
   const settings = (owner: string): AiSettings => { const row = settingsRow(owner); return row ? JSON.parse(row.data) : defaultSettings() }
   const ruleTexts = (value: AiSettings) => (value.rules ?? []).map(rule => rule.text)
   const rulesDigest = (value: AiSettings) => digest(ruleTexts(value))
+  /** Decisions inferred under different user rules stay in force but are not reused by an inbox pass. Legacy decisions without a digest count as no rules. */
+  const currentRules = (owner: string, decision: AiDecision) => (decision.rulesDigest ?? digest([])) === rulesDigest(settings(owner))
   const ruleOK = (value: unknown): value is AiRule => object(value) && commandOK(value.id) && typeof value.text === 'string' && !!value.text.trim() && value.text.length <= 240 && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value.text) &&
     [null, 'Important', 'Other'].includes(value.category as string | null) && typeof value.createdAt === 'string' && Number.isFinite(Date.parse(value.createdAt)) && Object.keys(value).every(key => ['id', 'text', 'category', 'createdAt'].includes(key))
   const decisionStatement = db.prepare<DecisionRow, [string, string, string]>('SELECT data,fingerprint,sender,seq FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?')
@@ -399,7 +401,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     }
     if (previous && unchanged && !existing) {
       const prior: AiDecision = JSON.parse(previous.data)
-      if (prior.settingsRevision >= fenceRevision(owner) && reusableDecision(prior, (JSON.parse(row.data) as AiSettings).model, lane === 'history' && !!job && jobRow(owner, job)?.input_policy === AI_INPUT_POLICY_VERSION)) { if (job) { db.query("UPDATE local_ai_job_items SET status='completed' WHERE owner=? AND job=? AND source=? AND thread=?").run(owner, job, source, thread); refreshJob(owner, job) }; return false }
+      if (prior.settingsRevision >= fenceRevision(owner) && currentRules(owner, prior) && reusableDecision(prior, (JSON.parse(row.data) as AiSettings).model, lane === 'history' && !!job && jobRow(owner, job)?.input_policy === AI_INPUT_POLICY_VERSION)) { if (job) { db.query("UPDATE local_ai_job_items SET status='completed' WHERE owner=? AND job=? AND source=? AND thread=?").run(owner, job, source, thread); refreshJob(owner, job) }; return false }
     }
     const count = db.query<{ queued: number }, [string]>('SELECT queued FROM local_ai_queue_counts WHERE owner=?').get(owner)?.queued ?? 0
     if (!existing && count >= (lane === 'history' ? HISTORY_LIMIT : QUEUE_LIMIT)) fail('AI_QUEUE_FULL', 429)
@@ -654,7 +656,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         row.examined++; row.bytes += size; saveJob(row, job)
         if (db.query('SELECT 1 FROM local_ai_job_items WHERE owner=? AND job=? AND source=? AND thread=?').get(owner, id, summary.sourceId, summary.threadId)) continue
         const previous = decisionRow(owner, summary.sourceId, summary.threadId)
-        if (previous && knownMessage(owner, summary)) { const decision: AiDecision = JSON.parse(previous.data); if (decision.settingsRevision >= fenceRevision(owner) && reusableDecision(decision, (JSON.parse(current.data) as AiSettings).model, row.input_policy === AI_INPUT_POLICY_VERSION)) continue }
+        if (previous && knownMessage(owner, summary)) { const decision: AiDecision = JSON.parse(previous.data); if (decision.settingsRevision >= fenceRevision(owner) && currentRules(owner, decision) && reusableDecision(decision, (JSON.parse(current.data) as AiSettings).model, row.input_policy === AI_INPUT_POLICY_VERSION)) continue }
         let selected = sourceScopes.get(summary.sourceId)
         if (!selected) { selected = await scope(owner, JSON.parse(current.data), summary.sourceId); sourceScopes.set(summary.sourceId, selected) }
         if (closed || settingsRow(owner)?.generation !== row.generation || JSON.parse(jobRow(owner, id)!.data).status !== 'running') return
@@ -740,6 +742,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     decision.updatedAt = stamp(now()); decision.holdUntil = null; decision.settingsRevision = value.revision
     decision.state = assessment ? 'ready' : 'failed'; decision.problemCode = problem
     decision.assessment = assessment
+    decision.rulesDigest = rulesDigest(value)
     if (inputPolicyVersion) {
       decision.inputPolicyVersion = inputPolicyVersion
       // Reuse must not relabel a retained pre-task assessment as the new schema.
@@ -1044,8 +1047,9 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       const boxes = await inbox.mailboxes(owner)
       if (input.mailboxIds?.some(id => !boxes.some(box => box.id === id && box.status === 'active'))) fail('AI_SCOPE_NOT_FOUND', 404)
       const value: AiSettings = { ...input, revision: previous.revision + 1, mailboxIds: input.mailboxIds === null ? null : [...new Set(input.mailboxIds)].sort(), interests: normalizeAiTopics(input.interests), rules: (input.rules ?? previous.rules ?? []).map(rule => ({ id: rule.id, text: rule.text.replace(/\s+/g, ' ').trim(), category: rule.category, createdAt: rule.createdAt })), autoLabels: input.autoLabels ?? previous.autoLabels ?? false }
-      // Rules change the model's instructions, so like a model change they invalidate every saved assessment.
-      const invalidated = previous.model !== value.model || JSON.stringify(previous.mailboxIds) !== JSON.stringify(value.mailboxIds) || rulesDigest(previous) !== rulesDigest(value)
+      // A rules change does not invalidate saved assessments: they stay in force and are re-inferred
+      // by the next inbox pass (their rulesDigest no longer matches), so nothing flashes back to Important.
+      const invalidated = previous.model !== value.model || JSON.stringify(previous.mailboxIds) !== JSON.stringify(value.mailboxIds)
       const fenced = previous.enabled !== value.enabled || invalidated
       const pauseOnly = previous.enabled !== value.enabled && !invalidated && previous.personalization === value.personalization && previous.readingSignals === value.readingSignals && JSON.stringify(previous.interests) === JSON.stringify(value.interests)
       const head = fenced || !priorRow ? (await inbox.changes(owner, { limit: 1 })).state : priorRow.cursor
@@ -1186,7 +1190,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       const existing = value.rules?.find(rule => rule.id === input.id)
       const priorRow = decisionRow(owner, input.sourceId, input.threadId)
       const prior: AiDecision | null = priorRow ? projected(owner, JSON.parse(priorRow.data)) : null
-      let rule = existing
+      let rule = existing, supersedes: string[] = []
       if (!rule) {
         // Content-light context: subjects and sender domains only, plus the saved assessment.
         const selected = await scope(owner, value, input.sourceId)
@@ -1197,9 +1201,11 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         const domains = [...new Set(items.filter(item => !selected.sent.has(item.from.email.trim().toLowerCase())).map(item => item.from.email.split('@')[1]?.trim().toLowerCase() ?? '').filter(Boolean))]
         const controller = new AbortController()
         const result = await inferAiRule({ note: input.note, conversation: { subjects: [...new Set(items.map(item => item.subject))], senderDomains: domains, type: prior?.assessment?.type ?? null,
-          reason: prior?.assessment?.reason ?? null, topics: prior?.assessment?.topics ?? [], currentCategory: prior?.override?.category ?? prior?.score?.category ?? null } }, configuration, { model: value.model, signal: controller.signal, fetcher })
+          reason: prior?.assessment?.reason ?? null, topics: prior?.assessment?.topics ?? [], currentCategory: prior?.override?.category ?? prior?.score?.category ?? null },
+          existingRules: (value.rules ?? []).map(item => ({ id: item.id, text: item.text })) }, configuration, { model: value.model, signal: controller.signal, fetcher })
         if (result.outcome !== 'completed' || !result.draft) fail(result.code ?? 'AI_RULE_FAILED', 502)
         rule = { id: input.id, text: result.draft.text, category: result.draft.category, createdAt: stamp(now()) }
+        supersedes = result.draft.supersedes
       }
       let decision: AiDecision | null = null
       if (rule.category && prior?.state === 'ready' && prior.assessment && prior.inputHash) {
@@ -1207,14 +1213,16 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         try { decision = await service.feedback(owner, { sourceId: input.sourceId, threadId: input.threadId, id: `${input.id}:feedback`, revision: prior.revision, category: rule.category, note: input.note.slice(0, 1000) }) }
         catch (error) { if (!(error instanceof InboxError) || !['AI_DECISION_CONFLICT', 'AI_FEEDBACK_CONFLICT', 'AI_NOT_FOUND'].includes(error.code)) throw error }
       }
-      let state = await service.state(owner)
+      let state = await service.state(owner), superseded: AiRule[] = []
       if (!existing) {
         const current = settings(owner)
-        state = await service.configure(owner, { ...current, rules: [...(current.rules ?? []), rule] })
-        // Bounded re-sort of the newest inbox conversations under the new rules; older history follows only on request.
-        if (state.settings.enabled) { try { await service.process(owner, { id: `${input.id}:resort`, scope: 'inbox', limit: 200 }); state = await service.state(owner) } catch (error) { if (!(error instanceof InboxError)) throw error } }
+        superseded = (current.rules ?? []).filter(item => supersedes.includes(item.id))
+        state = await service.configure(owner, { ...current, rules: [...(current.rules ?? []).filter(item => !supersedes.includes(item.id)), rule] })
+        // Existing decisions stay in force; the newest inbox conversations are re-inferred under the new rules in the
+        // background and each row changes only when its own new assessment lands. Older history follows on request.
+        if (state.settings.enabled) { try { await service.process(owner, { id: `${input.id}:resort`, scope: 'inbox', limit: 1000 }); state = await service.state(owner) } catch (error) { if (!(error instanceof InboxError)) throw error } }
       }
-      return { rule, state, decision }
+      return { rule, state, decision, superseded }
     },
     reading(owner: string, input: AiReadingInput): Promise<void> { return serial(owner, async () => {
       validateKey(input)
