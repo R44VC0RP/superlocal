@@ -196,6 +196,9 @@ protection; do not claim automatic remote enforcement or add CI without approval
 - Use the built-in Codex browser or Codex browser extension for browser QA,
   as requested by the user, rather than Browser Control. The user has signed
   into Superlocal in the Codex browser; verify session state before relying on it.
+  The user also explicitly confirmed use of the underlying Browser Use API
+  targeting that Codex in-app browser for production Compose and delivery QA.
+  Scope observations to test-message controls and metadata; avoid broad page dumps.
 - The user authorizes sending fictional test emails to `ryan@anoma.ly`,
   `me@ryan.ceo`, and `ryan@mandarin3d.com` to verify Superlocal sending and
   receiving. No further confirmation is needed for these test sends. Use clear
