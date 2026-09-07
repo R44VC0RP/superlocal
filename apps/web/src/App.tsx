@@ -140,6 +140,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const settingsFocus = useRef<HTMLElement | null>(null);
   const settingsScroll = useRef<Array<{ element: HTMLElement; top: number; left: number }>>([]);
   const historyPosition = useRef<number>(history.state?.superlocalIndex ?? 0);
+  // Automatic rollback must not take over a newer action, navigation or dialog.
+  const actionNavigationVersion = useRef(0);
   const restoringHistory = useRef(false);
   useLayoutEffect(() => {
     history.replaceState({ ...history.state, superlocalIndex: historyPosition.current }, "");
@@ -209,6 +211,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const [notice, setNotice] = useState<{
     text: string;
     undo?: () => void;
+    action?: { label: string; run: () => void };
     operationId?: string;
     scheduled?: boolean;
   } | null>(null);
@@ -320,7 +323,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     search: search && searchSubmitted, query: search && searchSubmitted ? resultQuery : "", filter: mailFilter as InboxViewQuery["filter"] }),
     [route.account, route.folder, route.split, search, searchSubmitted, resultQuery, mailFilter]);
   const matchingWindow = inbox.host?.inboxWindow && inbox.window && JSON.stringify(inbox.window.query) === JSON.stringify(windowQuery) ? inbox.window : null;
-  const activeWindow = inbox.host?.inboxWindow ? matchingWindow ?? { keys: [], totals: unknownTotals } : undefined;
+  const activeWindow = useMemo(() => inbox.host?.inboxWindow
+    ? matchingWindow ? store.presentWindow(matchingWindow) : { keys: [], totals: unknownTotals }
+    : undefined, [store, inbox.host?.inboxWindow, matchingWindow, inbox.mail, inbox.pendingDone]);
   useEffect(() => { void store.setWindowQuery(windowQuery).catch(actionError); }, [store, windowQuery]);
   // Static folders follow the receiving sources' capabilities; a unified view offers what any selected source supports.
   const hiddenFolders = useMemo(() => folders.filter(([, , , capability]) => capability && !store.sourceCapability(capability, route.account)).map(([name]) => name),
@@ -482,6 +487,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   });
   function startZero() {
     if (!leaveSettings()) return;
+    actionNavigationVersion.current++;
     setOverlay(null); setOverlayIds(null); setCommandDraftId(null);
     setImportantDoneAccount(current => current ?? route.account);
   }
@@ -489,6 +495,23 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const virtualized =
     !isDrafts && (!search || searchSubmitted) && entries.length > 100;
   const displayedRows = isDrafts ? accountDrafts : visibleMail;
+  const optimisticHighlight = useRef({ view: listViewKey, index: highlight, id: visibleMail[highlight]?.id,
+    reading: !!currentMail, pending: inbox.pendingDone.length > 0 });
+  useLayoutEffect(() => {
+    const previous = optimisticHighlight.current;
+    let index = highlight;
+    // A failed operation revealing an older row must not redirect the next E
+    // from the conversation the user has since highlighted.
+    if (!isDrafts && !currentMail && !previous.reading && previous.view === listViewKey && previous.index === highlight
+      && (previous.pending || inbox.pendingDone.length > 0) && previous.id) {
+      const restored = visibleMail.findIndex(mail => mail.id === previous.id);
+      if (restored >= 0 && restored !== highlight) {
+        index = restored; pointerHighlight.current = restored; setHighlight(restored);
+      }
+    }
+    optimisticHighlight.current = { view: listViewKey, index, id: visibleMail[index]?.id,
+      reading: !!currentMail, pending: inbox.pendingDone.length > 0 };
+  }, [visibleMail, highlight, listViewKey, currentMail?.id, isDrafts, inbox.pendingDone]);
   const rowsKey = useMemo(
     () =>
       `${preferences.density}:${displayedRows.map((item) => item.id).join("|")}`,
@@ -582,6 +605,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (!inbox.accounts.length || route.account === UNIFIED_ACCOUNT || inbox.accounts.some(account => account.id === route.account)) return;
     const account = inbox.accounts.find(account => account.email === route.account);
     const next: Route = { account: account?.id ?? UNIFIED_ACCOUNT, folder: "Inbox", split: preferences.splits[0] || "Important" };
+    actionNavigationVersion.current++;
     history.replaceState(history.state, "", routeUrl(next, settingsOpen.current ? settingsPage || "" : null));
     setRoute(next);
   }, [inbox.accounts, route.account, preferences.splits]);
@@ -606,6 +630,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   ]);
   const onHistoryChange = useEffectEvent(() => {
     if (restoringHistory.current) { restoringHistory.current = false; return; }
+    actionNavigationVersion.current++;
     const nextPage = readSettingsPage();
     const next = readRoute();
     const nextIndex = typeof history.state?.superlocalIndex === "number" ? history.state.superlocalIndex as number : null;
@@ -682,7 +707,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (!notice || noticeHovered) return;
     const operation = notice.operationId ? inbox.operations[notice.operationId] : undefined;
     if (!notice.scheduled && operation && ["pending", "processing"].includes(operation.status)) return;
-    const lifetime = notice.undo ? 10000 : 4000;
+    const lifetime = notice.undo || notice.action ? 10000 : 4000;
     const fade = setTimeout(() => setNoticeFading(true), lifetime);
     const remove = setTimeout(() => setNotice(null), lifetime + 2000);
     return () => {
@@ -722,6 +747,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
 
   function navigate(patch: Partial<Route>, preserveSettings = false) {
     if (!preserveSettings && !leaveSettings()) return false;
+    actionNavigationVersion.current++;
     const next = { ...route, ...patch };
     const replaceSettings = readSettingsPage() !== null;
     if (!replaceSettings) historyPosition.current += 1;
@@ -762,6 +788,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setHighlight(0);
   }
   function openOverlay(value: Overlay, ids = targetIds) {
+    actionNavigationVersion.current++;
     if (value === "shortcuts") { openSettings("Shortcuts"); return; }
     if (value === "label") setLabelMode("toggle");
     if (value === "command") {
@@ -826,8 +853,28 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setReadOnlyDismissed(true);
     writeSessionText("read-only-notice", "dismissed");
   }
+  function retryDone(id: string) {
+    if (!store.getSnapshot().pendingDone.some(command => command.id === id)) return;
+    void store.retryPendingDone(id).then(reverse => {
+      setNotice({ text: "Marked as Done.", undo: undoAction(reverse) });
+    }).catch(() => { /* The store retains unconfirmed recovery or raises a rejection issue. */ });
+  }
+  const pendingDoneCount = inbox.pendingDone.filter(command => command.status === "pending").reduce((sum, command) => sum + command.count, 0);
+  const unconfirmedDone = inbox.pendingDone.filter(command => command.status === "unconfirmed");
   const notices = (
     <Notices issues={inbox.issues} onRetry={retryIssue} onDismiss={store.dismissIssue}>
+      {pendingDoneCount > 0 && <div className="notice notice-quiet" role="status">
+        <p className="notice-text">{pendingDoneCount === 1 ? "Marking Done…" : `Marking ${pendingDoneCount} conversations Done…`}</p>
+      </div>}
+      {unconfirmedDone.slice(0, 3).map(command => {
+        return <div key={command.id} className="notice" role="status">
+          <p className="notice-text">Done not confirmed.{command.count > 1 && <span className="notice-detail"> · {command.count} conversations</span>}</p>
+          <button type="button" className="notice-action" onClick={() => retryDone(command.id)}>Retry</button>
+        </div>;
+      })}
+      {unconfirmedDone.length > 3 && <div className="notice notice-quiet" role="status">
+        <p className="notice-text">{unconfirmedDone.length - 3} more Done actions need confirmation.</p>
+      </div>}
       {inbox.host && !inbox.host.allowProviderWrites && !readOnlyDismissed && (
         <div role="status">
           <Notice quiet title="Read-only host" detail="Sending and provider changes are disabled." action={{ label: "Accounts", onClick: () => openSettings("Add Accounts") }} onDismiss={dismissReadOnly} data={{ scope: "read-only" }} />
@@ -850,15 +897,16 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           onMouseLeave={() => setNoticeHovered(false)}
         >
           <span className="toast-status">{notice.text}</span>
-          {notice.undo && (
+          {(notice.undo || notice.action) && (
             <button
               className="toast-undo"
               onClick={() => {
-                notice.undo?.();
+                const run = notice.undo ?? notice.action?.run;
                 setNotice(null);
+                run?.();
               }}
             >
-              Undo
+              {notice.undo ? "Undo" : notice.action?.label}
             </button>
           )}
           <IconButton
@@ -920,6 +968,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     else history.replaceState({ superlocalIndex: historyPosition.current }, "", routeUrl(route));
   }
   function openSettings(page?: string) {
+    actionNavigationVersion.current++;
     const alreadyOpen = settingsOpen.current;
     if (!alreadyOpen) {
       rememberSettingsFocus();
@@ -1190,6 +1239,84 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (found.some(mail => !mail)) throw new Error("Some selected conversations are not available. Reselect them before making changes.");
     return (found as Mail[]).map(captureActionMail);
   }
+  async function applyOptimisticDone(before: Mail[], timing: ReturnType<typeof measureAction>) {
+    const owner = getApplicationScope(), previousRoute = route, previousReader = currentMail;
+    const queryId = matchingWindow!.state.queryId, selectedIds = new Set(before.map(mail => mail.id));
+    const direction = preferences.advanceDirection === "Previous conversation" ? -1 : 1;
+    const index = previousReader ? visibleMail.findIndex(mail => mail.id === previousReader.id) : -1;
+    let nextIndex = index + direction;
+    while (index >= 0 && nextIndex >= 0 && nextIndex < visibleMail.length && selectedIds.has(visibleMail[nextIndex].id)) nextIndex += direction;
+    const neighbor = index >= 0 ? visibleMail[nextIndex] : undefined;
+    const command = { id: "" };
+    let admitted = false, failed = false, visualFinished = false;
+    const feedback = measureAction("done-feedback", before.length);
+    let expectedVersion = actionNavigationVersion.current, expectedRoute = routeUrl(readRoute());
+    const stillHere = () => !owner.signal.aborted && actionNavigationVersion.current === expectedVersion
+      && selectionViewKey.current === listViewKey && readSettingsPage() === null && routeUrl(readRoute()) === expectedRoute
+      && store.getSnapshot().window?.state.queryId === queryId;
+    const rememberNavigation = () => { expectedVersion = actionNavigationVersion.current; expectedRoute = routeUrl(readRoute()); };
+    const finishMotion = motion.prepare("remove", [...selectedIds]);
+    let operation: ReturnType<typeof store.doneOptimistically>;
+    try {
+      flushSync(() => {
+        operation = store.doneOptimistically(before, plan => { if (plan.kind === "mailbox-state") command.id = plan.input.id; });
+        void operation.catch(() => {});
+        admitted = store.getSnapshot().pendingDone.some(pending => pending.id === command.id);
+        if (!admitted) return;
+        setSelected([]); setOverlay(null);
+        if (previousReader) {
+          if (preferences.autoAdvance && neighbor) openMail(neighbor);
+          else goBack();
+        }
+        setHighlight(value => Math.max(0, Math.min(value, rowCount - before.length - 1)));
+        rememberNavigation();
+      });
+      finishMotion();
+      if (admitted) {
+        // Visual acknowledgement is deliberately distinct from durable completion.
+        feedback.accepted(); feedback.finish(); visualFinished = true;
+        if (previousReader && preferences.autoAdvance && !neighbor && index >= 0) {
+          const window = store.getSnapshot().window;
+          if (direction > 0 ? window?.nextCursor : window?.hasNewer) {
+            void (direction > 0 ? store.loadMoreWindow() : store.loadNewerWindow()).then(() => {
+              if (failed || !stillHere()) return;
+              const snapshot = store.getSnapshot(), window = snapshot.window;
+              if (!window) return;
+              const rows = new Map(snapshot.mail.map(mail => [mail.id, mail]));
+              const ordered = store.presentWindow(window).keys.flatMap(id => !selectedIds.has(id) && rows.has(id) ? [rows.get(id)!] : []);
+              const compare = (mail: Mail) => (previousReader.receivedAt ?? 0) - (mail.receivedAt ?? 0) || mail.id.localeCompare(previousReader.id);
+              const next = direction > 0 ? ordered.find(mail => compare(mail) > 0) : [...ordered].reverse().find(mail => compare(mail) < 0);
+              if (next) { openMail(next); rememberNavigation(); }
+            }).catch(error => { if (!failed && stillHere()) actionError(error); });
+          }
+        }
+      }
+      const reverse = await operation!;
+      timing.accepted();
+      setNotice({ text: before.length > 1 ? `${before.length} conversations: Marked as Done.` : "Marked as Done.", undo: undoAction(async () => {
+        await reverse(); navigate(previousRoute);
+        const window = store.getSnapshot().window;
+        const restored = window ? store.presentWindow(window).keys.indexOf(previousReader?.id ?? before[0].id) : -1;
+        if (restored >= 0) setHighlight(restored);
+      }) });
+      timing.finish();
+    } catch (error) {
+      failed = true;
+      // Retiring the command reveals current canonical rows; never write an old
+      // Mail snapshot back. Return the reader only if the user has not moved on.
+      if (admitted && previousReader && stillHere()) {
+        const snapshot = store.getSnapshot(), window = snapshot.window;
+        const current = snapshot.mail.find(mail => mail.id === previousReader.id);
+        const restored = window && current?.sourceId === previousReader.sourceId && current?.sourceGeneration === previousReader.sourceGeneration
+          ? store.presentWindow(window).keys.indexOf(previousReader.id) : -1;
+        if (restored >= 0) { motion.prepare("return"); navigate(previousRoute); setHighlight(restored); }
+      }
+      if (!visualFinished) feedback.finish("error");
+      if (!admitted) actionError(error);
+      // Admitted failures have a store-owned issue or an explicit same-ID Retry.
+      timing.finish("error");
+    } finally { finishMotion(); }
+  }
   async function applyAction(action: string, ids = targetIds) {
     if (zero.active && (zero.busy || zero.retry)) return;
     if (action === "more") {
@@ -1205,6 +1332,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       zero.decide(action); setOverlay(null); return;
     }
     if (!ids.length) return;
+    actionNavigationVersion.current++;
     const timing = measureAction(action, ids.length);
     if (action === "not-important" && inbox.pending) { timing.finish("ignored"); return; }
     const previousRoute = route;
@@ -1221,6 +1349,16 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       setNotice({ text: "Provider changes are disabled by this read-only host." });
       timing.finish("ignored");
       return;
+    }
+    if (action === "done" && matchingWindow && route.folder === "Inbox" && !search && !zero.active && before.every(mail => !mail.operationId && mail.window?.targetsComplete)) {
+      const existing = before.length === 1 ? store.pendingDoneFor(before[0]) : undefined;
+      if (existing) {
+        if (store.getSnapshot().pendingDone.find(command => command.id === existing)?.status === "unconfirmed") {
+          setNotice({ text: "Done is not confirmed yet.", action: { label: "Retry", run: () => retryDone(existing) } });
+        }
+        timing.finish("ignored"); return;
+      }
+      await applyOptimisticDone(before, timing); return;
     }
     const finishMotion = motion.prepare("remove", ids);
     const starred = before.some((m) => !m.starred);
@@ -1401,7 +1539,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (neighbor || !inbox.host?.inboxWindow) return neighbor;
     if (delta > 0) await store.loadMoreWindow(); else await store.loadNewerWindow();
     const snapshot = store.getSnapshot(), rows = new Map(snapshot.mail.map(mail => [mail.id, mail]));
-    const ordered = (snapshot.window?.keys ?? []).flatMap(id => rows.has(id) ? [rows.get(id)!] : []);
+    const ordered = (snapshot.window ? store.presentWindow(snapshot.window).keys : []).flatMap(id => rows.has(id) ? [rows.get(id)!] : []);
     const compare = (mail: Mail) => (current.receivedAt ?? 0) - (mail.receivedAt ?? 0) || mail.id.localeCompare(current.id);
     return delta > 0 ? ordered.find(mail => compare(mail) > 0) : [...ordered].reverse().find(mail => compare(mail) < 0);
   }
@@ -1414,7 +1552,10 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (!inbox.host?.inboxWindow || !currentMail) return;
     try {
       const next = await adjacentMail(currentMail, delta);
-      if (next) { setHighlight(store.getSnapshot().window?.keys.indexOf(next.id) ?? 0); openMail(next); }
+      if (next) {
+        const window = store.getSnapshot().window;
+        setHighlight(Math.max(0, window ? store.presentWindow(window).keys.indexOf(next.id) : 0)); openMail(next);
+      }
     } catch (error) { actionError(error); }
   }
   const commandDraft = drafts.find((draft) => draft.id === commandDraftId);
@@ -1668,6 +1809,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   }
 
   const onKey = useEffectEvent((e: KeyboardEvent) => {
+    actionNavigationVersion.current++;
     const target = e.target instanceof HTMLElement ? e.target : null;
     const editing = target?.closest(
       "input,textarea,[contenteditable=true],select",
@@ -1930,6 +2072,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     <div
       className={`app ${navigation ? "navigation-open" : ""} ${settings ? "settings-open" : ""} ${mobileSidebar ? "mobile-sidebar-open" : ""} ${route.view === "calendar" || route.view === "snippets" ? "auxiliary-view" : ""}`}
       data-inbox-state={inbox.loading ? "loading" : inbox.error ? "error" : "ready"}
+      onPointerDownCapture={() => { actionNavigationVersion.current++; }}
     >
       <nav className="app-rail" aria-label="Apps">
         <IconButton
@@ -2364,6 +2507,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                 {matchingWindow?.nextCursor && <button type="button" className="text-button" disabled={matchingWindow.paging} onClick={loadOlder}>{matchingWindow.paging ? "Loading older conversations…" : "Load older conversations"}</button>}
               </div>}
               {rowCount === 0 &&
+                !(route.folder === "Inbox" && pendingDoneCount > 0) &&
                 (!inbox.host?.inboxWindow || matchingWindow?.exhausted && !matchingWindow.nextCursor && !matchingWindow.hasNewer) &&
                 !holdingMail &&
                 !(search && searchResult?.key === searchKey && (searchResult.loading || searchResult.error)) &&

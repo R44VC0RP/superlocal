@@ -1,5 +1,5 @@
 /** Content-free, local-only timing samples. Never add message or account identifiers. */
-export const performanceActions = ["done", "not-important", "undo", "undo-done", "undo-feedback", "open", "read", "unread", "star", "trash", "spam", "inbox", "remind", "label", "undo-label", "save-draft", "send", "search", "other"] as const;
+export const performanceActions = ["done", "done-feedback", "not-important", "undo", "undo-done", "undo-feedback", "open", "read", "unread", "star", "trash", "spam", "inbox", "remind", "label", "undo-label", "save-draft", "send", "search", "other"] as const;
 export type PerformanceAction = typeof performanceActions[number];
 export type PerformanceSample = {
   kind: "action" | "input" | "work" | "refresh" | "rebuild" | "thread" | "request";

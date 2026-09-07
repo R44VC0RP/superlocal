@@ -261,3 +261,45 @@ A separate newest-timestamp fictional arrival appeared as the first Important ro
 Final verification on frozen source: **94 web tests and 358 API tests passed** (111,152 API assertions), with SDK/host/mock typechecks and optimized web build passing. New coverage stays in the existing API/web test files; existing byte-budget, paging, ownership and receipt regressions were retained. The existing bundle-size warning remains. Owned QA services/session were stopped, and the user's normal app was not stopped.
 
 **Optimizations are verified and committed; PR #25 remains draft and unmerged because release latency tails still miss the target.**
+
+## Optimistic Inbox Done feedback
+
+The user requested immediate UI feedback rather than waiting for durable Done acknowledgement. Ordinary Inbox Done/E now removes the displayed row or advances immediately, with a quiet “Marking Done…” status. It does not change canonical memberships, counts, receipt ownership, or guided-zero progress. Confirmation and conditional Undo still require the durable receipt. Search, other folders, W, bulk captured selections, guided-zero, and contexts without complete window targets retain their existing action path.
+
+A bounded, command-owned presentation overlay covers only exact captured membership revisions and source generations (32 commands / 4,096 targets total). Later replies and newer memberships remain visible. A definite rejection reveals current canonical mail rather than writing an old snapshot back; automatic reader restoration is cancelled by newer navigation or input. Unknown acknowledgement reveals current data with “Done not confirmed” and explicit same-ID Retry. It does not submit a new command or guess an inverse. The existing one same-ID transport retry remains unchanged.
+
+### Matched delayed-response evidence
+
+Before: `c72cb22`, served `index-T48BoRxP.js`. After: optimistic-Done implementation, measured and recorded with `index-BoVtvDuU.js`; final `index-BO-LrtnR.js` adds only the complete-window-target admission guard, preserving the old action path for unsupported contexts. A final real held-request/Undo smoke check verified that final asset, immediate advance, no premature Undo, and restoration. CSS remains `index--Kkdv2hC.css`.
+
+[Before: reader waits for receipt](optimistic-before.mp4) · [After: immediate advance, then confirmed Undo](optimistic-after.mp4) · [Genuine conflict: automatic rollback](optimistic-failure.mp4)
+
+All three fictional-mail recordings were inspected as contact sheets. Same optimized build mode, Agent Browser/Chrome 152, Apple M5 Max/macOS 27.0/Bun 1.4.0, 1440×960/DPR 1, dark/Comfortable, logging enabled. Fresh initial-digest-matched fictional clones contained 6,500 canonical messages / 3,331 native conversations and 50,003 / 25,083. Bodies were cached. No profiling, builds or suites ran during timing. Before's corrected control held one original-target Done request for 1,501ms; the original reader was still visible 166.5ms after input. An earlier incorrectly matched route delayed nothing and is retained privately as a failed setup, not baseline evidence.
+
+After held each original-target request for 1,500ms before forwarding it to the real SDK. Each size used four reader E samples and one list-button sample; the fourth 6.5k reader sample used reduced motion. All ten cycles showed pending feedback before receipt, withheld success/Undo until confirmation, and restored through real Undo, including after reload. The final-asset smoke cycle also restored.
+
+Values are milliseconds, median / p95 / max, n=5:
+
+| Measurement | 6,500 | 50,003 |
+| --- | ---: | ---: |
+| Trusted input → observed DOM feedback | 25.6 / 55.1 / 55.1 | 14.2 / 16.0 / 16.0 |
+| `done-feedback` telemetry | 19.6 / 43.1 / 43.1 | 25.5 / 33.0 / 33.0 |
+| `done` durable telemetry, including imposed delay | 1539.9 / 1591.1 / 1591.1 | 1543.4 / 1554.9 / 1554.9 |
+| Confirmed Undo | 61.2 / 83.6 / 83.6 | 61.3 / 83.9 / 83.9 |
+
+Complete sample arrays, in execution order:
+
+- 6.5k trusted input → DOM: `[11.4,25.6,6.8,55.1,28.2]`; visual telemetry: `[19.6,8,19.2,42.8,43.1]`; durable: `[1539.9,1538.1,1535.8,1591.1,1543.4]`; Undo: `[60.6,83.6,81.3,61.2,45.1]`.
+- 50k trusted input → DOM: `[14.2,8,16,14.8,12.4]`; visual telemetry: `[20.7,18.3,33,32.4,25.5]`; durable: `[1554.9,1553.8,1538.9,1533.8,1543.4]`; Undo: `[44.8,83.9,61.3,62,40.8]`.
+
+These are DOM/handler measurements, not paint/INP or animation-completion measurements. They prove visual acknowledgement is independent of durable latency; they do **not** replace the earlier ordinary-operation performance series, remeasure startup/first-body/cached-open, or waive any prior tail failure. Optional loaded-page-boundary and navigation-away-during-pagination browser checks were not performed.
+
+### Real failures and recovery
+
+1. A second authorized client reaffirmed the original's existing `done:false` state while the UI request was held, advancing only its revision. The real SDK rejected the stale UI request with HTTP 412. The UI had advanced in 43.6ms, then automatically restored the original and showed the rejection; no Undo request was sent. A response-waiter setup error was retained; the actual 412 and restoration were separately observed without repeating the action.
+2. With the same real conflict on A, the user marked the next conversation B Done before A settled. A→B took 42.5ms and B→C 65.3ms. A's 412 did not pull the reader back from C; B subsequently succeeded and real Undo restored B. Both A and B remained in Inbox. The earlier rejection notice was still visible, so this did not establish a distinct second error-notice instance.
+3. A sidecar delivered the exact captured UI command ID/payload to the real SDK, obtained its committed receipt, then stopped only the owned QA server before the browser received acknowledgement. Both browser attempts failed with connection refused, retaining the same ID/payload; the UI showed “Done not confirmed”, no Undo and no automatic inverse. After restart, the first Retry correctly remained unconfirmed on HTTP 401. The existing background Retry re-established the local session; explicit command Retry then fetched the already-committed receipt with **zero new Done POSTs**. One real Undo restored the original. The 401-blocked attempt remains retained, not relabelled as successful recovery.
+
+Existing test-file coverage includes held acknowledgements, canonical object preservation, revision/scope/concurrent-arrival safety, admission limits, rejected commands, ambiguous acknowledgements and same-ID recovery. Final store regressions: **94 web tests and 358 API tests passed**, with 111,152 API assertions; SDK/host/mock typechecks and build passed. The final App-only admission guard was typechecked/built and browser-smoked afterward; unchanged full suites were not repeated. The existing bundle warning remains. No new test files, dependencies, retries, provider writes, or database migrations were introduced.
+
+PR #25 remains draft and unmerged. Immediate feedback is verified; earlier durable-latency misses remain documented and are not silently converted into passing release gates.

@@ -92,6 +92,13 @@ export type InboxCommandRecovery = RecoveryScope & (
       before: MailboxMembership[]; accepted: MailboxMembership[]; undoStatus?: RecoveryStatus }
 );
 export type InboxRecoverySink = (plan: InboxCommandRecovery) => void;
+type PendingDone = {
+  plan: Extract<InboxCommandRecovery, { kind: "mailbox-state" }>;
+  generation: number; status: "pending" | "unconfirmed"; count: number;
+  targets: Map<string, number>; sink?: InboxRecoverySink; promise?: Promise<InboxUndo>;
+};
+const PENDING_DONE_LIMIT = 32;
+const PENDING_DONE_TARGET_LIMIT = 4096;
 export type InboxUndo = (() => Promise<void>) & { receipts?: InboxActionReceiptReference[]; inverseReceipts?: InboxActionReceiptReference[]; recovery?: InboxCommandRecovery };
 class InboxRecoveryStorageError extends InboxActionError {}
 export class InboxRecoveryRejected extends InboxActionError {}
@@ -132,6 +139,8 @@ export type InboxSnapshot = {
   loaded: boolean;
   refreshing: boolean;
   pending: number;
+  /** Presentation-only commands. Canonical mail and window counts remain receipt-owned. */
+  pendingDone: readonly { id: string; status: "pending" | "unconfirmed"; count: number }[];
   unsaved: boolean;
   /** The latest snapshot (connect/refresh) failure, or null once a refresh succeeds. */
   error: string | null;
@@ -144,7 +153,7 @@ export type InboxSnapshot = {
   operations: Readonly<Record<string, Operation>>;
 };
 
-const initial: InboxSnapshot = { window: null, accounts: [], mailboxes: [], sources: [], viewPreferences: null, splitPreferences: null, attentionFeedback: [], mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, loaded: false, refreshing: false, pending: 0, unsaved: false, error: null, issues: [], live: "connecting", policy: null, host: null, ai: null, aiError: null, operations: {} };
+const initial: InboxSnapshot = { window: null, accounts: [], mailboxes: [], sources: [], viewPreferences: null, splitPreferences: null, attentionFeedback: [], mail: [], senderHistory: [], drafts: [], labels: {}, loading: true, loaded: false, refreshing: false, pending: 0, pendingDone: [], unsaved: false, error: null, issues: [], live: "connecting", policy: null, host: null, ai: null, aiError: null, operations: {} };
 const MAX_ISSUES = 4;
 /** A problem stays visible until its recovery has held this long, so ready/error flapping never re-announces. */
 const RESOLVE_HOLD_MS = 10_000;
@@ -268,6 +277,9 @@ export class InboxStore {
   private flagWrites = new Set<FlagWrite>();
   private flagReconciler?: Promise<void>;
   private membershipReceipts = new Map<string, { sourceId: string; state: MailboxMembership }>();
+  private pendingDoneCommands = new Map<string, PendingDone>();
+  private pendingDoneTargets = new Map<string, Map<string, number>>();
+  private pendingDoneTargetCount = 0;
   private feedbackEpoch = 0;
   private calendarKey?: string;
   private draftEpoch = 0;
@@ -1142,6 +1154,7 @@ export class InboxStore {
   }
 
   constructor() {
+    this.applicationScope.signal.addEventListener("abort", () => this.clearPendingDone(), { once: true });
     this.client = createInboxClient({ baseUrl: location.origin, fetch: (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const start = performance.now();
       const path = new URL(input instanceof Request ? input.url : String(input), location.origin).pathname;
@@ -1167,7 +1180,10 @@ export class InboxStore {
   }
   private publish(patch: Partial<InboxSnapshot> = {}) {
     if (this.controller.signal.aborted || this.applicationScope.signal.aborted) return;
-    this.state = { ...this.state, ...patch };
+    let retired = false;
+    const validDone = this.currentPendingDoneScopes();
+    for (const id of this.pendingDoneCommands.keys()) if (!validDone.has(id)) { this.retirePendingDone(id); retired = true; }
+    this.state = { ...this.state, ...patch, ...(retired ? { pendingDone: this.pendingDoneDescriptors() } : {}) };
     if (patch.window !== undefined) this.scheduleImportantExpiry();
     this.listeners.forEach(listener => listener());
   }
@@ -1415,6 +1431,7 @@ export class InboxStore {
     return () => {
       window.removeEventListener("focus", onFocus);
       this.started = false; this.generation++; this.controller.abort(); this.clearThreadMessagePins();
+      this.clearPendingDone();
       this.retainedViews.clear(); this.windowCounts = undefined;
       this.client.clearCache();
       clearTimeout(this.refreshTimer); clearTimeout(this.importantTimer); this.importantDeadline = Infinity;
@@ -2849,6 +2866,8 @@ export class InboxStore {
   }
   private publishRecovery(plan: InboxCommandRecovery, sink?: InboxRecoverySink) {
     if (!validInboxCommandRecovery(plan)) throw new InboxRecoveryStorageError("The captured recovery plan is invalid or exceeds its bounded budget. No further command was sent.");
+    const pending = plan.kind === "mailbox-state" ? this.pendingDoneCommands.get(plan.input.id) : undefined;
+    if (pending && plan.kind === "mailbox-state") pending.plan = structuredClone(plan);
     try { sink?.(structuredClone(plan)); } catch { throw new InboxRecoveryStorageError("The frozen mail command could not be saved. No further command was sent."); }
   }
   private async checkRecovery(plan: InboxCommandRecovery, signal: AbortSignal, generation: number, local = false) {
@@ -2891,7 +2910,9 @@ export class InboxStore {
   private runRecoveredCommand = (saved: InboxCommandRecovery, sink: InboxRecoverySink | undefined, fresh: boolean): Promise<InboxUndo> => {
     if (!validInboxCommandRecovery(saved)) return Promise.reject(new InboxRecoveryRejected("Invalid captured command."));
     const plan = structuredClone(saved), signal = this.controller.signal, generation = this.generation;
-    return this.act("recover-mail-command", async () => {
+    const pending = plan.kind === "mailbox-state" ? this.pendingDoneCommands.get(plan.input.id) : undefined;
+    if (pending?.promise) return pending.promise;
+    const task = this.act("recover-mail-command", async () => {
       const check = await this.checkRecovery(plan, signal, generation, fresh);
       if (plan.kind === "attention-feedback") return this.applyFeedbackRecovery(plan, sink, signal, check);
       const reverse: InboxUndo = async () => { reverse.inverseReceipts = await this.undoCommand(plan, sink); };
@@ -2900,6 +2921,9 @@ export class InboxStore {
         if (plan.status === "rejected") throw new InboxRecoveryRejected("The original command was rejected. Review the captured conversation before choosing another action.");
         this.publishRecovery(plan, sink);
         let receipt;
+        // Once any attempt may have committed, a later auth/conflict response is
+        // not proof that the original command failed. Only its receipt can settle it.
+        let ambiguous = !!pending && plan.status !== "prepared";
         try {
           // An acknowledged/retracted result is read first, including after a
           // lost inverse acknowledgement. Never infer ownership from equal state.
@@ -2912,17 +2936,26 @@ export class InboxStore {
             try { receipt = await this.client.setMailboxStates(plan.input, { signal }); }
             catch (error) {
               if (signal.aborted || definitive(error)) throw error;
+              ambiguous = true;
               receipt = await this.client.setMailboxStates(plan.input, { signal });
             }
           }
         } catch (error) {
-          if (!(error instanceof InboxRecoveryStorageError) && definitive(error)) plan.status = "rejected";
+          if (!(error instanceof InboxRecoveryStorageError) && definitive(error) && !(pending && ambiguous)) plan.status = "rejected";
           this.publishRecovery(plan, sink); throw error;
         }
         check();
+        if (pending && !this.pendingDoneScopeCurrent(pending)) throw new DOMException("The captured Done scope changed", "AbortError");
+        if (pending && (receipt.id !== plan.input.id || receipt.states.length !== plan.input.targets.length
+          || new Set(receipt.states.map(state => `${state.mailboxId}\0${state.messageId}`)).size !== plan.input.targets.length
+          || receipt.states.some(state => !plan.input.targets.some(target => target.mailboxId === state.mailboxId && target.messageId === state.messageId && state.revision > target.revision)
+            || !receipt.retracted && !state.done))) throw new Error("The Done receipt is not yet confirmed. Retry the original command.");
         plan.status = receipt.retracted ? "retracted" : "accepted"; plan.accepted = receipt.states;
         if (receipt.retracted) plan.undoStatus = "accepted";
         this.publishRecovery(plan, sink); this.receiveMemberships(receipt.states);
+        if (pending && this.pendingDoneCommands.get(plan.input.id) === pending) {
+          this.retirePendingDone(plan.input.id); this.publish({ pendingDone: this.pendingDoneDescriptors() });
+        }
         if (receipt.retracted) throw new InboxRecoveryRejected("The original mail command was already undone. No new decision was sent.");
         reverse.receipts = [{ kind: "mailbox-state", id: receipt.id }];
       } else {
@@ -2953,6 +2986,21 @@ export class InboxStore {
       }
       this.scheduleRefresh(); return reverse;
     }, false);
+    if (!pending || plan.kind !== "mailbox-state") return task;
+    const id = plan.input.id;
+    pending.promise = task.then(result => { pending.promise = undefined; return result; }, error => {
+      pending.promise = undefined;
+      if (this.pendingDoneCommands.get(id) === pending) {
+        if (!this.pendingDoneScopeCurrent(pending)) this.retirePendingDone(id);
+        else if (pending.plan.status === "rejected") {
+          this.retirePendingDone(id);
+          this.raise({ key: `done:${id}`, scope: "action", code: failureCode(error), title: "Couldn't mark Done", detail: failureMessage(error), retry: false });
+        } else pending.status = "unconfirmed";
+        this.publish({ pendingDone: this.pendingDoneDescriptors() });
+      }
+      throw error;
+    });
+    return pending.promise;
   };
   /** The durable server receipt owns the conditional inverse, including reminders. */
   undoCommand = (saved: InboxCommandRecovery, sink?: InboxRecoverySink): Promise<InboxActionReceiptReference[]> => {
@@ -3187,9 +3235,90 @@ export class InboxStore {
     return resume();
   };
 
-  private done(selected: Mail[], done: boolean | undefined, sink?: InboxRecoverySink, snoozedUntil?: string | null): Promise<InboxUndo> {
+  private pendingDoneDescriptors(): InboxSnapshot["pendingDone"] {
+    return [...this.pendingDoneCommands].map(([id, { status, count }]) => ({ id, status, count }));
+  }
+  private pendingDoneScopeCurrent(command: PendingDone, sources = new Map(this.sourceAccounts.map(source => [source.id, source])), boxes = new Map(this.boxes.map(box => [box.id, box]))) {
+    return !this.controller.signal.aborted && !this.applicationScope.signal.aborted && command.generation === this.generation && command.plan.owner === this.applicationScope.scope
+      && command.plan.sources.every(expected => {
+        const source = sources.get(expected.sourceId);
+        return source?.generation === expected.generation && source.status === "connected"
+          && expected.mailboxIds.every(id => { const box = boxes.get(id); return box?.sourceId === expected.sourceId && box.status !== "detached"; });
+      });
+  }
+  /** Compile scope fences once per selection pass, never once per membership target. */
+  private currentPendingDoneScopes(): Map<string, Map<string, number>> {
+    const valid = new Map<string, Map<string, number>>();
+    if (!this.pendingDoneCommands.size) return valid;
+    const sources = new Map(this.sourceAccounts.map(source => [source.id, source])), boxes = new Map(this.boxes.map(box => [box.id, box]));
+    for (const [id, command] of this.pendingDoneCommands) if (this.pendingDoneScopeCurrent(command, sources, boxes))
+      valid.set(id, new Map(command.plan.sources.map(source => [source.sourceId, source.generation])));
+    return valid;
+  }
+  private retirePendingDone(id: string) {
+    const command = this.pendingDoneCommands.get(id); if (!command) return;
+    for (const key of command.targets.keys()) {
+      const entries = this.pendingDoneTargets.get(key); entries?.delete(id);
+      if (!entries?.size) this.pendingDoneTargets.delete(key);
+    }
+    this.pendingDoneTargetCount -= command.targets.size;
+    this.pendingDoneCommands.delete(id);
+  }
+  private clearPendingDone() {
+    this.pendingDoneCommands.clear(); this.pendingDoneTargets.clear(); this.pendingDoneTargetCount = 0;
+    if (this.state.pendingDone.length) this.state = { ...this.state, pendingDone: [] };
+  }
+  private matchingPendingDone(mail: Mail, target: MailboxStateTarget, pendingOnly: boolean, valid: Map<string, Map<string, number>>): string | undefined {
+    if (!mail.sourceId || !mail.sourceGeneration) return;
+    for (const [id, revision] of this.pendingDoneTargets.get(membershipKey(mail.sourceId, target)) ?? []) {
+      if (revision !== target.revision || valid.get(id)?.get(mail.sourceId) !== mail.sourceGeneration) continue;
+      if (!pendingOnly || this.pendingDoneCommands.get(id)?.status === "pending") return id;
+    }
+  }
+  private coveredByPendingDone(mail: Mail, valid: Map<string, Map<string, number>>): boolean {
+    return !!mail.window?.targetsComplete && mail.window.targets.length > 0
+      && mail.window.targets.every(target => !!this.matchingPendingDone(mail, target, true, valid));
+  }
+  /** Only complete, current membership coverage can remove a row from the presentation. */
+  isPendingDone = (mail: Mail): boolean => this.coveredByPendingDone(mail, this.currentPendingDoneScopes());
+  /** Unconfirmed commands still own their captured revisions; Retry must reuse their ID. */
+  pendingDoneFor = (mail: Mail): string | undefined => {
+    const valid = this.currentPendingDoneScopes();
+    for (const target of mail.window?.targets ?? []) {
+      const id = this.matchingPendingDone(mail, target, false, valid); if (id) return id;
+    }
+  };
+  presentWindow = (window: InboxActiveWindow): InboxActiveWindow => {
+    if (window.query.folder !== "Inbox" || window.query.search || !this.pendingDoneCommands.size) return window;
+    const current = new Map(this.state.mail.map(mail => [mail.id, mail])), valid = this.currentPendingDoneScopes();
+    const keys = window.keys.filter(key => { const mail = current.get(key); return !mail || !this.coveredByPendingDone(mail, valid); });
+    return keys.length === window.keys.length ? window : { ...window, keys };
+  };
+  doneOptimistically = (selected: Mail[], sink?: InboxRecoverySink): Promise<InboxUndo> => {
+    try { return this.done(selected, true, sink, undefined, true); }
+    catch (error) { return Promise.reject(error); }
+  };
+  retryPendingDone = (id: string): Promise<InboxUndo> => {
+    const command = this.pendingDoneCommands.get(id);
+    if (!command || !this.pendingDoneScopeCurrent(command)) {
+      if (command) { this.retirePendingDone(id); this.publish({ pendingDone: this.pendingDoneDescriptors() }); }
+      return Promise.reject(new InboxRecoveryRejected("The captured Done command is no longer available in this scope."));
+    }
+    if (command.promise) return command.promise;
+    command.status = "pending"; this.publish({ pendingDone: this.pendingDoneDescriptors() });
+    return this.replayCommand(command.plan, command.sink);
+  };
+  private done(selected: Mail[], done: boolean | undefined, sink?: InboxRecoverySink, snoozedUntil?: string | null, optimistic = false): Promise<InboxUndo> {
     const targets = new Map<string, MailboxStateTarget>();
     try {
+      if (optimistic) {
+        this.controller.signal.throwIfAborted(); this.applicationScope.signal.throwIfAborted();
+        if (!this.state.host?.inboxWindow || !this.state.window || this.state.window.query.folder !== "Inbox" || this.state.window.query.search || selected.some(mail => !mail.window))
+          throw new Error("Optimistic Done is only available in the Inbox window.");
+        const valid = this.currentPendingDoneScopes();
+        if (selected.some(mail => mail.window!.targets.some(target => this.matchingPendingDone(mail, target, false, valid))))
+          throw new Error("This Done command is still pending. Retry the original command before making another decision.");
+      }
       for (const mail of selected) {
         if (mail.operationId) throw new Error("Cancel the queued send before changing it.");
         if (mail.window) {
@@ -3222,7 +3351,18 @@ export class InboxStore {
     // SDK setMailboxStates now owns snooze as well as Done: its idempotent
     // receipt stores the actual original states and conditional inverse. Never
     // fall back to non-idempotent PATCH or infer a receipt from equal state.
+    if (optimistic && (this.pendingDoneCommands.size >= PENDING_DONE_LIMIT || this.pendingDoneTargetCount + targets.size > PENDING_DONE_TARGET_LIMIT))
+      return Promise.reject(new Error("Wait for existing Done commands to finish before marking more mail Done."));
     this.publishRecovery(plan, sink);
+    if (optimistic) {
+      const command: PendingDone = { plan: structuredClone(plan), generation: this.generation, status: "pending", count: new Set(selected.map(mail => mail.id)).size,
+        targets: new Map([...targets].map(([key, target]) => [key, target.revision])), sink };
+      this.pendingDoneCommands.set(input.id, command); this.pendingDoneTargetCount += command.targets.size;
+      for (const [key, revision] of command.targets) {
+        const entries = this.pendingDoneTargets.get(key) ?? new Map<string, number>(); entries.set(input.id, revision); this.pendingDoneTargets.set(key, entries);
+      }
+      this.publish({ pendingDone: this.pendingDoneDescriptors() });
+    }
     return this.runRecoveredCommand(plan, sink, true);
   }
   canRecordFeedback = (selected: Mail[]): boolean => !!this.state.host?.preferenceScope && selected.length > 0 && selected.every(mail => !mail.operationId && !!mail.sourceId && mail.messages.some(message => !message.pending && !message.outgoing && message.nativeFolder === "inbox"

@@ -2840,7 +2840,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       const row = (index: number): Row => {
         const id = `${box.id}:thread-${index}`, messageId = `message-${index}`;
         return { key: id, sourceId: source.id, threadId: `thread-${index}`, sourceGeneration: 1, revision: 1, pageCursor: `row-${index}`,
-          mail: { ...inbox, id, account: box.id, mailboxId: box.id, sourceId: source.id, sdkThreadId: `thread-${index}`, subject: `Fictional page row ${index}`,
+          mail: { ...inbox, id, account: box.id, mailboxId: box.id, sourceId: source.id, sourceGeneration: source.generation, sdkThreadId: `thread-${index}`, subject: `Fictional page row ${index}`,
             receivedAt: Date.parse(deadline) - index * 1000, folder: "Inbox", locations: ["Inbox"], messages: [{ ...inbox.messages[0], id: messageId, body: "", loaded: false }] },
           summaries: [], messagesComplete: false, counts: { messages: 1, memberships: 1, unread: 1, done: 0, snoozed: 0 },
           targets: [{ mailboxId: box.id, messageId, revision: 1 }], targetsComplete: true, actionContextComplete: false, contextVersion: `context-${index}` };
@@ -3418,6 +3418,131 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           assert.equal(doneRequests, 3, "the controlled conflicts do not retry their Done POSTs");
           globalThis.fetch = senderFetch;
 
+          // Optimistic Done is a bounded presentation overlay, not a fabricated membership receipt.
+          type DoneInput = Parameters<import("inbox-sdk/types").Inbox["setMailboxStates"]>[1];
+          type DoneReceipt = import("inbox-sdk/types").MailboxStateReceipt;
+          type Recovery = import("../src/inbox").InboxCommandRecovery;
+          const heldDone: Array<{ input: DoneInput; release: (response: Response) => void }> = [];
+          const receiptReads: string[] = [];
+          let recoveredReceipt: DoneReceipt | undefined;
+          const receiptFor = (input: DoneInput): DoneReceipt => ({ id: input.id, retracted: false,
+            states: input.targets.map(target => ({ ...target, revision: target.revision + 1, done: true, snoozedUntil: null })) });
+          globalThis.fetch = (async (input, init) => {
+            const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+            if (url.pathname === `/v1/accounts/${source.id}`) return Response.json(source);
+            if (url.pathname === `/v1/mailboxes/${box.id}`) return Response.json(box);
+            if (url.pathname.startsWith("/v1/mailbox-actions/")) {
+              receiptReads.push(url.pathname.split("/").at(-1)!);
+              return recoveredReceipt ? Response.json(recoveredReceipt) : Response.json({ code: "NOT_FOUND", error: "Not found" }, { status: 404 });
+            }
+            if (url.pathname === "/v1/mailbox-actions" && init?.method === "POST")
+              return new Promise<Response>(release => heldDone.push({ input: JSON.parse(String(init.body)), release }));
+            return senderFetch(input, init);
+          }) as typeof fetch;
+          const pendingRow = row(9000), pendingKey = pendingRow.key;
+          pendingRow.summaries = [{ ...summary(9000, pendingRow.threadId), id: pendingRow.targets[0].messageId,
+            memberships: [{ ...pendingRow.targets[0], done: false, snoozedUntil: null }] }];
+          reverseDelta = { upserts: [pendingRow], newHead: [pendingRow], removed: [] }; await store.retry();
+          const pendingMail = () => store.getSnapshot().mail.find(mail => mail.id === pendingKey)!;
+          const beforeOptimism = store.getSnapshot(), bodyBaseline = bodyReads.length, queryBaseline = queries, pageBaseline = pages.length;
+          let capturedDone: Recovery | undefined;
+          const captureDone = (plan: Recovery) => { capturedDone = plan; };
+          const optimistic = store.doneOptimistically([pendingMail()], captureDone);
+          let settled = false; void optimistic.then(() => { settled = true; }, () => { settled = true; });
+          assert.ok(capturedDone?.kind === "mailbox-state");
+          const firstId = capturedDone.input.id;
+          assert.deepEqual(store.getSnapshot().pendingDone, [{ id: firstId, status: "pending", count: 1 }]);
+          assert.equal(store.isPendingDone(pendingMail()), true);
+          assert.equal(store.pendingDoneFor(pendingMail()), firstId);
+          assert.strictEqual(store.getSnapshot().mail, beforeOptimism.mail);
+          assert.strictEqual(store.getSnapshot().window, beforeOptimism.window);
+          const presented = store.presentWindow(beforeOptimism.window!);
+          assert.ok(!presented.keys.includes(pendingKey)); assert.ok(beforeOptimism.window!.keys.includes(pendingKey));
+          assert.strictEqual(presented.totals, beforeOptimism.window!.totals); assert.strictEqual(presented.state, beforeOptimism.window!.state);
+          assert.equal(presented.nextCursor, beforeOptimism.window!.nextCursor); assert.equal(presented.residentBytes, beforeOptimism.window!.residentBytes);
+          assert.equal(pendingMail().folder, "Inbox"); assert.deepEqual(pendingMail().window!.targets, pendingRow.targets);
+          for (const query of [{ ...presented.query, folder: "Sent" }, { ...presented.query, search: true }]) {
+            const elsewhere = { ...beforeOptimism.window!, query }; assert.strictEqual(store.presentWindow(elsewhere), elsewhere);
+          }
+          assert.equal(store.isPendingDone({ ...pendingMail(), sourceGeneration: 2 }), false);
+          assert.equal(store.isPendingDone({ ...pendingMail(), window: { ...pendingMail().window!, targetsComplete: false } }), false);
+          await assert.rejects(store.doneOptimistically([pendingMail()]), /still pending/);
+          await until(() => heldDone.length === 1, "optimistic Done reaches its held durable POST");
+          assert.equal(settled, false); assert.equal(bodyReads.length, bodyBaseline); assert.equal(queries, queryBaseline); assert.equal(pages.length, pageBaseline);
+          heldDone[0].release(Response.json(receiptFor(heldDone[0].input)));
+          const acceptedDone = await optimistic;
+          assert.deepEqual(acceptedDone.receipts, [{ kind: "mailbox-state", id: firstId }]);
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.equal(pendingMail().folder, "Done");
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), beforeOptimism.mail.find(mail => mail.id === giantKey), "pending presentation does not invalidate cached bodies");
+
+          // A newer target revision can carry its own intent while an older command settles.
+          const freshRow: Row = { ...pendingRow, revision: 3, targets: pendingRow.targets.map(target => ({ ...target, revision: 3 })),
+            summaries: pendingRow.summaries.map(summary => ({ ...summary, revision: 3, memberships: summary.memberships.map(state => ({ ...state, revision: 3 })) })) };
+          reverseDelta = { upserts: [freshRow], newHead: [freshRow], removed: [] }; await store.retry();
+          assert.ok(pendingMail(), "the next scenario recaptures the authoritative newer Inbox head after accepted Done eviction");
+          const olderDone = store.doneOptimistically([pendingMail()], captureDone);
+          const olderRejected = assert.rejects(olderDone, /Fictional optimistic conflict/);
+          await until(() => heldDone.length === 2, "older revision write is held");
+          const newerRow: Row = { ...freshRow, revision: 4, contextVersion: "current-revision-4", mail: { ...freshRow.mail, subject: "Latest canonical subject" },
+            targets: freshRow.targets.map(target => ({ ...target, revision: 4 })),
+            summaries: freshRow.summaries.map(summary => ({ ...summary, revision: 4, memberships: summary.memberships.map(state => ({ ...state, revision: 4 })) })) };
+          reverseDelta = { upserts: [newerRow], newHead: [], removed: [] }; await store.retry();
+          assert.equal(store.isPendingDone(pendingMail()), false); assert.equal(store.pendingDoneFor(pendingMail()), undefined);
+          assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+          const newer = store.doneOptimistically([pendingMail()], captureDone);
+          const newerRejected = assert.rejects(newer, /Fictional optimistic conflict/);
+          const newerId = (capturedDone as Extract<Recovery, { kind: "mailbox-state" }>).input.id;
+          assert.equal(store.getSnapshot().pendingDone.length, 2); assert.equal(store.isPendingDone(pendingMail()), true);
+          heldDone[1].release(Response.json({ code: "CONFLICT", error: "Fictional optimistic conflict" }, { status: 412 })); await olderRejected;
+          assert.deepEqual(store.getSnapshot().pendingDone, [{ id: newerId, status: "pending", count: 1 }]);
+          assert.equal(store.isPendingDone(pendingMail()), true, "rejecting an older owner cannot retire a newer revision's mask");
+          assert.equal(pendingMail().subject, "Latest canonical subject");
+          await until(() => heldDone.length === 3, "newer revision write reaches the queue head");
+          const replyRow: Row = { ...newerRow, revision: 5, contextVersion: "native-reply", counts: { ...newerRow.counts, messages: 2, memberships: 2 },
+            targets: [...newerRow.targets, { mailboxId: box.id, messageId: "native-reply-after-done", revision: 1 }],
+            mail: { ...newerRow.mail, subject: "Latest canonical reply", messages: [...newerRow.mail.messages, { ...newerRow.mail.messages[0], id: "native-reply-after-done" }] } };
+          reverseDelta = { upserts: [replyRow], newHead: [], removed: [] }; await store.retry();
+          assert.equal(store.isPendingDone(pendingMail()), false, "complete targets, not preview membership, expose a later native reply");
+          assert.equal(store.pendingDoneFor(pendingMail()), newerId, "partial exact overlap still blocks a fresh duplicate");
+          heldDone[2].release(Response.json({ code: "CONFLICT", error: "Fictional optimistic conflict" }, { status: 412 })); await newerRejected;
+          assert.equal(pendingMail().subject, "Latest canonical reply"); assert.equal(pendingMail().window!.targets.length, 2);
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+
+          // A lost first acknowledgement followed by auth failure is still ambiguous.
+          const issuesBeforeAmbiguous = store.getSnapshot().issues;
+          const ambiguous = store.doneOptimistically([pendingMail()], captureDone);
+          const unconfirmed = assert.rejects(ambiguous, /Fictional retry authorization/);
+          await until(() => heldDone.length === 4, "first ambiguous attempt is held");
+          const ambiguousId = heldDone[3].input.id;
+          recoveredReceipt = receiptFor(heldDone[3].input);
+          heldDone[3].release(Response.json({ code: "TEMPORARY", error: "Lost first acknowledgement" }, { status: 503 }));
+          await until(() => heldDone.length === 5, "the existing same-ID second attempt is held");
+          assert.deepEqual(heldDone[4].input, heldDone[3].input);
+          heldDone[4].release(Response.json({ code: "UNAUTHENTICATED", error: "Fictional retry authorization" }, { status: 401 })); await unconfirmed;
+          assert.deepEqual(store.getSnapshot().pendingDone, [{ id: ambiguousId, status: "unconfirmed", count: 1 }]);
+          assert.equal(capturedDone!.kind === "mailbox-state" && capturedDone!.status, "uncertain");
+          assert.strictEqual(store.getSnapshot().issues, issuesBeforeAmbiguous, "ambiguous completion belongs only to the command Retry notice, not a generic failure");
+          assert.equal(store.isPendingDone(pendingMail()), false); assert.equal(store.pendingDoneFor(pendingMail()), ambiguousId);
+          assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+          await assert.rejects(store.doneOptimistically([pendingMail()]), /still pending/);
+          const retryDone = store.retryPendingDone(ambiguousId);
+          assert.equal(store.isPendingDone(pendingMail()), true, "explicit same-ID Retry reactivates only applicable targets");
+          assert.strictEqual(store.retryPendingDone(ambiguousId), retryDone, "repeated retry joins the already-pending original command");
+          const recoveredDone = await retryDone;
+          assert.deepEqual(recoveredDone.receipts, [{ kind: "mailbox-state", id: ambiguousId }]);
+          assert.deepEqual(receiptReads, [ambiguousId]); assert.equal(heldDone.length, 5, "the authoritative stored receipt avoids a third POST");
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.equal(pendingMail().folder, "Done");
+
+          // The initial recovery write and preflight must succeed before any mask or POST exists.
+          const failedStorage = store.getSnapshot();
+          await assert.rejects(store.doneOptimistically([pendingMail()], () => { throw new Error("storage full"); }), /could not be saved/);
+          await assert.rejects(store.doneOptimistically([{ ...pendingMail(), window: { ...pendingMail().window!, targetsComplete: false } }]), /500 message memberships/);
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.strictEqual(store.getSnapshot().mail, failedStorage.mail);
+          assert.strictEqual(store.getSnapshot().window, failedStorage.window); assert.equal(heldDone.length, 5);
+          assert.equal(bodyReads.length, bodyBaseline); assert.equal(queries, queryBaseline); assert.equal(pages.length, pageBaseline);
+          globalThis.fetch = senderFetch;
+          reverseDelta = { newHead: [], removed: [{ key: pendingKey, reason: "deleted" }] }; await store.retry();
+
           store.clearSenderWindow();
           const oldReader = store.loadThread(giantKey, "giant-697");
           const oldSender = store.senderWindow({ ...senderInput, selectedMessageId: "giant-697" }, oldReader);
@@ -3662,6 +3787,57 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         }
       }
       assert.deepEqual(mismatchedCheckpoints, [], "every published checkpoint keeps its revision and token paired, including a deferred pin replay");
+      if (name === "full") {
+        await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Inbox", search: false });
+        const boundedRows = Array.from({ length: 33 }, (_, index) => {
+          const item = row(9500 + index), count = index < 8 ? 500 : 1;
+          return { ...item, counts: { ...item.counts, memberships: count }, targets: Array.from({ length: count }, (_, target) => ({ mailboxId: box.id, messageId: `bounded-${index}-${target}`, revision: 1 })) };
+        });
+        reverseDelta = { upserts: boundedRows, newHead: boundedRows, removed: [] }; await store.retry();
+        const selected = (index: number) => store.getSnapshot().mail.find(mail => mail.id === boundedRows[index].key)!;
+        const priorFetch = globalThis.fetch;
+        let backendWrites = 0, releaseHeld: ((response: Response) => void) | undefined;
+        globalThis.fetch = (async (input, init) => {
+          const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+          if (url.pathname === "/v1/mailbox-actions" && init?.method === "POST") {
+            backendWrites++; return new Promise<Response>(resolve => { releaseHeld = resolve; });
+          }
+          return priorFetch(input, init);
+        }) as typeof fetch;
+        const commands: Promise<unknown>[] = [];
+        for (let index = 0; index < 8; index++) commands.push(store.doneOptimistically([selected(index)]).catch(error => error));
+        const beforeTargetLimit = store.getSnapshot();
+        let recoveryWrites = 0;
+        const tooManyTargets = { ...selected(8), window: { ...selected(8).window!, targets: Array.from({ length: 100 }, (_, target) => ({ mailboxId: box.id, messageId: `overflow-${target}`, revision: 1 })) } };
+        await assert.rejects(store.doneOptimistically([tooManyTargets], () => { recoveryWrites++; }), /Wait for existing Done commands/);
+        assert.strictEqual(store.getSnapshot().pendingDone, beforeTargetLimit.pendingDone); assert.equal(recoveryWrites, 0);
+        assert.equal(store.getSnapshot().pendingDone.length, 8);
+        for (let index = 8; index < 32; index++) commands.push(store.doneOptimistically([selected(index)]).catch(error => error));
+        const beforeCommandLimit = store.getSnapshot();
+        await assert.rejects(store.doneOptimistically([selected(32)], () => { recoveryWrites++; }), /Wait for existing Done commands/);
+        assert.strictEqual(store.getSnapshot().pendingDone, beforeCommandLimit.pendingDone); assert.equal(recoveryWrites, 0);
+        assert.equal(store.getSnapshot().pendingDone.length, 32);
+        await until(() => !!releaseHeld, "only the admitted queue head reaches the backend"); assert.equal(backendWrites, 1);
+        const captured = selected(0);
+        source.generation = 2; await store.retry();
+        assert.deepEqual(store.getSnapshot().pendingDone, [], "source generation replacement retires every old visual owner");
+        assert.equal(store.isPendingDone(captured), false); assert.equal(store.pendingDoneFor(captured), undefined);
+        releaseHeld!(Response.json({ code: "CONFLICT", error: "Old generation response" }, { status: 412 }));
+        assert.ok((await Promise.all(commands)).every(value => value instanceof Error));
+        assert.equal(backendWrites, 1, "queued source-invalidated commands never send");
+        source.generation = 1; await store.retry();
+        const activeQuery = store.getSnapshot().window!.query;
+        await store.setWindowQuery({ ...activeQuery, folder: "Sent" });
+        await assert.rejects(store.doneOptimistically([captured]), /only available in the Inbox/);
+        assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+        await store.setWindowQuery(activeQuery);
+        const closing = store.doneOptimistically([selected(0)]);
+        const closed = assert.rejects(closing, error => error instanceof DOMException && error.name === "AbortError");
+        assert.equal(store.getSnapshot().pendingDone.length, 1);
+        stop!(); assert.deepEqual(store.getSnapshot().pendingDone, []); assert.equal(store.isPendingDone(captured), false);
+        await closed; assert.equal(backendWrites, 1, "close cancels a queued command before its POST");
+        globalThis.fetch = priorFetch;
+      }
       unsubscribe(); stop(); stop = undefined;
       await sleep(0);
     }
