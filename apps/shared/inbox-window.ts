@@ -93,8 +93,6 @@ export type InboxConversationCounts = {
 }
 
 export type InboxWindowRow = InboxThreadKey & {
-  /** Presentation only; native messages, action targets and explicit lookup remain intact. */
-  hiddenAsForwardedDuplicate?: true
   /** Stable existing app Mail.id, deduplicated by source/thread within this query. */
   key: string
   sourceGeneration: number

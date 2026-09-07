@@ -184,11 +184,13 @@ export default function MailboxSettings({ store, host, onEditStateChange }: {
             <input type="radio" name="unified-mailbox-mode" checked={!all} onChange={() => edit({ unifiedMode: "selected" })} />
             <span>Chosen mailboxes<span className="mailbox-option-note">Only checked mailboxes. Newly added mailboxes stay excluded.</span></span>
           </label>
-          <label className="settings-radio-row">
-            <input type="checkbox" checked={draft.hideForwardedDuplicates ?? true} onChange={event => edit({ hideForwardedDuplicates: event.target.checked })} />
-            <span>Hide forwarded duplicates<span className="mailbox-option-note">Show the original in the unified inbox. Copies remain available in each mailbox.</span></span>
-          </label>
         </fieldset>
+        <div className="mailbox-mode">
+          <label className="settings-radio-row">
+            <input type="checkbox" disabled={saving} checked={draft.hideForwardedDuplicates ?? true} onChange={event => edit({ hideForwardedDuplicates: event.target.checked })} />
+            <span>Hide forwarded duplicates<span className="mailbox-option-note">Show the original when both copies are in a loaded batch. Stored mail and totals stay unchanged.</span></span>
+          </label>
+        </div>
 
         <section className="mailbox-inclusion" aria-label="Added mailboxes">
           <div className="mailbox-section-heading">

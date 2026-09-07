@@ -179,7 +179,7 @@ export function createInboxWindowService(deps: Dependencies) {
     const selectedSources = sources.filter(source => boxes.some(box => box.sourceId === source.id))
     const identity = { account, boxes: boxes.map(box => [box.id, box.sourceId, box.revision, box.status]).sort(), sources: selectedSources.map(source => [source.id, source.generation]).sort() }
     const id = digest(identity), split = deps.splitPreferences.read() ?? { ...normalizeSplits({}), revision: 0 }
-    const preference = digest(['demand-window-1', 'forwarded-duplicates-1', ATTENTION_VERSION, AI_PREFERENCE_VERSION, IMPORTANT_WINDOW_VERSION, preferences.revision, split, ai.configured, ai.settings])
+    const preference = digest(['demand-window-1', 'request-batch-duplicates-1', ATTENTION_VERSION, AI_PREFERENCE_VERSION, IMPORTANT_WINDOW_VERSION, preferences.revision, split, ai.configured, ai.settings])
     aiCursor ??= ai.cursor
     const categoryHead = db.query<{ head: number }, string[]>('SELECT head FROM local_category_clock WHERE owner=?').get(owner)?.head ?? 0
     categoryCursor ??= categoryHead
@@ -406,21 +406,21 @@ export function createInboxWindowService(deps: Dependencies) {
       if (full) budget.legacy.set(row.key, legacyContextFingerprint(scope, values))
       rows.push(row)
     }
-    if (scope.row.account === 'unified' && scope.hideForwardedDuplicates) {
-      // Consume every SDK ordinal, including duplicates, before filtering matches.
-      // Partial/large conversations and threads with any unique reply stay visible.
-      const candidates = rows.filter(row => row.messagesComplete && row.summaries.length > 0
-        && row.summaries.every(message => message.folder !== 'sent'))
-      const messageIds = candidates.flatMap(row => row.summaries.map(message => message.id)), hidden = new Set<string>()
-      // The SDK page already bounds rows and preview messages. Resolve every
-      // candidate in bounded calls so counts, lookup and reverse paging agree.
-      for (let offset = 0; offset < messageIds.length; offset += 500) {
-        const copies = await inbox.mailboxForwardedCopies(owner, { mailboxIds: scope.boxes.map(box => box.id), messageIds: messageIds.slice(offset, offset + 500) })
-        for (const copy of copies) hidden.add(copy.messageId)
-      }
-      for (const row of candidates) if (row.summaries.every(message => hidden.has(message.id))) row.hiddenAsForwardedDuplicate = true
-    }
     return rows
+  }
+  /** Compact only a completed, view-filtered response batch. Counts, captures,
+   * detail reads and resident updates never invoke duplicate detection. */
+  async function compactBatch<T extends DTO.InboxWindowRow>(scope: Scope, rows: T[]): Promise<T[]> {
+    if (!scope.hideForwardedDuplicates || rows.length < 2) return rows
+    const candidates = rows.filter(row => row.messagesComplete && row.summaries.length > 0)
+    const messageIds = candidates.flatMap(row => row.summaries.map(message => message.id))
+    // Preserve the existing proof budget without making results depend on which
+    // part of a large conversation happens to fit. Never fetch extra history.
+    if (candidates.length < 2 || messageIds.length > 500) return rows
+    const copies = await inbox.mailboxForwardedCopies(owner, { mailboxIds: scope.boxes.map(box => box.id), messageIds })
+    const hidden = new Set(copies.map(copy => copy.messageId))
+    const redundant = new Set(candidates.filter(row => row.summaries.every(message => hidden.has(message.id))).map(row => row.key))
+    return redundant.size ? rows.filter(row => !redundant.has(row.key)) : rows
   }
   /** Capture-only materialization. No query/page/lookup/change/sender read calls it. */
   async function buildRows(scope: Scope, inputKeys: DTO.InboxThreadKey[], live?: ReadonlyMap<string, MailboxConversation>) {
@@ -590,12 +590,6 @@ export function createInboxWindowService(deps: Dependencies) {
   async function evaluateRow(scope: Scope, query: DTO.InboxViewQuery, row: DTO.InboxWindowRow, budget: ReadBudget = readBudget(), includeCounts = false) {
     const mail = row.mail, inbox = inFolder(mail, 'Inbox'), holding = inbox && (mail.aiHoldUntil ?? 0) > budget.now
     const attention = mail.split, recent = recentImportant(mail, budget.now), counts: Record<string, number> = {}
-    if (scope.row.account === 'unified' && scope.hideForwardedDuplicates && row.hiddenAsForwardedDuplicate) {
-      counts.inbox = 0; counts.holding = 0
-      for (const name of new Set([...scope.preferences.splits, query.split])) counts[`split:${name}`] = 0
-      for (const folder of ['Inbox', 'Starred', 'Sent', 'Done', 'Auto Archived', 'Reminders', 'Spam', 'Trash', 'All Mail']) counts[`folder:${folder}`] = 0
-      return { matches: false, counts }
-    }
     if (includeCounts && budget.unknownLocation.has(row.key)) throw pendingContext
     const splitMatches = new Map<string, boolean>()
     for (const name of new Set(includeCounts ? [...scope.preferences.splits, query.split] : !query.search && query.folder === 'Inbox' ? [query.split] : [])) {
@@ -742,7 +736,7 @@ export function createInboxWindowService(deps: Dependencies) {
    * pages maximum, in either direction. Only consumed leaders advance the cursor;
    * an unreturned match is never skipped, including at an SDK page's terminal edge.
    */
-  async function preparePage(scope: Scope, query: QueryRow, maximum: number, cursor?: PageCursor, reverse = false, budget = readBudget()): Promise<DTO.InboxWindowPage> {
+  async function preparePage(scope: Scope, query: QueryRow, maximum: number, cursor?: PageCursor, reverse = false, budget = readBudget(), compact = true): Promise<DTO.InboxWindowPage> {
     if (cursor && (typeof cursor.older !== 'string' || typeof cursor.newer !== 'string' || !['older', 'newer'].includes(cursor.direction)
       || !cursor.baseline || typeof cursor.baseline.scopeState !== 'string' || typeof cursor.baseline.sdkState !== 'string'
       || ![cursor.baseline.revision, cursor.baseline.ai, cursor.baseline.category, cursor.baseline.at].every(value => Number.isSafeInteger(value) && value >= 0))) fail('HOST_INBOX_CURSOR_INVALID')
@@ -758,6 +752,7 @@ export function createInboxWindowService(deps: Dependencies) {
     const metadata = readMetadata(query)
     if (recentView && !metadata.importantSince) { metadata.importantSince = new Date(budget.now - IMPORTANT_WINDOW_MS).toISOString(); saveReadMetadata(query, metadata) }
     const queryFilter = recentView ? { ...nativeQuery(scope, view), after: metadata.importantSince } : nativeQuery(scope, view), rows: PageableRow[] = []
+    const positions = new Map<string, string>()
     let size = 65536, exhausted = false, stopped = false, wake = Infinity, firstConsumed: string | undefined, firstVisible: string | undefined
     const bookmark = (older: string, newer: string) => token(`page:${query.id}`, scope, { older, newer, baseline: { ...read! }, direction } satisfies PageCursor)
     while (budget.pages > 0 && rows.length < maximum && !stopped) {
@@ -780,7 +775,7 @@ export function createInboxWindowService(deps: Dependencies) {
           // this response. A page-first bookmark would skip the evicted prefix.
           const result: PageableRow = { ...row, pageCursor: bookmark(at, at) }, cost = bytes(result)
           if (size + cost > DTO.INBOX_RESPONSE_BYTE_LIMIT) { stopped = true; break }
-          rows.push(result); size += cost; firstVisible ??= at
+          rows.push(result); positions.set(row.key, at); size += cost; firstVisible ??= at
         }
         firstConsumed ??= at; position = at; consumed++
         if (rows.length >= maximum) { stopped = true; break }
@@ -793,8 +788,23 @@ export function createInboxWindowService(deps: Dependencies) {
     const saved = readMetadata(query)
     if (Number.isFinite(wake)) { saved.wake = Math.min(saved.wake ?? Infinity, wake); saveReadMetadata(query, saved) }
     const opposite = firstVisible ?? firstConsumed ?? position
-    if (reverse) rows.reverse() // SDK traverses oldest-to-newest; the UI always displays newest first.
-    return { state: state(scope, query, read), rows, totals: totals(scope, query), exhausted,
+    // Filters and the requested raw-match limit are final before compaction.
+    // A removed duplicate never causes another SDK page to be fetched to fill it.
+    const compacted = compact ? await compactBatch(scope, rows) : rows
+    if (compacted !== rows) {
+      const kept = new Set(compacted.map(row => row.key))
+      const indexes = rows.flatMap((row, index) => kept.has(row.key) ? [index] : [])
+      for (const [index, row] of compacted.entries()) {
+        // Retain each visible row's consumed hidden prefix/suffix when the client
+        // later evicts part of this batch and resumes from a per-row bookmark.
+        const start = indexes[index - 1] === undefined ? 0 : indexes[index - 1]! + 1
+        const end = indexes[index + 1] === undefined ? rows.length - 1 : indexes[index + 1]! - 1
+        const before = positions.get(rows[start]!.key)!, after = positions.get(rows[end]!.key)!
+        row.pageCursor = reverse ? bookmark(before, after) : bookmark(after, before)
+      }
+    }
+    if (reverse) compacted.reverse() // SDK traverses oldest-to-newest; the UI always displays newest first.
+    return { state: state(scope, query, read), rows: compacted, totals: totals(scope, query), exhausted,
       nextCursor: exhausted ? null : reverse ? bookmark(opposite!, position!) : bookmark(position!, opposite!) }
   }
 
@@ -1541,12 +1551,17 @@ export function createInboxWindowService(deps: Dependencies) {
     if (!consumed && entries.length) throw pendingContext
     const nextOffset = offset + consumed
     if (headStage) {
-      const view = json<DTO.InboxViewQuery>(query!.data), head = await preparePage(scope, query!, maximum, undefined, false, budget)
-      for (const row of head.rows) {
-        if (wanted.includes(row.key)) continue
-        // preparePage records the hold's wake even when this unseen arrival is
-        // withheld. A later bounded changes pass retries it without another event.
-        if (!view.search && view.folder === 'Inbox' && (row.mail.aiHoldUntil ?? 0) > budget.now) continue
+      const view = json<DTO.InboxViewQuery>(query!.data), head = await preparePage(scope, query!, maximum, undefined, false, budget, false)
+      // Head-only arrival holds must be applied before matching copies. A withheld
+      // original cannot suppress a visible copy; already-resident rows remain
+      // valid context within this requested head batch, never arbitrary history.
+      const visible = head.rows.filter(row => resident.includes(row.key) || view.search || view.folder !== 'Inbox' || (row.mail.aiHoldUntil ?? 0) <= budget.now)
+      const compacted = await compactBatch(scope, visible), kept = new Set(compacted.map(row => row.key))
+      for (const row of visible) if (resident.includes(row.key) && !kept.has(row.key)) removed.push({ key: row.key, reason: 'not-matching' })
+      for (const row of compacted) {
+        // A pinned reader is not necessarily in the active list (notably after
+        // Undo). Restore matching head rows, not just previously unknown IDs.
+        if (resident.includes(row.key)) continue
         const cost = bytes(row)
         if (size + cost > DTO.INBOX_RESPONSE_BYTE_LIMIT) break
         row.revision = pass.baseline.revision; newHead.push(row); size += cost

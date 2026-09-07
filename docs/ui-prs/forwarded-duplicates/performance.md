@@ -1,5 +1,7 @@
 # Forwarded duplicates: verification and review blockers
 
+> Historical report for the superseded mailbox-wide implementation. The user requested request-batch-only compaction afterward. See [the current design and verification](batch-scope.md); the timings and blockers below are retained history, not current acceptance evidence.
+
 **The PR remains draft.** The requested hiding/toggle workflow passes, but release acceptance is not complete: the 6.5k inbox can remain stale after Undo, and some first-body/action/Undo tails exceed the baseline or action budget. The same stale-Undo class was observed before this feature. These findings are not waived or attributed to a cause without evidence.
 
 ## Revisions and environment

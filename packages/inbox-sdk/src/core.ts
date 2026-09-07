@@ -83,8 +83,6 @@ export function createInbox(options: InboxOptions): Inbox {
     CREATE INDEX IF NOT EXISTS sdk_message_account ON sdk_messages(owner,account,deleted,received_at,id);
     CREATE INDEX IF NOT EXISTS sdk_message_inventory ON sdk_messages(owner,account,deleted,received_at DESC,id,generation);
     CREATE INDEX IF NOT EXISTS sdk_message_thread ON sdk_messages(owner,thread_id,deleted,received_at,id);
-    CREATE INDEX IF NOT EXISTS sdk_message_forwarding_rfc ON sdk_messages(owner,(CASE WHEN json_valid(body) THEN json_extract(body,'$.rfcMessageId') END)) WHERE deleted=0;
-    CREATE INDEX IF NOT EXISTS sdk_message_forwarding_parent_source ON sdk_messages(owner,(CASE WHEN json_valid(body) THEN json_extract(body,'$.inReplyTo') END),account) WHERE deleted=0;
     CREATE INDEX IF NOT EXISTS sdk_message_due_snooze ON sdk_messages(snoozed_until) WHERE deleted=0 AND snoozed_until IS NOT NULL;
     CREATE INDEX IF NOT EXISTS sdk_message_sync_states ON sdk_messages(account,generation,native_id,json_extract(confirmed,'$.isRead'),json_extract(confirmed,'$.isStarred')) WHERE deleted=0;
     CREATE TABLE IF NOT EXISTS sdk_thread_keys (account TEXT NOT NULL, generation INTEGER NOT NULL, native_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(account,generation,native_id));
@@ -99,7 +97,6 @@ export function createInbox(options: InboxOptions): Inbox {
     CREATE TABLE IF NOT EXISTS sdk_cooldowns (account TEXT PRIMARY KEY, next_at INTEGER NOT NULL, failures INTEGER NOT NULL, hard INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS sdk_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, data TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS sdk_event_owner ON sdk_events(owner,seq);
-    CREATE TABLE IF NOT EXISTS sdk_forwarding_events (seq INTEGER NOT NULL, rfc_id TEXT NOT NULL, PRIMARY KEY(seq,rfc_id), FOREIGN KEY(seq) REFERENCES sdk_events(seq) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS sdk_states (owner TEXT PRIMARY KEY, seq INTEGER NOT NULL DEFAULT 0, floor INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS sdk_policy (owner TEXT PRIMARY KEY, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sdk_connections (id TEXT PRIMARY KEY, owner TEXT NOT NULL, generation INTEGER NOT NULL, status TEXT NOT NULL, credential_version INTEGER NOT NULL DEFAULT 1, data TEXT NOT NULL, credentials TEXT NOT NULL, UNIQUE(id,owner));
@@ -574,15 +571,9 @@ export function createInbox(options: InboxOptions): Inbox {
     } finally { changedOwners = outer }
   }
 
-  function event(owner: string, type: ChangeEvent['type'], accountId: string | null, entityId: string, change: ChangeEvent['change'] = 'updated', reason: ChangeEvent['reason'] = 'mutation', mailboxId?: string, previousRfcId?: string | null): void {
+  function event(owner: string, type: ChangeEvent['type'], accountId: string | null, entityId: string, change: ChangeEvent['change'] = 'updated', reason: ChangeEvent['reason'] = 'mutation', mailboxId?: string): void {
     const data = { type, accountId, entityId, change, reason, at: new Date(now()).toISOString(), ...(mailboxId ? { mailboxId } : {}) }
     const seq = Number(db.query('INSERT INTO sdk_events(owner,data) VALUES (?,?)').run(owner, JSON.stringify(data)).lastInsertRowid)
-    if (type === 'mail.changed' || type === 'membership.updated') {
-      const current = db.query<{ rfc: string | null }, [string, string]>("SELECT substr((CASE WHEN json_valid(body) THEN json_extract(body,'$.rfcMessageId') END),1,999) rfc FROM sdk_messages WHERE owner=? AND id=?").get(owner, entityId)
-      for (const rfc of new Set([forwardingRfcId(current?.rfc), forwardingRfcId(previousRfcId)])) {
-        if (rfc) db.query('INSERT OR IGNORE INTO sdk_forwarding_events VALUES (?,?)').run(seq, rfc)
-      }
-    }
     db.query('INSERT INTO sdk_states(owner,seq) VALUES (?,?) ON CONFLICT(owner) DO UPDATE SET seq=excluded.seq').run(owner, seq)
     if (type === 'mail.changed' && reason === 'mutation') db.query('UPDATE sdk_messages SET last_mutation_seq=? WHERE owner=? AND id=?').run(seq, owner, entityId)
     changedOwners.add(owner)
@@ -637,21 +628,16 @@ export function createInbox(options: InboxOptions): Inbox {
     if (inserted.changes && row.id !== row.source) event(row.owner, 'membership.updated', row.source, messageId, 'created', reason === 'arrival' ? 'initial' : reason, row.id)
   }
 
-  function recordEvidence(row: AccountRow, mail: MailMessage, id: string, reason: ChangeEvent['reason']): boolean {
-    let addressesAdded = false
+  function recordEvidence(row: AccountRow, mail: MailMessage, id: string, reason: ChangeEvent['reason']): void {
     for (const [kind, values] of [['domain', mail.sourceDomains], ['address', mail.deliveryRecipients]] as const) {
       for (const value of values ?? []) {
         let normalized: MailboxSelector
         try { normalized = selector({ kind, value }) } catch { throw new InboxError('INVALID_PROVIDER', 'Provider supplied invalid delivery evidence.', 502) }
-        if (normalized.kind !== 'all') {
-          const inserted = db.query('INSERT OR IGNORE INTO sdk_delivery_evidence VALUES (?,?,?,?,?)').run(row.owner, row.id, id, kind, normalized.value)
-          if (kind === 'address' && inserted.changes) addressesAdded = true
-        }
+        if (normalized.kind !== 'all') db.query('INSERT OR IGNORE INTO sdk_delivery_evidence VALUES (?,?,?,?,?)').run(row.owner, row.id, id, kind, normalized.value)
       }
     }
     // Partial observations add proof. Omission is never a retraction or a delivery guess from To/CC.
     for (const mailbox of db.query<MailboxRow, [string, string]>('SELECT * FROM sdk_mailboxes WHERE owner=? AND source=?').all(row.owner, row.id)) materializeMailbox(mailbox, id, reason)
-    return addressesAdded
   }
 
   async function candidates(owner: string, connectionId: string): Promise<MailboxCandidate[]> {
@@ -748,63 +734,69 @@ export function createInbox(options: InboxOptions): Inbox {
     return limit
   }
 
-  /** Indexed, capped candidate discovery precedes body loading and scope filtering. */
+  const forwardingBatches = new Map<string, MailboxForwardedCopy[]>()
+  let forwardingDatabaseState = ''
+
+  /** Resolve only the authorized request batch; no mailbox-wide relation lookup or maintenance. */
   function forwardedCopies(owner: string, scope: ReturnType<typeof mailboxReadScope>, ids: string[]): MailboxForwardedCopy[] {
-    type Candidate = { id: string; account: string; thread_id: string; bytes: number; eligible: number; parent_rfc: string | null }
+    // These read-only counters also cover additive delivery evidence and writes by
+    // another connection, without adding ingestion events or dependency indexes.
+    const state = JSON.stringify([db.query('SELECT total_changes() AS changes').get(), db.query('PRAGMA data_version').get()])
+    if (state !== forwardingDatabaseState) { forwardingBatches.clear(); forwardingDatabaseState = state }
+    const key = JSON.stringify([owner, scope.binding, ids])
+    const previous = forwardingBatches.get(key)
+    if (previous) {
+      forwardingBatches.delete(key); forwardingBatches.set(key, previous)
+      return previous.map(value => ({ ...value }))
+    }
+    type Candidate = { id: string; account: string; thread_id: string; bytes: number; rfc: string | null; parent_rfc: string | null }
     type Cached = { row: Candidate; message: ForwardingMessage; body: ForwardingBody }
-    const cache = new Map<string, Cached | null>()
-    const columns = `m.id,m.account,m.thread_id,substr((CASE WHEN json_valid(m.body) THEN json_extract(m.body,'$.inReplyTo') END),1,999) parent_rfc,
-      length(CAST(m.body AS BLOB))+length(CAST(m.visible AS BLOB))+length(CAST(m.confirmed AS BLOB)) bytes,
-      (m.generation=(SELECT generation FROM sdk_accounts a WHERE a.id=m.account AND a.owner=m.owner AND a.status<>'disconnected')
-       AND m.account IN (SELECT value FROM json_each(?)) AND ${selectedMembership()}) eligible`
-    const load = (row: Candidate | null): Cached | null => {
-      if (!row || !row.eligible) return null
+    const excluded = "'draft','drafts','scheduled','outbox','queued','unsent','pending'"
+    const candidates = db.query<Candidate, [string, string, string, string]>(`
+      SELECT m.id,m.account,m.thread_id,
+        substr((CASE WHEN json_valid(m.body) THEN json_extract(m.body,'$.rfcMessageId') END),1,999) rfc,
+        substr((CASE WHEN json_valid(m.body) THEN json_extract(m.body,'$.inReplyTo') END),1,999) parent_rfc,
+        length(CAST(m.body AS BLOB))+length(CAST(m.visible AS BLOB))+length(CAST(m.confirmed AS BLOB)) bytes
+      FROM sdk_messages m INDEXED BY sqlite_autoindex_sdk_messages_1
+      WHERE m.owner=? AND m.id IN (SELECT value FROM json_each(?)) AND m.deleted=0
+        AND m.generation=(SELECT generation FROM sdk_accounts a WHERE a.id=m.account AND a.owner=m.owner AND a.status<>'disconnected')
+        AND m.account IN (SELECT value FROM json_each(?)) AND ${selectedMembership()}
+        AND (CASE WHEN json_valid(m.visible) THEN json_extract(m.visible,'$.folder') END) NOT IN (${excluded})
+        AND (CASE WHEN json_valid(m.confirmed) THEN json_extract(m.confirmed,'$.folder') END) NOT IN (${excluded})
+        AND NOT EXISTS(SELECT 1 FROM sdk_folders f WHERE f.owner=m.owner AND f.account=m.account
+          AND f.id IN (SELECT value FROM json_each(CASE WHEN json_valid(m.visible) THEN m.visible ELSE '{}' END,'$.folderIds')
+            UNION SELECT value FROM json_each(CASE WHEN json_valid(m.confirmed) THEN m.confirmed ELSE '{}' END,'$.folderIds'))
+          AND json_type(f.data,'$.custom') IS NOT 'true' AND json_extract(f.data,'$.role') IN (${excluded}))
+    `).all(owner, JSON.stringify(ids), scope.sourceJson, scope.json)
+    const byId = new Map(candidates.map(row => [row.id, row]))
+    const parents = new Map<string, Candidate | null>()
+    for (const row of candidates) {
+      const rfc = forwardingRfcId(row.rfc)
+      if (rfc) parents.set(rfc, parents.has(rfc) ? null : row)
+    }
+    const cache = new Map<string, Cached | null>(), edges = new Map<string, boolean>()
+    const load = (row: Candidate): Cached | null => {
       if (cache.has(row.id)) return cache.get(row.id)!
       cache.set(row.id, null)
       if (row.bytes > FORWARDING_BODY_BYTES) return null
-      const stored = db.query<{ visible: string; body: string; confirmed: string }, [string, string]>('SELECT visible,body,confirmed FROM sdk_messages WHERE owner=? AND id=?').get(owner, row.id)!
-      const message = JSON.parse(stored.visible) as MessageSummary, confirmed = JSON.parse(stored.confirmed) as MessageSummary
-      const excluded = new Set(['sent', 'draft', 'drafts', 'scheduled', 'outbox', 'queued', 'unsent', 'spam', 'trash'])
-      if (excluded.has(message.folder) || excluded.has(confirmed.folder)) return null
-      const roles = db.query<{ role: string }, [string, string, string]>("SELECT json_extract(data,'$.role') role FROM sdk_folders WHERE owner=? AND account=? AND id IN (SELECT value FROM json_each(?)) AND json_type(data,'$.custom') IS NOT 'true'").all(owner, row.account, JSON.stringify([...message.folderIds, ...confirmed.folderIds]))
-      if (roles.some(value => excluded.has(value.role))) return null
-      const result = { row, message, body: JSON.parse(stored.body) as ForwardingBody }
-      cache.set(row.id, result)
-      return result
-    }
-    const byId = (id: string) => {
-      const row = db.query<Candidate, [string, string, string, string]>(`SELECT ${columns} FROM sdk_messages m WHERE m.owner=? AND m.id=? AND m.deleted=0`).get(scope.sourceJson, scope.json, owner, id)
-      // Reject ordinary same-source replies from indexed metadata before loading
-      // either body; large inbox counts must not hydrate their reply histories.
-      const rfc = row && forwardingRfcId(row.parent_rfc)
-      if (!row || !row.eligible || !rfc) return null
-      const found = parent(rfc)
-      return !found.ambiguous && found.value && found.value.account !== row.account ? load(row) : null
-    }
-    const parents = new Map<string, { value: Candidate | null; ambiguous: boolean }>()
-    const edges = new Map<string, boolean>()
-    const parent = (rfc: string): { value: Candidate | null; ambiguous: boolean } => {
-      if (parents.has(rfc)) return parents.get(rfc)!
-      // Even an adversarial RFC collision set cannot trigger a mailbox scan. More
-      // than two owner candidates fails open before any body crosses the boundary.
-      const rows = db.query<Candidate, [string, string, string, string]>(`SELECT ${columns} FROM sdk_messages m INDEXED BY sdk_message_forwarding_rfc WHERE m.owner=? AND (CASE WHEN json_valid(m.body) THEN json_extract(m.body,'$.rfcMessageId') END)=? AND m.deleted=0 LIMIT 3`).all(scope.sourceJson, scope.json, owner, rfc)
-      const selected = rows.filter(row => row.eligible)
-      const result = rows.length > 2 || selected.length > 1 ? { value: null, ambiguous: true } : { value: selected[0] ?? null, ambiguous: false }
-      parents.set(rfc, result)
-      return result
+      const stored = db.query<{ visible: string; body: string; confirmed: string }, [string, string]>('SELECT visible,body,confirmed FROM sdk_messages WHERE owner=? AND id=?').get(owner, row.id)
+      if (!stored) return null
+      try {
+        const message = JSON.parse(stored.visible) as MessageSummary
+        const result = { row, message, body: JSON.parse(stored.body) as ForwardingBody }
+        cache.set(row.id, result)
+        return result
+      } catch { return null } // Malformed legacy records cannot establish proof.
     }
     const resolve = (current: Cached, visited: Set<string>, depth: number): Cached | null => {
       if (visited.has(current.row.id) || depth > FORWARDING_DEPTH) return null
       visited.add(current.row.id)
       const rfc = forwardingRfcId(current.body.inReplyTo)
-      if (!rfc) return current
+      if (!rfc || !parents.has(rfc)) return current
       if (depth === FORWARDING_DEPTH) return null
-      const found = parent(rfc)
-      if (found.ambiguous) return null
-      if (!found.value) return current
-      if (visited.has(found.value.id)) return null
-      if (current.row.account === found.value.account) return current
-      const original = load(found.value)
+      const found = parents.get(rfc)
+      if (!found || visited.has(found.id)) return null
+      const original = load(found)
       if (!original) return current
       if (!edges.has(current.row.id)) {
         const sender = current.message.from.email.trim().toLowerCase()
@@ -814,59 +806,17 @@ export function createInbox(options: InboxOptions): Inbox {
       if (!edges.get(current.row.id)) return current
       return resolve(original, visited, depth + 1)
     }
-    return ids.flatMap(id => {
-      // At most nine capped bodies per message. Batch neighbors and their order
-      // cannot change proof availability or retain an entire page of bodies.
-      cache.clear(); parents.clear(); edges.clear()
-      const current = byId(id)
+    const result = ids.flatMap(id => {
+      const row = byId.get(id), rfc = forwardingRfcId(row?.parent_rfc)
+      if (!row || !rfc || !parents.get(rfc)) return []
+      const current = load(row)
       if (!current) return []
       const original = resolve(current, new Set(), 0)
       return original && original.row.id !== id ? [{ messageId: id, originalMessageId: original.row.id, originalSourceId: original.row.account, originalThreadId: original.row.thread_id }] : []
     })
-  }
-
-  function forwardingAffectedThreads(owner: string, scope: ReturnType<typeof mailboxReadScope>, since: number, through: number, threads: MailboxThreadKey[]): MailboxThreadKey[] {
-    const affected = new Map(threads.map(key => [JSON.stringify([key.sourceId, key.threadId]), key]))
-    const seen = new Set<string>(), sourceCache = new Map<string, string[]>()
-    type Reference = { rfc: string; source: string }
-    let frontier = db.query<Reference, [string, number, number]>(`SELECT DISTINCT f.rfc_id rfc,json_extract(e.data,'$.accountId') source FROM sdk_events e JOIN sdk_forwarding_events f ON f.seq=e.seq WHERE e.owner=? AND e.seq>? AND e.seq<=? LIMIT 1001`).all(owner, since, through)
-    let nodes = 0
-    for (let depth = 0; frontier.length && depth < FORWARDING_DEPTH; depth++) {
-      if (frontier.length > 1000) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'Forwarded-copy invalidation exceeds its relation budget.', 413)
-      const refs: Reference[] = []
-      for (const ref of frontier) {
-        // A same-source RFC collision can invalidate a previously cross-source
-        // match. Retain current candidate sources as well as the old event source.
-        if (!sourceCache.has(ref.rfc)) sourceCache.set(ref.rfc, db.query<{ account: string }, [string, string]>(`SELECT account FROM sdk_messages INDEXED BY sdk_message_forwarding_rfc WHERE owner=? AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.rfcMessageId') END)=? AND deleted=0 LIMIT 3`).all(owner, ref.rfc).map(row => row.account))
-        for (const source of new Set([ref.source, ...sourceCache.get(ref.rfc)!])) {
-          const key = JSON.stringify([ref.rfc, source])
-          if (!seen.has(key)) { seen.add(key); refs.push({ rfc: ref.rfc, source }) }
-        }
-      }
-      if (!refs.length) break
-      frontier = []
-      // Two indexed account ranges skip ALL same-source replies, rather than
-      // reading their unbounded fanout and filtering after the LIMIT.
-      for (const comparison of ['<', '>']) {
-        const rows = db.query<{ id: string; account: string; thread_id: string; rfc: string | null; eligible: number }, [string, string, string, number]>(`
-          SELECT m.id,m.account,m.thread_id,substr((CASE WHEN json_valid(m.body) THEN json_extract(m.body,'$.rfcMessageId') END),1,999) rfc,
-            (m.generation=(SELECT generation FROM sdk_accounts a WHERE a.owner=m.owner AND a.id=m.account AND a.status<>'disconnected') AND ${selectedMembership()}) eligible
-          FROM json_each(?) r CROSS JOIN sdk_messages m INDEXED BY sdk_message_forwarding_parent_source
-          ON m.owner=? AND (CASE WHEN json_valid(m.body) THEN json_extract(m.body,'$.inReplyTo') END)=json_extract(r.value,'$.rfc') AND m.account${comparison}json_extract(r.value,'$.source') AND m.deleted=0
-          LIMIT ?`).all(scope.json, JSON.stringify(refs), owner, 513 - nodes)
-        nodes += rows.length
-        if (nodes > 512) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'Forwarded-copy invalidation exceeds its relation budget.', 413)
-        for (const row of rows) {
-          if (!row.eligible) continue
-          const key = { sourceId: row.account, threadId: row.thread_id }
-          affected.set(JSON.stringify([key.sourceId, key.threadId]), key)
-          if (affected.size > 500) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'Forwarded-copy invalidation exceeds its thread budget.', 413)
-          const rfc = forwardingRfcId(row.rfc)
-          if (rfc) frontier.push({ rfc, source: row.account })
-        }
-      }
-    }
-    return [...affected.values()]
+    forwardingBatches.set(key, result)
+    if (forwardingBatches.size > 32) forwardingBatches.delete(forwardingBatches.keys().next().value!)
+    return result.map(value => ({ ...value }))
   }
 
   function conversationQuery(input: MailboxConversationQuery | undefined): MailboxConversationQuery {
@@ -1436,15 +1386,9 @@ export function createInbox(options: InboxOptions): Inbox {
       ?? db.query<MessageRow, [string, number, string]>('SELECT m.* FROM sdk_native_keys k JOIN sdk_messages m ON m.id=k.message_id WHERE k.account=? AND k.generation=? AND k.native_id=?').get(row.id, row.generation, mail.id)
       ?? (mail.folder === 'sent' && mail.rfcMessageId ? db.query<MessageRow, [string, number, string, string]>("SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id LIKE 'submission:%' AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.rfcMessageId') END)=? AND lower(json_extract(visible,'$.from.email'))=lower(?)").get(row.id, row.generation, mail.rfcMessageId, mail.from.email) : null)
     if (old?.deleted === 1) return old.id
-    const evidenceChanged = old ? recordEvidence(row, mail, old.id, reason) : false
-    const unchanged = () => {
-      // Additive delivery proof can enable an off-page copy without any body or
-      // summary change. Publish that dependency change without a revision bump.
-      if (evidenceChanged) event(row.owner, 'mail.changed', row.id, old!.id, 'updated', 'initial')
-      return old!.id
-    }
-    if (old && !old.deleted && (reason === 'backfill' || old.last_mutation_seq > fence)) return unchanged()
-    if (old && old.native_id !== mail.id && !preferredId && !old.native_id.startsWith('submission:')) return unchanged()
+    if (old) recordEvidence(row, mail, old.id, reason)
+    if (old && !old.deleted && (reason === 'backfill' || old.last_mutation_seq > fence)) return old.id
+    if (old && old.native_id !== mail.id && !preferredId && !old.native_id.startsWith('submission:')) return old.id
     const id = old?.id ?? preferredId ?? randomUUID()
     const threadKey = mail.threadId || mail.id
     const thread = db.query<{ id: string }, [string, number, string]>('SELECT id FROM sdk_thread_keys WHERE account=? AND generation=? AND native_id=?').get(row.id, row.generation, threadKey)
@@ -1468,12 +1412,7 @@ export function createInbox(options: InboxOptions): Inbox {
     summary.bodyRevision = createHmac('sha256', options.encryptionKey)
       .update(JSON.stringify([row.owner, row.id, row.generation, id])).update('\0').update(body).digest('base64url')
     const confirmed = JSON.stringify(summary)
-    if (old && !old.deleted && old.confirmed === confirmed && old.body === body) return unchanged()
-    let previousRfcId: string | null = null
-    if (old) {
-      try { previousRfcId = forwardingRfcId((JSON.parse(old.body) as ForwardingBody)?.rfcMessageId) }
-      catch { /* Malformed legacy bodies have no usable forwarding identity. */ }
-    }
+    if (old && !old.deleted && old.confirmed === confirmed && old.body === body) return old.id
     db.query(`INSERT INTO sdk_messages(id,owner,account,generation,native_id,thread_id,confirmed,visible,body,received_at,folder,is_read,is_starred,subject,search_text)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET native_id=excluded.native_id,confirmed=excluded.confirmed,body=excluded.body,received_at=excluded.received_at,subject=excluded.subject,search_text=excluded.search_text,deleted=0`).run(
       id, row.owner, row.id, row.generation, mail.id, threadId, confirmed, confirmed, body, mail.receivedAt, mail.folder,
@@ -1482,8 +1421,7 @@ export function createInbox(options: InboxOptions): Inbox {
     db.query('INSERT OR IGNORE INTO sdk_native_keys VALUES (?,?,?,?)').run(row.id, row.generation, mail.id, id)
     if (!old) recordEvidence(row, mail, id, reason)
     if (old) project(id)
-    event(row.owner, 'mail.changed', row.id, id, old ? 'updated' : 'created', old && reason === 'arrival' ? 'mutation' : reason, undefined,
-      previousRfcId)
+    event(row.owner, 'mail.changed', row.id, id, old ? 'updated' : 'created', old && reason === 'arrival' ? 'mutation' : reason)
     return id
   }
 
@@ -2862,10 +2800,10 @@ export function createInbox(options: InboxOptions): Inbox {
           removed.push({ sourceId, messageId, reason: deleted ? 'deleted' : 'unselected', revision: deleted ? row?.revision ?? null : null })
         }
       }
-      const affectedThreads = forwardingAffectedThreads(owner, scope, from.seq, through, [...new Map([...selected].flatMap(([messageId, sourceId]) => {
+      const affectedThreads = [...new Map([...selected].flatMap(([messageId, sourceId]) => {
         const row = hydrated.rows.get(messageId)
         return row && row.account === sourceId ? [[JSON.stringify([sourceId, row.thread_id]), { sourceId, threadId: row.thread_id }] as const] : []
-      })).values()])
+      })).values()]
       const result: MailboxChangesPage = { events, upserts, removed, affectedThreads, state: token(owner, through), hasMore: through < head, resetRequired: false }
       if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The mailbox changes exceed their encoded budget.', 413)
       return result
