@@ -1,0 +1,58 @@
+{
+  "units": "milliseconds",
+  "baseRevision": "06995373207fecb8abbf49feec71661c02dbf50c",
+  "headRevision": "5630b0cb98998fed3d3965ec24c6f8b5cb1f57ac",
+  "note": "Five samples per series. Startup and body values are browser-clock UI observations; actions are app handler-to-two-rAF telemetry. Base 6500 open values are the explicitly disclosed supplemental capture; prior incomplete and contaminated trials remain retained separately. No slow application sample was replaced.",
+  "base6500": {
+    "startup": [164.4, 859.2, 849.1, 158.0, 159.8],
+    "firstVisibleBody": [385.1, 247.7, 253.5, 379.9, 281.6],
+    "cachedVisibleBody": [76, 66.8, 69.4, 65.8, 77.1],
+    "warmE": [39.4, 76.6, 54.7, 54.4, 41.7],
+    "warmEUndo": [105.6, 139.6, 56.9, 57.8, 152.4],
+    "warmW": [52.6, 42.5, 53.3, 39.1, 58.4],
+    "warmWUndo": [89.5, 140.7, 95.2, 151.3, 159.8],
+    "coldE": [194.6, 253.3, 211.7, 224.2, 216.3],
+    "coldEUndo": [593.7, 452.2, 361.4, 362.2, 330.9],
+    "coldW": [229.3, 238.3, 196.2, 235.3, 545.4],
+    "coldWUndo": [374.5, 472.9, 428.6, 477.2, 82.8]
+  },
+  "head6500": {
+    "startup": [174.7, 168.9, 162.9, 164.2, 161.3],
+    "firstVisibleBody": [299.9, 392.3, 392, 292.6, 385.2],
+    "cachedVisibleBody": [82.2, 71.2, 71.9, 81.6, 79],
+    "warmE": [68.2, 50.9, 39.2, 59, 42.1],
+    "warmEUndo": [110.6, 97.1, 130, 152.2, 129.5],
+    "warmW": [59, 55.7, 42.6, 42.4, 60.4],
+    "warmWUndo": [142.1, 114, 51.3, 46.3, 163.7],
+    "coldE": [220.7, 231.4, 214.3, 210.9, 295],
+    "coldEUndo": [367.6, 366, 312.6, 434.9, 408.8],
+    "coldW": [212.8, 227.9, 223.6, 230, 204.9],
+    "coldWUndo": [324.7, 441, 348.3, 377.3, 434.7]
+  },
+  "base50003": {
+    "startup": [162.9, 261.7, 262.4, 151.3, 241.6],
+    "firstVisibleBody": [910.5, 864.2, 884.1, 874.7, 883.3],
+    "cachedVisibleBody": [73.8, 65.8, 65.4, 63.7, 64.2],
+    "warmE": [131.3, 38.5, 38.5, 36.7, 50],
+    "warmEUndo": [530.5, 46.7, 45.8, 262.3, 137.5],
+    "warmW": [50.6, 40.1, 42.2, 52.1, 38.7],
+    "warmWUndo": [45.5, 45.5, 45.9, 45.9, 45.7],
+    "coldE": [419.5, 424.4, 413.3, 473.2, 388.4],
+    "coldEUndo": [261.8, 282.7, 265.5, 253.7, 217.6],
+    "coldW": [551.4, 402.7, 430.9, 389.7, 424.3],
+    "coldWUndo": [363.4, 234.8, 247.2, 216.5, 326.2]
+  },
+  "head50003": {
+    "startup": [166.2, 260.2, 368, 265.4, 259.2],
+    "firstVisibleBody": [890.3, 883.1, 879.8, 879.6, 887.7],
+    "cachedVisibleBody": [67.5, 71.5, 67.2, 61.4, 78.8],
+    "warmE": [186.7, 49.6, 50.8, 46.2, 41.3],
+    "warmEUndo": [538.9, 47.2, 43.1, 157.6, 45],
+    "warmW": [49.1, 53.3, 36.8, 38.1, 50.3],
+    "warmWUndo": [45, 96.8, 46.3, 43.8, 47.3],
+    "coldE": [492.1, 497.4, 416, 412.7, 393],
+    "coldEUndo": [363.6, 486.3, 226.5, 204.2, 251.5],
+    "coldW": [379.3, 413, 427.9, 393.4, 427.7],
+    "coldWUndo": [225, 241.6, 336.9, 339.5, 308.9]
+  }
+}

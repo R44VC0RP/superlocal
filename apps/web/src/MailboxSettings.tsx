@@ -11,9 +11,11 @@ const draftFrom = (value: InboxViewPreferences): ViewDraft => ({
   unifiedMode: value.unifiedMode,
   includedMailboxIds: [...value.includedMailboxIds],
   pinnedMailboxIds: [...value.pinnedMailboxIds],
+  hideForwardedDuplicates: value.hideForwardedDuplicates ?? true,
 });
 const sameDraft = (left: ViewDraft, right: ViewDraft) =>
   left.unifiedMode === right.unifiedMode &&
+  (left.hideForwardedDuplicates ?? true) === (right.hideForwardedDuplicates ?? true) &&
   JSON.stringify([...left.includedMailboxIds].sort()) === JSON.stringify([...right.includedMailboxIds].sort()) &&
   JSON.stringify(left.pinnedMailboxIds) === JSON.stringify(right.pinnedMailboxIds);
 
@@ -183,6 +185,12 @@ export default function MailboxSettings({ store, host, onEditStateChange }: {
             <span>Chosen mailboxes<span className="mailbox-option-note">Only checked mailboxes. Newly added mailboxes stay excluded.</span></span>
           </label>
         </fieldset>
+        <div className="mailbox-mode">
+          <label className="settings-radio-row">
+            <input type="checkbox" disabled={saving} checked={draft.hideForwardedDuplicates ?? true} onChange={event => edit({ hideForwardedDuplicates: event.target.checked })} />
+            <span>Hide forwarded duplicates<span className="mailbox-option-note">Show the original when both copies are in a loaded batch. Stored mail and totals stay unchanged.</span></span>
+          </label>
+        </div>
 
         <section className="mailbox-inclusion" aria-label="Added mailboxes">
           <div className="mailbox-section-heading">

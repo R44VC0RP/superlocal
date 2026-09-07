@@ -8,13 +8,14 @@ import { sanitizeEmailBody } from '../server/sanitize'
 import { createMediaStore } from './media'
 import { mailFacts } from './mail-facts'
 import { mailPreview } from './mail-preview'
+import { FORWARDING_BODY_BYTES, FORWARDING_DEPTH, forwardingRfcId, isForwardedCopy, type ForwardingBody, type ForwardingMessage } from './forwarding'
 import { ProviderError, ProviderMutationError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
 import { CredentialError, InboxError, MAILBOX_SYNC_PROBLEM_CODES, type MailboxSyncStatus, type MailboxSyncProblemCode, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
   type DraftInput, type Folder, type Inbox, type InboxOptions, type Label, type Message,
   type MessageSummary, type MutationInput, type Operation, type Participant, type Policy,
   type Problem, type Query, type SyncCheckpoint, type SyncRequest, type ThreadSummary, type Connection, type ConnectionIdentity,
   type Mailbox, type MailboxCandidate, type MailboxInput, type MailboxMembership, type MailboxMessageSummary,
-  type MailboxQuery, type MailboxConversationQuery, type MailboxConversation, type MailboxThreadKey, type MailboxSelector, type MailboxStateReceipt, type MailboxChangesPage, type SendingIdentity, type SendingIdentities } from './contracts'
+  type MailboxQuery, type MailboxConversationQuery, type MailboxConversation, type MailboxThreadKey, type MailboxSelector, type MailboxStateReceipt, type MailboxChangesPage, type MailboxForwardedCopy, type SendingIdentity, type SendingIdentities } from './contracts'
 
 type AccountRow = { id: string; owner: string; generation: number; status: Account['status']; data: string; native: string; credentials: string; connection_id: string; connection_generation: number; credential_version: number }
 type ConnectionRow = { id: string; owner: string; generation: number; status: Connection['status']; credential_version: number; data: string; credentials: string }
@@ -733,6 +734,91 @@ export function createInbox(options: InboxOptions): Inbox {
     return limit
   }
 
+  const forwardingBatches = new Map<string, MailboxForwardedCopy[]>()
+  let forwardingDatabaseState = ''
+
+  /** Resolve only the authorized request batch; no mailbox-wide relation lookup or maintenance. */
+  function forwardedCopies(owner: string, scope: ReturnType<typeof mailboxReadScope>, ids: string[]): MailboxForwardedCopy[] {
+    // These read-only counters also cover additive delivery evidence and writes by
+    // another connection, without adding ingestion events or dependency indexes.
+    const state = JSON.stringify([db.query('SELECT total_changes() AS changes').get(), db.query('PRAGMA data_version').get()])
+    if (state !== forwardingDatabaseState) { forwardingBatches.clear(); forwardingDatabaseState = state }
+    const key = JSON.stringify([owner, scope.binding, ids])
+    const previous = forwardingBatches.get(key)
+    if (previous) {
+      forwardingBatches.delete(key); forwardingBatches.set(key, previous)
+      return previous.map(value => ({ ...value }))
+    }
+    type Candidate = { id: string; account: string; thread_id: string; bytes: number; rfc: string | null; parent_rfc: string | null }
+    type Cached = { row: Candidate; message: ForwardingMessage; body: ForwardingBody }
+    const excluded = "'draft','drafts','scheduled','outbox','queued','unsent','pending'"
+    const candidates = db.query<Candidate, [string, string, string, string]>(`
+      SELECT m.id,m.account,m.thread_id,
+        substr((CASE WHEN json_valid(m.body) THEN json_extract(m.body,'$.rfcMessageId') END),1,999) rfc,
+        substr((CASE WHEN json_valid(m.body) THEN json_extract(m.body,'$.inReplyTo') END),1,999) parent_rfc,
+        length(CAST(m.body AS BLOB))+length(CAST(m.visible AS BLOB))+length(CAST(m.confirmed AS BLOB)) bytes
+      FROM sdk_messages m INDEXED BY sqlite_autoindex_sdk_messages_1
+      WHERE m.owner=? AND m.id IN (SELECT value FROM json_each(?)) AND m.deleted=0
+        AND m.generation=(SELECT generation FROM sdk_accounts a WHERE a.id=m.account AND a.owner=m.owner AND a.status<>'disconnected')
+        AND m.account IN (SELECT value FROM json_each(?)) AND ${selectedMembership()}
+        AND (CASE WHEN json_valid(m.visible) THEN json_extract(m.visible,'$.folder') END) NOT IN (${excluded})
+        AND (CASE WHEN json_valid(m.confirmed) THEN json_extract(m.confirmed,'$.folder') END) NOT IN (${excluded})
+        AND NOT EXISTS(SELECT 1 FROM sdk_folders f WHERE f.owner=m.owner AND f.account=m.account
+          AND f.id IN (SELECT value FROM json_each(CASE WHEN json_valid(m.visible) THEN m.visible ELSE '{}' END,'$.folderIds')
+            UNION SELECT value FROM json_each(CASE WHEN json_valid(m.confirmed) THEN m.confirmed ELSE '{}' END,'$.folderIds'))
+          AND json_type(f.data,'$.custom') IS NOT 'true' AND json_extract(f.data,'$.role') IN (${excluded}))
+    `).all(owner, JSON.stringify(ids), scope.sourceJson, scope.json)
+    const byId = new Map(candidates.map(row => [row.id, row]))
+    const parents = new Map<string, Candidate | null>()
+    for (const row of candidates) {
+      const rfc = forwardingRfcId(row.rfc)
+      if (rfc) parents.set(rfc, parents.has(rfc) ? null : row)
+    }
+    const cache = new Map<string, Cached | null>(), edges = new Map<string, boolean>()
+    const load = (row: Candidate): Cached | null => {
+      if (cache.has(row.id)) return cache.get(row.id)!
+      cache.set(row.id, null)
+      if (row.bytes > FORWARDING_BODY_BYTES) return null
+      const stored = db.query<{ visible: string; body: string; confirmed: string }, [string, string]>('SELECT visible,body,confirmed FROM sdk_messages WHERE owner=? AND id=?').get(owner, row.id)
+      if (!stored) return null
+      try {
+        const message = JSON.parse(stored.visible) as MessageSummary
+        const result = { row, message, body: JSON.parse(stored.body) as ForwardingBody }
+        cache.set(row.id, result)
+        return result
+      } catch { return null } // Malformed legacy records cannot establish proof.
+    }
+    const resolve = (current: Cached, visited: Set<string>, depth: number): Cached | null => {
+      if (visited.has(current.row.id) || depth > FORWARDING_DEPTH) return null
+      visited.add(current.row.id)
+      const rfc = forwardingRfcId(current.body.inReplyTo)
+      if (!rfc || !parents.has(rfc)) return current
+      if (depth === FORWARDING_DEPTH) return null
+      const found = parents.get(rfc)
+      if (!found || visited.has(found.id)) return null
+      const original = load(found)
+      if (!original) return current
+      if (!edges.has(current.row.id)) {
+        const sender = current.message.from.email.trim().toLowerCase()
+        const delivered = !!db.query('SELECT 1 FROM sdk_delivery_evidence WHERE owner=? AND source=? AND message=? AND kind=\'address\' AND value=?').get(owner, original.row.account, original.row.id, sender)
+        edges.set(current.row.id, isForwardedCopy(current.message, current.body, original.message, original.body, delivered))
+      }
+      if (!edges.get(current.row.id)) return current
+      return resolve(original, visited, depth + 1)
+    }
+    const result = ids.flatMap(id => {
+      const row = byId.get(id), rfc = forwardingRfcId(row?.parent_rfc)
+      if (!row || !rfc || !parents.get(rfc)) return []
+      const current = load(row)
+      if (!current) return []
+      const original = resolve(current, new Set(), 0)
+      return original && original.row.id !== id ? [{ messageId: id, originalMessageId: original.row.id, originalSourceId: original.row.account, originalThreadId: original.row.thread_id }] : []
+    })
+    forwardingBatches.set(key, result)
+    if (forwardingBatches.size > 32) forwardingBatches.delete(forwardingBatches.keys().next().value!)
+    return result.map(value => ({ ...value }))
+  }
+
   function conversationQuery(input: MailboxConversationQuery | undefined): MailboxConversationQuery {
     if (input === undefined) return {}
     if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['folder', 'labelId', 'search', 'unreadOnly', 'starredOnly', 'hasAttachments', 'from', 'to', 'before', 'after', 'done', 'snoozed', 'participant'].includes(key))) throw new InboxError('VALIDATION', 'Invalid conversation query.')
@@ -1298,7 +1384,7 @@ export function createInbox(options: InboxOptions): Inbox {
     }
     const old = preferred ?? exact
       ?? db.query<MessageRow, [string, number, string]>('SELECT m.* FROM sdk_native_keys k JOIN sdk_messages m ON m.id=k.message_id WHERE k.account=? AND k.generation=? AND k.native_id=?').get(row.id, row.generation, mail.id)
-      ?? (mail.folder === 'sent' && mail.rfcMessageId ? db.query<MessageRow, [string, number, string, string]>("SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id LIKE 'submission:%' AND json_extract(body,'$.rfcMessageId')=? AND lower(json_extract(visible,'$.from.email'))=lower(?)").get(row.id, row.generation, mail.rfcMessageId, mail.from.email) : null)
+      ?? (mail.folder === 'sent' && mail.rfcMessageId ? db.query<MessageRow, [string, number, string, string]>("SELECT * FROM sdk_messages WHERE account=? AND generation=? AND native_id LIKE 'submission:%' AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.rfcMessageId') END)=? AND lower(json_extract(visible,'$.from.email'))=lower(?)").get(row.id, row.generation, mail.rfcMessageId, mail.from.email) : null)
     if (old?.deleted === 1) return old.id
     if (old) recordEvidence(row, mail, old.id, reason)
     if (old && !old.deleted && (reason === 'backfill' || old.last_mutation_seq > fence)) return old.id
@@ -2109,7 +2195,8 @@ export function createInbox(options: InboxOptions): Inbox {
         const backfill = db.query<{ data: string }, [string, number, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND scope=? AND lane=\'backfill\'').get(id, row.generation, checkpointScope)
         const backfillCheckpoint: SyncCheckpoint | undefined = backfill ? JSON.parse(backfill.data) : undefined
         let fence: number
-        const known = db.query<{ native_id: string; is_read: number; is_starred: number; folder: string }, [string, number]>(
+        const definition = definitions.get((JSON.parse(row.data) as Account).providerId)
+        const known = definition?.syncHints === false ? undefined : db.query<{ native_id: string; is_read: number; is_starred: number; folder: string }, [string, number]>(
           "SELECT native_id,json_extract(confirmed,'$.isRead') is_read,json_extract(confirmed,'$.isStarred') is_starred,json_extract(confirmed,'$.folder') folder FROM sdk_messages WHERE account=? AND generation=? AND deleted=0").all(id, row.generation)
         const syncOptions = { folder: scope, limit: request.limit ?? 100, ...(selection?.scopes ? { mailboxScopes: selection.scopes } : {}) }
         // Runtime hints are separate from providers' validated operation input.
@@ -2118,8 +2205,9 @@ export function createInbox(options: InboxOptions): Inbox {
           snapshotComplete: !request.reset && (backfillCheckpoint
             ? backfillCheckpoint.initialized && backfillCheckpoint.cursor === null
             : checkpoint.snapshotComplete ?? (Boolean(saved) && checkpoint.initialized && (JSON.parse(row.data) as Account).sync.coverage === 'complete')),
-          knownMessageIds: known.map(message => message.native_id),
-          knownMessageStates: known.map(message => ({ id: message.native_id, isRead: Boolean(message.is_read), isStarred: Boolean(message.is_starred), folder: message.folder })) }
+          ...(known ? {
+            knownMessageIds: known.map(message => message.native_id),
+            knownMessageStates: known.map(message => ({ id: message.native_id, isRead: Boolean(message.is_read), isStarred: Boolean(message.is_starred), folder: message.folder })) } : {}) }
         let page: SyncResult
         let synchronized = 0
         let inputCursor = checkpoint.cursor
@@ -2656,6 +2744,13 @@ export function createInbox(options: InboxOptions): Inbox {
         if (Buffer.byteLength(JSON.stringify(result)) > READ_BYTES) throw new InboxError('MAILBOX_READ_TOO_LARGE', 'The mailbox page exceeds its encoded budget.', 413)
         return result
       } catch (error) { if (created) discardInventory(key); throw error }
+    }).deferred()),
+    mailboxForwardedCopies: (owner, input) => run(() => db.transaction(() => {
+      if (!input || Object.keys(input).some(key => !['mailboxIds', 'messageIds'].includes(key)) || !Array.isArray(input.messageIds) || input.messageIds.length > 500) throw new InboxError('VALIDATION', 'Forwarded-copy reads contain at most 500 message IDs.')
+      const scope = mailboxReadScope(owner, input.mailboxIds)
+      if (!scope.attached) throw new InboxError('NOT_FOUND', 'Mailbox not found.', 404)
+      const ids = [...new Set(input.messageIds.map(id => text(id, 'Message ID', 512)))]
+      return forwardedCopies(owner, scope, ids)
     }).deferred()),
     mailboxChanges: (owner, input) => run(() => db.transaction(() => {
       if (!input || Object.keys(input).some(key => !['mailboxIds', 'since', 'scopeState', 'limit'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox changes input.')

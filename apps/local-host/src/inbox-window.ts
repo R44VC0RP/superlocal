@@ -49,7 +49,7 @@ type Dependencies = {
 }
 type ScopeRow = { id: string; account: string; data: string; cursor: string | null; baseline: string | null; sdk_state: string | null; sdk_scope: string; raw_complete: number; revision: number; generation: number; reset: string | null; checked: number }
 type ReadBaseline = { sdkState: string | null; scopeState: string; revision: number; ai: number; category: number; at: number }
-type Scope = { row: ScopeRow; boxes: Mailbox[]; sources: Account[]; labels: Label[]; folders: Map<string, Folder[]>; preference: string; preferences: Preferences; ai: AiTriageState; users: number; lastUsed: number; metadataAt: number; metadataDirty: boolean; seenEvents: number; read?: ReadBaseline }
+type Scope = { row: ScopeRow; boxes: Mailbox[]; sources: Account[]; labels: Label[]; folders: Map<string, Folder[]>; preference: string; preferences: Preferences; hideForwardedDuplicates: boolean; ai: AiTriageState; users: number; lastUsed: number; metadataAt: number; metadataDirty: boolean; seenEvents: number; read?: ReadBaseline }
 type ProjectionStamp = { preference?: string; metadata?: string; aiCursor?: number; categoryCursor?: number; contextVersion?: 3 }
 type QueryRow = { id: string; scope: string; data: string; preference: string; scanned: number; generation: number; expires: number; problem: string | null; read_state: string | null }
 type ReadMetadata = { importantSince?: string; baselines: Array<{ revision: number; token: string }>; wake?: number; changes?: { id: string; input: string; baseline: ReadBaseline; keys: string[]; head: boolean; more: boolean }; counts?: { position?: PagePosition; progress?: number; baseline: ReadBaseline; totals: DTO.InboxTotals; complete: boolean; wake?: number } }
@@ -179,7 +179,7 @@ export function createInboxWindowService(deps: Dependencies) {
     const selectedSources = sources.filter(source => boxes.some(box => box.sourceId === source.id))
     const identity = { account, boxes: boxes.map(box => [box.id, box.sourceId, box.revision, box.status]).sort(), sources: selectedSources.map(source => [source.id, source.generation]).sort() }
     const id = digest(identity), split = deps.splitPreferences.read() ?? { ...normalizeSplits({}), revision: 0 }
-    const preference = digest(['demand-window-1', ATTENTION_VERSION, AI_PREFERENCE_VERSION, IMPORTANT_WINDOW_VERSION, preferences.revision, split, ai.configured, ai.settings])
+    const preference = digest(['demand-window-1', 'request-batch-duplicates-1', ATTENTION_VERSION, AI_PREFERENCE_VERSION, IMPORTANT_WINDOW_VERSION, preferences.revision, split, ai.configured, ai.settings])
     aiCursor ??= ai.cursor
     const categoryHead = db.query<{ head: number }, string[]>('SELECT head FROM local_category_clock WHERE owner=?').get(owner)?.head ?? 0
     categoryCursor ??= categoryHead
@@ -192,7 +192,7 @@ export function createInboxWindowService(deps: Dependencies) {
         scopes.delete(oldest!.row.id)
       }
       db.query('INSERT OR IGNORE INTO local_window_scopes(owner,id,account,data) VALUES (?,?,?,?)').run(owner, id, account, JSON.stringify(identity))
-      scope = { row: getScopeRow(id), boxes, sources: selectedSources, labels: [], folders: new Map(), preference, preferences: split as unknown as Preferences, ai, users: 0, lastUsed: Date.now(), metadataAt: 0, metadataDirty: true, seenEvents: -1 }
+      scope = { row: getScopeRow(id), boxes, sources: selectedSources, labels: [], folders: new Map(), preference, preferences: split as unknown as Preferences, hideForwardedDuplicates: preferences.hideForwardedDuplicates !== false, ai, users: 0, lastUsed: Date.now(), metadataAt: 0, metadataDirty: true, seenEvents: -1 }
       scopes.set(id, scope)
       // Existing capture data remains durable, but resolving an ordinary view neither
       // reads that copy as live mail nor resumes its materialization.
@@ -205,6 +205,7 @@ export function createInboxWindowService(deps: Dependencies) {
       if (preparations.has(scope.row.id)) { invalidateProjection(scope); stamp(scope, { preference }) }
     }
     scope.boxes = boxes; scope.sources = selectedSources; scope.ai = ai; scope.preferences = split as unknown as Preferences
+    scope.hideForwardedDuplicates = preferences.hideForwardedDuplicates !== false
     await refreshMetadata(scope)
     refresh(scope)
     return scope
@@ -397,15 +398,31 @@ export function createInboxWindowService(deps: Dependencies) {
         counts: { messages: sdk.messageCount, memberships: sdk.membershipCount, unread: full ? values.filter(value => !value.isRead).length : sdk.isRead ? 0 : null, done: sdk.doneMembershipCount,
           snoozed: full ? values.reduce((sum, value) => sum + value.memberships.filter(state => !!state.snoozedUntil && Date.parse(state.snoozedUntil) > budget.now).length, 0) : sdk.earliestSnoozedUntil ? null : 0 },
         targets: sdk.targets, targetsComplete, actionContextComplete: full && targetsComplete && preview.length === sdk.messageCount, contextVersion: context.hash }
-      while (bytes(row) > 512 * 1024 && row.summaries.length > 1) {
+      let rowSize = bytes(row)
+      while (rowSize > 512 * 1024 && row.summaries.length > 1) {
         const removed = row.summaries.pop()!; row.mail.messages = row.mail.messages.filter(message => message.id !== removed.id); row.messagesComplete = false; row.actionContextComplete = false
+        rowSize = bytes(row)
       }
-      if (bytes(row) > DTO.INBOX_RESPONSE_BYTE_LIMIT - 65536) fail('HOST_INBOX_TOO_LARGE', 413)
+      if (rowSize > DTO.INBOX_RESPONSE_BYTE_LIMIT - 65536) fail('HOST_INBOX_TOO_LARGE', 413)
       budget.summaries.set(row.key, values); budget.contexts.set(row.key, context.evidence)
       if (full) budget.legacy.set(row.key, legacyContextFingerprint(scope, values))
       rows.push(row)
     }
     return rows
+  }
+  /** Compact only a completed, view-filtered response batch. Counts, captures,
+   * detail reads and resident updates never invoke duplicate detection. */
+  async function compactBatch<T extends DTO.InboxWindowRow>(scope: Scope, rows: T[]): Promise<T[]> {
+    if (!scope.hideForwardedDuplicates || rows.length < 2) return rows
+    const candidates = rows.filter(row => row.messagesComplete && row.summaries.length > 0)
+    const messageIds = candidates.flatMap(row => row.summaries.map(message => message.id))
+    // Preserve the existing proof budget without making results depend on which
+    // part of a large conversation happens to fit. Never fetch extra history.
+    if (candidates.length < 2 || messageIds.length > 500) return rows
+    const copies = await inbox.mailboxForwardedCopies(owner, { mailboxIds: scope.boxes.map(box => box.id), messageIds })
+    const hidden = new Set(copies.map(copy => copy.messageId))
+    const redundant = new Set(candidates.filter(row => row.summaries.every(message => hidden.has(message.id))).map(row => row.key))
+    return redundant.size ? rows.filter(row => !redundant.has(row.key)) : rows
   }
   /** Capture-only materialization. No query/page/lookup/change/sender read calls it. */
   async function buildRows(scope: Scope, inputKeys: DTO.InboxThreadKey[], live?: ReadonlyMap<string, MailboxConversation>) {
@@ -721,7 +738,7 @@ export function createInboxWindowService(deps: Dependencies) {
    * pages maximum, in either direction. Only consumed leaders advance the cursor;
    * an unreturned match is never skipped, including at an SDK page's terminal edge.
    */
-  async function preparePage(scope: Scope, query: QueryRow, maximum: number, cursor?: PageCursor, reverse = false, budget = readBudget()): Promise<DTO.InboxWindowPage> {
+  async function preparePage(scope: Scope, query: QueryRow, maximum: number, cursor?: PageCursor, reverse = false, budget = readBudget(), compact = true): Promise<DTO.InboxWindowPage> {
     if (cursor && (typeof cursor.older !== 'string' || typeof cursor.newer !== 'string' || !['older', 'newer'].includes(cursor.direction)
       || !cursor.baseline || typeof cursor.baseline.scopeState !== 'string' || typeof cursor.baseline.sdkState !== 'string'
       || ![cursor.baseline.revision, cursor.baseline.ai, cursor.baseline.category, cursor.baseline.at].every(value => Number.isSafeInteger(value) && value >= 0))) fail('HOST_INBOX_CURSOR_INVALID')
@@ -737,6 +754,7 @@ export function createInboxWindowService(deps: Dependencies) {
     const metadata = readMetadata(query)
     if (recentView && !metadata.importantSince) { metadata.importantSince = new Date(budget.now - IMPORTANT_WINDOW_MS).toISOString(); saveReadMetadata(query, metadata) }
     const queryFilter = recentView ? { ...nativeQuery(scope, view), after: metadata.importantSince } : nativeQuery(scope, view), rows: PageableRow[] = []
+    const positions = new Map<string, string>()
     let size = 65536, exhausted = false, stopped = false, wake = Infinity, firstConsumed: string | undefined, firstVisible: string | undefined
     const bookmark = (older: string, newer: string) => token(`page:${query.id}`, scope, { older, newer, baseline: { ...read! }, direction } satisfies PageCursor)
     while (budget.pages > 0 && rows.length < maximum && !stopped) {
@@ -759,7 +777,7 @@ export function createInboxWindowService(deps: Dependencies) {
           // this response. A page-first bookmark would skip the evicted prefix.
           const result: PageableRow = { ...row, pageCursor: bookmark(at, at) }, cost = bytes(result)
           if (size + cost > DTO.INBOX_RESPONSE_BYTE_LIMIT) { stopped = true; break }
-          rows.push(result); size += cost; firstVisible ??= at
+          rows.push(result); positions.set(row.key, at); size += cost; firstVisible ??= at
         }
         firstConsumed ??= at; position = at; consumed++
         if (rows.length >= maximum) { stopped = true; break }
@@ -772,8 +790,23 @@ export function createInboxWindowService(deps: Dependencies) {
     const saved = readMetadata(query)
     if (Number.isFinite(wake)) { saved.wake = Math.min(saved.wake ?? Infinity, wake); saveReadMetadata(query, saved) }
     const opposite = firstVisible ?? firstConsumed ?? position
-    if (reverse) rows.reverse() // SDK traverses oldest-to-newest; the UI always displays newest first.
-    return { state: state(scope, query, read), rows, totals: totals(scope, query), exhausted,
+    // Filters and the requested raw-match limit are final before compaction.
+    // A removed duplicate never causes another SDK page to be fetched to fill it.
+    const compacted = compact ? await compactBatch(scope, rows) : rows
+    if (compacted !== rows) {
+      const kept = new Set(compacted.map(row => row.key))
+      const indexes = rows.flatMap((row, index) => kept.has(row.key) ? [index] : [])
+      for (const [index, row] of compacted.entries()) {
+        // Retain each visible row's consumed hidden prefix/suffix when the client
+        // later evicts part of this batch and resumes from a per-row bookmark.
+        const start = indexes[index - 1] === undefined ? 0 : indexes[index - 1]! + 1
+        const end = indexes[index + 1] === undefined ? rows.length - 1 : indexes[index + 1]! - 1
+        const before = positions.get(rows[start]!.key)!, after = positions.get(rows[end]!.key)!
+        row.pageCursor = reverse ? bookmark(before, after) : bookmark(after, before)
+      }
+    }
+    if (reverse) compacted.reverse() // SDK traverses oldest-to-newest; the UI always displays newest first.
+    return { state: state(scope, query, read), rows: compacted, totals: totals(scope, query), exhausted,
       nextCursor: exhausted ? null : reverse ? bookmark(opposite!, position!) : bookmark(position!, opposite!) }
   }
 
@@ -1402,19 +1435,29 @@ export function createInboxWindowService(deps: Dependencies) {
     if (count?.complete && totals(scope, query).conversations !== null) return { state: state(scope, query), totals: count.totals }
     const empty = (): DTO.InboxTotals => ({ conversations: 0, messages: 0, inbox: 0, splits: Object.fromEntries(scope.preferences.splits.map(name => [name, 0])),
       folders: Object.fromEntries(['Inbox', 'Starred', 'Sent', 'Done', 'Auto Archived', 'Reminders', 'Spam', 'Trash', 'All Mail'].map(name => [name, 0])), holding: false })
-    if (!count) {
-      // SDK counts are exact for the cached receiving scope. App folder/category
-      // conjunctions are not message predicates; do not mislabel matching-message
-      // counts as whole-conversation message totals.
-      const cached = scope.boxes.length ? await inbox.mailboxCounts(owner, { mailboxIds: scope.boxes.map(box => box.id) }) : null
-      const read = observe(scope, cached?.asOfState ?? null, cached?.scopeState ?? scope.row.id, query)
-      count = { baseline: read, totals: empty(), complete: !cached || cached.conversations === 0 }
-    }
     const budget = readBudget(), view = json<DTO.InboxViewQuery>(query.data)
-    while (!count.complete && budget.pages > 0) {
+    let firstPage: Awaited<ReturnType<Inbox['mailboxConversations']>> | undefined
+    if (!count) {
+      // The first bounded page supplies both the snapshot fence and emptiness.
+      // A preliminary mailbox-wide count adds no information to this traversal.
+      if (scope.boxes.length) {
+        await wait()
+        budget.pages--
+        firstPage = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 100 })
+      }
+      const read = observe(scope, firstPage?.state ?? null, firstPage?.scopeState ?? scope.row.id, query)
+      count = { baseline: read, totals: empty(), complete: !firstPage || firstPage.items.length === 0 }
+    }
+    while (!count.complete && (firstPage || budget.pages > 0)) {
       const position = count.position ?? {}
-      budget.pages--
-      const page = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 100, ...(position.cursor ? { cursor: position.cursor } : {}) })
+      if (!firstPage) {
+        // Counting is background work. Resolved SDK promises alone do not let
+        // queued body/action HTTP requests run between synchronous SQLite pages.
+        await wait()
+        budget.pages--
+      }
+      const page = firstPage ?? await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 100, ...(position.cursor ? { cursor: position.cursor } : {}) })
+      firstPage = undefined
       if (page.state !== count.baseline.sdkState || page.scopeState !== count.baseline.scopeState) {
         saved = readMetadata(query); delete saved.counts; saveReadMetadata(query, saved)
         return { state: state(scope, query), totals: unknownTotals(scope) }
@@ -1520,12 +1563,17 @@ export function createInboxWindowService(deps: Dependencies) {
     if (!consumed && entries.length) throw pendingContext
     const nextOffset = offset + consumed
     if (headStage) {
-      const view = json<DTO.InboxViewQuery>(query!.data), head = await preparePage(scope, query!, maximum, undefined, false, budget)
-      for (const row of head.rows) {
-        if (wanted.includes(row.key)) continue
-        // preparePage records the hold's wake even when this unseen arrival is
-        // withheld. A later bounded changes pass retries it without another event.
-        if (!view.search && view.folder === 'Inbox' && (row.mail.aiHoldUntil ?? 0) > budget.now) continue
+      const view = json<DTO.InboxViewQuery>(query!.data), head = await preparePage(scope, query!, maximum, undefined, false, budget, false)
+      // Head-only arrival holds must be applied before matching copies. A withheld
+      // original cannot suppress a visible copy; already-resident rows remain
+      // valid context within this requested head batch, never arbitrary history.
+      const visible = head.rows.filter(row => resident.includes(row.key) || view.search || view.folder !== 'Inbox' || (row.mail.aiHoldUntil ?? 0) <= budget.now)
+      const compacted = await compactBatch(scope, visible), kept = new Set(compacted.map(row => row.key))
+      for (const row of visible) if (resident.includes(row.key) && !kept.has(row.key)) removed.push({ key: row.key, reason: 'not-matching' })
+      for (const row of compacted) {
+        // A pinned reader is not necessarily in the active list (notably after
+        // Undo). Restore matching head rows, not just previously unknown IDs.
+        if (resident.includes(row.key)) continue
         const cost = bytes(row)
         if (size + cost > DTO.INBOX_RESPONSE_BYTE_LIMIT) break
         row.revision = pass.baseline.revision; newHead.push(row); size += cost

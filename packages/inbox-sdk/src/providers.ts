@@ -8,7 +8,7 @@ import { CredentialError, type ProviderDefinition } from './contracts'
 export const builtInProviders: readonly ProviderDefinition[] = Object.freeze([
   {
     id: 'gmail', name: 'Gmail', connection: 'oauth',
-    nativeCategoryRoles: GMAIL_CATEGORY_ROLES,
+    nativeCategoryRoles: GMAIL_CATEGORY_ROLES, syncHints: false,
     scopes: ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/gmail.send'],
     onboarding: { summary: 'Sign in with your Google account', actionLabel: 'Sign in with Google',
       redirectNote: 'You will be sent to Google to approve access, then brought back here while your mail loads.' },

@@ -127,6 +127,8 @@ export interface ProviderDefinition {
   name: string
   /** Translate retained native folder roles into upstream category facts, without opening a provider connection. */
   nativeCategoryRoles?: Readonly<Record<string, string>>
+  /** Defaults to true. False omits knownMessageIds/knownMessageStates only; use it only if sync never consumes them. */
+  syncHints?: boolean
   connection?: 'oauth' | 'credentials'
   scopes?: string[]
   /** Runtime cancellation is separate from provider-validated credential fields. */
@@ -364,6 +366,9 @@ export interface MailboxSnapshotPage {
   scopeState: string
   expiresAt: string
 }
+export interface MailboxForwardedCopiesInput { mailboxIds: string[]; messageIds: string[] }
+/** Proven cached copy within one request batch. Canonical messages and workflow states remain independent. */
+export interface MailboxForwardedCopy { messageId: string; originalMessageId: string; originalSourceId: string; originalThreadId: string }
 export interface MailboxChangesInput { mailboxIds: string[]; since: string; scopeState: string; limit?: number }
 export interface MailboxChangesPage extends ChangePage {
   /** Includes retained identities of deleted/unselected messages. Empty on scope/history reset. */
@@ -616,6 +621,8 @@ export interface Inbox {
   /** Read-only primary-inbox activity, grouped by source; excludes detached mailbox selections. */
   mailboxSyncStatus(owner: string, input: { mailboxIds: string[] }): Promise<MailboxSyncStatus[]>
   mailboxSnapshot(owner: string, input: MailboxSnapshotInput): Promise<MailboxSnapshotPage>
+  /** At most 500 requested IDs; both copy and original must be in this authorized current-generation batch. */
+  mailboxForwardedCopies(owner: string, input: MailboxForwardedCopiesInput): Promise<MailboxForwardedCopy[]>
   mailboxChanges(owner: string, input: MailboxChangesInput): Promise<MailboxChangesPage>
   /** Cached metadata only; never reads a body, including legacy fact enrichment. */
   mailboxMessageSummary(owner: string, mailboxId: string, messageId: string): Promise<MailboxMessageSummary>

@@ -7,16 +7,18 @@ export type InboxViewPreferences = {
   unifiedMode: 'all' | 'selected'
   includedMailboxIds: string[]
   pinnedMailboxIds: string[]
+  hideForwardedDuplicates?: boolean
 }
 
 export const INBOX_PREFERENCES_BODY_LIMIT = 262_144
-const fields = ['revision', 'unifiedMode', 'includedMailboxIds', 'pinnedMailboxIds']
+const fields = ['revision', 'unifiedMode', 'includedMailboxIds', 'pinnedMailboxIds', 'hideForwardedDuplicates']
 type PreferencesRow = {
   revision: number
   unified_mode: string
   included_mailbox_ids: string
   pinned_mailbox_ids: string
   pins_seeded: number
+  hide_forwarded_duplicates: number
 }
 
 function mailboxIds(value: unknown, maximum: number, field: string): string[] {
@@ -27,8 +29,11 @@ function mailboxIds(value: unknown, maximum: number, field: string): string[] {
 }
 
 function preferences(input: unknown): InboxViewPreferences {
-  if (!object(input) || Object.getPrototypeOf(input) !== Object.prototype || Object.keys(input).length !== fields.length || Object.keys(input).some(key => !fields.includes(key))) {
-    throw new InboxError('HOST_INBOX_PREFERENCES_INVALID', 'Provide only revision, unifiedMode, includedMailboxIds, and pinnedMailboxIds.', 400)
+  if (!object(input) || Object.getPrototypeOf(input) !== Object.prototype || Object.keys(input).some(key => !fields.includes(key))) {
+    throw new InboxError('HOST_INBOX_PREFERENCES_INVALID', 'Provide only revision, unifiedMode, includedMailboxIds, pinnedMailboxIds, and optional hideForwardedDuplicates.', 400)
+  }
+  if (Object.hasOwn(input, 'hideForwardedDuplicates') && typeof input.hideForwardedDuplicates !== 'boolean') {
+    throw new InboxError('HOST_INBOX_PREFERENCES_INVALID', 'Hide forwarded duplicates must be a boolean.', 400)
   }
   if (typeof input.revision !== 'number' || !Number.isSafeInteger(input.revision) || input.revision < 1) {
     throw new InboxError('HOST_INBOX_PREFERENCES_INVALID', 'Use the positive integer revision from the current inbox preferences.', 400)
@@ -38,14 +43,16 @@ function preferences(input: unknown): InboxViewPreferences {
   }
   return { revision: input.revision, unifiedMode: input.unifiedMode,
     includedMailboxIds: mailboxIds(input.includedMailboxIds, 5000, 'Unified inclusion'),
-    pinnedMailboxIds: mailboxIds(input.pinnedMailboxIds, 9, 'Pinned mailboxes') }
+    pinnedMailboxIds: mailboxIds(input.pinnedMailboxIds, 9, 'Pinned mailboxes'),
+    ...(Object.hasOwn(input, 'hideForwardedDuplicates') ? { hideForwardedDuplicates: input.hideForwardedDuplicates as boolean } : {}) }
 }
 
 function savedPreferences(row: PreferencesRow): InboxViewPreferences {
   try {
-    if (row.included_mailbox_ids.length > INBOX_PREFERENCES_BODY_LIMIT || row.pinned_mailbox_ids.length > INBOX_PREFERENCES_BODY_LIMIT || ![0, 1].includes(row.pins_seeded)) throw new Error()
+    if (row.included_mailbox_ids.length > INBOX_PREFERENCES_BODY_LIMIT || row.pinned_mailbox_ids.length > INBOX_PREFERENCES_BODY_LIMIT || ![0, 1].includes(row.pins_seeded) || ![0, 1].includes(row.hide_forwarded_duplicates)) throw new Error()
     return preferences({ revision: row.revision, unifiedMode: row.unified_mode,
-      includedMailboxIds: JSON.parse(row.included_mailbox_ids), pinnedMailboxIds: JSON.parse(row.pinned_mailbox_ids) })
+      includedMailboxIds: JSON.parse(row.included_mailbox_ids), pinnedMailboxIds: JSON.parse(row.pinned_mailbox_ids),
+      hideForwardedDuplicates: row.hide_forwarded_duplicates === 1 })
   } catch { throw new InboxError('HOST_INBOX_PREFERENCES_UNREADABLE', 'Saved inbox preferences could not be read safely. They were not reset.', 500) }
 }
 
@@ -56,30 +63,38 @@ function nextRevision(revision: number): number {
 
 /** Host-owned view settings only: no SDK policy, native mail state, discovery, or credential writes. */
 export function createInboxViewPreferencesStore(database: Database, inbox: Pick<Inbox, 'mailboxes'>, owner: string) {
-  database.transaction(() => database.exec(`CREATE TABLE IF NOT EXISTS local_inbox_preferences (
-    owner TEXT PRIMARY KEY NOT NULL,
-    revision INTEGER NOT NULL CHECK (revision >= 1 AND revision <= 9007199254740991),
-    unified_mode TEXT NOT NULL CHECK (unified_mode IN ('all','selected')),
-    included_mailbox_ids TEXT NOT NULL,
-    pinned_mailbox_ids TEXT NOT NULL,
-    pins_seeded INTEGER NOT NULL CHECK (pins_seeded IN (0,1))
-  ) STRICT`)).immediate()
-  const select = database.query<PreferencesRow, [string]>(`SELECT revision,unified_mode,included_mailbox_ids,pinned_mailbox_ids,pins_seeded
+  database.transaction(() => {
+    database.exec(`CREATE TABLE IF NOT EXISTS local_inbox_preferences (
+      owner TEXT PRIMARY KEY NOT NULL,
+      revision INTEGER NOT NULL CHECK (revision >= 1 AND revision <= 9007199254740991),
+      unified_mode TEXT NOT NULL CHECK (unified_mode IN ('all','selected')),
+      included_mailbox_ids TEXT NOT NULL,
+      pinned_mailbox_ids TEXT NOT NULL,
+      pins_seeded INTEGER NOT NULL CHECK (pins_seeded IN (0,1)),
+      hide_forwarded_duplicates INTEGER NOT NULL DEFAULT 1 CHECK (hide_forwarded_duplicates IN (0,1))
+    ) STRICT`)
+    const columns = database.query<{ name: string }, []>('PRAGMA table_info(local_inbox_preferences)').all()
+    if (!columns.some(column => column.name === 'hide_forwarded_duplicates')) {
+      database.exec('ALTER TABLE local_inbox_preferences ADD COLUMN hide_forwarded_duplicates INTEGER NOT NULL DEFAULT 1 CHECK (hide_forwarded_duplicates IN (0,1))')
+    }
+  }).immediate()
+  const select = database.query<PreferencesRow, [string]>(`SELECT revision,unified_mode,included_mailbox_ids,pinned_mailbox_ids,pins_seeded,hide_forwarded_duplicates
     FROM local_inbox_preferences WHERE owner=?`)
   const insert = database.query(`INSERT INTO local_inbox_preferences
-    (owner,revision,unified_mode,included_mailbox_ids,pinned_mailbox_ids,pins_seeded) VALUES (?,?,?,?,?,?)`)
-  const update = database.query(`UPDATE local_inbox_preferences SET revision=?,unified_mode=?,included_mailbox_ids=?,pinned_mailbox_ids=?,pins_seeded=?
+    (owner,revision,unified_mode,included_mailbox_ids,pinned_mailbox_ids,pins_seeded,hide_forwarded_duplicates) VALUES (?,?,?,?,?,?,?)`)
+  const update = database.query(`UPDATE local_inbox_preferences SET revision=?,unified_mode=?,included_mailbox_ids=?,pinned_mailbox_ids=?,pins_seeded=?,hide_forwarded_duplicates=?
     WHERE owner=? AND revision=?`)
   const conflict = () => new InboxError('HOST_INBOX_PREFERENCES_CONFLICT', 'Inbox preferences changed elsewhere. Reload them before saving again.', 412)
   const available = async () => (await inbox.mailboxes(owner)).filter(mailbox => mailbox.status !== 'detached')
   function initial(mailboxes: Mailbox[]): InboxViewPreferences {
-    return { revision: 1, unifiedMode: 'all', includedMailboxIds: [], pinnedMailboxIds: mailboxes.slice(0, 9).map(mailbox => mailbox.id) }
+    return { revision: 1, unifiedMode: 'all', includedMailboxIds: [], pinnedMailboxIds: mailboxes.slice(0, 9).map(mailbox => mailbox.id), hideForwardedDuplicates: true }
   }
   function save(value: InboxViewPreferences, seeded: boolean, previousRevision: number | null): InboxViewPreferences {
     const included = JSON.stringify(value.includedMailboxIds), pinned = JSON.stringify(value.pinnedMailboxIds)
-    if (previousRevision === null) insert.run(owner, value.revision, value.unifiedMode, included, pinned, Number(seeded))
-    else if (update.run(value.revision, value.unifiedMode, included, pinned, Number(seeded), owner, previousRevision).changes !== 1) throw conflict()
-    return value
+    const hideForwardedDuplicates = value.hideForwardedDuplicates ?? true
+    if (previousRevision === null) insert.run(owner, value.revision, value.unifiedMode, included, pinned, Number(seeded), Number(hideForwardedDuplicates))
+    else if (update.run(value.revision, value.unifiedMode, included, pinned, Number(seeded), Number(hideForwardedDuplicates), owner, previousRevision).changes !== 1) throw conflict()
+    return { ...value, hideForwardedDuplicates }
   }
   return {
     async read(): Promise<InboxViewPreferences> {
@@ -109,7 +124,9 @@ export function createInboxViewPreferencesStore(database: Database, inbox: Pick<
         const current = row ? savedPreferences(row) : initial(mailboxes)
         if (value.revision !== current.revision) throw conflict()
         // Even an explicit empty PUT permanently opts out of automatic pin seeding.
-        return save({ ...value, revision: nextRevision(current.revision) }, true, row ? current.revision : null)
+        // Older clients must not reset an explicit choice when they omit the new field.
+        return save({ ...value, hideForwardedDuplicates: value.hideForwardedDuplicates ?? current.hideForwardedDuplicates ?? true,
+          revision: nextRevision(current.revision) }, true, row ? current.revision : null)
       }).immediate()
     },
   }

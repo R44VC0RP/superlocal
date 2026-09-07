@@ -2840,7 +2840,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       const row = (index: number): Row => {
         const id = `${box.id}:thread-${index}`, messageId = `message-${index}`;
         return { key: id, sourceId: source.id, threadId: `thread-${index}`, sourceGeneration: 1, revision: 1, pageCursor: `row-${index}`,
-          mail: { ...inbox, id, account: box.id, mailboxId: box.id, sourceId: source.id, sdkThreadId: `thread-${index}`, subject: `Fictional page row ${index}`,
+          mail: { ...inbox, id, account: box.id, mailboxId: box.id, sourceId: source.id, sourceGeneration: source.generation, sdkThreadId: `thread-${index}`, subject: `Fictional page row ${index}`,
             receivedAt: Date.parse(deadline) - index * 1000, folder: "Inbox", locations: ["Inbox"], messages: [{ ...inbox.messages[0], id: messageId, body: "", loaded: false }] },
           summaries: [], messagesComplete: false, counts: { messages: 1, memberships: 1, unread: 1, done: 0, snoozed: 0 },
           targets: [{ mailboxId: box.id, messageId, revision: 1 }], targetsComplete: true, actionContextComplete: false, contextVersion: `context-${index}` };
@@ -3318,6 +3318,21 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           const senderRequests: SenderInput[] = [], requestOrder: string[] = [];
           const senderBodyBaseline = bodyReads.length, senderQueryBaseline = queries, senderPageBaseline = pages.length;
           const senderInput: SenderInput = { account: box.id, id: giantKey, domain: null };
+          const senderFetch = globalThis.fetch, doneRow = store.getSnapshot().mail.find(mail => mail.id === row(1601).key)!;
+          assert.ok(doneRow, "the Done target is separate from the pending reader and its companion");
+          const doneMail = { ...doneRow, sourceGeneration: source.generation };
+          let releaseDone: (() => void) | undefined, rejectDone = false, doneRequests = 0;
+          globalThis.fetch = (async (input, init) => {
+            const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+            if (url.pathname !== "/v1/mailbox-actions" || init?.method !== "POST") return senderFetch(input, init);
+            const command = JSON.parse(String(init.body)) as Parameters<import("inbox-sdk/types").Inbox["setMailboxStates"]>[1];
+            assert.equal(command.done, true); assert.deepEqual(command.targets, doneMail.window!.targets.map(({ mailboxId, messageId, revision }) => ({ mailboxId, messageId, revision })));
+            doneRequests++; requestOrder.push("done");
+            await new Promise<void>(resolve => { releaseDone = resolve; });
+            requestOrder.push(rejectDone ? "done:failed" : "done:ack");
+            return rejectDone ? Response.json({ code: "CONFLICT", error: "Fictional Done conflict." }, { status: 412 })
+              : Response.json({ id: command.id, retracted: false, states: command.targets.map(target => ({ ...target, revision: target.revision + 1, done: true, snoozedUntil: null })) } satisfies import("inbox-sdk/types").MailboxStateReceipt);
+          }) as typeof fetch;
           let readerError: Error | undefined, cachedAtDispatch: readonly Mail[] | undefined;
           bodyRead = async id => {
             assert.ok(["giant-700", "giant-699", "giant-698", "giant-697"].includes(id));
@@ -3341,8 +3356,15 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           await until(() => !!releaseReader, "the actual current-reader body request is held");
           assert.deepEqual(bodyReads.slice(senderBodyBaseline), ["giant-700"]); assert.equal(senderRequests.length, 0, "secondary statistics cannot dispatch while the reader body is pending");
           assert.strictEqual(store.loadThread(giantKey), readerReady, "the parent reader effect shares the already-started body request");
-          releaseReader!(); releaseReader = undefined; await opening;
-          assert.deepEqual(requestOrder, ["body:giant-700", "ready:giant-700", "sender"]);
+          const done = store.action([doneMail], "done"); void done.catch(() => {});
+          await until(() => !!releaseDone, "the actual Done POST is held after the reader and sender requests began");
+          releaseReader!(); releaseReader = undefined; await readerReady; await sleep(30);
+          assert.equal(senderRequests.length, 0, "settled reader statistics cannot compete with an already-queued durable Done write");
+          assert.equal(store.getSnapshot().pending, 1);
+          releaseDone!(); releaseDone = undefined;
+          const doneReceipt = await done; await opening;
+          assert.ok(doneReceipt.receipts?.some(receipt => receipt.kind === "mailbox-state"), "the durable Done receipt releases optional statistics");
+          assert.deepEqual(requestOrder, ["body:giant-700", "done", "ready:giant-700", "done:ack", "sender"]);
           assert.deepEqual(senderRequests, [senderInput]);
           assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.find(message => message.id === "giant-700")!.body, "<p>Priority body giant-700.</p>");
           const cachedReader = store.getSnapshot().mail.find(mail => mail.id === giantKey);
@@ -3375,6 +3397,152 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           await store.senderWindow({ ...senderInput, selectedMessageId: "giant-698" });
           assert.equal(senderRequests.length, 4); assert.equal(bodyReads.length, senderBodyBaseline + 3, "ungated sender reads remain body-free even for an unloaded reader message");
 
+          rejectDone = true;
+          for (const clearWhileWaiting of [false, true]) {
+            const before = senderRequests.length;
+            const failedDone = assert.rejects(store.action([doneMail], "done"), /Fictional Done conflict/);
+            await until(() => !!releaseDone, "the conflicting Done POST is held before its acknowledgement");
+            const waitingSender = store.senderWindow(senderInput, store.loadThread(giantKey));
+            const settledSender = clearWhileWaiting
+              ? assert.rejects(waitingSender, error => error instanceof DOMException && error.name === "AbortError") : waitingSender;
+            void settledSender.catch(() => {});
+            await sleep(30);
+            assert.equal(senderRequests.length, before, "even a cached reader waits for an already-queued action");
+            if (clearWhileWaiting) store.clearSenderWindow();
+            releaseDone!(); releaseDone = undefined; await Promise.all([failedDone, settledSender]);
+            assert.equal(store.getSnapshot().pending, 0);
+            assert.equal(senderRequests.length, before + (clearWhileWaiting ? 0 : 1), clearWhileWaiting
+              ? "clearing the sender while it waits on Done prevents dispatch after queue release"
+              : "a failed durable action releases optional sender statistics without hiding its error");
+          }
+          assert.equal(doneRequests, 3, "the controlled conflicts do not retry their Done POSTs");
+          globalThis.fetch = senderFetch;
+
+          // Optimistic Done is a bounded presentation overlay, not a fabricated membership receipt.
+          type DoneInput = Parameters<import("inbox-sdk/types").Inbox["setMailboxStates"]>[1];
+          type DoneReceipt = import("inbox-sdk/types").MailboxStateReceipt;
+          type Recovery = import("../src/inbox").InboxCommandRecovery;
+          const heldDone: Array<{ input: DoneInput; release: (response: Response) => void }> = [];
+          const receiptReads: string[] = [];
+          let recoveredReceipt: DoneReceipt | undefined;
+          const receiptFor = (input: DoneInput): DoneReceipt => ({ id: input.id, retracted: false,
+            states: input.targets.map(target => ({ ...target, revision: target.revision + 1, done: true, snoozedUntil: null })) });
+          globalThis.fetch = (async (input, init) => {
+            const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+            if (url.pathname === `/v1/accounts/${source.id}`) return Response.json(source);
+            if (url.pathname === `/v1/mailboxes/${box.id}`) return Response.json(box);
+            if (url.pathname.startsWith("/v1/mailbox-actions/")) {
+              receiptReads.push(url.pathname.split("/").at(-1)!);
+              return recoveredReceipt ? Response.json(recoveredReceipt) : Response.json({ code: "NOT_FOUND", error: "Not found" }, { status: 404 });
+            }
+            if (url.pathname === "/v1/mailbox-actions" && init?.method === "POST")
+              return new Promise<Response>(release => heldDone.push({ input: JSON.parse(String(init.body)), release }));
+            return senderFetch(input, init);
+          }) as typeof fetch;
+          const pendingRow = row(9000), pendingKey = pendingRow.key;
+          pendingRow.summaries = [{ ...summary(9000, pendingRow.threadId), id: pendingRow.targets[0].messageId,
+            memberships: [{ ...pendingRow.targets[0], done: false, snoozedUntil: null }] }];
+          reverseDelta = { upserts: [pendingRow], newHead: [pendingRow], removed: [] }; await store.retry();
+          const pendingMail = () => store.getSnapshot().mail.find(mail => mail.id === pendingKey)!;
+          const beforeOptimism = store.getSnapshot(), bodyBaseline = bodyReads.length, queryBaseline = queries, pageBaseline = pages.length;
+          let capturedDone: Recovery | undefined;
+          const captureDone = (plan: Recovery) => { capturedDone = plan; };
+          const optimistic = store.doneOptimistically([pendingMail()], captureDone);
+          let settled = false; void optimistic.then(() => { settled = true; }, () => { settled = true; });
+          assert.ok(capturedDone?.kind === "mailbox-state");
+          const firstId = capturedDone.input.id;
+          assert.deepEqual(store.getSnapshot().pendingDone, [{ id: firstId, status: "pending", count: 1 }]);
+          assert.equal(store.isPendingDone(pendingMail()), true);
+          assert.equal(store.pendingDoneFor(pendingMail()), firstId);
+          assert.strictEqual(store.getSnapshot().mail, beforeOptimism.mail);
+          assert.strictEqual(store.getSnapshot().window, beforeOptimism.window);
+          const presented = store.presentWindow(beforeOptimism.window!);
+          assert.ok(!presented.keys.includes(pendingKey)); assert.ok(beforeOptimism.window!.keys.includes(pendingKey));
+          assert.strictEqual(presented.totals, beforeOptimism.window!.totals); assert.strictEqual(presented.state, beforeOptimism.window!.state);
+          assert.equal(presented.nextCursor, beforeOptimism.window!.nextCursor); assert.equal(presented.residentBytes, beforeOptimism.window!.residentBytes);
+          assert.equal(pendingMail().folder, "Inbox"); assert.deepEqual(pendingMail().window!.targets, pendingRow.targets);
+          for (const query of [{ ...presented.query, folder: "Sent" }, { ...presented.query, search: true }]) {
+            const elsewhere = { ...beforeOptimism.window!, query }; assert.strictEqual(store.presentWindow(elsewhere), elsewhere);
+          }
+          assert.equal(store.isPendingDone({ ...pendingMail(), sourceGeneration: 2 }), false);
+          assert.equal(store.isPendingDone({ ...pendingMail(), window: { ...pendingMail().window!, targetsComplete: false } }), false);
+          await assert.rejects(store.doneOptimistically([pendingMail()]), /still pending/);
+          await until(() => heldDone.length === 1, "optimistic Done reaches its held durable POST");
+          assert.equal(settled, false); assert.equal(bodyReads.length, bodyBaseline); assert.equal(queries, queryBaseline); assert.equal(pages.length, pageBaseline);
+          heldDone[0].release(Response.json(receiptFor(heldDone[0].input)));
+          const acceptedDone = await optimistic;
+          assert.deepEqual(acceptedDone.receipts, [{ kind: "mailbox-state", id: firstId }]);
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.equal(pendingMail().folder, "Done");
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), beforeOptimism.mail.find(mail => mail.id === giantKey), "pending presentation does not invalidate cached bodies");
+
+          // A newer target revision can carry its own intent while an older command settles.
+          const freshRow: Row = { ...pendingRow, revision: 3, targets: pendingRow.targets.map(target => ({ ...target, revision: 3 })),
+            summaries: pendingRow.summaries.map(summary => ({ ...summary, revision: 3, memberships: summary.memberships.map(state => ({ ...state, revision: 3 })) })) };
+          reverseDelta = { upserts: [freshRow], newHead: [freshRow], removed: [] }; await store.retry();
+          assert.ok(pendingMail(), "the next scenario recaptures the authoritative newer Inbox head after accepted Done eviction");
+          const olderDone = store.doneOptimistically([pendingMail()], captureDone);
+          const olderRejected = assert.rejects(olderDone, /Fictional optimistic conflict/);
+          await until(() => heldDone.length === 2, "older revision write is held");
+          const newerRow: Row = { ...freshRow, revision: 4, contextVersion: "current-revision-4", mail: { ...freshRow.mail, subject: "Latest canonical subject" },
+            targets: freshRow.targets.map(target => ({ ...target, revision: 4 })),
+            summaries: freshRow.summaries.map(summary => ({ ...summary, revision: 4, memberships: summary.memberships.map(state => ({ ...state, revision: 4 })) })) };
+          reverseDelta = { upserts: [newerRow], newHead: [], removed: [] }; await store.retry();
+          assert.equal(store.isPendingDone(pendingMail()), false); assert.equal(store.pendingDoneFor(pendingMail()), undefined);
+          assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+          const newer = store.doneOptimistically([pendingMail()], captureDone);
+          const newerRejected = assert.rejects(newer, /Fictional optimistic conflict/);
+          const newerId = (capturedDone as Extract<Recovery, { kind: "mailbox-state" }>).input.id;
+          assert.equal(store.getSnapshot().pendingDone.length, 2); assert.equal(store.isPendingDone(pendingMail()), true);
+          heldDone[1].release(Response.json({ code: "CONFLICT", error: "Fictional optimistic conflict" }, { status: 412 })); await olderRejected;
+          assert.deepEqual(store.getSnapshot().pendingDone, [{ id: newerId, status: "pending", count: 1 }]);
+          assert.equal(store.isPendingDone(pendingMail()), true, "rejecting an older owner cannot retire a newer revision's mask");
+          assert.equal(pendingMail().subject, "Latest canonical subject");
+          await until(() => heldDone.length === 3, "newer revision write reaches the queue head");
+          const replyRow: Row = { ...newerRow, revision: 5, contextVersion: "native-reply", counts: { ...newerRow.counts, messages: 2, memberships: 2 },
+            targets: [...newerRow.targets, { mailboxId: box.id, messageId: "native-reply-after-done", revision: 1 }],
+            mail: { ...newerRow.mail, subject: "Latest canonical reply", messages: [...newerRow.mail.messages, { ...newerRow.mail.messages[0], id: "native-reply-after-done" }] } };
+          reverseDelta = { upserts: [replyRow], newHead: [], removed: [] }; await store.retry();
+          assert.equal(store.isPendingDone(pendingMail()), false, "complete targets, not preview membership, expose a later native reply");
+          assert.equal(store.pendingDoneFor(pendingMail()), newerId, "partial exact overlap still blocks a fresh duplicate");
+          heldDone[2].release(Response.json({ code: "CONFLICT", error: "Fictional optimistic conflict" }, { status: 412 })); await newerRejected;
+          assert.equal(pendingMail().subject, "Latest canonical reply"); assert.equal(pendingMail().window!.targets.length, 2);
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+
+          // A lost first acknowledgement followed by auth failure is still ambiguous.
+          const issuesBeforeAmbiguous = store.getSnapshot().issues;
+          const ambiguous = store.doneOptimistically([pendingMail()], captureDone);
+          const unconfirmed = assert.rejects(ambiguous, /Fictional retry authorization/);
+          await until(() => heldDone.length === 4, "first ambiguous attempt is held");
+          const ambiguousId = heldDone[3].input.id;
+          recoveredReceipt = receiptFor(heldDone[3].input);
+          heldDone[3].release(Response.json({ code: "TEMPORARY", error: "Lost first acknowledgement" }, { status: 503 }));
+          await until(() => heldDone.length === 5, "the existing same-ID second attempt is held");
+          assert.deepEqual(heldDone[4].input, heldDone[3].input);
+          heldDone[4].release(Response.json({ code: "UNAUTHENTICATED", error: "Fictional retry authorization" }, { status: 401 })); await unconfirmed;
+          assert.deepEqual(store.getSnapshot().pendingDone, [{ id: ambiguousId, status: "unconfirmed", count: 1 }]);
+          assert.equal(capturedDone!.kind === "mailbox-state" && capturedDone!.status, "uncertain");
+          assert.strictEqual(store.getSnapshot().issues, issuesBeforeAmbiguous, "ambiguous completion belongs only to the command Retry notice, not a generic failure");
+          assert.equal(store.isPendingDone(pendingMail()), false); assert.equal(store.pendingDoneFor(pendingMail()), ambiguousId);
+          assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+          await assert.rejects(store.doneOptimistically([pendingMail()]), /still pending/);
+          const retryDone = store.retryPendingDone(ambiguousId);
+          assert.equal(store.isPendingDone(pendingMail()), true, "explicit same-ID Retry reactivates only applicable targets");
+          assert.strictEqual(store.retryPendingDone(ambiguousId), retryDone, "repeated retry joins the already-pending original command");
+          const recoveredDone = await retryDone;
+          assert.deepEqual(recoveredDone.receipts, [{ kind: "mailbox-state", id: ambiguousId }]);
+          assert.deepEqual(receiptReads, [ambiguousId]); assert.equal(heldDone.length, 5, "the authoritative stored receipt avoids a third POST");
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.equal(pendingMail().folder, "Done");
+
+          // The initial recovery write and preflight must succeed before any mask or POST exists.
+          const failedStorage = store.getSnapshot();
+          await assert.rejects(store.doneOptimistically([pendingMail()], () => { throw new Error("storage full"); }), /could not be saved/);
+          await assert.rejects(store.doneOptimistically([{ ...pendingMail(), window: { ...pendingMail().window!, targetsComplete: false } }]), /500 message memberships/);
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.strictEqual(store.getSnapshot().mail, failedStorage.mail);
+          assert.strictEqual(store.getSnapshot().window, failedStorage.window); assert.equal(heldDone.length, 5);
+          assert.equal(bodyReads.length, bodyBaseline); assert.equal(queries, queryBaseline); assert.equal(pages.length, pageBaseline);
+          globalThis.fetch = senderFetch;
+          reverseDelta = { newHead: [], removed: [{ key: pendingKey, reason: "deleted" }] }; await store.retry();
+
           store.clearSenderWindow();
           const oldReader = store.loadThread(giantKey, "giant-697");
           const oldSender = store.senderWindow({ ...senderInput, selectedMessageId: "giant-697" }, oldReader);
@@ -3384,7 +3552,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Sent" });
           await until(() => !store.getSnapshot().window!.paging, "the replacement view finishes its single buffer");
           releaseReader!(); releaseReader = undefined; await switched;
-          assert.equal(senderRequests.length, 4, "a changed window epoch rejects queued old-view statistics before dispatch");
+          assert.equal(senderRequests.length, 5, "a changed window epoch rejects queued old-view statistics before dispatch");
           await store.retry(); assert.deepEqual(changes.at(-1)!.pinnedKeys, []);
           assert.equal(changes.at(-1)!.queryId, store.getSnapshot().window!.state.queryId); assert.equal(store.getSnapshot().error, null);
           assert.ok(!store.getSnapshot().mail.some(mail => mail.id === giantKey));
@@ -3619,6 +3787,57 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         }
       }
       assert.deepEqual(mismatchedCheckpoints, [], "every published checkpoint keeps its revision and token paired, including a deferred pin replay");
+      if (name === "full") {
+        await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Inbox", search: false });
+        const boundedRows = Array.from({ length: 33 }, (_, index) => {
+          const item = row(9500 + index), count = index < 8 ? 500 : 1;
+          return { ...item, counts: { ...item.counts, memberships: count }, targets: Array.from({ length: count }, (_, target) => ({ mailboxId: box.id, messageId: `bounded-${index}-${target}`, revision: 1 })) };
+        });
+        reverseDelta = { upserts: boundedRows, newHead: boundedRows, removed: [] }; await store.retry();
+        const selected = (index: number) => store.getSnapshot().mail.find(mail => mail.id === boundedRows[index].key)!;
+        const priorFetch = globalThis.fetch;
+        let backendWrites = 0, releaseHeld: ((response: Response) => void) | undefined;
+        globalThis.fetch = (async (input, init) => {
+          const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+          if (url.pathname === "/v1/mailbox-actions" && init?.method === "POST") {
+            backendWrites++; return new Promise<Response>(resolve => { releaseHeld = resolve; });
+          }
+          return priorFetch(input, init);
+        }) as typeof fetch;
+        const commands: Promise<unknown>[] = [];
+        for (let index = 0; index < 8; index++) commands.push(store.doneOptimistically([selected(index)]).catch(error => error));
+        const beforeTargetLimit = store.getSnapshot();
+        let recoveryWrites = 0;
+        const tooManyTargets = { ...selected(8), window: { ...selected(8).window!, targets: Array.from({ length: 100 }, (_, target) => ({ mailboxId: box.id, messageId: `overflow-${target}`, revision: 1 })) } };
+        await assert.rejects(store.doneOptimistically([tooManyTargets], () => { recoveryWrites++; }), /Wait for existing Done commands/);
+        assert.strictEqual(store.getSnapshot().pendingDone, beforeTargetLimit.pendingDone); assert.equal(recoveryWrites, 0);
+        assert.equal(store.getSnapshot().pendingDone.length, 8);
+        for (let index = 8; index < 32; index++) commands.push(store.doneOptimistically([selected(index)]).catch(error => error));
+        const beforeCommandLimit = store.getSnapshot();
+        await assert.rejects(store.doneOptimistically([selected(32)], () => { recoveryWrites++; }), /Wait for existing Done commands/);
+        assert.strictEqual(store.getSnapshot().pendingDone, beforeCommandLimit.pendingDone); assert.equal(recoveryWrites, 0);
+        assert.equal(store.getSnapshot().pendingDone.length, 32);
+        await until(() => !!releaseHeld, "only the admitted queue head reaches the backend"); assert.equal(backendWrites, 1);
+        const captured = selected(0);
+        source.generation = 2; await store.retry();
+        assert.deepEqual(store.getSnapshot().pendingDone, [], "source generation replacement retires every old visual owner");
+        assert.equal(store.isPendingDone(captured), false); assert.equal(store.pendingDoneFor(captured), undefined);
+        releaseHeld!(Response.json({ code: "CONFLICT", error: "Old generation response" }, { status: 412 }));
+        assert.ok((await Promise.all(commands)).every(value => value instanceof Error));
+        assert.equal(backendWrites, 1, "queued source-invalidated commands never send");
+        source.generation = 1; await store.retry();
+        const activeQuery = store.getSnapshot().window!.query;
+        await store.setWindowQuery({ ...activeQuery, folder: "Sent" });
+        await assert.rejects(store.doneOptimistically([captured]), /only available in the Inbox/);
+        assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+        await store.setWindowQuery(activeQuery);
+        const closing = store.doneOptimistically([selected(0)]);
+        const closed = assert.rejects(closing, error => error instanceof DOMException && error.name === "AbortError");
+        assert.equal(store.getSnapshot().pendingDone.length, 1);
+        stop!(); assert.deepEqual(store.getSnapshot().pendingDone, []); assert.equal(store.isPendingDone(captured), false);
+        await closed; assert.equal(backendWrites, 1, "close cancels a queued command before its POST");
+        globalThis.fetch = priorFetch;
+      }
       unsubscribe(); stop(); stop = undefined;
       await sleep(0);
     }
@@ -4078,6 +4297,326 @@ test("host-service-backed bounded startup pages, lookup and search without brows
     releasePage?.(); releaseChanges?.(); stop?.(); await service.close(); await ai.close(); await host.close(); database.close();
     globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
     for (const [key, descriptor] of globals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); }
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("host-service-backed forwarded duplicate compaction is response-batch local", async () => {
+  if (process.env.INBOX_FORWARDED_TEST_CHILD !== "1") {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "host-service-backed forwarded duplicate", "--timeout", "60000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_FORWARDED_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const [{ createMockHost }, { Database }, { createInboxWindowService }, { createInboxViewPreferencesStore },
+    { createSplitPreferencesStore }, { createAttentionOverridesStore }, { createAiTriageService }, fs, { tmpdir }, { join }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("bun:sqlite"), import("../../local-host/src/inbox-window.ts"), import("../../local-host/src/inbox-preferences.ts"),
+    import("../../local-host/src/split-preferences.ts"), import("../../local-host/src/attention-overrides.ts"), import("../../local-host/src/ai-triage.ts"),
+    import("node:fs/promises"), import("node:os"), import("node:path"),
+  ]);
+  type Query = import("../../shared/inbox-window").InboxViewQuery;
+  type State = import("../../shared/inbox-window").InboxWindowState;
+  const root = await fs.mkdtemp(join(tmpdir(), "host-forwarded-")), originalInfo = console.info, originalWarn = console.warn;
+  console.info = () => {}; console.warn = () => {};
+  const token = "fictional-forwarded-fixture-token-only";
+  const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 49).toString("base64"), token, allowProviderWrites: true });
+  const database = new Database(join(root, "host-window.sqlite"));
+  const preferences = createInboxViewPreferencesStore(database, host.inbox, host.owner);
+  const ai = createAiTriageService({ database, inbox: host.inbox, configuration: null, sessionKey: token });
+  const service = createInboxWindowService({ database, inbox: host.inbox, owner: host.owner, sessionKey: token, allowProviderWrites: true,
+    inboxPreferences: preferences, splitPreferences: createSplitPreferencesStore(database, host.owner),
+    attentionOverrides: createAttentionOverridesStore(database, host.inbox, host.owner), ai });
+  type Transport = import("../../shared/inbox-window").InboxWindowTransport;
+  const request = <K extends "query" | "page" | "counts" | "lookup" | "changes">(name: K, input: Parameters<Transport[K]>[0]) =>
+    service.dispatch(`/host/inbox/${name}`, input) as ReturnType<Transport[K]>;
+  const query: Query = { account: "unified", folder: "All Mail", split: "Important", search: true, query: 'subject:"Forwarded host fixture"', filter: null };
+  const collect = async (view: Query = query, pageSize = 2) => {
+    const first = await request("query", { ...view, limit: pageSize });
+    let page = first, calls = 1;
+    const rows = [...page.rows];
+    while (page.nextCursor && calls < 300) {
+      page = await request("page", { queryId: first.state.queryId, cursor: page.nextCursor, limit: pageSize }); rows.push(...page.rows); calls++;
+    }
+    assert.equal(page.exhausted, true, "bounded pages eventually exhaust even across suppressed/nonmatching ordinals");
+    assert.equal(new Set(rows.map(row => row.key)).size, rows.length, "page boundaries neither duplicate nor skip matching conversations");
+    let counts = await request("counts", { queryId: first.state.queryId });
+    for (let attempt = 0; counts.totals.conversations === null && attempt < 100; attempt++) counts = await request("counts", { queryId: first.state.queryId });
+    return { first, rows, counts, calls };
+  };
+  const drain = async (state: State, residentKeys: string[], pinnedKeys: string[] = []) => {
+    const input = { queryId: state.queryId, sinceRevision: state.indexRevision, sinceCursor: state.readCursor, residentKeys, pinnedKeys, limit: 2 };
+    let page = await request("changes", input), calls = 1;
+    const upserts = [...page.upserts], newHead = [...page.newHead], removed = [...page.removed];
+    while (page.nextCursor && calls++ < 100) {
+      page = await request("changes", { ...input, cursor: page.nextCursor }); upserts.push(...page.upserts); newHead.push(...page.newHead); removed.push(...page.removed);
+    }
+    assert.equal(page.nextCursor, null); assert.equal(page.resetReason, null, "ordinary dependencies reconcile without a query reset");
+    return { state: page.state, upserts, newHead, removed };
+  };
+  try {
+    const [nativeOriginal, nativeForward] = host.store.mailboxes(host.owner);
+    const source = (native: typeof nativeOriginal) => ({ owner: host.owner, storeId: native.id, accountId: host.store.link(host.owner, native.id)!.accountId });
+    const originalSource = source(nativeOriginal), forwardSource = source(nativeForward);
+    const sync = async (accountId: string) => {
+      let more = true; while (more) more = (await host.inbox.sync(host.owner, accountId, { folder: "all", lane: "latest", limit: 100 })).hasMore;
+    };
+    const boxes = await host.inbox.mailboxes(host.owner), originalBox = boxes.find(box => box.sourceId === originalSource.accountId)!, forwardBox = boxes.find(box => box.sourceId === forwardSource.accountId)!;
+    const now = Date.now(), at = (offset: number) => new Date(now + offset).toISOString();
+    const text = "Please bring the fictional paper lantern to our imaginary meeting.";
+    const pair = (label: string, originalAt: number, copyAt: number, sameSource = false, extra: Partial<Parameters<typeof host.store.receive>[1]> = {}) => {
+      const subject = `Forwarded host fixture ${label}`, rfcMessageId = `<forwarded-host-${label.replaceAll(" ", "-")}@example.test>`;
+      const receiveCopy = () => host.store.receive(sameSource ? originalSource : forwardSource, { from: nativeOriginal.email, to: sameSource ? nativeOriginal.email : nativeForward.email,
+        replyTo: "author@example.test", subject, text, inReplyTo: rfcMessageId, receivedAt: at(copyAt) });
+      // Receive same-source copies first so the mock does not automatically join
+      // them to the original thread; exercise two real native conversations.
+      const earlyCopy = sameSource ? receiveCopy() : undefined;
+      const original = host.store.receive(originalSource, { from: "author@example.test", to: nativeOriginal.email, subject, text, rfcMessageId, receivedAt: at(originalAt), ...extra });
+      return { original, copy: earlyCopy ?? receiveCopy() };
+    };
+    const firstPair = pair("paging first", 5000, 4000), secondPair = pair("paging second", 2000, 3000);
+    const unique = host.store.receive(forwardSource, { from: "colleague@example.test", to: nativeForward.email, subject: "Forwarded host fixture paging unique", text: "A distinct fictional note.", receivedAt: at(1000) });
+    const pagingQuery = { ...query, query: 'subject:"Forwarded host fixture paging"' };
+    await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    const summaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: pagingQuery.query, limit: 100 })).items;
+    const summary = (native: typeof unique) => summaries.find(message => message.receivedAt === native.receivedAt)!;
+    const key = (message: typeof summaries[number]) => `unified:${message.sourceId}:${message.threadId}`;
+    const ordered = [firstPair.original, firstPair.copy, secondPair.copy, secondPair.original, unique].map(summary);
+    assert.equal(new Set(ordered.map(message => message.id)).size, 5);
+    const [originalSummary, forwardSummary] = ordered, originalKey = key(originalSummary), forwardKey = key(forwardSummary);
+    const resolver = host.inbox.mailboxForwardedCopies.bind(host.inbox), resolverCalls: string[][] = [];
+    host.inbox.mailboxForwardedCopies = async (owner, input) => { resolverCalls.push([...input.messageIds]); return resolver(owner, input); };
+    const expectBatch = (messages: typeof summaries, message: string) => {
+      assert.equal(resolverCalls.length, messages.length < 2 ? 0 : 1, message);
+      if (messages.length >= 2) assert.deepEqual(new Set(resolverCalls[0]), new Set(messages.map(value => value.id)), message);
+      resolverCalls.length = 0;
+    };
+    assert.equal((await preferences.read()).hideForwardedDuplicates, true);
+    const first = await request("query", { ...pagingQuery, limit: 2 });
+    assert.deepEqual(first.rows.map(row => row.key), [originalKey], "two raw matches compact to one; do not consume the third match to fill the page");
+    expectBatch(ordered.slice(0, 2), "resolver sees only the final two matching raw rows, not the next SDK candidates");
+    assert.ok(first.nextCursor);
+    const second = await request("page", { queryId: first.state.queryId, cursor: first.nextCursor!, limit: 2 });
+    assert.deepEqual(second.rows.map(row => row.key), [key(ordered[3])]);
+    expectBatch(ordered.slice(2, 4), "the next response resolves only its different pair");
+    const third = await request("page", { queryId: first.state.queryId, cursor: second.nextCursor!, limit: 2 });
+    assert.deepEqual(third.rows.map(row => row.key), [key(ordered[4])]); expectBatch(ordered.slice(4), "last response remains local");
+    assert.equal(third.exhausted, true);
+    const fromFirstRow = await request("page", { queryId: first.state.queryId, cursor: first.rows[0].pageCursor, limit: 2 });
+    assert.deepEqual(fromFirstRow.rows.map(row => row.key), second.rows.map(row => row.key), "evicting at a row bookmark consumes its hidden trailing raw row");
+    expectBatch(ordered.slice(2, 4), "row bookmarks do not backfill hidden suffixes");
+    const beforeSecondRow = await request("page", { queryId: first.state.queryId, cursor: second.rows[0].pageCursor, direction: "newer", limit: 2 });
+    assert.deepEqual(beforeSecondRow.rows.map(row => row.key), first.rows.map(row => row.key), "reverse row bookmarks consume hidden leading raw rows");
+    expectBatch(ordered.slice(0, 2), "reverse traversal remains a single raw response batch");
+    const whole = await request("query", { ...pagingQuery, limit: 5 });
+    assert.deepEqual(whole.rows.map(row => row.key), [originalKey, key(ordered[3]), key(ordered[4])]);
+    expectBatch(ordered, "one larger response resolves exactly its five matching raw rows");
+    const subpage = await request("page", { queryId: whole.state.queryId, cursor: whole.rows[0].pageCursor, limit: 1 });
+    assert.deepEqual(subpage.rows.map(row => row.key), [key(ordered[3])], "a smaller resumed response does not backfill hidden rows already consumed by the larger response");
+    expectBatch([ordered[3]], "subpage resumes beyond the hidden gap without pulling earlier response candidates");
+    const beforeMiddle = await request("page", { queryId: whole.state.queryId, cursor: whole.rows[1].pageCursor, direction: "newer", limit: 2 });
+    assert.deepEqual(beforeMiddle.rows.map(row => row.key), [originalKey], "a middle-row reverse bookmark accounts for its hidden leading copy");
+    expectBatch([ordered[0]], "middle-row reverse bookmarks do not repeat hidden raw ordinals");
+    const hidden = await collect(pagingQuery, 2); resolverCalls.length = 0;
+    assert.deepEqual(hidden.rows.map(row => row.key), [originalKey, key(ordered[3]), key(ordered[4])]);
+    assert.equal(hidden.counts.totals.conversations, 5); assert.equal(hidden.counts.totals.messages, 5, "counters describe canonical native mail, not compacted rows");
+    await request("counts", { queryId: hidden.first.state.queryId }); assert.equal(resolverCalls.length, 0, "counts never invoke the forwarding resolver");
+    const singles = await collect(pagingQuery, 1);
+    assert.deepEqual(singles.rows.map(row => row.key), ordered.map(key), "copies whose source is on a different response page remain visible");
+    assert.equal(resolverCalls.length, 0, "single-conversation responses cannot fold against earlier pages and need no resolver call");
+    const lookup = await request("lookup", { account: "unified", ids: [forwardKey, originalKey] });
+    assert.deepEqual(lookup.entries.map(entry => entry.status), ["found", "found"]);
+    assert.ok(lookup.entries.every(entry => entry.status === "found" && !("hiddenAsForwardedDuplicate" in entry.row)), "explicit lookup returns unchanged native rows");
+    assert.equal(resolverCalls.length, 0, "explicit lookup does not classify duplicates");
+    const originalRow = first.rows[0];
+    assert.deepEqual(originalRow.targets.map(target => [target.mailboxId, target.messageId]), [[originalBox.id, originalSummary.id]], "compaction does not merge action targets across accounts");
+    const fromOnly = await collect({ ...pagingQuery, query: `${pagingQuery.query} from:${nativeOriginal.email}` }, 100);
+    assert.deepEqual(new Set(fromOnly.rows.map(row => row.key)), new Set([forwardKey, key(ordered[2])]));
+    expectBatch([ordered[1], ordered[2]], "search filtering happens before batch classification; off-filter parents cannot hide copies");
+    const forwardOnly = await collect({ ...pagingQuery, account: forwardBox.id }, 100);
+    assert.equal(forwardOnly.rows.length, 3); expectBatch([ordered[1], ordered[2], ordered[4]], "individual receiving scope never looks up outside parents");
+
+    const disabled = await preferences.write({ ...await preferences.read(), hideForwardedDuplicates: false });
+    const reset = await request("changes", { queryId: hidden.first.state.queryId, sinceRevision: hidden.first.state.indexRevision, residentKeys: hidden.rows.map(row => row.key), pinnedKeys: [] });
+    assert.equal(reset.resetReason, "query", "preference revision invalidates the old filtered query");
+    const visible = await collect(pagingQuery, 2); assert.deepEqual(visible.rows.map(row => row.key), ordered.map(key));
+    assert.deepEqual(visible.counts.totals, hidden.counts.totals, "the preference never changes native counters");
+    assert.equal(resolverCalls.length, 0, "disabled compaction does not call the resolver");
+    const reopened = createInboxViewPreferencesStore(database, host.inbox, host.owner);
+    assert.equal((await reopened.read()).hideForwardedDuplicates, false, "explicit false survives reopening the persisted store");
+    const { hideForwardedDuplicates: _omitted, ...legacy } = disabled;
+    assert.equal((await reopened.write(legacy)).hideForwardedDuplicates, false, "older clients omitting the field preserve explicit false");
+    await preferences.write({ ...await preferences.read(), hideForwardedDuplicates: true, unifiedMode: "selected", includedMailboxIds: [forwardBox.id] });
+    const selected = await collect(pagingQuery, 100); assert.equal(selected.rows.length, 3);
+    expectBatch([ordered[1], ordered[2], ordered[4]], "selected unified scope stays within its matching response");
+    await preferences.write({ ...await preferences.read(), unifiedMode: "all", includedMailboxIds: [] });
+
+    pair("same source", 10000, 11000, true);
+    pair("receipt", 12000, 13000);
+    const aged = pair("aged source", -46 * 86400000, 14000);
+    const archived = pair("archived source", 15000, 16000, false, { folder: "archive" });
+    const starred = pair("starred source", 17000, 18000, false, { isStarred: true });
+    await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    resolverCalls.length = 0;
+    const same = await collect({ ...query, account: originalBox.id, query: 'subject:"Forwarded host fixture same source"' }, 100);
+    assert.equal(same.rows.length, 1, "verified forwarding also compacts inside an individual source/mailbox");
+    assert.equal(same.rows[0].summaries[0].from.email, "author@example.test");
+    assert.equal(resolverCalls.length, 1); assert.equal(resolverCalls[0].length, 2); resolverCalls.length = 0;
+    const receipt = await collect({ ...query, search: false, query: "", folder: "Inbox", split: "Other" }, 100);
+    assert.equal(receipt.rows.filter(row => row.mail.subject === "Forwarded host fixture receipt").length, 1, "Other is compacted after its own split filter");
+    const scopeSummaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: query.query, limit: 100 })).items;
+    const scopeSummary = (native: typeof unique) => scopeSummaries.find(message => message.receivedAt === native.receivedAt)!;
+    const receiptIds = scopeSummaries.filter(message => message.subject === "Forwarded host fixture receipt").map(message => message.id);
+    assert.ok(resolverCalls.some(ids => receiptIds.every(id => ids.includes(id))));
+    assert.ok(resolverCalls.every(ids => ids.every(id => !ordered.some(message => message.id === id))), "Other does not classify Important candidates"); resolverCalls.length = 0;
+    const important = await collect({ ...query, search: false, query: "", folder: "Inbox", split: "Important" }, 100);
+    assert.ok(important.rows.some(row => row.key === key(scopeSummary(aged.copy))), "an original outside the 45-day Important window cannot hide a current copy");
+    assert.ok(important.rows.some(row => row.key === key(scopeSummary(archived.copy))), "an archived original cannot hide its Inbox copy");
+    assert.ok(resolverCalls.every(ids => !ids.includes(scopeSummary(aged.original).id) && !ids.includes(scopeSummary(archived.original).id) && receiptIds.every(id => !ids.includes(id))), "folder, age and split exclusions precede the resolver");
+    resolverCalls.length = 0;
+    const filtered = await collect({ ...query, query: 'subject:"Forwarded host fixture starred source"', filter: "Starred" }, 100);
+    assert.equal(filtered.rows.length, 1); expectBatch([scopeSummary(starred.original)], "active filters apply before forwarding candidate collection");
+
+    const beforeFlags = await collect(pagingQuery, 2); resolverCalls.length = 0;
+    host.store.mutate(originalSource, firstPair.original.id, { isRead: true }); await sync(originalSource.accountId);
+    const flags = await drain(beforeFlags.first.state, beforeFlags.rows.map(row => row.key), [forwardKey]);
+    assert.ok(flags.upserts.some(row => row.key === originalKey && !row.mail.unread));
+    assert.ok(!flags.upserts.some(row => row.key === forwardKey) && !flags.removed.some(row => row.key === forwardKey), "an ordinary source flag change never walks a forwarded-dependency graph");
+    assert.ok(resolverCalls.every(ids => ids.length <= 2 && ids.every(id => ordered.slice(0, 2).some(message => message.id === id))), "changes may classify only their bounded new-head response, never resident or pinned lookups");
+    resolverCalls.length = 0;
+    const arrivalState = flags.state;
+    const arrived = pair("paging arrived", 21000, 22000); await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    const arrivedSummaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: 'subject:"Forwarded host fixture paging arrived"', limit: 100 })).items;
+    for (let repeat = 0; repeat < 2; repeat++) {
+      const arrival = await drain(arrivalState, beforeFlags.rows.map(row => row.key));
+      assert.equal(arrival.newHead.filter(row => row.mail.subject === arrived.original.subject).length, 1, "new-head polls compact their own final response batch");
+      assert.ok(resolverCalls.length > 0); assert.ok(resolverCalls.every(ids => ids.length <= 2 && ids.every(id => arrivedSummaries.some(message => message.id === id))), "replaying an old poll never broadens its batch into loaded history");
+      resolverCalls.length = 0;
+    }
+    // An oversized complete response fails open as a whole, even when its first
+    // two rows alone would prove a duplicate. No chunk-dependent partial hiding.
+    const batchSubject = "Forwarded batch fixture original", batchRfc = "<forwarded-host-batch@example.test>";
+    const batchText = "Please bring a fictional blue notebook.", batchHtml = `<p>${batchText}</p>`;
+    const batchQuery = { ...query, query: 'subject:"Forwarded batch fixture"' };
+    host.store.receive(originalSource, { from: "author@example.test", to: nativeOriginal.email, subject: batchSubject,
+      text: batchText, html: batchHtml, rfcMessageId: batchRfc, receivedAt: at(40000) });
+    host.store.receive(forwardSource, { from: nativeOriginal.email, to: nativeForward.email, replyTo: "author@example.test", subject: batchSubject,
+      text: batchText, html: batchHtml, inReplyTo: batchRfc, receivedAt: at(39000) });
+    for (let index = 0; index < 84; index++) {
+      let threadId: string | undefined;
+      for (let member = 0; member < 6; member++) {
+        const copy = host.store.receive(forwardSource, { from: nativeOriginal.email, to: nativeForward.email, replyTo: "author@example.test",
+          subject: batchSubject, text: batchText, html: batchHtml, inReplyTo: batchRfc, threadId, receivedAt: at(30000 + index * 10 + member) });
+        threadId = copy.threadId;
+      }
+    }
+    await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    const batchRaw = await host.inbox.mailboxConversations(host.owner, { mailboxIds: boxes.map(box => box.id), query: { search: batchQuery.query }, limit: 100 });
+    assert.equal(batchRaw.items.length, 86);
+    assert.ok(batchRaw.items.every(row => row.messagesComplete), "the >500 case contains complete conversations, not conservative partial previews");
+    assert.equal(batchRaw.items.reduce((sum, row) => sum + row.messages.length, 0), 506);
+    resolverCalls.length = 0;
+    const batch = await collect(batchQuery, 100);
+    assert.equal(batch.rows.length, 86); assert.equal(batch.counts.totals.messages, 506);
+    assert.equal(resolverCalls.length, 0, "over-500 complete response bypasses the resolver entirely rather than resolving chunks");
+    const shortBatch = await request("query", { ...batchQuery, limit: 2 });
+    assert.equal(shortBatch.rows.length, 1, "the same known pair compacts when the complete response is within budget");
+    assert.equal(resolverCalls.length, 1); assert.equal(resolverCalls[0].length, 2); resolverCalls.length = 0;
+    const rawRemainder = await request("page", { queryId: shortBatch.state.queryId, cursor: shortBatch.nextCursor!, limit: 100 });
+    assert.equal(rawRemainder.rows.length, 84); assert.equal(resolverCalls.length, 0, "the next >500 response cannot reuse the source from the previous response");
+
+    // Reverse pagination is request-local too. Single-row subpages intentionally
+    // retain all copies and must not duplicate or omit any canonical boundary.
+    let reversePage = await request("page", { queryId: batch.first.state.queryId, seek: "end", limit: 1 }), reverseCalls = 1;
+    const reverseRows = [...reversePage.rows];
+    while (reversePage.nextCursor && reverseCalls++ < 100) {
+      reversePage = await request("page", { queryId: batch.first.state.queryId, cursor: reversePage.nextCursor, direction: "newer", limit: 1 });
+      reverseRows.push(...reversePage.rows);
+    }
+    assert.equal(reversePage.exhausted, true); assert.equal(reverseRows.length, 86);
+    assert.equal(new Set(reverseRows.map(row => row.key)).size, 86);
+    assert.deepEqual(new Set(reverseRows.map(row => row.key)), new Set(batch.rows.map(row => row.key)), "reverse raw subpages preserve all native identities without cross-page folding");
+    resolverCalls.length = 0;
+    const batchLookup = await request("lookup", { account: "unified", ids: batch.rows.map(row => row.key) });
+    assert.equal(batchLookup.entries.length, 86);
+    assert.ok(batchLookup.entries.every(entry => entry.status === "found" && !("hiddenAsForwardedDuplicate" in entry.row)));
+    assert.equal(resolverCalls.length, 0, "bulk explicit lookup never resolves forwarded copies");
+
+    // Hold only an unseen original: new-head presentation must remove that row
+    // before resolving duplicates, without changing normal query/page behavior.
+    const readAiState = ai.state, readAiLookup = ai.lookup, savedAiState = await ai.state(host.owner);
+    let heldDecision: AiDecision | undefined;
+    ai.state = async () => ({ ...savedAiState, configured: true, problemCode: null,
+      settings: { ...savedAiState.settings, enabled: true, mode: "apply", model: "fictional-hold-model" } });
+    ai.lookup = async (_owner, keys) => ({ decisions: heldDecision && keys.some(item => item.sourceId === heldDecision!.sourceId && item.threadId === heldDecision!.threadId) ? [heldDecision] : [],
+      removed: [], cursor: savedAiState.cursor, hasMore: false, resetRequired: false });
+    try {
+      const holdQuery = { ...query, search: false, query: "", folder: "Inbox", split: "Important" };
+      const beforeHold = await request("query", { ...holdQuery, limit: 2 });
+      const heldPair = pair("held arrival", 60000, 61000);
+      await sync(originalSource.accountId); await sync(forwardSource.accountId);
+      const heldSummaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: 'subject:"Forwarded host fixture held arrival"', limit: 100 })).items;
+      const heldOriginal = heldSummaries.find(message => message.receivedAt === heldPair.original.receivedAt)!;
+      const unheldCopy = heldSummaries.find(message => message.receivedAt === heldPair.copy.receivedAt)!;
+      heldDecision = { sourceId: heldOriginal.sourceId, threadId: heldOriginal.threadId, revision: 1, settingsRevision: savedAiState.settings.revision,
+        state: "pending", mailboxIds: [originalBox.id], messageIds: [heldOriginal.id], contextVersions: [{ messageId: heldOriginal.id, bodyRevision: heldOriginal.bodyRevision ?? null }],
+        latestMessageId: heldOriginal.id, inputHash: null, model: "fictional-hold-model", schemaVersion: AI_TRIAGE_VERSION, updatedAt: at(0), holdUntil: at(120000),
+        assessment: null, score: null, override: null, problemCode: null };
+      resolverCalls.length = 0;
+      const openHeld = await request("query", { ...holdQuery, limit: 2 });
+      assert.deepEqual(openHeld.rows.map(row => row.key), [key(heldOriginal)], "normal initial queries still show held originals and compact their same-batch copy");
+      assert.equal(openHeld.rows[0].mail.aiHoldUntil, Date.parse(heldDecision.holdUntil!));
+      expectBatch(heldSummaries, "normal query compaction retains the existing ignore-holds policy");
+      const pageHeld = await request("page", { queryId: openHeld.state.queryId, seek: "start", limit: 2 });
+      assert.deepEqual(pageHeld.rows.map(row => row.key), [key(heldOriginal)], "normal page reads also ignore new-arrival holds");
+      expectBatch(heldSummaries, "normal page compaction still receives both matching rows");
+      const heldArrival = await drain(beforeHold.state, beforeHold.rows.map(row => row.key));
+      assert.deepEqual(heldArrival.newHead.map(row => row.key), [key(unheldCopy)], "an unseen AI-held original cannot suppress its unheld forward in the new-head response");
+      assert.equal(heldArrival.newHead[0].mail.aiHoldUntil, undefined);
+      assert.equal(resolverCalls.length, 0, "removing the unseen held original leaves one row, so no off-response parent reaches the resolver");
+      const residentHeld = await drain(beforeHold.state, [...beforeHold.rows.map(row => row.key), key(heldOriginal)]);
+      assert.deepEqual(residentHeld.newHead, [], "a held original already resident within the same requested head remains valid batch context");
+      expectBatch(heldSummaries, "resident context is retained only when it belongs to this same bounded head response");
+    } finally {
+      ai.state = readAiState; ai.lookup = readAiLookup;
+    }
+
+    // Real conditional Done/Undo receipts change which raw rows match Inbox.
+    // A pinned reader is not an active resident row after Done removes it.
+    const undoPair = pair("Undo restoration", 80000, 81000);
+    await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    const undoSummaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: 'subject:"Forwarded host fixture Undo restoration"', limit: 100 })).items;
+    const undoOriginal = undoSummaries.find(message => message.receivedAt === undoPair.original.receivedAt)!;
+    const undoCopy = undoSummaries.find(message => message.receivedAt === undoPair.copy.receivedAt)!;
+    const undoOriginalKey = key(undoOriginal), undoCopyKey = key(undoCopy);
+    resolverCalls.length = 0;
+    const beforeDone = await request("query", { ...query, search: false, query: "", folder: "Inbox", split: "Important", limit: 2 });
+    assert.deepEqual(beforeDone.rows.map(row => row.key), [undoOriginalKey]);
+    expectBatch(undoSummaries, "the initial Inbox response compacts the same-batch copy");
+    const doneReceipt = await host.inbox.setMailboxStates(host.owner, { id: "forwarded-batch-original-done", done: true, targets: beforeDone.rows[0].targets });
+    assert.equal(doneReceipt.states.length, 1); assert.equal(doneReceipt.states[0].done, true);
+    const afterDone = await drain(beforeDone.state, [undoOriginalKey]);
+    assert.ok(afterDone.removed.some(row => row.key === undoOriginalKey && row.reason === "not-matching"));
+    assert.ok(afterDone.newHead.some(row => row.key === undoCopyKey), "Done moves the original outside Inbox, so the next requested head shows its copy");
+    assert.ok(!afterDone.newHead.some(row => row.key === undoOriginalKey));
+    assert.ok(resolverCalls.every(ids => !ids.includes(undoOriginal.id)), "the Done original is outside the final matching response and cannot suppress its copy");
+    resolverCalls.length = 0;
+    await host.inbox.undoMailboxStates(host.owner, doneReceipt.id);
+    const undoneReceipt = await host.inbox.mailboxStateReceipt(host.owner, doneReceipt.id);
+    assert.equal(undoneReceipt.retracted, true); assert.equal(undoneReceipt.states[0].done, false);
+    const afterUndo = await drain(afterDone.state, afterDone.newHead.map(row => row.key), [undoOriginalKey, undoCopyKey]);
+    assert.deepEqual(afterUndo.removed, [{ key: undoCopyKey, reason: "not-matching" }], "Undo compaction removes the now-redundant resident copy only within the current requested head");
+    assert.deepEqual(afterUndo.newHead.map(row => row.key), [undoOriginalKey], "the restored original re-enters the active view even though it is already a pinned reader");
+    expectBatch(undoSummaries, "Undo resolves the final matching head once, with no offpage resident or pinned context");
+    const retainedReaders = await request("lookup", { account: "unified", ids: [undoCopyKey, undoOriginalKey] });
+    assert.deepEqual(retainedReaders.entries.map(entry => entry.status), ["found", "found"], "compaction removes only the active row, never the copy's canonical data or pinned-reader lookup");
+    assert.ok(retainedReaders.entries.every(entry => entry.status === "found" && !("hiddenAsForwardedDuplicate" in entry.row)));
+    assert.equal(resolverCalls.length, 0, "reader lookup stays raw after Done/Undo compaction");
+  } finally {
+    await service.close(); await ai.close(); await host.close(); database.close(); console.info = originalInfo; console.warn = originalWarn;
     await fs.rm(root, { recursive: true, force: true });
   }
 });
