@@ -193,4 +193,71 @@ Intermediate failures were also retained: count yielding alone left cold E up to
 
 Existing API regressions now verify count scheduling with real Done/Undo receipts, no preliminary inventory count, exact/empty/cached totals, stale-count rejection, and folder snapshot consistency while 1,100 fictional messages undergo concurrent changes. Targeted tests and host/mock typechecks passed. With the final source frozen and browser timings complete, the full suites passed: **94 web tests and 354 API tests** (111,053 API assertions). Owned QA services and the browser session were stopped; the user's normal app remained untouched.
 
-**PR remains draft and unmerged: the latest result is a verified improvement, not completion of all release gates.**
+**This checkpoint remained draft and unmerged; it did not complete all release gates.**
+
+## Sync and secondary-work optimization
+
+Following the Fable review, `bcb4d1d` applies three narrow changes against current-app base `5a2e72c` (including main `d197878`):
+
+1. Gmail and the mock provider explicitly opt out of unused known-message sync inventories. Other provider definitions retain the original eager arrays and snapshot timing by default. IMAP/Inbound hints are not deleted or evaluated lazily after a concurrent write.
+2. Optional sender statistics wait for actions already queued when the reader settles, then recheck cancellation and scope before dispatch. Existing action receipts, W flag dependencies and ownership/revision fences remain unchanged.
+3. Projected rows reuse their unchanged encoded byte size, recalculating after each trimming mutation. Byte limits and incomplete/oversized-row handling are unchanged.
+
+Automatic prefetch, count traversal, head refreshes and the strict duplicate proof were not removed. There are no new queues, timers, caches, dependencies, migrations or test files in this follow-up.
+
+### Confirmed work reduction
+
+Five real two-source quiet-sync request pairs per variant, with zero changed messages and no remaining page. These are **sync HTTP timings, not Done or navigation latency**. Values are median / p95 / max in milliseconds:
+
+| Canonical messages | Before | After |
+| --- | ---: | ---: |
+| 6,500 | 25.65 / 43.98 / 43.98 | 1.36 / 10.81 / 10.81 |
+| 50,003 | 110.69 / 120.56 / 120.56 | 1.25 / 12.98 / 12.98 |
+
+The SDK regression additionally observes eight inventory queries for default/enabled hints versus **zero** for opted-out hints, while retaining arrivals, flags, deletion and the original hint snapshot across delayed provider access. Tests cover the real Gmail/mock definitions and conservative defaults for other providers. Sender tests hold Done acknowledgement, including failure and cancellation; statistics cannot dispatch ahead of that action.
+
+### Matched browser verification
+
+Fresh paired clones again matched the recorded initial canonical/native/membership/body-version/workflow digests: 6,500/3,331 and 50,003/25,083 messages/conversations. Same Apple M5 Max, macOS 27.0, Bun 1.4.0, Chrome 152, 1440×960/DPR 1, dark/Comfortable settings and logging. Base asset: `index-BEuUtuY0.js`; final head: `index-T48BoRxP.js`; CSS unchanged. CPU profiling, builds and test suites were off during timing. Five quiet-sync pairs and one warm navigation preceded each variant's unchanged 25-sample protocol.
+
+[All raw latency samples](sync-optimization-samples.json). Values below are median / p95 / max, n=5 per cell. The first three rows retain the original **pre-automation-command to DOM** clock. Extra trusted-click instrumentation was added without replacing those measurements: its bounded passive listener records the actual click's `timeStamp`, `timeOrigin` and `isTrusted`, avoiding time spent waiting for Playwright to dispatch. Before-50k did not record that extra timestamp, so its gesture value is unavailable—not inferred from app telemetry.
+
+| Scenario | Before 6,500 | After 6,500 | Before 50,003 | After 50,003 |
+| --- | ---: | ---: | ---: | ---: |
+| Navigation to usable row | 161.4 / 255.3 / 255.3 | 162.0 / 264.8 / 264.8 | 163.9 / 245.6 / 245.6 | 278.0 / 872.2 / 872.2 |
+| First body, pre-command clock | 161.5 / 188.9 / 188.9 | 168.8 / 173.6 / 173.6 | 189.6 / 354.9 / 354.9 | 259.6 / 903.5 / 903.5 |
+| Cached body, pre-command clock | 63.0 / 69.4 / 69.4 | 68.2 / 71.5 / 71.5 | 78.3 / 82.3 / 82.3 | 69.0 / 113.8 / 113.8 |
+| Cached body, trusted click clock | 28.6 / 32.1 / 32.1 | 29.6 / 36.7 / 36.7 | — | 33.6 / 60.9 / 60.9 |
+| Body-ready E | 38.0 / 65.3 / 65.3 | 64.3 / 75.9 / 75.9 | 46.7 / 180.2 / 180.2 | 47.7 / 79.6 / 79.6 |
+| Body-ready W | 38.3 / 56.9 / 56.9 | 48.6 / 83.3 / 83.3 | 43.1 / 53.4 / 53.4 | 46.9 / 62.6 / 62.6 |
+| No-body-wait E | 143.5 / 243.7 / 243.7 | **109.8 / 413.3 / 413.3** | 110.6 / 113.3 / 113.3 | **136.4 / 200.4 / 200.4** |
+| No-body-wait W | 79.5 / 102.3 / 102.3 | 74.6 / 98.2 / 98.2 | 82.2 / 84.4 / 84.4 | **75.2 / 160.0 / 160.0** |
+| Undo after body-ready E | 147.5 / 170.0 / 170.0 | 148.1 / 181.1 / 181.1 | 44.2 / 298.9 / 298.9 | 44.9 / 220.4 / 220.4 |
+| Undo after body-ready W | 142.0 / 160.3 / 160.3 | 158.3 / 175.3 / 175.3 | 44.6 / 126.3 / 126.3 | 43.9 / 65.2 / 65.2 |
+| Undo after no-body-wait E | 239.5 / 376.3 / 376.3 | 218.1 / 373.4 / 373.4 | 196.4 / 341.5 / 341.5 | 261.6 / 310.1 / 310.1 |
+| Undo after no-body-wait W | 205.1 / 327.4 / 327.4 | 211.1 / 260.3 / 260.3 | 177.3 / 184.7 / 184.7 | 227.3 / 237.7 / 237.7 |
+
+**The work reduction is proven; an across-the-board UI latency improvement is not.** Final cold E misses were 413.3ms at 6.5k and 200.4/150.4ms at 50k; cold W also reached 160ms at 50k. The 150ms target was not changed. The older cached pre-command clock retained its 113.8ms head sample; its trusted-click-to-body measurement was 60.9ms. All measured final trusted cached clicks were below 100ms. This distinguishes measurement boundaries rather than silently discarding the older upper-bound miss.
+
+All **40/40 final-head action/Undo cycles** restored the original reader and inbox row, with persistence after reload; all 80 paired before/after cycles did so. First/cached body GET counts remained 1/0. All final warm inputs had their bodies ready and all final no-body-wait inputs did not. Before-6500 cold E5 happened to be body-ready without a wait; it remained in its planned series.
+
+The intermediate head without sender gating is retained separately, including cached pre-command bounds of 128.7/180.3ms and cold E at 203.9/150.3ms. No slow sample was replaced. Residual tails could have other causes; request overlap alone does not identify them, and unused sync work was not asserted to explain every previous outlier.
+
+Animation timing remains separate: both revisions showed the same 254ms/128ms thread-message animations. Final rAF interval median/p95/max was 16.7/17.7/82.8ms at 6.5k and 16.7/17.7/117.5ms at 50k. All per-action frame estimates, accepted times and rAF arrays remain retained; these are not paint/INP claims.
+
+### Current media and arrival check
+
+All media is inspected fictional mail on the current baseline, not private browser chrome:
+
+| Dataset | Before `5a2e72c` | After `bcb4d1d` |
+| --- | --- | --- |
+| 6,500 | [Still](sync-before-6500.png) | [Still](sync-after-6500.png) |
+| 50,003 | [Still](sync-before-50003.png) | [Still](sync-after-50003.png) |
+
+[Before interaction](sync-before.mp4) · [After interaction](sync-after.mp4). Each is a separate illustrative reload/open/E/Undo cycle, outside the timed sample arrays; leading idle time was trimmed after inspecting the recordings. The after clip briefly shows the independent forwarded row during receipt restoration and subsequent head-batch reconciliation, then returns to the compacted view. This is not a promise of atomic cross-response deduplication. Original restoration was verified without a recovery reload.
+
+A separate newest-timestamp fictional arrival appeared as the first Important row without reload or search while the restored original remained visible: [arrival evidence](sync-arrival.png). Upstream receive ran at 15:13:17.325–17.437Z and overlapped UI Undo (17.348Z start, 26.4ms to acceptance). SDK import then completed at 17.442Z, and the row was observed at 17.648Z. Thus receive overlapped Undo; **SDK import did not overlap the Undo transaction**. No repeat send, search, selection or opening of the new arrival was used. This supplemental record does not change the timed fixture counts or constitute a five-sample concurrency benchmark.
+
+Final verification on frozen source: **94 web tests and 358 API tests passed** (111,152 API assertions), with SDK/host/mock typechecks and optimized web build passing. New coverage stays in the existing API/web test files; existing byte-budget, paging, ownership and receipt regressions were retained. The existing bundle-size warning remains. Owned QA services/session were stopped, and the user's normal app was not stopped.
+
+**Optimizations are verified and committed; PR #25 remains draft and unmerged because release latency tails still miss the target.**

@@ -1,0 +1,77 @@
+{
+  "beforeRevision": "5a2e72c2baa52b277e800f9bdf7035868f1aa641",
+  "afterRevision": "bcb4d1d23f808c1e34a0887f9f817b5dcd4d9659",
+  "units": "milliseconds",
+  "notes": [
+    "Five samples per series, same optimized mode and immutable fictional fixture digests. Canonical/native conversation counts: 6500/3331 and 50003/25083.",
+    "Startup, firstBody and cachedBody retain the pre-automation-command browser-clock upper bounds. Gesture values start at the trusted DOM click event; before50003 did not capture that extra timestamp.",
+    "E/W use existing handler-to-two-rAF telemetry, not paint or INP. Undo has no separate formal budget. All normal action/Undo cycles restored the reader and inbox row.",
+    "Quiet sync is two concurrent real host sync requests, zero changed messages, measured separately before browser samples. Not an action or startup measurement.",
+    "No failures were replaced. Final cold-action tails still exceed 150ms; no release acceptance pass is claimed."
+  ],
+  "quietSync": {
+    "base6500": [43.98,25.78,25.65,23.29,17.68],
+    "head6500": [10.81,1.8,1.36,1.19,1.24],
+    "base50003": [120.56,110.5,110.69,110.73,110.54],
+    "head50003": [12.98,1.51,1.13,1.25,1.15]
+  },
+  "base6500": {
+    "startup": [255.3,170,155.6,158.8,161.4],
+    "firstBody": [161.5,156.5,169.2,188.9,154.4],
+    "cachedBody": [69.4,58.7,68.1,63,62.3],
+    "firstGesture": [115.7,121.4,120.4,130.7,120.5],
+    "cachedGesture": [32.1,27.6,29.2,25.6,28.6],
+    "warmE": [65.3,34.6,38,31.1,48.9],
+    "warmEUndo": [134.7,160.1,129,170,147.5],
+    "warmW": [37.7,32.6,38.3,52.3,56.9],
+    "warmWUndo": [157.5,127.2,160.3,135.8,142],
+    "coldE": [122.3,105.9,183.8,243.7,143.5],
+    "coldEUndo": [130.6,310.4,376.3,239.5,185.3],
+    "coldEBodyReady": [false,false,false,false,true],
+    "coldW": [77.7,102.3,101.8,53,79.5],
+    "coldWUndo": [327.4,176.6,223.3,196,205.1]
+  },
+  "head6500": {
+    "startup": [264.8,158.9,162,259.9,159.6],
+    "firstBody": [172,166.5,173.6,120.7,168.8],
+    "cachedBody": [70.9,68.2,59,63.5,71.5],
+    "firstGesture": [115.8,117.2,125.4,79.3,129.8],
+    "cachedGesture": [29.6,26.2,28,30.7,36.7],
+    "warmE": [75.9,61,64.3,55.5,71.9],
+    "warmEUndo": [107.8,159.4,137.1,148.1,181.1],
+    "warmW": [75.4,83.3,48.6,39.2,37.8],
+    "warmWUndo": [160.6,175.3,121.3,151.3,158.3],
+    "coldE": [112.9,82.9,90.5,109.8,413.3],
+    "coldEUndo": [218.1,194.5,373.4,231.1,62.8],
+    "coldW": [82.6,52,98.2,74.4,74.6],
+    "coldWUndo": [260.3,211.1,177.9,226.8,176.5]
+  },
+  "base50003": {
+    "startup": [163.9,160.1,166.5,149,245.6],
+    "firstBody": [189.6,190.5,179.6,354.9,167.6],
+    "cachedBody": [61.9,81.1,78.3,66.3,82.3],
+    "warmE": [86.5,38.7,46.7,46.5,180.2],
+    "warmEUndo": [298.9,44.2,44.1,45.6,43.5],
+    "warmW": [50.8,41.6,53.4,43.1,41.8],
+    "warmWUndo": [126.3,43.7,100.8,44.6,44.6],
+    "coldE": [111,97.8,84.6,113.3,110.6],
+    "coldEUndo": [197.7,196.4,138.8,341.5,177.2],
+    "coldW": [82.2,84.2,84.4,81.8,77.9],
+    "coldWUndo": [177.3,177.8,184.7,177.1,143]
+  },
+  "head50003": {
+    "startup": [278,264.9,872.2,267.4,351.2],
+    "firstBody": [253.8,289.1,259.6,903.5,182.7],
+    "cachedBody": [113.8,84.5,69,67.7,62.8],
+    "firstGesture": [181.8,250.8,237.5,868.7,136.6],
+    "cachedGesture": [60.9,42.1,29.2,33.6,28.4],
+    "warmE": [79.6,51.8,40.6,47.7,46.7],
+    "warmEUndo": [220.4,44.9,44.9,43.3,112.9],
+    "warmW": [39.9,37.7,62.6,49.4,46.9],
+    "warmWUndo": [37.8,43.9,42.6,65.2,45.1],
+    "coldE": [133.8,200.4,136.4,100.2,150.4],
+    "coldEUndo": [271.2,53.4,261.6,179,310.1],
+    "coldW": [66.9,95,66.7,160,75.2],
+    "coldWUndo": [228.3,227.3,210.2,91.9,237.7]
+  }
+}
