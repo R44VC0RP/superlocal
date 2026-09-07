@@ -143,7 +143,8 @@ export type AiDecision = AiThreadKey & {
 export type AiHistoryJob = {
   id: string;
   status: "running" | "paused" | "completed" | "cancelled" | "failed";
-  scope: "inbox" | "all";
+  /** important: awake Inbox conversations not already assessed as Other, i.e. what a taught rule can still change. */
+  scope: "inbox" | "all" | "important";
   limit: number;
   /** Captured configuration consent; absent only on retained older jobs. */
   settingsRevision?: number;
@@ -259,7 +260,7 @@ export type AiReadingInput = AiThreadKey & { visitId: string; sequence: number; 
 export type AiTriageActions = {
   state(): Promise<AiTriageState>;
   configure(input: AiSettings): Promise<AiTriageState>;
-  process(input: { id: string; scope: "inbox" | "all"; limit: number; settingsRevision?: number }): Promise<AiHistoryJob>;
+  process(input: { id: string; scope: "inbox" | "all" | "important"; limit: number; settingsRevision?: number }): Promise<AiHistoryJob>;
   control(id: string, action: "pause" | "resume" | "cancel"): Promise<AiHistoryJob>;
   lookup(keys: AiThreadKey[]): Promise<AiDecisionPage>;
   changes(after: number): Promise<AiDecisionPage>;

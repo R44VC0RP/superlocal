@@ -290,7 +290,7 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
         </div>
       </div>}
       {state.jobs.slice(0, 5).map(job => {
-        const done = job.completed + job.failed, scopeLabel = job.scope === "inbox" ? "Inbox" : "All mail";
+        const done = job.completed + job.failed, scopeLabel = job.scope === "inbox" ? "Inbox" : job.scope === "important" ? "Important" : "All mail";
         const summary = job.status === "running" ? `${number(done)} of ${number(job.queued)} assessed` : job.status === "paused" ? `Paused at ${number(done)} of ${number(job.queued)}`
           : job.status === "completed" ? `${number(job.completed)} assessed${job.failed ? `, ${number(job.failed)} could not be` : ""}` : `${aiLabel(job.status)} after ${number(done)}`;
         return <div className="ai-job" key={job.id}>

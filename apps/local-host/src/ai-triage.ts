@@ -660,7 +660,9 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         let selected = sourceScopes.get(summary.sourceId)
         if (!selected) { selected = await scope(owner, JSON.parse(current.data), summary.sourceId); sourceScopes.set(summary.sourceId, selected) }
         if (closed || settingsRow(owner)?.generation !== row.generation || JSON.parse(jobRow(owner, id)!.data).status !== 'running') return
-        if (job.scope === 'inbox' && (summary.folder !== 'inbox' || outgoing(summary, selected) || !summary.memberships.some(item => !item.done && (!item.snoozedUntil || Date.parse(item.snoozedUntil) <= now())))) continue
+        if (job.scope !== 'all' && (summary.folder !== 'inbox' || outgoing(summary, selected) || !summary.memberships.some(item => !item.done && (!item.snoozedUntil || Date.parse(item.snoozedUntil) <= now())))) continue
+        // A rule can only move mail that is still in front of the user: skip conversations already assessed as Other.
+        if (job.scope === 'important' && previous) { const decision: AiDecision = JSON.parse(previous.data); if (decision.state === 'ready' && (decision.override?.category ?? decision.score?.category) === 'Other') continue }
         if (!selected.boxes.length) continue
         if (closed || settingsRow(owner)?.generation !== row.generation || JSON.parse(jobRow(owner, id)!.data).status !== 'running') return
         job.scanned++
@@ -1075,8 +1077,8 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       if (value.enabled) { watch(owner); schedule(owner) } else { subscriptions.get(owner)?.(); subscriptions.delete(owner) }
       return service.state(owner)
     }) },
-    process(owner: string, input: { id: string; scope: 'inbox' | 'all'; limit: number; settingsRevision?: number }): Promise<AiHistoryJob> { return serial(owner, async () => {
-      if (!object(input) || Object.keys(input).some(key => !['id', 'scope', 'limit', 'settingsRevision'].includes(key)) || !commandOK(input.id) || !['inbox', 'all'].includes(input.scope) || !Number.isInteger(input.limit) || input.limit < 100 || input.limit > 10000 || input.settingsRevision !== undefined && (!Number.isSafeInteger(input.settingsRevision) || input.settingsRevision < 0)) fail('AI_INVALID_JOB')
+    process(owner: string, input: { id: string; scope: 'inbox' | 'all' | 'important'; limit: number; settingsRevision?: number }): Promise<AiHistoryJob> { return serial(owner, async () => {
+      if (!object(input) || Object.keys(input).some(key => !['id', 'scope', 'limit', 'settingsRevision'].includes(key)) || !commandOK(input.id) || !['inbox', 'all', 'important'].includes(input.scope) || !Number.isInteger(input.limit) || input.limit < 100 || input.limit > 10000 || input.settingsRevision !== undefined && (!Number.isSafeInteger(input.settingsRevision) || input.settingsRevision < 0)) fail('AI_INVALID_JOB')
       const receipt = (): AiHistoryJob | null => {
         const previous = jobRow(owner, input.id); if (!previous) return null
         const job: AiHistoryJob = JSON.parse(previous.data)
@@ -1220,7 +1222,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         state = await service.configure(owner, { ...current, rules: [...(current.rules ?? []).filter(item => !supersedes.includes(item.id)), rule] })
         // Existing decisions stay in force; the newest inbox conversations are re-inferred under the new rules in the
         // background and each row changes only when its own new assessment lands. Older history follows on request.
-        if (state.settings.enabled) { try { await service.process(owner, { id: `${input.id}:resort`, scope: 'inbox', limit: 1000 }); state = await service.state(owner) } catch (error) { if (!(error instanceof InboxError)) throw error } }
+        if (state.settings.enabled) { try { await service.process(owner, { id: `${input.id}:resort`, scope: 'important', limit: 1000 }); state = await service.state(owner) } catch (error) { if (!(error instanceof InboxError)) throw error } }
       }
       return { rule, state, decision, superseded }
     },

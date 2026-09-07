@@ -291,7 +291,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Triage input belongs in the JSON body.')
         const input = await jsonBody(request, 'triage')
         if (route === '/settings' && request.method === 'PATCH') return reply(await aiTriage.configure(owner, input as unknown as AiSettings))
-        if (route === '/process' && request.method === 'POST') return reply(await aiTriage.process(owner, input as unknown as { id: string; scope: 'inbox' | 'all'; limit: number }))
+        if (route === '/process' && request.method === 'POST') return reply(await aiTriage.process(owner, input as unknown as { id: string; scope: 'inbox' | 'all' | 'important'; limit: number }))
         if (route === '/lookup' && request.method === 'POST') {
           if (Object.keys(input).join(',') !== 'keys' || !Array.isArray(input.keys) || input.keys.length > 100) return problem(400, 'HOST_INVALID_INPUT', 'Provide up to 100 triage identities.')
           return reply(await aiTriage.lookup(owner, input.keys as AiThreadKey[]))

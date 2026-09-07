@@ -14055,7 +14055,7 @@ describe('AI triage service', () => {
   test('teaching generalizes a note into a rule that overrides the thread, enters the prompt with highest precedence, invalidates saved assessments, and re-sorts newest inbox mail', async () => {
     const h = await fixture(), database = new Database(':memory:')
     const seeds = [native('taught-alert'), native('taught-other')]
-    const { account } = await h.seed('alice', 'ai-taught-rules', seeds)
+    const { account, box } = await h.seed('alice', 'ai-taught-rules', seeds)
     const requests: Array<{ instructions: string; schema: string; content: Record<string, unknown> }> = []
     const ruleResponse = { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify({ text: 'Fixture vendor account alerts are not important.', category: 'Other' }) }] }] }
     const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
@@ -14087,18 +14087,22 @@ describe('AI triage service', () => {
     expect(taught.decision).toMatchObject({ threadId: alert.threadId, override: { category: 'Other' }, score: { category: 'Other' } })
     expect(taught.state.settings.rules).toEqual([taught.rule])
     expect(taught.state.settings.revision).toBe(before.settingsRevision + 1)
-    // Saved assessments are invalidated by the rule and re-sorted newest-first under the new instructions.
+    // The re-sort covers only awake Inbox conversations not already assessed as Other. Both seeds are Other
+    // (the taught one by override), so nothing is re-billed; Done, snoozed and Other mail is never touched.
     await bounded((async () => { while ((await service.state('alice')).jobs.find(job => job.id === 'ai-taught-rule-1:resort')?.status !== 'completed') await Bun.sleep(10) })(), 'taught re-sort')
-    const triageAfterRule = requests.filter(request => request.schema === 'triage_result_v2').slice(2)
-    expect(triageAfterRule.length).toBeGreaterThan(0)
-    for (const request of triageAfterRule) {
+    expect((await service.state('alice')).jobs.find(job => job.id === 'ai-taught-rule-1:resort')).toMatchObject({ scope: 'important', queued: 0 })
+    expect(requests.filter(request => request.schema === 'triage_result_v2')).toHaveLength(2)
+    // New mail is assessed under the rule: it leads the instructions and never rides in the user content.
+    box.put({ ...native('taught-arrival'), subject: 'Subject taught-arrival' })
+    await h.sync('alice', account.id)
+    await bounded((async () => { while (requests.filter(request => request.schema === 'triage_result_v2').length < 3) await Bun.sleep(10) })(), 'arrival under the rule')
+    for (const request of requests.filter(request => request.schema === 'triage_result_v2').slice(2)) {
       expect(request.instructions.startsWith('USER RULES')).toBe(true)
       expect(request.instructions).toContain('- Fixture vendor account alerts are not important.')
       expect(request.content).not.toHaveProperty('rules')
     }
     const after = (await service.lookup('alice', [{ sourceId: account.id, threadId: alert.threadId }])).decisions[0]!
-    expect(after).toMatchObject({ state: 'ready', settingsRevision: taught.state.settings.revision })
-    expect(after.inputHash).not.toBe(before.inputHash)
+    expect(after).toMatchObject({ state: 'ready', inputHash: before.inputHash, override: { category: 'Other' } })
     // Teaching with the same id is idempotent and never bills another rule request.
     const ruleRequests = requests.filter(request => request.schema === 'triage_rule_v1').length
     expect((await service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-1', note: 'Do not mark these as important anymore' })).rule).toEqual(taught.rule)
