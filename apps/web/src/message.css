@@ -1165,7 +1165,7 @@
   color: var(--text);
 }
 .thread-message {
-  margin-bottom: 20px;
+  margin-bottom: 16px;
   border-radius: 4px;
 }
 .thread-message:focus-visible {
