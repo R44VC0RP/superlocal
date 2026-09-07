@@ -2,7 +2,7 @@
 
 Desktop-focused email, backed by a provider-agnostic Inbox SDK. Bring your mailboxes into one unified inbox while keeping their identities, credentials, and provider capabilities separate.
 
-![Unified inbox showing the included fictional mailboxes](docs/screenshots/unified-inbox.png)
+![Superlocal inbox demo](docs/screenshots/superlocal-demo.gif)
 
 ## Run locally
 
