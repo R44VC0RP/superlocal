@@ -4600,15 +4600,17 @@ test("host-service-backed forwarded duplicate compaction is response-batch local
     assert.equal(doneReceipt.states.length, 1); assert.equal(doneReceipt.states[0].done, true);
     const afterDone = await drain(beforeDone.state, [undoOriginalKey]);
     assert.ok(afterDone.removed.some(row => row.key === undoOriginalKey && row.reason === "not-matching"));
-    assert.ok(afterDone.newHead.some(row => row.key === undoCopyKey), "Done moves the original outside Inbox, so the next requested head shows its copy");
+    // The head pass recalls the original this host already proved, so marking it Done does not resurface its copy as new mail.
+    assert.ok(!afterDone.newHead.some(row => row.key === undoCopyKey), "a copy stays hidden after its proven original is marked Done");
     assert.ok(!afterDone.newHead.some(row => row.key === undoOriginalKey));
-    assert.ok(resolverCalls.every(ids => !ids.includes(undoOriginal.id)), "the Done original is outside the final matching response and cannot suppress its copy");
+    assert.ok(resolverCalls.some(ids => ids.includes(undoOriginal.id) && ids.includes(undoCopy.id)), "the head pass re-proves the copy against its remembered Done original");
+    assert.ok(resolverCalls.every(ids => ids.length <= 2 + 2), "recall adds only the remembered originals, never a history search");
     resolverCalls.length = 0;
     await host.inbox.undoMailboxStates(host.owner, doneReceipt.id);
     const undoneReceipt = await host.inbox.mailboxStateReceipt(host.owner, doneReceipt.id);
     assert.equal(undoneReceipt.retracted, true); assert.equal(undoneReceipt.states[0].done, false);
     const afterUndo = await drain(afterDone.state, afterDone.newHead.map(row => row.key), [undoOriginalKey, undoCopyKey]);
-    assert.deepEqual(afterUndo.removed, [{ key: undoCopyKey, reason: "not-matching" }], "Undo compaction removes the now-redundant resident copy only within the current requested head");
+    assert.deepEqual(afterUndo.removed, [], "the copy was never resident, so Undo removes nothing");
     assert.deepEqual(afterUndo.newHead.map(row => row.key), [undoOriginalKey], "the restored original re-enters the active view even though it is already a pinned reader");
     expectBatch(undoSummaries, "Undo resolves the final matching head once, with no offpage resident or pinned context");
     const retainedReaders = await request("lookup", { account: "unified", ids: [undoCopyKey, undoOriginalKey] });

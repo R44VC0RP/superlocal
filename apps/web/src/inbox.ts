@@ -2929,7 +2929,12 @@ export class InboxStore {
           // lost inverse acknowledgement. Never infer ownership from equal state.
           if (!fresh) {
             try { receipt = await this.client.mailboxStateReceipt(plan.input.id, { signal }); }
-            catch (error) { if (!(error instanceof ApiError && error.status === 404)) throw error; }
+            catch (error) {
+              if (!(error instanceof ApiError && error.status === 404)) throw error;
+              // A 404 receipt read proves no earlier attempt committed, so a definitive
+              // rejection of the retry below is final rather than "unconfirmed" forever.
+              ambiguous = false;
+            }
           }
           if (!receipt) {
             plan.status = "uncertain"; this.publishRecovery(plan, sink);

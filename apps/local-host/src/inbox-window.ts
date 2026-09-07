@@ -412,14 +412,27 @@ export function createInboxWindowService(deps: Dependencies) {
   }
   /** Compact only a completed, view-filtered response batch. Counts, captures,
    * detail reads and resident updates never invoke duplicate detection. */
-  async function compactBatch<T extends DTO.InboxWindowRow>(scope: Scope, rows: T[]): Promise<T[]> {
-    if (!scope.hideForwardedDuplicates || rows.length < 2) return rows
+  // Copy -> original pairs this host already proved. When the original leaves the
+  // batch (typically marked Done), the copy is still re-proved against it instead
+  // of resurfacing as a new arrival the user has to act on twice.
+  const provenOriginals = new Map<string, string>()
+  async function compactBatch<T extends DTO.InboxWindowRow>(scope: Scope, rows: T[], recall?: { withheld: ReadonlySet<string> }): Promise<T[]> {
+    if (!scope.hideForwardedDuplicates || rows.length < 1) return rows
     const candidates = rows.filter(row => row.messagesComplete && row.summaries.length > 0)
-    const messageIds = candidates.flatMap(row => row.summaries.map(message => message.id))
+    const batchIds = candidates.flatMap(row => row.summaries.map(message => message.id))
+    // Paging stays strictly batch-local. Only the head-arrival pass recalls originals this host already proved,
+    // so a copy does not resurface as new mail right after its original was marked Done. An original that is
+    // merely withheld from this head (AI arrival hold) is not recalled: the user has not seen it yet.
+    const remembered = recall ? [...new Set(batchIds.flatMap(id => { const original = provenOriginals.get(id); return original && !batchIds.includes(original) && !recall.withheld.has(original) ? [original] : [] }))] : []
+    const messageIds = [...batchIds, ...remembered]
     // Preserve the existing proof budget without making results depend on which
     // part of a large conversation happens to fit. Never fetch extra history.
-    if (candidates.length < 2 || messageIds.length > 500) return rows
-    const copies = await inbox.mailboxForwardedCopies(owner, { mailboxIds: scope.boxes.map(box => box.id), messageIds })
+    if (candidates.length < 2 && !remembered.length || messageIds.length > 500) return rows
+    // Presentation only: a proof failure (detached box mid-request, SDK error) shows the uncompacted rows rather than failing the page.
+    let copies: Awaited<ReturnType<typeof inbox.mailboxForwardedCopies>>
+    try { copies = await inbox.mailboxForwardedCopies(owner, { mailboxIds: scope.boxes.map(box => box.id), messageIds }) }
+    catch (error) { console.warn(JSON.stringify({ event: 'local.inbox', code: error instanceof InboxError ? error.code : 'FORWARDED_COPIES_FAILED' })); return rows }
+    for (const copy of copies) { if (provenOriginals.size >= 4000) provenOriginals.delete(provenOriginals.keys().next().value!); provenOriginals.set(copy.messageId, copy.originalMessageId) }
     const hidden = new Set(copies.map(copy => copy.messageId))
     const redundant = new Set(candidates.filter(row => row.summaries.every(message => hidden.has(message.id))).map(row => row.key))
     return redundant.size ? rows.filter(row => !redundant.has(row.key)) : rows
@@ -1568,7 +1581,8 @@ export function createInboxWindowService(deps: Dependencies) {
       // original cannot suppress a visible copy; already-resident rows remain
       // valid context within this requested head batch, never arbitrary history.
       const visible = head.rows.filter(row => resident.includes(row.key) || view.search || view.folder !== 'Inbox' || (row.mail.aiHoldUntil ?? 0) <= budget.now)
-      const compacted = await compactBatch(scope, visible), kept = new Set(compacted.map(row => row.key))
+      const withheld = new Set(head.rows.filter(row => !visible.includes(row)).flatMap(row => row.summaries.map(message => message.id)))
+      const compacted = await compactBatch(scope, visible, { withheld }), kept = new Set(compacted.map(row => row.key))
       for (const row of visible) if (resident.includes(row.key) && !kept.has(row.key)) removed.push({ key: row.key, reason: 'not-matching' })
       for (const row of compacted) {
         // A pinned reader is not necessarily in the active list (notably after
