@@ -179,7 +179,7 @@ export function createInboxWindowService(deps: Dependencies) {
     const selectedSources = sources.filter(source => boxes.some(box => box.sourceId === source.id))
     const identity = { account, boxes: boxes.map(box => [box.id, box.sourceId, box.revision, box.status]).sort(), sources: selectedSources.map(source => [source.id, source.generation]).sort() }
     const id = digest(identity), split = deps.splitPreferences.read() ?? { ...normalizeSplits({}), revision: 0 }
-    const preference = digest(['demand-window-1', ATTENTION_VERSION, AI_PREFERENCE_VERSION, IMPORTANT_WINDOW_VERSION, preferences.revision, split, ai.configured, ai.settings])
+    const preference = digest(['demand-window-1', 'forwarded-duplicates-1', ATTENTION_VERSION, AI_PREFERENCE_VERSION, IMPORTANT_WINDOW_VERSION, preferences.revision, split, ai.configured, ai.settings])
     aiCursor ??= ai.cursor
     const categoryHead = db.query<{ head: number }, string[]>('SELECT head FROM local_category_clock WHERE owner=?').get(owner)?.head ?? 0
     categoryCursor ??= categoryHead
