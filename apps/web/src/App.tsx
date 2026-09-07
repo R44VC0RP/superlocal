@@ -262,6 +262,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   // Positions live only for this mounted App; never retain mail or virtual windows.
   const listPositions = useRef(new Map<string, { current: number }>());
   const sequence = useRef({ key: "", time: 0 });
+  const readerScroll = useRef<HTMLDivElement>(null);
   const searchOrigin = useRef<Route | null>(null);
   const searchHistoryStates = useRef(new Map<number, { search: boolean; query: string; submitted: boolean; origin: Route | null; filter: string | null }>());
   useLayoutEffect(() => {
@@ -1808,9 +1809,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setSearch(false);
   }
 
-  const onKey = useEffectEvent((e: KeyboardEvent) => {
+  const onKey = useEffectEvent((e: KeyboardEvent, sequencesOnly = false) => {
     actionNavigationVersion.current++;
-    const target = e.target instanceof HTMLElement ? e.target : null;
+    const target = e.target && (e.target as Node).nodeType === 1 ? e.target as HTMLElement : null;
     const editing = target?.closest(
       "input,textarea,[contenteditable=true],select",
     );
@@ -1836,9 +1837,19 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       sequence:
         sequence.current.key === "g" &&
         Date.now() - sequence.current.time < 1500,
+      calendarSequence: sequence.current.key === "0" && Date.now() - sequence.current.time < 1500,
       search,
       hasHighlightedMail: !!visibleMail[highlight],
     });
+    if (sequencesOnly && !(
+      intent?.type === "sequence" || intent?.type === "goFolder" ||
+      intent?.type === "jump" || intent?.type === "labelMode" && intent.mode === "navigate" ||
+      intent?.type === "calendar" && e.key === "0"
+    )) {
+      // Unrelated keys cancel the prefix, then reach their usual owner once.
+      if (!e.repeat) sequence.current.key = "";
+      return;
+    }
     if (!intent) return;
     if (intent.clearSequence) sequence.current.key = "";
     if (intent.type === "account" || intent.type === "unified") {
@@ -1850,6 +1861,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       return;
     }
     if (intent.type === "sequence") {
+      if (intent.phase === "start") e.preventDefault();
       sequence.current = {
         key: intent.phase === "start" ? "g" : "",
         time: Date.now(),
@@ -1878,6 +1890,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         toggleComposeFocus();
         break;
       case "calendar":
+        sequence.current = { key: e.key === "0" && intent.view === "day" ? "0" : "", time: Date.now() };
         setCalendarInitialView(intent.view);
         navigate({ view: "calendar", thread: undefined, draft: undefined });
         break;
@@ -1893,6 +1906,11 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         else void selectAllMail();
         break;
       case "jump":
+        if (currentMail) {
+          const pane = readerScroll.current;
+          pane?.scrollTo({ top: intent.edge === "top" ? 0 : pane.scrollHeight, behavior: "auto" });
+          break;
+        }
         if (inbox.host?.inboxWindow) {
           void store.seekWindow(intent.edge === "top" ? "start" : "end").then(() => {
             const count = store.getSnapshot().window?.keys.length ?? 0;
@@ -1989,6 +2007,12 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       case "reply":
         composeReply(intent.mode, intent.popOut);
         break;
+      case "extendSelection": {
+        const id = visibleMail[highlight]?.id;
+        if (id) setSelected(items => items.includes(id) ? items : [...items, id]);
+        setHighlight(value => Math.max(0, Math.min(rowCount - 1, value + intent.delta)));
+        break;
+      }
       case "toggleSelection": {
         const id = visibleMail[highlight]?.id;
         if (id)
@@ -2018,9 +2042,20 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       }
     }
   });
+  const onSequenceKey = useEffectEvent((event: KeyboardEvent) => {
+    if (event.key.toLowerCase() === "g" || event.key === "0" || sequence.current.key)
+      onKey(event, true);
+  });
   useEffect(() => {
-    addEventListener("keydown", onKey);
-    return () => removeEventListener("keydown", onKey);
+    // Own prefixes before reader/calendar capture handlers can consume their second key.
+    const capture = (event: KeyboardEvent) => onSequenceKey(event);
+    const bubble = (event: KeyboardEvent) => onKey(event);
+    addEventListener("keydown", capture, true);
+    addEventListener("keydown", bubble);
+    return () => {
+      removeEventListener("keydown", capture, true);
+      removeEventListener("keydown", bubble);
+    };
   }, []);
 
   if (!inbox.loaded && !inbox.host?.inboxWindow) {
@@ -2187,6 +2222,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           </div>
         ) : currentMail ? (
           <ThreadView
+            scrollRef={readerScroll}
+            onSequenceKey={onSequenceKey}
             onLoadMessage={loadReaderMessage}
             onLoadOlder={loadOlderMessages}
             onResetHistory={inbox.host?.inboxWindow ? resetReaderHistory : undefined}

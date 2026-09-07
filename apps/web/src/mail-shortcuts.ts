@@ -7,6 +7,7 @@ export type MailShortcutEvent = {
   ctrlKey?: boolean;
   shiftKey?: boolean;
   isComposing?: boolean;
+  repeat?: boolean;
   defaultPrevented?: boolean;
 };
 
@@ -22,6 +23,7 @@ export type MailShortcutContext = {
   isDrafts?: boolean;
   accountDialog?: boolean;
   sequence?: boolean;
+  calendarSequence?: boolean;
   search?: boolean;
   hasHighlightedMail?: boolean;
 };
@@ -52,6 +54,7 @@ export type MailShortcut = (
   | { type: "navigateConversation"; delta: -1 | 1 }
   | { type: "reply"; mode: "reply" | "replyAll" | "forward"; popOut: boolean }
   | { type: "toggleSelection" }
+  | { type: "extendSelection"; delta: -1 | 1 }
   | { type: "removeLabels"; all: boolean; delta: -1 | 0 | 1 }
   | {
       type: "triage";
@@ -111,8 +114,9 @@ export function resolveMailShortcut(
   )
     return null;
 
+  if (!mod && !shift && event.key === "0" && event.repeat) return null;
   if (!mod && !shift && (event.key === "0" || event.key === "2"))
-    return { type: "calendar", view: event.key === "0" ? "day" : "week" };
+    return { type: "calendar", view: event.key === "0" && !context.calendarSequence ? "day" : "week" };
   if (mod) {
     if (event.ctrlKey && !event.metaKey && event.key === "/")
       return { type: "copyLink" };
@@ -122,19 +126,15 @@ export function resolveMailShortcut(
       return { type: "jump", edge: event.key === "ArrowUp" ? "top" : "bottom" };
     return null;
   }
-  if (context.navigation) {
-    if (event.key === "ArrowUp" || event.key === "ArrowDown")
-      return {
-        type: "drawerNavigate",
-        delta: event.key === "ArrowDown" ? 1 : -1,
-      };
-    if (event.key === "ArrowRight") return { type: "drawerActivate" };
-    return null;
-  }
-  if (context.interactive && ["Enter", " ", "Tab"].includes(event.key))
-    return null;
-
   let intent: MailShortcut | null = null;
+  if (key === "g" && (list || reader) && !context.navigation && shift)
+    return { type: "jump", edge: "bottom", clearSequence: true };
+  if (event.key === "g" && !shift) {
+    if (event.repeat) return null;
+    if (context.sequence && (list || reader) && !context.navigation)
+      return { type: "jump", edge: "top", clearSequence: true };
+    return { type: "sequence", phase: "start" };
+  }
   if (context.sequence) {
     // Inbox's explicit split must win over the shared folder mapping.
     if (key === "o" || key === "i")
@@ -152,7 +152,17 @@ export function resolveMailShortcut(
     }
   }
   if (intent) return { ...intent, clearSequence: true };
-  if (event.key === "g") return { type: "sequence", phase: "start" };
+  if (context.navigation) {
+    if (event.key === "ArrowUp" || event.key === "ArrowDown")
+      return {
+        type: "drawerNavigate",
+        delta: event.key === "ArrowDown" ? 1 : -1,
+      };
+    if (event.key === "ArrowRight") return { type: "drawerActivate" };
+    return null;
+  }
+  if (context.interactive && ["Enter", " ", "Tab"].includes(event.key))
+    return null;
 
   if (context.mode !== "auxiliary") {
     if (key === "c") intent = { type: "compose", popOut: shift };
@@ -178,6 +188,8 @@ export function resolveMailShortcut(
           { u: "Unread", s: "Starred", i: "Important", r: "No reply" } as const
         )[key],
       };
+    else if (list && !context.isDrafts && shift && ["j", "k"].includes(key) && context.hasHighlightedMail)
+      intent = { type: "extendSelection", delta: key === "j" ? 1 : -1 };
     else if (["j", "k"].includes(event.key) || list && ["ArrowDown", "ArrowUp"].includes(event.key))
       intent = {
         type: "navigateConversation",

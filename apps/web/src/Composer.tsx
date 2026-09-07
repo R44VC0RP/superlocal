@@ -788,7 +788,9 @@ export default function Composer({
                     ?.focus(),
                 );
               };
-            } else if (matches("u", "KeyU") && fileInput.current) {
+            } else if (matches("m", "KeyM")) {
+              action = () => editor.current?.focus();
+            } else if ((matches("a", "KeyA") || matches("u", "KeyU")) && fileInput.current) {
               action = () => fileInput.current?.click();
             } else if (matches(",", "Comma")) {
               action = onDiscard;
@@ -1539,7 +1541,7 @@ export default function Composer({
               </div>
               <IconButton
                 name="Paperclip"
-                title="Attach file (Command Shift U)"
+                title="Attach file (Command Shift A)"
                 onClick={() => fileInput.current?.click()}
               />
               <div className="compose-menu-anchor">
