@@ -17,6 +17,7 @@ import { assertApplicationAuthRuntime, createApplicationAuth } from './applicati
 import { loadAiInferenceConfig, type AiInferenceConfig } from './ai-inference'
 import { createAiTriageService } from './ai-triage'
 import { createInboxWindowService } from './inbox-window'
+import { createZeroSweepService } from './zero-sweep'
 import type { AiSettings, AiFeedbackInput, AiReadingInput, AiTeachInput, AiThreadKey } from '../../shared/ai-triage'
 
 const safeHeaders = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', Vary: 'Origin, Cookie' }
@@ -130,6 +131,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     attentionOverrides: ReturnType<typeof createAttentionOverridesStore>
     senderDomains: ReturnType<typeof createSenderDomainHost>
     inboxWindow: ReturnType<typeof createInboxWindowService>
+    zeroSweep: ReturnType<typeof createZeroSweepService>
   }>()
   function contextFor(owner: string) {
     if (closed) throw new InboxError('HOST_CLOSED', 'The local host is shutting down.', 503)
@@ -145,7 +147,8 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         senderDomains: createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' }),
       }
       context = { ...services, inboxWindow: createInboxWindowService({ database: runtime.database, inbox: liveInbox, owner,
-        sessionKey: runtime.sessionKey, allowProviderWrites: config.allowProviderWrites, ai: aiTriage, ...services }) }
+        sessionKey: runtime.sessionKey, allowProviderWrites: config.allowProviderWrites, ai: aiTriage, ...services }),
+        zeroSweep: createZeroSweepService({ database: runtime.database, inbox: liveInbox, owner }) }
       ownerContexts.set(owner, context)
     }
     return context
@@ -348,6 +351,17 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       if (request.method === 'POST' && url.pathname.endsWith('/undo')) return Response.json(await attentionFeedback.undo(url.pathname.split('/')[3]!), { headers: safeHeaders })
       if (request.method === 'POST') return Response.json(await attentionFeedback.record(await jsonBody(request, 'preferences')), { headers: safeHeaders })
       return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use GET or POST for feedback.')
+    }
+    if (url.pathname === '/host/zero-sweep' || url.pathname.startsWith('/host/zero-sweep/')) {
+      if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Get me to zero takes no query parameters.')
+      const { zeroSweep } = contextFor(owner), route = url.pathname.slice('/host/zero-sweep'.length)
+      if (route === '' && request.method === 'GET') return Response.json(zeroSweep.recent(), { headers: safeHeaders })
+      if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use POST for Get me to zero.')
+      const input = await jsonBody(request, 'preferences')
+      if (route === '/preview') return Response.json(await zeroSweep.preview(input), { headers: safeHeaders })
+      if (route === '/apply') return Response.json(await zeroSweep.apply(input), { headers: safeHeaders })
+      if (route === '/undo') return Response.json(await zeroSweep.undo(input), { headers: safeHeaders })
+      return problem(404, 'HOST_NOT_FOUND', 'Unknown Get me to zero route.')
     }
     if (url.pathname === '/host/inbox-preferences') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Inbox preferences take no query parameters.')

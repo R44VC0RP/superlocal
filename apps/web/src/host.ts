@@ -291,3 +291,16 @@ export function createAiTriageClient(signal: () => AbortSignal, fetcher: typeof 
     diagnostics: () => call<Awaited<ReturnType<AiTriageActions["diagnostics"]>>>("/diagnostics"),
   };
 }
+
+export type ZeroSweepInput = { account: string; olderThanDays: number; keepUnread: boolean; keepStarred: boolean };
+export type ZeroSweepPreview = { token: string; conversations: number; messages: number; cutoff: string; complete: boolean };
+export type ZeroSweepRun = { id: string; account: string; at: string; cutoff: string; conversations: number; messages: number; skipped: number; undone: boolean; receipts: number };
+/** Get me to zero: host-side bulk Done for inbox conversations older than a cutoff, with a 7-day undo. */
+export async function zeroSweep<T>(path: "/preview" | "/apply" | "/undo" | "", input: unknown, signal: AbortSignal): Promise<T> {
+  const response = await hostFetch(`/host/zero-sweep${path}`, { method: path ? "POST" : "GET", credentials: "include", cache: "no-store", signal,
+    ...(path ? { headers: { "Content-Type": "application/json", "X-Superlocal": "1" }, body: JSON.stringify(input) } : {}) });
+  const result = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(result?.code === "HOST_ZERO_PREVIEW_EXPIRED" ? "That count is out of date. Check it again before confirming." : result?.code === "HOST_ZERO_UNDO_EXPIRED" ? "Undo is only available for 7 days." : "Get me to zero could not be completed. Try again.");
+  if (result === null || typeof result !== "object") throw new Error("The host returned an invalid response.");
+  return result as T;
+}

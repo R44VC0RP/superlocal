@@ -1568,7 +1568,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       label: `Filter: ${name}`, detail: "Use saved AI assessments in the current view", key: "", icon: "Search",
       run: () => { setOverlay(null); setMailFilter(value => value === name ? null : name); setHighlight(0); },
     })) : []),
-    { label: "Get me to zero", detail: "Mark everything in Important as Done", key: "", icon: "Check", run: startZero },
+    { label: "Get me to zero", detail: "Mark inbox conversations older than a week as Done", key: "", icon: "Check", run: startZero },
     { label: "AI triage", detail: "Assessment settings, historical processing and costs", key: "", icon: "Gear", run: () => openSettings("AI triage") },
     {
       label: "Settings",
@@ -2536,9 +2536,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             </div>
           )}
         </div>
-        {importantDoneAccount !== null && <ImportantDone store={store} account={importantDoneAccount} accountLabel={importantDoneAccount === UNIFIED_ACCOUNT ? "Unified inbox" : inbox.accounts.find(account => account.id === importantDoneAccount)?.email || "Selected mailbox"} onClose={() => setImportantDoneAccount(null)} onDone={(count, changed, undo, unfinished) => {
+        {importantDoneAccount !== null && <ImportantDone account={importantDoneAccount} accountLabel={importantDoneAccount === UNIFIED_ACCOUNT ? "your unified inbox" : inbox.accounts.find(account => account.id === importantDoneAccount)?.email || "this mailbox"} onClose={() => setImportantDoneAccount(null)} onDone={(run, undo) => {
           setImportantDoneAccount(null);
-          setNotice({ text: `${count.toLocaleString()} Important conversations marked Done.${changed ? ` ${changed.toLocaleString()} changed conversations left untouched.` : ""}${unfinished ? " Stopped before completing all mail; an unconfirmed request may still settle." : ""}`, undo: undoAction(undo) });
+          setNotice({ text: `${run.conversations.toLocaleString()} conversations marked Done.${run.skipped ? ` ${run.skipped.toLocaleString()} changed meanwhile were left untouched.` : ""}`, undo: undoAction(undo) });
         }} />}
         <AiSortingStatus state={inbox.ai} onOpen={() => openSettings("AI triage")} />
         <MailSyncStatus client={inbox.store.client} mailboxes={inbox.mailboxes} sources={inbox.sources} enabled={inbox.loaded && !settings && !route.view} onMailboxes={() => openSettings("Mailboxes")} />

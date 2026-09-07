@@ -1908,3 +1908,47 @@ kbd {
   height: auto;
   background: var(--sidebar);
 }
+.zero-form .zero-lead {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.6;
+}
+.zero-lead select {
+  margin: 0 6px;
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.zero-options {
+  display: grid;
+  gap: 8px;
+}
+.zero-check {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 10px !important;
+  color: var(--text) !important;
+}
+.zero-check input { width: auto; }
+.zero-count {
+  margin: 0;
+  color: var(--muted);
+  min-height: 21px;
+}
+.zero-recent {
+  width: 100%;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+}
+.zero-recent p {
+  margin: 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
