@@ -3,7 +3,7 @@ import type { SplitPreferences } from "../../shared/splits";
 import type { MailboxMembership } from "inbox-sdk/types";
 import { configurePerformanceLogging, measureRequest } from "./browser-logs";
 import { privateFetch } from "./application-auth";
-import type { AiTriageActions, AiTriageState, AiDecisionPage, AiHistoryJob, AiDecision } from "../../shared/ai-triage";
+import type { AiTriageActions, AiTriageState, AiDecisionPage, AiHistoryJob, AiDecision, AiTeachResult } from "../../shared/ai-triage";
 import { CATEGORY_BATCH_LIMIT, CATEGORY_RESPONSE_LIMIT, categoryErrorMessages, isCategoryEntry, type CategoryErrorCode, type CategoryEntry, type CategoryPage, type CategoryReceipt, type CategoryTransport } from "../../shared/attention-overrides";
 export type SavedSplitPreferences = SplitPreferences & { revision: number };
 export type AttentionFeedback = { id: string; createdAt: string; status: "pending" | "active" | "retracting" | "retracted" | "failed"; count: number; problem?: string; states?: MailboxMembership[] };
@@ -283,6 +283,7 @@ export function createAiTriageClient(signal: () => AbortSignal, fetcher: typeof 
     changes: after => call<AiDecisionPage>(`/changes?after=${encodeURIComponent(after)}`),
     results: after => call<AiDecisionPage>(after === undefined ? "/results" : `/results?after=${encodeURIComponent(after)}`),
     feedback: input => call<AiDecision>("/feedback", "POST", input),
+    teach: input => call<AiTeachResult>("/teach", "POST", input),
     reading: async input => { await call("/reading", "POST", input); },
     clearReading: async () => { await call("/reading", "DELETE"); },
     diagnostics: () => call<Awaited<ReturnType<AiTriageActions["diagnostics"]>>>("/diagnostics"),

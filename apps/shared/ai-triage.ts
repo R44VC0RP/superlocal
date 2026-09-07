@@ -89,7 +89,13 @@ export type AiSettings = {
   readingSignals: boolean;
   /** Explicit local interests, not instructions sent to inference. */
   interests: string[];
+  /** User-taught classification rules. Unlike interests, these ARE appended to the model's instructions; absent on older saved settings. */
+  rules?: AiRule[];
 };
+/** One durable rule generalized from the user's own feedback. Text is the user's data, never provider output executed as instructions. */
+export type AiRule = { id: string; text: string; category: AiCategory | null; createdAt: string };
+export type AiTeachInput = AiThreadKey & { id: string; note: string };
+export type AiTeachResult = { rule: AiRule; state: AiTriageState; decision: AiDecision | null };
 export type AiScoreSignals = {
   correspondenceDays: number;
   readingSeconds: number;
@@ -251,6 +257,7 @@ export type AiTriageActions = {
   changes(after: number): Promise<AiDecisionPage>;
   results(after?: number): Promise<AiDecisionPage>;
   feedback(input: AiFeedbackInput): Promise<AiDecision>;
+  teach(input: AiTeachInput): Promise<AiTeachResult>;
   reading(input: AiReadingInput): Promise<void>;
   clearReading(): Promise<void>;
   diagnostics(): Promise<AiDiagnostics>;

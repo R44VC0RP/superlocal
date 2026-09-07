@@ -251,6 +251,14 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
         <label className="settings-checkbox-row"><span>Personalize categories</span><input type="checkbox" checked={draft.personalization} onChange={event => change({ personalization: event.target.checked })} /></label>
         <label className="settings-field"><span>Local interests</span><input value={interests} maxLength={1220} placeholder="Comma-separated topics" onChange={event => { setInterests(event.target.value); change({}); }} aria-invalid={invalidInterests} /></label>
         <p className={invalidInterests ? "settings-error" : "settings-note"}>Up to 20 comma-separated terms, 60 characters each. Used locally, not sent to the model.</p>
+        <div className="settings-field ai-rules"><span>Taught rules</span>
+          {draft.rules?.length ? <ul className="ai-rule-list">{draft.rules.map(rule => <li key={rule.id}>
+            <span className="ai-rule-text">{rule.text}</span>
+            {rule.category && <span className="ai-rule-category">{rule.category}</span>}
+            <button type="button" className="settings-text-button" onClick={() => change({ rules: draft.rules!.filter(item => item.id !== rule.id) })} aria-label={`Remove rule: ${rule.text}`}>Remove</button>
+          </li>)}</ul> : <p className="settings-note">None yet. Open a conversation, press ⌘K, and choose Teach AI.</p>}
+        </div>
+        {!!draft.rules?.length && <p className="settings-note">Rules are added to the classifier's instructions. Removing or adding one re-sorts recent inbox mail.</p>}
         <label className="settings-checkbox-row"><span>Use estimated reading activity<span className="settings-checkbox-note">Optional reading history; it does not change Important or Other. No text, typing, or screenshots are collected.</span></span><input type="checkbox" checked={draft.readingSignals} onChange={event => change({ readingSignals: event.target.checked })} /></label>
       </fieldset>
       {dirty && <p className="settings-note">Unsaved AI changes. Status and processing still use your saved settings.</p>}

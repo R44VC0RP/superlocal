@@ -1,8 +1,8 @@
 import type { Database } from 'bun:sqlite'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { InboxError, type Inbox, type Mailbox, type Message, type MessageSummary } from 'inbox-sdk'
-import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, AI_PREFERENCE_VERSION, aiKinds, aiResponses, aiActions, aiUrgencies, aiRisks, aiActivityReasons, type AiActivityReason, type AiAssessment, type AiDecision, type AiDecisionPage, type AiDiagnosticActivity, type AiDiagnosticAttempt, type AiDiagnostics, type AiFeedbackInput, type AiHistoryJob, type AiInferenceResult, type AiReadingInput, type AiSettings, type AiThreadKey, type AiTriageInput, type AiTriageState, type AiUsageSummary } from '../../shared/ai-triage'
-import { inferAiTriage, prepareAiText, publicAiProvider, type AiInferenceConfig } from './ai-inference'
+import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, AI_PREFERENCE_VERSION, aiKinds, aiResponses, aiActions, aiUrgencies, aiRisks, aiActivityReasons, type AiActivityReason, type AiAssessment, type AiDecision, type AiDecisionPage, type AiRule, type AiTeachInput, type AiTeachResult, type AiDiagnosticActivity, type AiDiagnosticAttempt, type AiDiagnostics, type AiFeedbackInput, type AiHistoryJob, type AiInferenceResult, type AiReadingInput, type AiSettings, type AiThreadKey, type AiTriageInput, type AiTriageState, type AiUsageSummary } from '../../shared/ai-triage'
+import { AI_RULES_PROMPT_VERSION, inferAiRule, inferAiTriage, prepareAiText, publicAiProvider, type AiInferenceConfig } from './ai-inference'
 import { countAiTopicMatches, normalizeAiTopics, scoreAiTriage } from './ai-preferences'
 
 type Options = { database: Database; inbox: Inbox; configuration: AiInferenceConfig | null; configurationProblem?: string; sessionKey: string | Uint8Array; now?: () => number; fetcher?: typeof fetch }
@@ -155,8 +155,12 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
   }
   const settingsStatement = db.prepare<SettingsRow, [string]>('SELECT * FROM local_ai_settings WHERE owner=?')
   const settingsRow = (owner: string) => settingsStatement.get(owner)
-  const defaultSettings = (): AiSettings => ({ revision: 0, enabled: false, mode: 'preview', model: configuration?.defaultModel ?? '', mailboxIds: null, personalization: true, readingSignals: false, interests: [] })
+  const defaultSettings = (): AiSettings => ({ revision: 0, enabled: false, mode: 'preview', model: configuration?.defaultModel ?? '', mailboxIds: null, personalization: true, readingSignals: false, interests: [], rules: [] })
   const settings = (owner: string): AiSettings => { const row = settingsRow(owner); return row ? JSON.parse(row.data) : defaultSettings() }
+  const ruleTexts = (value: AiSettings) => (value.rules ?? []).map(rule => rule.text)
+  const rulesDigest = (value: AiSettings) => digest(ruleTexts(value))
+  const ruleOK = (value: unknown): value is AiRule => object(value) && commandOK(value.id) && typeof value.text === 'string' && !!value.text.trim() && value.text.length <= 240 && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value.text) &&
+    [null, 'Important', 'Other'].includes(value.category as string | null) && typeof value.createdAt === 'string' && Number.isFinite(Date.parse(value.createdAt)) && Object.keys(value).every(key => ['id', 'text', 'category', 'createdAt'].includes(key))
   const decisionStatement = db.prepare<DecisionRow, [string, string, string]>('SELECT data,fingerprint,sender,seq FROM local_ai_decisions WHERE owner=? AND source=? AND thread=?')
   const decisionRow = (owner: string, source: string, thread: string) => decisionStatement.get(owner, source, thread)
   const usage = (owner: string): AiUsageSummary => { const row = db.query<{ data: string }, [string]>('SELECT data FROM local_ai_usage WHERE owner=?').get(owner); return row ? JSON.parse(row.data) : emptyUsage() }
@@ -349,7 +353,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     }
     const senderMessage = messages.find(message => !outgoing(message, selected))
     rememberCorrespondence(owner, messages, selected)
-    return { input, fingerprint, hash: digest({ messages: input.messages, model: value.model, schema: AI_TRIAGE_VERSION, configuration: configVersion }), legacyHash: digest({ messages: input.messages, model: value.model, schema: 'triage-1', configuration: configVersion }), messages, boxes: [...new Set(messages.flatMap(message => message.memberships.map(item => item.mailboxId)))], versions: messages.map(message => ({ messageId: message.id, bodyRevision: message.bodyRevision ?? null })), sender: senderMessage ? hashIdentity(owner, senderMessage.from.email) : '', insufficient: !input.messages.some(message => message.direction === 'incoming' && message.text.trim().length > 0) }
+    return { input, fingerprint, hash: digest({ messages: input.messages, model: value.model, schema: AI_TRIAGE_VERSION, configuration: configVersion, ...(value.rules?.length ? { rules: rulesDigest(value), rulesPrompt: AI_RULES_PROMPT_VERSION } : {}) }), legacyHash: digest({ messages: input.messages, model: value.model, schema: 'triage-1', configuration: configVersion }), messages, boxes: [...new Set(messages.flatMap(message => message.memberships.map(item => item.mailboxId)))], versions: messages.map(message => ({ messageId: message.id, bodyRevision: message.bodyRevision ?? null })), sender: senderMessage ? hashIdentity(owner, senderMessage.from.email) : '', insufficient: !input.messages.some(message => message.direction === 'incoming' && message.text.trim().length > 0) }
   }
   function capturedContext(owner: string, context: Context, decision: AiDecision, value: AiSettings): Context | null {
     if (decision.model !== value.model || decision.settingsRevision < fenceRevision(owner) || JSON.stringify(context.versions) !== JSON.stringify(decision.contextVersions)) return null
@@ -395,7 +399,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     }
     if (previous && unchanged && !existing) {
       const prior: AiDecision = JSON.parse(previous.data)
-      if (reusableDecision(prior, (JSON.parse(row.data) as AiSettings).model, lane === 'history' && !!job && jobRow(owner, job)?.input_policy === AI_INPUT_POLICY_VERSION)) { if (job) { db.query("UPDATE local_ai_job_items SET status='completed' WHERE owner=? AND job=? AND source=? AND thread=?").run(owner, job, source, thread); refreshJob(owner, job) }; return false }
+      if (prior.settingsRevision >= fenceRevision(owner) && reusableDecision(prior, (JSON.parse(row.data) as AiSettings).model, lane === 'history' && !!job && jobRow(owner, job)?.input_policy === AI_INPUT_POLICY_VERSION)) { if (job) { db.query("UPDATE local_ai_job_items SET status='completed' WHERE owner=? AND job=? AND source=? AND thread=?").run(owner, job, source, thread); refreshJob(owner, job) }; return false }
     }
     const count = db.query<{ queued: number }, [string]>('SELECT queued FROM local_ai_queue_counts WHERE owner=?').get(owner)?.queued ?? 0
     if (!existing && count >= (lane === 'history' ? HISTORY_LIMIT : QUEUE_LIMIT)) fail('AI_QUEUE_FULL', 429)
@@ -650,7 +654,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         row.examined++; row.bytes += size; saveJob(row, job)
         if (db.query('SELECT 1 FROM local_ai_job_items WHERE owner=? AND job=? AND source=? AND thread=?').get(owner, id, summary.sourceId, summary.threadId)) continue
         const previous = decisionRow(owner, summary.sourceId, summary.threadId)
-        if (previous && knownMessage(owner, summary)) { const decision: AiDecision = JSON.parse(previous.data); if (reusableDecision(decision, (JSON.parse(current.data) as AiSettings).model, row.input_policy === AI_INPUT_POLICY_VERSION)) continue }
+        if (previous && knownMessage(owner, summary)) { const decision: AiDecision = JSON.parse(previous.data); if (decision.settingsRevision >= fenceRevision(owner) && reusableDecision(decision, (JSON.parse(current.data) as AiSettings).model, row.input_policy === AI_INPUT_POLICY_VERSION)) continue }
         let selected = sourceScopes.get(summary.sourceId)
         if (!selected) { selected = await scope(owner, JSON.parse(current.data), summary.sourceId); sourceScopes.set(summary.sourceId, selected) }
         if (closed || settingsRow(owner)?.generation !== row.generation || JSON.parse(jobRow(owner, id)!.data).status !== 'running') return
@@ -678,12 +682,12 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     return !!current && current.generation === queue.generation && current.fingerprint === queue.fingerprint
   }
   function pump() {
-    if (!started || closed || pumping || !configuration || active.size >= Math.min(2, configuration.concurrency ?? 2)) return
+    if (!started || closed || pumping || !configuration || active.size >= (configuration.concurrency ?? 2)) return
     pumping = true
     try {
       const rows = db.query<QueueRow, [number]>(`SELECT q.* FROM local_ai_queue q INDEXED BY local_ai_queue_ready JOIN local_ai_settings s ON s.owner=q.owner LEFT JOIN local_ai_jobs j ON j.owner=q.owner AND j.id=q.job WHERE q.status='queued' AND q.due<=? AND q.generation=s.generation AND json_extract(s.data,'$.enabled')=1 AND (q.job IS NULL OR (j.enumerated=1 AND json_extract(j.data,'$.status')='running')) ORDER BY CASE q.lane WHEN 'incoming' THEN 0 ELSE 1 END,q.queued LIMIT 20`).all(now())
       for (const row of rows) {
-        if (active.size >= Math.min(2, configuration.concurrency ?? 2)) break
+        if (active.size >= (configuration.concurrency ?? 2)) break
         const id = key(row.owner, row.source, row.thread)
         if (active.has(id) || !permitted(row)) continue
         db.query("UPDATE local_ai_queue SET status='processing' WHERE owner=? AND source=? AND thread=?").run(row.owner, row.source, row.thread)
@@ -810,7 +814,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     if (!permitted(queue) || controller.signal.aborted) return
     const attempt = beginAttempt(queue, value.model, context.hash)
     let result: AiInferenceResult
-    try { result = await inferAiTriage(context.input, configuration!, { model: value.model, signal: controller.signal, fetcher, retrying: queue.attempts > 0 }) }
+    try { result = await inferAiTriage(context.input, configuration!, { model: value.model, signal: controller.signal, fetcher, retrying: queue.attempts > 0, rules: ruleTexts(value) }) }
     catch { finishAttempt(queue.owner, attempt, null); if (permitted(queue)) transaction(() => finishDecision(queue, context, null, 'AI_REQUEST_FAILED')); return }
     let current: Context | null = null
     if (permitted(queue) && !controller.signal.aborted) { try { current = await prepare(queue.owner, queue.source, queue.thread, contextSettings(settings(queue.owner))) } catch {} }
@@ -1001,7 +1005,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       return { configured: !!configuration, provider: configuration ? publicAiProvider(configuration) : null, problemCode: configuration ? configuration.models.some(model => model.id === value.model) ? recoveryRow(owner)?.problem ?? rescoreRow(owner)?.problem ?? db.query<CoverageRow, [string]>('SELECT counts,last_drain,problem FROM local_ai_coverage WHERE owner=?').get(owner)?.problem ?? null : 'AI_MODEL_UNAVAILABLE' : configurationProblem && /^[A-Z][A-Z0-9_]{0,79}$/.test(configurationProblem) ? configurationProblem : 'AI_NOT_CONFIGURED', settings: value, queue: { pending: counts.find(item => item.status === 'queued')?.count ?? 0, processing: counts.find(item => item.status === 'processing')?.count ?? 0, failed }, usage: usage(owner), jobs: db.query<{ data: string }, [string]>('SELECT data FROM local_ai_jobs WHERE owner=? ORDER BY rowid DESC LIMIT 20').all(owner).map(row => JSON.parse(row.data)), cursor: cursor(owner).head }
     },
     configure(owner: string, input: AiSettings): Promise<AiTriageState> { return serial(owner, async () => {
-      if (!object(input) || Object.keys(input).some(key => !['revision', 'enabled', 'mode', 'model', 'mailboxIds', 'personalization', 'readingSignals', 'interests'].includes(key)) || !Number.isSafeInteger(input.revision) || input.revision < 0 || typeof input.enabled !== 'boolean' || !['preview', 'apply'].includes(input.mode) || typeof input.model !== 'string' || input.model.length > 200 || typeof input.personalization !== 'boolean' || typeof input.readingSignals !== 'boolean' || !Array.isArray(input.interests) || input.interests.length > 64 || input.interests.some(topic => typeof topic !== 'string' || topic.length > 256) || input.mailboxIds !== null && (!Array.isArray(input.mailboxIds) || input.mailboxIds.length > 1000 || input.mailboxIds.some(id => !idOK(id)))) fail('AI_INVALID_SETTINGS')
+      if (!object(input) || Object.keys(input).some(key => !['revision', 'enabled', 'mode', 'model', 'mailboxIds', 'personalization', 'readingSignals', 'interests', 'rules'].includes(key)) || !Number.isSafeInteger(input.revision) || input.revision < 0 || typeof input.enabled !== 'boolean' || !['preview', 'apply'].includes(input.mode) || typeof input.model !== 'string' || input.model.length > 200 || typeof input.personalization !== 'boolean' || typeof input.readingSignals !== 'boolean' || !Array.isArray(input.interests) || input.interests.length > 64 || input.interests.some(topic => typeof topic !== 'string' || topic.length > 256) || input.rules !== undefined && (!Array.isArray(input.rules) || input.rules.length > 64 || !input.rules.every(ruleOK) || new Set(input.rules.map(rule => rule.id)).size !== input.rules.length) || input.mailboxIds !== null && (!Array.isArray(input.mailboxIds) || input.mailboxIds.length > 1000 || input.mailboxIds.some(id => !idOK(id)))) fail('AI_INVALID_SETTINGS')
       const previous = settings(owner), priorRow = settingsRow(owner)
       if (!priorRow && (db.query<{ count: number }, []>('SELECT COUNT(*) count FROM local_ai_settings').get()?.count ?? 0) >= 256) fail('AI_OWNER_LIMIT', 429)
       if (previous.revision !== input.revision) fail('AI_SETTINGS_CONFLICT', 412)
@@ -1009,8 +1013,9 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       if (configuration && !configuration.models.some(model => model.id === input.model)) fail('AI_MODEL_UNAVAILABLE')
       const boxes = await inbox.mailboxes(owner)
       if (input.mailboxIds?.some(id => !boxes.some(box => box.id === id && box.status === 'active'))) fail('AI_SCOPE_NOT_FOUND', 404)
-      const value: AiSettings = { ...input, revision: previous.revision + 1, mailboxIds: input.mailboxIds === null ? null : [...new Set(input.mailboxIds)].sort(), interests: normalizeAiTopics(input.interests) }
-      const invalidated = previous.model !== value.model || JSON.stringify(previous.mailboxIds) !== JSON.stringify(value.mailboxIds)
+      const value: AiSettings = { ...input, revision: previous.revision + 1, mailboxIds: input.mailboxIds === null ? null : [...new Set(input.mailboxIds)].sort(), interests: normalizeAiTopics(input.interests), rules: (input.rules ?? previous.rules ?? []).map(rule => ({ id: rule.id, text: rule.text.replace(/\s+/g, ' ').trim(), category: rule.category, createdAt: rule.createdAt })) }
+      // Rules change the model's instructions, so like a model change they invalidate every saved assessment.
+      const invalidated = previous.model !== value.model || JSON.stringify(previous.mailboxIds) !== JSON.stringify(value.mailboxIds) || rulesDigest(previous) !== rulesDigest(value)
       const fenced = previous.enabled !== value.enabled || invalidated
       const pauseOnly = previous.enabled !== value.enabled && !invalidated && previous.personalization === value.personalization && previous.readingSignals === value.readingSignals && JSON.stringify(previous.interests) === JSON.stringify(value.interests)
       const head = fenced || !priorRow ? (await inbox.changes(owner, { limit: 1 })).state : priorRow.cursor
@@ -1137,6 +1142,49 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       })
       return decision
     }) },
+    /** Turn the user's note about one conversation into a durable rule: generalize with the model, override that thread now,
+     * save the rule (which invalidates saved assessments), and re-sort a bounded newest-first inbox slice under the new rules.
+     * Not itself serialized: it composes serialized feedback/configure/process steps. */
+    async teach(owner: string, input: AiTeachInput): Promise<AiTeachResult> {
+      validateKey(input)
+      if (!commandOK(input.id) || typeof input.note !== 'string' || !input.note.trim() || input.note.length > 1000 || Object.keys(input).some(key => !['sourceId', 'threadId', 'id', 'note'].includes(key))) fail('AI_INVALID_FEEDBACK')
+      const value = settings(owner)
+      if (!configuration) fail('AI_NOT_CONFIGURED', 503)
+      if (!configuration.models.some(model => model.id === value.model)) fail('AI_MODEL_UNAVAILABLE')
+      if ((value.rules?.length ?? 0) >= 64) fail('AI_RULE_LIMIT', 429)
+      const existing = value.rules?.find(rule => rule.id === input.id)
+      const priorRow = decisionRow(owner, input.sourceId, input.threadId)
+      const prior: AiDecision | null = priorRow ? projected(owner, JSON.parse(priorRow.data)) : null
+      let rule = existing
+      if (!rule) {
+        // Content-light context: subjects and sender domains only, plus the saved assessment.
+        const selected = await scope(owner, value, input.sourceId)
+        if (!selected.boxes.length) fail('AI_NOT_FOUND', 404)
+        const page = await inbox.thread(owner, input.threadId, { sort: 'newest', limit: 4 })
+        const items = page.items.filter(item => item.accountId === input.sourceId)
+        if (!items.length) fail('AI_NOT_FOUND', 404)
+        const domains = [...new Set(items.filter(item => !selected.sent.has(item.from.email.trim().toLowerCase())).map(item => item.from.email.split('@')[1]?.trim().toLowerCase() ?? '').filter(Boolean))]
+        const controller = new AbortController()
+        const result = await inferAiRule({ note: input.note, conversation: { subjects: [...new Set(items.map(item => item.subject))], senderDomains: domains, type: prior?.assessment?.type ?? null,
+          reason: prior?.assessment?.reason ?? null, topics: prior?.assessment?.topics ?? [], currentCategory: prior?.override?.category ?? prior?.score?.category ?? null } }, configuration, { model: value.model, signal: controller.signal, fetcher })
+        if (result.outcome !== 'completed' || !result.draft) fail(result.code ?? 'AI_RULE_FAILED', 502)
+        rule = { id: input.id, text: result.draft.text, category: result.draft.category, createdAt: stamp(now()) }
+      }
+      let decision: AiDecision | null = null
+      if (rule.category && prior?.state === 'ready' && prior.assessment && prior.inputHash) {
+        // Best effort: the immediate override for this thread must not block saving the rule.
+        try { decision = await service.feedback(owner, { sourceId: input.sourceId, threadId: input.threadId, id: `${input.id}:feedback`, revision: prior.revision, category: rule.category, note: input.note.slice(0, 1000) }) }
+        catch (error) { if (!(error instanceof InboxError) || !['AI_DECISION_CONFLICT', 'AI_FEEDBACK_CONFLICT', 'AI_NOT_FOUND'].includes(error.code)) throw error }
+      }
+      let state = await service.state(owner)
+      if (!existing) {
+        const current = settings(owner)
+        state = await service.configure(owner, { ...current, rules: [...(current.rules ?? []), rule] })
+        // Bounded re-sort of the newest inbox conversations under the new rules; older history follows only on request.
+        if (state.settings.enabled) { try { await service.process(owner, { id: `${input.id}:resort`, scope: 'inbox', limit: 200 }); state = await service.state(owner) } catch (error) { if (!(error instanceof InboxError)) throw error } }
+      }
+      return { rule, state, decision }
+    },
     reading(owner: string, input: AiReadingInput): Promise<void> { return serial(owner, async () => {
       validateKey(input)
       if (!commandOK(input.visitId) || !idOK(input.messageId) || !Number.isSafeInteger(input.sequence) || input.sequence < 1 || !Number.isSafeInteger(input.activeMs) || input.activeMs < 0 || input.activeMs > 600_000 || Object.keys(input).some(key => !['sourceId', 'threadId', 'visitId', 'sequence', 'messageId', 'activeMs'].includes(key))) fail('AI_INVALID_READING')
@@ -1186,7 +1234,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       }
     }
   }
-  return { start: safe(service.start), close: safe(service.close), state: safe(service.state), configure: safe(service.configure), process: safe(service.process), control: safe(service.control), lookup: safe(service.lookup), changes: safe(service.changes), results: safe(service.results), feedback: safe(service.feedback), reading: safe(service.reading), clearReading: safe(service.clearReading), diagnostics: safe(service.diagnostics) }
+  return { start: safe(service.start), close: safe(service.close), state: safe(service.state), configure: safe(service.configure), process: safe(service.process), control: safe(service.control), lookup: safe(service.lookup), changes: safe(service.changes), results: safe(service.results), feedback: safe(service.feedback), teach: safe(service.teach), reading: safe(service.reading), clearReading: safe(service.clearReading), diagnostics: safe(service.diagnostics) }
 }
 
 export type AiTriageService = ReturnType<typeof createAiTriageService>

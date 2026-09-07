@@ -17,7 +17,7 @@ import { assertApplicationAuthRuntime, createApplicationAuth } from './applicati
 import { loadAiInferenceConfig, type AiInferenceConfig } from './ai-inference'
 import { createAiTriageService } from './ai-triage'
 import { createInboxWindowService } from './inbox-window'
-import type { AiSettings, AiFeedbackInput, AiReadingInput, AiThreadKey } from '../../shared/ai-triage'
+import type { AiSettings, AiFeedbackInput, AiReadingInput, AiTeachInput, AiThreadKey } from '../../shared/ai-triage'
 
 const safeHeaders = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', Vary: 'Origin, Cookie' }
 function problem(status: number, code: string, error: string): Response {
@@ -294,6 +294,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
           return reply(await aiTriage.lookup(owner, input.keys as AiThreadKey[]))
         }
         if (route === '/feedback' && request.method === 'POST') return reply(await aiTriage.feedback(owner, input as unknown as AiFeedbackInput))
+        if (route === '/teach' && request.method === 'POST') return reply(await aiTriage.teach(owner, input as unknown as AiTeachInput))
         if (route === '/reading' && request.method === 'POST') { await aiTriage.reading(owner, input as unknown as AiReadingInput); return reply({ accepted: true }) }
         if (route === '/reading' && request.method === 'DELETE') {
           if (Object.keys(input).length) return problem(400, 'HOST_INVALID_INPUT', 'Clearing reading signals takes no parameters.')
