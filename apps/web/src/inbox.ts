@@ -1080,7 +1080,9 @@ export class InboxStore {
     if (this.aiPollPromise) return this.aiPollPromise;
     const signal = this.controller.signal, generation = this.generation;
     const work = (async () => {
-      if (!this.state.ai || Date.now() - this.aiStateAt > 15_000) await this.ai.state();
+      // Refresh status faster while work is visibly in progress so the sidebar progress stays current.
+      const working = !!this.state.ai && (this.state.ai.queue.pending + this.state.ai.queue.processing > 0 || this.state.ai.jobs.some(job => job.status === "running"));
+      if (!this.state.ai || Date.now() - this.aiStateAt > (working ? 4000 : 15_000)) await this.ai.state();
       if (signal.aborted || generation !== this.generation || !this.state.ai?.configured || !this.state.ai.settings.enabled) return;
       if (this.state.host?.inboxWindow) return; // Row provenance comes from the bounded host index, not AI history drains.
       const epoch = this.aiEpoch;

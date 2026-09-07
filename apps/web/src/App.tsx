@@ -15,6 +15,7 @@ import { flushSync } from "react-dom";
 import type { InboxViewQuery, InboxSelection, InboxTotals } from "../../shared/inbox-window";
 import { ApiError } from "inbox-sdk/client";
 import { aiSortingStatus } from "../../shared/ai-triage";
+import AiSortingStatus from "./AiSortingStatus";
 import {
   defaultPreferences,
   captureActionMail,
@@ -2539,6 +2540,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
           setImportantDoneAccount(null);
           setNotice({ text: `${count.toLocaleString()} Important conversations marked Done.${changed ? ` ${changed.toLocaleString()} changed conversations left untouched.` : ""}${unfinished ? " Stopped before completing all mail; an unconfirmed request may still settle." : ""}`, undo: undoAction(undo) });
         }} />}
+        <AiSortingStatus state={inbox.ai} onOpen={() => openSettings("AI triage")} />
         <MailSyncStatus client={inbox.store.client} mailboxes={inbox.mailboxes} sources={inbox.sources} enabled={inbox.loaded && !settings && !route.view} onMailboxes={() => openSettings("Mailboxes")} />
         <footer className="sidebar-footer">
           {applicationUser && onSignOut && (
