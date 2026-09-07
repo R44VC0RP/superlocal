@@ -64,6 +64,7 @@ export type InboxViewPreferences = {
   unifiedMode: "all" | "selected";
   includedMailboxIds: string[];
   pinnedMailboxIds: string[];
+  hideForwardedDuplicates?: boolean;
 };
 
 export class InboxViewPreferencesError extends Error {
@@ -110,10 +111,11 @@ export function connectHostProvider(id: string, credentials: Record<string, stri
 function isInboxViewPreferences(value: unknown): value is InboxViewPreferences {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const input = value as Record<string, unknown>;
-  const fields = ["revision", "unifiedMode", "includedMailboxIds", "pinnedMailboxIds"];
+  const fields = ["revision", "unifiedMode", "includedMailboxIds", "pinnedMailboxIds", "hideForwardedDuplicates"];
   const ids = (value: unknown, maximum: number) => Array.isArray(value) && value.length <= maximum &&
     value.every(id => typeof id === "string" && id.length > 0 && id.length <= 512 && id.trim() === id && !/[\x00-\x1f\x7f/\\]/.test(id)) && new Set(value).size === value.length;
-  return Object.keys(input).length === fields.length && Object.keys(input).every(key => fields.includes(key)) &&
+  return Object.keys(input).every(key => fields.includes(key)) &&
+    (!Object.hasOwn(input, "hideForwardedDuplicates") || typeof input.hideForwardedDuplicates === "boolean") &&
     typeof input.revision === "number" && Number.isSafeInteger(input.revision) && input.revision >= 1 &&
     (input.unifiedMode === "all" || input.unifiedMode === "selected") && ids(input.includedMailboxIds, 5000) && ids(input.pinnedMailboxIds, 9);
 }
@@ -134,7 +136,7 @@ async function requestInboxViewPreferences(signal: AbortSignal, input?: InboxVie
     throw new InboxViewPreferencesError(typeof result?.error === "string" && result.error.length <= 512 ? result.error : fallback, response.status, code);
   }
   if (!isInboxViewPreferences(result)) throw new InboxViewPreferencesError("The host returned invalid inbox preferences.", response.status, "HOST_INBOX_PREFERENCES_INVALID_RESPONSE");
-  return result;
+  return { ...result, hideForwardedDuplicates: result.hideForwardedDuplicates ?? true };
 }
 
 export function readInboxViewPreferences(signal: AbortSignal): Promise<InboxViewPreferences> {

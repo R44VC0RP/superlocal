@@ -4127,6 +4127,221 @@ describe('reversible mailbox conversation pages', () => {
 })
 
 describe('live bounded mailbox reads', () => {
+  test('bounded forwarded copies require directional cached content and exact automation evidence without changing canonical state', async () => {
+    const h = await fixture(), author = participant('author@example.test'), forwarder = participant('relay@example.test')
+    const bodyText = 'A fictional status update. Read the plan.'
+    const bodyHtml = '<!--[if mso]>\n<p>Fictional Outlook fallback.</p>\n<![endif]--><p style="display:block">A fictional status update. <a href="https://example.test/plan">Read the plan.</a><img src="https://example.test/map.png" alt="Approve" title="Plan"></p>'
+    const footer = `\n\n---\nsent via inbound.new, block ${forwarder.email}: https://inbound.new/addtoblocklist?email=${encodeURIComponent(forwarder.email)}\n`
+    const banner = `<div style="text-align: center; margin: 20px 0; padding: 10px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 12px; color: #6b7280; border-top: 1px solid #e5e7eb;">sent via <a href="https://inbound.new" style="color: #8b5cf6; text-decoration: none;">inbound.new</a>, <a href="https://inbound.new/addtoblocklist?email=relay%40example.test" target="_blank" rel="noopener noreferrer" style="color: #8b5cf6; text-decoration: none;">block relay@example.test</a></div>`
+    const trackingPixel = '<img src="https://fictional.awstrack.me/I0/fictional/token" style="display: none; width: 1px; height: 1px;" alt="">'
+    const original = native('original', { subject: 'Fictional plan', from: author, to: [forwarder], bodyText, bodyHtml, rfcMessageId: '<original@example.test>' })
+    const copy = (id: string, overrides: Partial<MailMessage> = {}) => native(id, { ...original, id, threadId: `thread-${id}`, from: forwarder, to: [participant('destination@example.test')], replyTo: [author], rfcMessageId: `<${id}@example.test>`, inReplyTo: original.rfcMessageId, ...overrides })
+    const originalSource = await h.seed('alice', 'forwarding-original', [original,
+      native('trusted-original', { ...original, id: 'trusted-original', threadId: 'trusted-original', to: [], deliveryRecipients: [forwarder.email], rfcMessageId: '<trusted-original@example.test>' })])
+    const forwards = await h.seed('alice', 'forwarding-copies', [copy('exact'), copy('automation', { bodyText: bodyText + footer, bodyHtml: `<html><body>${bodyHtml}${banner}</body></html>` }),
+      copy('automation-pixel', { bodyText: bodyText + footer, bodyHtml: `<html><body>${bodyHtml}${banner}${trackingPixel}</body></html>` }),
+      copy('automation-visible-pixel', { bodyText: bodyText + footer, bodyHtml: bodyHtml + banner + trackingPixel.replace('display: none', 'display: block') }),
+      copy('automation-other-pixel', { bodyText: bodyText + footer, bodyHtml: bodyHtml + banner + trackingPixel.replace('fictional.awstrack.me', 'example.test') }),
+      copy('unverified-pixel', { bodyHtml: bodyHtml + trackingPixel }),
+      copy('trusted', { inReplyTo: '<trusted-original@example.test>' }), copy('comment', { bodyText: 'My comment. ' + bodyText }),
+      copy('reply', { bodyText: 'Thanks for the update.' }), copy('suffix-comment', { bodyText: bodyText + ' My comment.' }),
+      copy('wrong-reply-to', { replyTo: [participant('other@example.test')] }), copy('missing-reply-to', { replyTo: [] }),
+      copy('wrong-sender', { from: participant('stranger@example.test') }), copy('same-sender', { from: author }),
+      copy('wrong-subject', { subject: 'Re: Fictional plan' }), copy('same-rfc-only', { inReplyTo: undefined, rfcMessageId: original.rfcMessageId }),
+      copy('changed-link', { bodyHtml: bodyHtml.replace('/plan', '/different') }), copy('changed-image', { bodyHtml: bodyHtml.replace('map.png', 'other.png') }),
+      copy('crlf-html', { bodyHtml: bodyHtml.replaceAll('\n', '\r\n') }),
+      copy('changed-comment', { bodyHtml: bodyHtml.replace('Fictional Outlook fallback.', 'Different Outlook fallback.') }),
+      copy('changed-alt', { bodyHtml: bodyHtml.replace('alt="Approve"', 'alt="Reject"') }),
+      copy('changed-title', { bodyHtml: bodyHtml.replace('title="Plan"', 'title="Reject"') }),
+      copy('changed-visibility', { bodyHtml: bodyHtml.replace('display:block', 'display:none') }),
+      copy('missing-html', { bodyHtml: '' }), copy('missing-text', { bodyText: '' }),
+      copy('attachment', { attachments: [{ id: 'file', filename: 'notes.txt', contentType: 'text/plain', size: 1, url: 'https://example.test/notes.txt' }] }),
+      copy('unverified-footer', { bodyText: bodyText + footer, bodyHtml: bodyHtml + banner.replace('relay%40example.test', 'someone%40example.test') }),
+      copy('comment-after-footer', { bodyText: bodyText + footer + '\nAnother comment.', bodyHtml: bodyHtml + banner }),
+      copy('sent', { folder: 'sent' }), copy('oversized', { bodyText: 'a'.repeat(300000) })])
+    // Same RFC alone must not collapse anything or make another owner's candidate ambiguous.
+    await h.seed('bob', 'forwarding-private', [original])
+    const database = new Database(h.database)
+    const mappings = database.query<{ id: string; native_id: string; account: string }, []>('SELECT id,native_id,account FROM sdk_messages').all()
+    const id = (name: string) => mappings.find(row => row.native_id === name && row.account === forwards.account.id)!.id
+    const originalId = mappings.find(row => row.native_id === 'original' && row.account === originalSource.account.id)!.id
+    const mailboxIds = (await h.inbox.mailboxes('alice')).map(box => box.id)
+    expect(await h.inbox.mailboxForwardedCopies('alice', { mailboxIds, messageIds: [id('same-rfc-only')] })).toEqual([])
+    expect(await h.inbox.mailboxForwardedCopies('alice', { mailboxIds, messageIds: [id('exact')] })).toEqual([])
+    // Remove the directionless same-RFC collision from selection so the positive cases are unambiguous.
+    forwards.box.remove('same-rfc-only'); await h.sync('alice', forwards.account.id)
+    await h.restart(database)
+    const before = await h.inbox.mailboxMessagePage('alice', { mailboxIds }), calls = [structuredClone(originalSource.box.calls), structuredClone(forwards.box.calls)]
+    const changesBefore = database.query<{ total: number }, []>('SELECT total_changes() total').get()!
+    database.exec('PRAGMA query_only=ON')
+    const result = await h.inbox.mailboxForwardedCopies('alice', { mailboxIds, messageIds: mappings.filter(row => row.account === forwards.account.id).map(row => row.id) })
+    expect(result.map(row => mappings.find(value => value.id === row.messageId)!.native_id).sort()).toEqual(['automation', 'automation-pixel', 'crlf-html', 'exact', 'trusted'])
+    expect(result.find(row => row.messageId === id('exact'))).toMatchObject({ originalMessageId: originalId, originalSourceId: originalSource.account.id })
+    expect(await h.inbox.mailboxForwardedCopies('alice', { mailboxIds, messageIds: [id('exact')] })).toHaveLength(1)
+    expect(await h.inbox.mailboxForwardedCopies('alice', { mailboxIds: mailboxIds.filter(box => box === forwards.account.id), messageIds: [id('exact')] })).toEqual([])
+    await expect(h.inbox.mailboxForwardedCopies('bob', { mailboxIds, messageIds: [id('exact')] })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(h.inbox.mailboxForwardedCopies('alice', { mailboxIds, messageIds: Array(501).fill(id('exact')) })).rejects.toMatchObject({ code: 'VALIDATION' })
+    expect(await h.inbox.mailboxMessagePage('alice', { mailboxIds })).toEqual(before)
+    expect([originalSource.box.calls, forwards.box.calls]).toEqual(calls)
+    const plan = database.query<{ detail: string }, [string, string]>("EXPLAIN QUERY PLAN SELECT id FROM sdk_messages INDEXED BY sdk_message_forwarding_rfc WHERE owner=? AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.rfcMessageId') END)=? AND deleted=0 LIMIT 3").all('alice', original.rfcMessageId!)
+    expect(plan.some(row => row.detail.includes('SEARCH') && row.detail.includes('sdk_message_forwarding_rfc'))).toBe(true)
+    expect(plan.some(row => row.detail.includes('SCAN'))).toBe(false)
+    expect(database.query<{ total: number }, []>('SELECT total_changes() total').get()).toEqual(changesBefore)
+    database.exec('PRAGMA query_only=OFF')
+    await h.inbox.setMailboxState('alice', originalSource.account.id, originalId, { done: true }, 1)
+    expect(await h.inbox.mailboxForwardedCopies('alice', { mailboxIds, messageIds: [id('exact')] })).toHaveLength(1)
+    expect((await h.inbox.mailboxMessageSummary('alice', forwards.account.id, id('exact'))).memberships[0]!.done).toBe(false)
+    await h.inbox.disconnect('alice', originalSource.account.id)
+    expect(await h.inbox.mailboxForwardedCopies('alice', { mailboxIds: [forwards.account.id], messageIds: [id('exact')] })).toEqual([])
+  })
+
+  test('bounded forwarded copies invalidate off-page dependents for reversed arrivals, old/new references, collisions and deletion', async () => {
+    const h = await fixture(), author = participant('author@example.test'), forwarder = participant('relay@example.test')
+    const original = native('original', { subject: 'Fictional delta', from: author, to: [forwarder], bodyText: 'A fictional message.', bodyHtml: '<p>A fictional message.</p>', rfcMessageId: '<delta-original@example.test>' })
+    const copy = native('copy', { ...original, id: 'copy', from: forwarder, replyTo: [author], rfcMessageId: '<delta-copy@example.test>', inReplyTo: original.rfcMessageId })
+    const source = await h.seed('alice', 'delta-source', []), forward = await h.seed('alice', 'delta-forward', [copy])
+    const mailboxIds = (await h.inbox.mailboxes('alice')).map(box => box.id)
+    let page = await h.inbox.mailboxMessagePage('alice', { mailboxIds }), forwarded = page.items[0]!
+    const lookup = () => h.inbox.mailboxForwardedCopies('alice', { mailboxIds, messageIds: [forwarded.id] })
+    const delta = async () => {
+      const change = await h.inbox.mailboxChanges('alice', { mailboxIds, since: page.state, scopeState: page.scopeState })
+      expect(change.affectedThreads).toContainEqual({ sourceId: forward.account.id, threadId: forwarded.threadId })
+      expect(JSON.stringify(change.events)).not.toContain('@example.test>')
+      page = await h.inbox.mailboxMessagePage('alice', { mailboxIds })
+      return change
+    }
+    expect(await lookup()).toEqual([])
+    source.box.put(original); await h.sync('alice', source.account.id)
+    await delta(); expect(await lookup()).toHaveLength(1)
+    source.box.put({ ...original, rfcMessageId: '<changed-original@example.test>' }); await h.sync('alice', source.account.id)
+    await delta(); expect(await lookup()).toEqual([])
+    forward.box.put({ ...copy, inReplyTo: '<changed-original@example.test>' }); await h.sync('alice', forward.account.id)
+    await delta(); expect(await lookup()).toHaveLength(1)
+    source.box.put({ ...original, id: 'collision', threadId: 'collision', rfcMessageId: '<changed-original@example.test>' }); await h.sync('alice', source.account.id)
+    await delta(); expect(await lookup()).toEqual([])
+    source.box.remove('collision'); await h.sync('alice', source.account.id)
+    await delta(); expect(await lookup()).toHaveLength(1)
+    source.box.put({ ...original, rfcMessageId: '<changed-original@example.test>', bodyText: 'Changed content.' }); await h.sync('alice', source.account.id)
+    await delta(); expect(await lookup()).toEqual([])
+    source.box.put({ ...original, rfcMessageId: '<changed-original@example.test>' }); await h.sync('alice', source.account.id)
+    await delta(); expect(await lookup()).toHaveLength(1)
+    source.box.remove('original'); await h.sync('alice', source.account.id)
+    await delta(); expect(await lookup()).toEqual([])
+  })
+
+  test('bounded forwarded copies fail open on cycles, excessive depth, candidate collisions and stale generations', async () => {
+    const h = await fixture(), a = participant('a@example.test'), b = participant('b@example.test')
+    const chain = Array.from({ length: 10 }, (_, index) => native(`chain-${index}`, {
+      subject: 'Fictional chain', bodyText: 'Unchanged fictional content.', bodyHtml: '<p>Unchanged fictional content.</p>',
+      from: index % 2 ? b : a, to: [index % 2 ? a : b], replyTo: [index % 2 ? a : b],
+      rfcMessageId: `<chain-${index}@example.test>`, ...(index ? { inReplyTo: `<chain-${index - 1}@example.test>` } : {}),
+    }))
+    const even = await h.seed('alice', 'chain-even', chain.filter((_, index) => index % 2 === 0))
+    const odd = await h.seed('alice', 'chain-odd', chain.filter((_, index) => index % 2 === 1))
+    const mailboxIds = (await h.inbox.mailboxes('alice')).map(box => box.id)
+    const database = new Database(h.database); await h.restart(database)
+    const stored = database.query<{ id: string; native_id: string }, []>('SELECT id,native_id FROM sdk_messages').all()
+    const id = (index: number) => stored.find(row => row.native_id === `chain-${index}`)!.id
+    const lookup = (indexes: number[]) => h.inbox.mailboxForwardedCopies('alice', { mailboxIds, messageIds: indexes.map(id) })
+    expect(await lookup([8])).toEqual([{ messageId: id(8), originalMessageId: id(0), originalSourceId: even.account.id,
+      originalThreadId: (await h.inbox.mailboxMessageSummary('alice', even.account.id, id(0))).threadId }])
+    expect(await lookup([9])).toEqual([])
+    even.box.put({ ...chain[0]!, inReplyTo: '<chain-9@example.test>' }); await h.sync('alice', even.account.id)
+    expect(await lookup([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])).toEqual([])
+    even.box.put(chain[0]!); await h.sync('alice', even.account.id)
+    expect(await lookup([1])).toHaveLength(1)
+    // The fixed candidate limit fails open before hydrating a collision set.
+    for (let index = 0; index < 3; index++) even.box.put({ ...chain[0]!, id: `collision-${index}`, threadId: `collision-${index}` })
+    await h.sync('alice', even.account.id)
+    expect(await lookup([1])).toEqual([])
+    for (let index = 0; index < 3; index++) even.box.remove(`collision-${index}`)
+    await h.sync('alice', even.account.id)
+    expect(await lookup([1])).toHaveLength(1)
+    database.query('UPDATE sdk_accounts SET generation=generation+1 WHERE id=?').run(even.account.id)
+    expect(await lookup([1])).toEqual([])
+    expect(odd.box.calls.getMessage).toEqual([])
+  })
+
+  test('bounded forwarded copies are batch-order independent and ordinary mail never hydrates bodies', async () => {
+    const h = await fixture(), author = participant('author@example.test'), relay = participant('relay@example.test')
+    const originals = Array.from({ length: 22 }, (_, index) => native(`large-original-${index}`, { subject: `Large fictional ${index}`, from: author, to: [relay],
+      bodyText: `${index}:` + 'fictional '.repeat(13000), bodyHtml: `<p>Fictional ${index}</p>`, rfcMessageId: `<large-${index}@example.test>` }))
+    const copies = originals.map((mail, index) => ({ ...mail, id: `large-copy-${index}`, threadId: `large-copy-${index}`, from: relay, replyTo: [author],
+      rfcMessageId: `<large-copy-${index}@example.test>`, inReplyTo: mail.rfcMessageId }))
+    await h.seed('alice', 'batch-originals', originals)
+    const forwarded = await h.seed('alice', 'batch-copies', copies)
+    await h.seed('alice', 'batch-ordinary', Array.from({ length: 20 }, (_, index) => native(`ordinary-${index}`, { bodyText: 'ordinary '.repeat(20000) })))
+    const mailboxIds = (await h.inbox.mailboxes('alice')).map(box => box.id)
+    const page = await h.inbox.mailboxMessagePage('alice', { mailboxIds })
+    const requested = page.items.filter(mail => mail.sourceId === forwarded.account.id).map(mail => mail.id)
+    const ordinary = page.items.filter(mail => mail.subject.startsWith('Subject ordinary-')).map(mail => mail.id)
+    const database = new Database(h.database); await h.restart(database)
+    const query = database.query.bind(database), bodyIds = new Set<string>()
+    const guard = spyOn(database, 'query').mockImplementation(((sql: string) => {
+      const statement = query(sql)
+      return new Proxy(statement, { get(statement, key) {
+        const value = Reflect.get(statement, key, statement)
+        if (key !== 'get') return typeof value === 'function' ? value.bind(statement) : value
+        return (...params: Parameters<typeof statement.get>) => {
+          const result = value.apply(statement, params)
+          if (result && Object.hasOwn(result, 'body')) bodyIds.add(String(params[1]))
+          return result
+        }
+      } })
+    }) as typeof database.query)
+    try {
+      const lookup = (messageIds: string[]) => h.inbox.mailboxForwardedCopies('alice', { mailboxIds, messageIds })
+      expect(await lookup(ordinary)).toEqual([]); expect(bodyIds.size).toBe(0)
+      const batch = await lookup([...ordinary, ...requested])
+      expect(batch).toHaveLength(22)
+      expect(await lookup([...requested].reverse())).toEqual([...batch].reverse())
+      expect(await lookup([requested.at(-1)!])).toEqual([batch.at(-1)!])
+      expect(ordinary.some(id => bodyIds.has(id))).toBe(false)
+    } finally { guard.mockRestore() }
+  })
+
+  test('bounded forwarded copies skip same-source reply fanout but publish additive delivery evidence', async () => {
+    const h = await fixture({ eventRetention: 5000 }), author = participant('author@example.test'), relay = participant('relay@example.test')
+    const original = native('ordinary-root', { subject: 'Fictional ordinary thread', from: author, to: [relay], rfcMessageId: '<ordinary-root@example.test>' })
+    const messages = [original, ...Array.from({ length: 513 }, (_, index) => native(`ordinary-reply-${index}`, { inReplyTo: original.rfcMessageId, rfcMessageId: `<ordinary-reply-${index}@example.test>` }))]
+    const source = await h.seed('alice', 'ordinary-source', messages)
+    const evidenceOriginal = native('evidence-original', { subject: 'Fictional delivery', from: author, to: [], bodyText: 'Fictional text-only content.', bodyHtml: '', rfcMessageId: '<evidence-original@example.test>' })
+    source.box.put(evidenceOriginal); await h.sync('alice', source.account.id)
+    const forwarded = await h.seed('alice', 'evidence-copy', [{ ...evidenceOriginal, id: 'evidence-copy', from: relay, to: [participant('destination@example.test')], replyTo: [author],
+      rfcMessageId: '<evidence-copy@example.test>', inReplyTo: evidenceOriginal.rfcMessageId }])
+    const mailboxIds = (await h.inbox.mailboxes('alice')).map(box => box.id)
+    const first = await h.inbox.mailboxMessagePage('alice', { mailboxIds: [forwarded.account.id] }), copy = first.items[0]!
+    let baseline = await h.inbox.mailboxMessagePage('alice', { mailboxIds })
+    const lookup = () => h.inbox.mailboxForwardedCopies('alice', { mailboxIds, messageIds: [copy.id] })
+    source.box.put({ ...original, isStarred: true }); await h.sync('alice', source.account.id)
+    const ordinaryDelta = await h.inbox.mailboxChanges('alice', { mailboxIds, since: baseline.state, scopeState: baseline.scopeState })
+    expect(ordinaryDelta.hasMore).toBe(false); expect(ordinaryDelta.affectedThreads).toHaveLength(1)
+    expect(await lookup()).toEqual([])
+    baseline = await h.inbox.mailboxMessagePage('alice', { mailboxIds })
+    const evidenceBefore = (await h.inbox.mailboxMessages('alice', { mailboxIds, search: 'subject:"Fictional delivery"' })).items.find(mail => mail.sourceId === source.account.id)!
+    source.box.put({ ...evidenceOriginal, deliveryRecipients: [relay.email] }); await h.sync('alice', source.account.id)
+    const changed = await h.inbox.mailboxChanges('alice', { mailboxIds, since: baseline.state, scopeState: baseline.scopeState })
+    expect(changed.state).not.toBe(baseline.state)
+    expect(changed.affectedThreads).toContainEqual({ sourceId: forwarded.account.id, threadId: copy.threadId })
+    expect(await lookup()).toHaveLength(1)
+    expect(await h.inbox.mailboxMessageSummary('alice', source.account.id, evidenceBefore.id)).toMatchObject({ revision: evidenceBefore.revision, bodyRevision: evidenceBefore.bodyRevision })
+    baseline = await h.inbox.mailboxMessagePage('alice', { mailboxIds })
+    source.box.put(evidenceOriginal); await h.sync('alice', source.account.id)
+    expect(await lookup()).toHaveLength(1)
+    const repeated = await h.inbox.mailboxChanges('alice', { mailboxIds, since: baseline.state, scopeState: baseline.scopeState })
+    expect(repeated.affectedThreads).toEqual([])
+    // Same-source collision insertion/deletion must still invalidate this copy:
+    // there is also a selected original in a different source.
+    baseline = await h.inbox.mailboxMessagePage('alice', { mailboxIds })
+    forwarded.box.put({ ...evidenceOriginal, id: 'same-source-collision' }); await h.sync('alice', forwarded.account.id)
+    expect((await h.inbox.mailboxChanges('alice', { mailboxIds, since: baseline.state, scopeState: baseline.scopeState })).affectedThreads).toContainEqual({ sourceId: forwarded.account.id, threadId: copy.threadId })
+    expect(await lookup()).toEqual([])
+    baseline = await h.inbox.mailboxMessagePage('alice', { mailboxIds })
+    forwarded.box.remove('same-source-collision'); await h.sync('alice', forwarded.account.id)
+    expect((await h.inbox.mailboxChanges('alice', { mailboxIds, since: baseline.state, scopeState: baseline.scopeState })).affectedThreads).toContainEqual({ sourceId: forwarded.account.id, threadId: copy.threadId })
+    expect(await lookup()).toHaveLength(1)
+  })
+
   test('cached keyset messages survive ordinary events and reconcile arrivals, backfill and deletion from the first state', async () => {
     const h = await fixture()
     const { account, box } = await h.seed('alice', 'live-keyset', Array.from({ length: 6 }, (_, index) => native(`live-${index}`, { bodyText: BODY_SECRET })))

@@ -49,7 +49,7 @@ type Dependencies = {
 }
 type ScopeRow = { id: string; account: string; data: string; cursor: string | null; baseline: string | null; sdk_state: string | null; sdk_scope: string; raw_complete: number; revision: number; generation: number; reset: string | null; checked: number }
 type ReadBaseline = { sdkState: string | null; scopeState: string; revision: number; ai: number; category: number; at: number }
-type Scope = { row: ScopeRow; boxes: Mailbox[]; sources: Account[]; labels: Label[]; folders: Map<string, Folder[]>; preference: string; preferences: Preferences; ai: AiTriageState; users: number; lastUsed: number; metadataAt: number; metadataDirty: boolean; seenEvents: number; read?: ReadBaseline }
+type Scope = { row: ScopeRow; boxes: Mailbox[]; sources: Account[]; labels: Label[]; folders: Map<string, Folder[]>; preference: string; preferences: Preferences; hideForwardedDuplicates: boolean; ai: AiTriageState; users: number; lastUsed: number; metadataAt: number; metadataDirty: boolean; seenEvents: number; read?: ReadBaseline }
 type ProjectionStamp = { preference?: string; metadata?: string; aiCursor?: number; categoryCursor?: number; contextVersion?: 3 }
 type QueryRow = { id: string; scope: string; data: string; preference: string; scanned: number; generation: number; expires: number; problem: string | null; read_state: string | null }
 type ReadMetadata = { importantSince?: string; baselines: Array<{ revision: number; token: string }>; wake?: number; changes?: { id: string; input: string; baseline: ReadBaseline; keys: string[]; head: boolean; more: boolean }; counts?: { position?: PagePosition; progress?: number; baseline: ReadBaseline; totals: DTO.InboxTotals; complete: boolean; wake?: number } }
@@ -192,7 +192,7 @@ export function createInboxWindowService(deps: Dependencies) {
         scopes.delete(oldest!.row.id)
       }
       db.query('INSERT OR IGNORE INTO local_window_scopes(owner,id,account,data) VALUES (?,?,?,?)').run(owner, id, account, JSON.stringify(identity))
-      scope = { row: getScopeRow(id), boxes, sources: selectedSources, labels: [], folders: new Map(), preference, preferences: split as unknown as Preferences, ai, users: 0, lastUsed: Date.now(), metadataAt: 0, metadataDirty: true, seenEvents: -1 }
+      scope = { row: getScopeRow(id), boxes, sources: selectedSources, labels: [], folders: new Map(), preference, preferences: split as unknown as Preferences, hideForwardedDuplicates: preferences.hideForwardedDuplicates !== false, ai, users: 0, lastUsed: Date.now(), metadataAt: 0, metadataDirty: true, seenEvents: -1 }
       scopes.set(id, scope)
       // Existing capture data remains durable, but resolving an ordinary view neither
       // reads that copy as live mail nor resumes its materialization.
@@ -205,6 +205,7 @@ export function createInboxWindowService(deps: Dependencies) {
       if (preparations.has(scope.row.id)) { invalidateProjection(scope); stamp(scope, { preference }) }
     }
     scope.boxes = boxes; scope.sources = selectedSources; scope.ai = ai; scope.preferences = split as unknown as Preferences
+    scope.hideForwardedDuplicates = preferences.hideForwardedDuplicates !== false
     await refreshMetadata(scope)
     refresh(scope)
     return scope
@@ -405,6 +406,20 @@ export function createInboxWindowService(deps: Dependencies) {
       if (full) budget.legacy.set(row.key, legacyContextFingerprint(scope, values))
       rows.push(row)
     }
+    if (scope.row.account === 'unified' && scope.hideForwardedDuplicates) {
+      // Consume every SDK ordinal, including duplicates, before filtering matches.
+      // Partial/large conversations and threads with any unique reply stay visible.
+      const candidates = rows.filter(row => row.messagesComplete && row.summaries.length > 0
+        && row.summaries.every(message => message.folder !== 'sent'))
+      const messageIds = candidates.flatMap(row => row.summaries.map(message => message.id)), hidden = new Set<string>()
+      // The SDK page already bounds rows and preview messages. Resolve every
+      // candidate in bounded calls so counts, lookup and reverse paging agree.
+      for (let offset = 0; offset < messageIds.length; offset += 500) {
+        const copies = await inbox.mailboxForwardedCopies(owner, { mailboxIds: scope.boxes.map(box => box.id), messageIds: messageIds.slice(offset, offset + 500) })
+        for (const copy of copies) hidden.add(copy.messageId)
+      }
+      for (const row of candidates) if (row.summaries.every(message => hidden.has(message.id))) row.hiddenAsForwardedDuplicate = true
+    }
     return rows
   }
   /** Capture-only materialization. No query/page/lookup/change/sender read calls it. */
@@ -575,6 +590,12 @@ export function createInboxWindowService(deps: Dependencies) {
   async function evaluateRow(scope: Scope, query: DTO.InboxViewQuery, row: DTO.InboxWindowRow, budget: ReadBudget = readBudget(), includeCounts = false) {
     const mail = row.mail, inbox = inFolder(mail, 'Inbox'), holding = inbox && (mail.aiHoldUntil ?? 0) > budget.now
     const attention = mail.split, recent = recentImportant(mail, budget.now), counts: Record<string, number> = {}
+    if (scope.row.account === 'unified' && scope.hideForwardedDuplicates && row.hiddenAsForwardedDuplicate) {
+      counts.inbox = 0; counts.holding = 0
+      for (const name of new Set([...scope.preferences.splits, query.split])) counts[`split:${name}`] = 0
+      for (const folder of ['Inbox', 'Starred', 'Sent', 'Done', 'Auto Archived', 'Reminders', 'Spam', 'Trash', 'All Mail']) counts[`folder:${folder}`] = 0
+      return { matches: false, counts }
+    }
     if (includeCounts && budget.unknownLocation.has(row.key)) throw pendingContext
     const splitMatches = new Map<string, boolean>()
     for (const name of new Set(includeCounts ? [...scope.preferences.splits, query.split] : !query.search && query.folder === 'Inbox' ? [query.split] : [])) {

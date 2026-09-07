@@ -4082,6 +4082,212 @@ test("host-service-backed bounded startup pages, lookup and search without brows
   }
 });
 
+test("host-service-backed forwarded duplicate visibility, counts and dependency deltas", async () => {
+  if (process.env.INBOX_FORWARDED_TEST_CHILD !== "1") {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "host-service-backed forwarded duplicate", "--timeout", "60000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_FORWARDED_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const [{ createMockHost }, { Database }, { createInboxWindowService }, { createInboxViewPreferencesStore },
+    { createSplitPreferencesStore }, { createAttentionOverridesStore }, { createAiTriageService }, fs, { tmpdir }, { join }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("bun:sqlite"), import("../../local-host/src/inbox-window.ts"), import("../../local-host/src/inbox-preferences.ts"),
+    import("../../local-host/src/split-preferences.ts"), import("../../local-host/src/attention-overrides.ts"), import("../../local-host/src/ai-triage.ts"),
+    import("node:fs/promises"), import("node:os"), import("node:path"),
+  ]);
+  type Query = import("../../shared/inbox-window").InboxViewQuery;
+  type State = import("../../shared/inbox-window").InboxWindowState;
+  const root = await fs.mkdtemp(join(tmpdir(), "host-forwarded-")), originalInfo = console.info, originalWarn = console.warn;
+  console.info = () => {}; console.warn = () => {};
+  const token = "fictional-forwarded-fixture-token-only";
+  const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 49).toString("base64"), token, allowProviderWrites: true });
+  const database = new Database(join(root, "host-window.sqlite"));
+  const preferences = createInboxViewPreferencesStore(database, host.inbox, host.owner);
+  const ai = createAiTriageService({ database, inbox: host.inbox, configuration: null, sessionKey: token });
+  const service = createInboxWindowService({ database, inbox: host.inbox, owner: host.owner, sessionKey: token, allowProviderWrites: true,
+    inboxPreferences: preferences, splitPreferences: createSplitPreferencesStore(database, host.owner),
+    attentionOverrides: createAttentionOverridesStore(database, host.inbox, host.owner), ai });
+  type Transport = import("../../shared/inbox-window").InboxWindowTransport;
+  const request = <K extends "query" | "page" | "counts" | "lookup" | "changes">(name: K, input: Parameters<Transport[K]>[0]) =>
+    service.dispatch(`/host/inbox/${name}`, input) as ReturnType<Transport[K]>;
+  const query: Query = { account: "unified", folder: "All Mail", split: "Important", search: true, query: 'subject:"Forwarded host fixture"', filter: null };
+  const collect = async (view: Query = query, pageSize = 2) => {
+    const first = await request("query", { ...view, limit: pageSize });
+    let page = first, calls = 1;
+    const rows = [...page.rows];
+    while (page.nextCursor && calls < 300) {
+      page = await request("page", { queryId: first.state.queryId, cursor: page.nextCursor, limit: pageSize }); rows.push(...page.rows); calls++;
+    }
+    assert.equal(page.exhausted, true, "bounded pages eventually exhaust even across suppressed/nonmatching ordinals");
+    assert.equal(new Set(rows.map(row => row.key)).size, rows.length, "page boundaries neither duplicate nor skip matching conversations");
+    let counts = await request("counts", { queryId: first.state.queryId });
+    for (let attempt = 0; counts.totals.conversations === null && attempt < 100; attempt++) counts = await request("counts", { queryId: first.state.queryId });
+    assert.equal(counts.totals.conversations, rows.length, "whole-query count equals the fully traversed visible rows");
+    assert.equal(counts.totals.messages, rows.reduce((sum, row) => sum + row.counts.messages!, 0));
+    return { first, rows, counts, calls };
+  };
+  const drain = async (state: State, residentKeys: string[], pinnedKeys: string[] = []) => {
+    const input = { queryId: state.queryId, sinceRevision: state.indexRevision, sinceCursor: state.readCursor, residentKeys, pinnedKeys, limit: 2 };
+    let page = await request("changes", input), calls = 1;
+    const upserts = [...page.upserts], newHead = [...page.newHead], removed = [...page.removed];
+    while (page.nextCursor && calls++ < 100) {
+      page = await request("changes", { ...input, cursor: page.nextCursor }); upserts.push(...page.upserts); newHead.push(...page.newHead); removed.push(...page.removed);
+    }
+    assert.equal(page.nextCursor, null); assert.equal(page.resetReason, null, "ordinary dependencies reconcile without a query reset");
+    return { state: page.state, upserts, newHead, removed };
+  };
+  try {
+    const [nativeOriginal, nativeForward] = host.store.mailboxes(host.owner);
+    const source = (native: typeof nativeOriginal) => ({ owner: host.owner, storeId: native.id, accountId: host.store.link(host.owner, native.id)!.accountId });
+    const originalSource = source(nativeOriginal), forwardSource = source(nativeForward);
+    const sync = async (accountId: string) => {
+      let more = true; while (more) more = (await host.inbox.sync(host.owner, accountId, { folder: "all", lane: "latest", limit: 100 })).hasMore;
+    };
+    const boxes = await host.inbox.mailboxes(host.owner), originalBox = boxes.find(box => box.sourceId === originalSource.accountId)!, forwardBox = boxes.find(box => box.sourceId === forwardSource.accountId)!;
+    const now = Date.now(), at = (offset: number) => new Date(now + offset).toISOString();
+    const subject = "Forwarded host fixture exact original", text = "Please bring the fictional paper lantern to our imaginary meeting.";
+    const original = host.store.receive(originalSource, { from: "author@example.test", to: nativeOriginal.email, subject, text,
+      receivedAt: at(-30 * 86400000), rfcMessageId: "<forwarded-host-original@example.test>" });
+    const forwardInput = { from: nativeOriginal.email, to: nativeForward.email, replyTo: "author@example.test", subject, text, inReplyTo: original.rfcMessageId! };
+    const forward = host.store.receive(forwardSource, { ...forwardInput, receivedAt: at(0) });
+    host.store.receive(forwardSource, { ...forwardInput, subject: "Forwarded host fixture unknown ordinary reply", inReplyTo: "<unknown-host-original@example.test>", receivedAt: at(1000) });
+    host.store.receive(forwardSource, { ...forwardInput, from: "colleague@example.test", receivedAt: at(2000) });
+    const mixed = host.store.receive(forwardSource, { ...forwardInput, receivedAt: at(3000) });
+    host.store.receive(forwardSource, { from: "colleague@example.test", to: nativeForward.email, subject, text: "A unique fictional reply must not disappear.", threadId: mixed.threadId, receivedAt: at(4000) });
+    const partial = host.store.receive(forwardSource, { ...forwardInput, receivedAt: at(5000) });
+    for (let index = 1; index < 51; index++) host.store.receive(forwardSource, { ...forwardInput, threadId: partial.threadId, receivedAt: at(5000 + index) });
+    await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    const summaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: query.query, limit: 100 })).items;
+    const originalSummary = summaries.find(message => message.sourceId === originalSource.accountId)!;
+    const forwardSummary = summaries.find(message => message.receivedAt === forward.receivedAt)!;
+    const key = (message: typeof originalSummary) => `unified:${message.sourceId}:${message.threadId}`;
+    const originalKey = key(originalSummary), forwardKey = key(forwardSummary);
+    const rawFirst = await host.inbox.mailboxConversations(host.owner, { mailboxIds: boxes.map(box => box.id), limit: 100 });
+    assert.ok(rawFirst.items.some(row => row.threadId === forwardSummary.threadId));
+    assert.ok(!rawFirst.items.some(row => row.threadId === originalSummary.threadId), "the original is outside the first real SDK page, not just the browser window");
+    assert.equal((await preferences.read()).hideForwardedDuplicates, true);
+    const hidden = await collect();
+    assert.equal(hidden.rows.length, 5); assert.equal(hidden.counts.totals.messages, 56); assert.ok(hidden.calls > 1);
+    assert.ok(!hidden.rows.some(row => row.key === forwardKey)); assert.ok(hidden.rows.some(row => row.key === originalKey));
+    assert.ok(hidden.rows.some(row => row.mail.subject.endsWith("unknown ordinary reply")));
+    assert.ok(hidden.rows.some(row => row.summaries.some(message => message.from.email === "colleague@example.test") && row.counts.messages === 1), "an ordinary reply to the known RFC is not forwarding evidence");
+    const mixedRow = hidden.rows.find(row => row.counts.messages === 2)!;
+    assert.equal(mixedRow.messagesComplete, true); assert.equal(mixedRow.summaries.length, 2, "mixed thread keeps both its copy and unique reply");
+    const partialRow = hidden.rows.find(row => row.counts.messages === 51)!;
+    assert.equal(partialRow.messagesComplete, false); assert.equal(partialRow.summaries.length, 50, "partial conversation is conservatively retained");
+    const lookup = await request("lookup", { account: "unified", ids: [forwardKey, originalKey] });
+    assert.deepEqual(lookup.entries.map(entry => entry.status), ["found", "found"], "hidden native conversation remains directly addressable");
+    const originalRow = hidden.rows.find(row => row.key === originalKey)!;
+    assert.deepEqual(originalRow.targets.map(target => [target.mailboxId, target.messageId]), [[originalBox.id, originalSummary.id]], "hiding is not cross-account action-target merging");
+    assert.equal((await collect({ ...query, account: originalBox.id })).rows.length, 1);
+    assert.equal((await collect({ ...query, account: forwardBox.id })).rows.length, 5, "individual receiving mailbox retains all copies");
+
+    const disabled = await preferences.write({ ...await preferences.read(), hideForwardedDuplicates: false });
+    const reset = await request("changes", { queryId: hidden.first.state.queryId, sinceRevision: hidden.first.state.indexRevision, residentKeys: hidden.rows.map(row => row.key), pinnedKeys: [] });
+    assert.equal(reset.resetReason, "query", "preference revision invalidates the old filtered query");
+    const visible = await collect(); assert.equal(visible.rows.length, 6); assert.equal(visible.counts.totals.messages, 57);
+    assert.equal(visible.counts.totals.inbox! - hidden.counts.totals.inbox!, 1);
+    for (const folder of ["Inbox", "All Mail"]) assert.equal(visible.counts.totals.folders[folder]! - hidden.counts.totals.folders[folder]!, 1);
+    const reopened = createInboxViewPreferencesStore(database, host.inbox, host.owner);
+    assert.equal((await reopened.read()).hideForwardedDuplicates, false, "explicit false survives reopening the persisted store");
+    const { hideForwardedDuplicates: _omitted, ...legacy } = disabled;
+    assert.equal((await reopened.write(legacy)).hideForwardedDuplicates, false, "older clients omitting the field preserve explicit false");
+    await preferences.write({ ...await preferences.read(), hideForwardedDuplicates: true, unifiedMode: "selected", includedMailboxIds: [forwardBox.id] });
+    const forwardOnly = await collect(); assert.equal(forwardOnly.rows.length, 5); assert.ok(forwardOnly.rows.some(row => row.key === forwardKey), "no in-scope original means no suppression");
+    await preferences.write({ ...await preferences.read(), unifiedMode: "all", includedMailboxIds: [] });
+
+    const beforeDone = await collect({ ...query, search: false, query: "", folder: "Inbox" }, 100);
+    await host.inbox.setMailboxStates(host.owner, { id: "forwarded-original-done", done: true, targets: originalRow.targets });
+    const doneDelta = await drain(beforeDone.first.state, beforeDone.rows.map(row => row.key), [forwardKey]);
+    assert.ok(doneDelta.removed.some(row => row.key === originalKey && row.reason === "not-matching"));
+    const pinnedForward = doneDelta.upserts.find(row => row.key === forwardKey);
+    assert.ok(pinnedForward, "source membership changes refresh a pinned forwarded dependency");
+    assert.equal(pinnedForward.hiddenAsForwardedDuplicate, true);
+    const afterDone = await collect({ ...query, search: false, query: "", folder: "Inbox" }, 100);
+    assert.ok(!afterDone.rows.some(row => row.key === originalKey || row.key === forwardKey), "Done on the original never resurfaces its hidden copy");
+    host.store.mutate(originalSource, original.id, { deletePermanently: true }); await sync(originalSource.accountId);
+    const deletion = await drain(afterDone.first.state, afterDone.rows.map(row => row.key), [forwardKey]);
+    assert.ok(deletion.upserts.some(row => row.key === forwardKey && !row.hiddenAsForwardedDuplicate), "deleting the source re-evaluates its otherwise unchanged forwarded dependency");
+    assert.ok((await collect()).rows.some(row => row.key === forwardKey));
+
+    const lateSubject = "Forwarded host fixture delayed original", lateRfc = "<forwarded-host-late@example.test>";
+    host.store.receive(forwardSource, { ...forwardInput, subject: lateSubject, inReplyTo: lateRfc, receivedAt: at(10000) }); await sync(forwardSource.accountId);
+    const beforeArrival = await collect();
+    const lateForward = beforeArrival.rows.find(row => row.mail.subject === lateSubject)!; assert.ok(lateForward);
+    host.store.receive(originalSource, { from: "author@example.test", to: nativeOriginal.email, subject: lateSubject, text, rfcMessageId: lateRfc, receivedAt: at(-31 * 86400000) }); await sync(originalSource.accountId);
+    const arrival = await drain(beforeArrival.first.state, beforeArrival.rows.map(row => row.key));
+    assert.ok(arrival.removed.some(row => row.key === lateForward.key && row.reason === "not-matching"), "an original arriving later removes its resident newer copy through affected-thread deltas");
+    const afterArrival = await collect();
+    assert.ok(!afterArrival.rows.some(row => row.key === lateForward.key));
+    assert.equal(afterArrival.rows.filter(row => row.mail.subject === lateSubject).length, 1);
+
+    // Sidebar counts span the whole scope, including the earlier late-source copy.
+    await preferences.write({ ...await preferences.read(), hideForwardedDuplicates: false });
+    const beforeBatchVisible = await collect();
+    assert.equal(beforeBatchVisible.counts.totals.inbox! - afterArrival.counts.totals.inbox!, 1);
+    for (const folder of ["Inbox", "All Mail"]) assert.equal(beforeBatchVisible.counts.totals.folders[folder]! - afterArrival.counts.totals.folders[folder]!, 1);
+    await preferences.write({ ...await preferences.read(), hideForwardedDuplicates: true });
+    // More than 500 candidate messages share one SDK leader page. Classification
+    // must not depend on truncation, reverse traversal, or the lookup batch size.
+    const batchSubject = "Forwarded batch fixture original", batchRfc = "<forwarded-host-batch@example.test>";
+    const batchText = "Please bring a fictional blue notebook.", batchHtml = `<p>${batchText}</p>`;
+    const batchQuery = { ...query, query: 'subject:"Forwarded batch fixture"' };
+    host.store.receive(originalSource, { from: "author@example.test", to: nativeOriginal.email, subject: batchSubject,
+      text: batchText, html: batchHtml, rfcMessageId: batchRfc, receivedAt: at(-32 * 86400000) });
+    for (let index = 0; index < 100; index++) {
+      let threadId: string | undefined;
+      for (let member = 0; member < 6; member++) {
+        const copy = host.store.receive(forwardSource, { from: nativeOriginal.email, to: nativeForward.email, replyTo: "author@example.test",
+          subject: batchSubject, text: batchText, html: batchHtml, inReplyTo: batchRfc, threadId, receivedAt: at(20000 + index * 10 + member) });
+        threadId = copy.threadId;
+      }
+      if (index % 20 === 10) host.store.receive(forwardSource, { from: "colleague@example.test", to: nativeForward.email,
+        subject: `Forwarded batch fixture unique ${index}`, text: "A distinct fictional note.", html: "<p>A distinct fictional note.</p>", receivedAt: at(20000 + index * 10 + 8) });
+    }
+    await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    let batchRaw = await host.inbox.mailboxConversations(host.owner, { mailboxIds: boxes.map(box => box.id), query: { search: batchQuery.query }, limit: 100 });
+    assert.equal(batchRaw.items.length, 100);
+    assert.ok(batchRaw.items.every(row => row.messagesComplete), "the >500 case contains complete conversations, not conservative partial previews");
+    assert.ok(batchRaw.items.reduce((sum, row) => sum + row.messages.length, 0) > 500, "exercise the candidate bound in a single actual SDK page");
+    assert.ok(batchRaw.items.every(row => row.sourceId !== originalSource.accountId), "the one source is off the SDK page");
+    const batchCopies = batchRaw.items.filter(row => row.messageCount === 6);
+    while (batchRaw.nextCursor) {
+      batchRaw = await host.inbox.mailboxConversations(host.owner, { mailboxIds: boxes.map(box => box.id), query: { search: batchQuery.query }, limit: 100, cursor: batchRaw.nextCursor });
+      batchCopies.push(...batchRaw.items.filter(row => row.messageCount === 6));
+    }
+    assert.equal(batchCopies.length, 100);
+    const batch = await collect(batchQuery);
+    assert.equal(batch.rows.length, 6); assert.equal(batch.counts.totals.messages, 6); assert.ok(batch.calls >= 3);
+    assert.ok(batch.rows.every(row => row.counts.messages === 1), "no duplicate-only thread leaks beyond the first 500 IDs");
+    const expectedKeys = new Set(batch.rows.map(row => row.key));
+    let reversePage = await request("page", { queryId: batch.first.state.queryId, seek: "end", limit: 2 }), reverseCalls = 1;
+    const reverseRows = [...reversePage.rows];
+    while (reversePage.nextCursor && reverseCalls++ < 100) {
+      reversePage = await request("page", { queryId: batch.first.state.queryId, cursor: reversePage.nextCursor, direction: "newer", limit: 2 });
+      reverseRows.push(...reversePage.rows);
+    }
+    assert.equal(reversePage.exhausted, true); assert.equal(reverseRows.length, 6);
+    assert.deepEqual(new Set(reverseRows.map(row => row.key)), expectedKeys, "reverse and forward traversal classify every batch identically");
+    const batchLookup = await request("lookup", { account: "unified", ids: batchCopies.map(row => `unified:${row.sourceId}:${row.threadId}`) });
+    assert.equal(batchLookup.entries.length, 100);
+    assert.ok(batchLookup.entries.every(entry => entry.status === "found" && entry.row.hiddenAsForwardedDuplicate && entry.row.counts.messages === 6),
+      "all hidden native conversations remain available and identically classified through bounded lookup");
+    await preferences.write({ ...await preferences.read(), hideForwardedDuplicates: false });
+    const batchVisible = await collect(batchQuery, 100);
+    assert.equal(batchVisible.rows.length, 106); assert.equal(batchVisible.counts.totals.messages, 606);
+    assert.equal((batchVisible.counts.totals.inbox! - beforeBatchVisible.counts.totals.inbox!) - (batch.counts.totals.inbox! - afterArrival.counts.totals.inbox!), 100);
+    for (const folder of ["Inbox", "All Mail"]) assert.equal(
+      (batchVisible.counts.totals.folders[folder]! - beforeBatchVisible.counts.totals.folders[folder]!) - (batch.counts.totals.folders[folder]! - afterArrival.counts.totals.folders[folder]!), 100);
+  } finally {
+    await service.close(); await ai.close(); await host.close(); database.close(); console.info = originalInfo; console.warn = originalWarn;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("guided zero recovery protocol preserves partial credit, exact retries, Undo and legacy traversal", async () => {
   if (!process.versions.bun) {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
