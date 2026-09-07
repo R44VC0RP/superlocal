@@ -76,7 +76,9 @@ Raw query-plus-page samples:
 - No global uniqueness across separately requested batches is promised. Stored totals and bulk capture semantics remain native, not globally compacted totals.
 - The old mailbox-wide design's UI timing report is historical. Current batch-design browser measurements are below. They expose remaining performance failures, not a blanket release-budget pass. The PR remains draft; nothing was merged into main or deployed.
 
-## Current release browser measurements
+## Initial release browser measurements
+
+These measurements precede the subsequent [background-read latency improvements](#background-read-latency-improvements). They remain intact as the before reference.
 
 Matched optimized builds: base `0699537`, candidate `5630b0c` (including the latest Get me to zero change). Served JavaScript was verified as `index-DskQ7YA-.js` / `index-CotLFh1L.js`, with shared `index--Kkdv2hC.css`. Hardware/runtime: Apple M5 Max, macOS 27.0, Bun 1.4.0, Chrome 152.0.0.0, Agent Browser; 1440×960, DPR 1, dark theme, Comfortable density, 36px rows. Timing logs stayed enabled. No builds or full suites ran during timed actions.
 
@@ -146,4 +148,49 @@ A supplemental 6.5k base arrival overlapped E/Undo as confirmed by the host: Don
 
 After all browser timings, the current integration passed **94 web tests and 354 API tests**, with the host typecheck and both optimized web builds also passing. The combined test command's 120-second wrapper first interrupted API execution after web completed; API alone was then rerun to completion (354 pass, zero fail). This is disclosed as a runner timeout, not an application test failure. The existing bundle-size warning remains. Final refs still matched base `0699537`; no concurrent source edits were swept in. Owned QA services and the browser session were stopped; no listeners remained on 5198/8818. The user's ordinary application was left running.
 
-**PR stays draft for the retained latency failures and remaining live-arrival evidence gap. No main merge or deployment was performed.**
+**This initial gate failed. No main merge or deployment was performed.**
+
+## Background-read latency improvements
+
+The follow-up fixes preserve the action/Undo protocol and address work running beside it:
+
+- Host counts no longer perform a redundant mailbox-wide `mailboxCounts()` scan before their bounded traversal. The first existing conversation page supplies the same snapshot/scope fence, and is consumed within the unchanged five-page budget. Count pages yield to the event loop. Exact totals, incomplete results, clock checks and concurrent-change rejection remain intact.
+- The fictional provider's folder listing no longer hydrates every full message on the host thread. It reads only folder/read metadata in yielding 512-row keyset pages, using its existing immutable version history and indexes. Folders and high-water are captured before the first yield; latest-version/tombstone handling and repeated ownership checks preserve one coherent snapshot during arrivals, moves, read changes and deletion. No schema, index, cache, dependency or new test file was added.
+
+This deliberately trades some background folder-list completion time for shorter uninterrupted work. Read-only 25k-message-per-source checks preserved all 10 folder counts: monolithic metadata took about 61–65ms; paged reads took about 137–157ms total, with typical individual pages about 2–4ms and one 18.46ms outlier. These microbenchmarks are diagnostic, not UI acceptance.
+
+The CPU/network traces showed E/W mutation requests dispatched within a few milliseconds rather than waiting on the client body loader. On the original cold path, the full count scan and mock folder hydration occupied the host while body/action HTTP requests waited. No receipt was acknowledged early, no flag dependency removed, and no owner/revision fence weakened.
+
+### Latest 50k result: improved, not release-ready
+
+Before is `a7caebc` (same runtime source as the earlier measured `5630b0c`); after is the source in this follow-up, identified by the hashes in [the raw samples](latency-samples.json). Fresh clones exactly matched the earlier initial canonical/native/membership/body-version/workflow digests: **50,003 messages / 25,083 conversations**, all bodies cached. Hardware, runtime, UI asset `index-CotLFh1L.js`, 1440×960/DPR 1, dark/Comfortable settings and logging were unchanged. CPU profiling was off and no builds or tests ran during the final measurement. One untimed warm navigation preceded the same 25 planned samples.
+
+Values are **median / p95 / max**, milliseconds; five samples per series, nearest-rank p95.
+
+| Scenario | Before | After |
+| --- | ---: | ---: |
+| Navigation to usable row | 260.2 / 368.0 / 368.0 | 162.7 / 351.7 / 351.7 |
+| First visible body | 883.1 / 890.3 / 890.3 | 144.2 / 163.3 / 163.3 |
+| Cached visible body | 67.5 / 78.8 / 78.8 | 63.1 / 68.5 / 68.5 |
+| Body-ready E | 49.6 / 186.7 / 186.7 | 52.1 / 68.8 / 68.8 |
+| Body-ready W | 49.1 / 53.3 / 53.3 | 50.2 / 53.7 / 53.7 |
+| No-body-wait E | 416.0 / 497.4 / 497.4 | **94.3 / 197.8 / 197.8** |
+| No-body-wait W | 413.0 / 427.9 / 427.9 | 78.1 / 79.0 / 79.0 |
+| Undo after body-ready E | 47.2 / 538.9 / 538.9 | 47.5 / 230.6 / 230.6 |
+| Undo after body-ready W | 46.3 / 96.8 / 96.8 | 45.6 / 47.7 / 47.7 |
+| Undo after no-body-wait E | 251.5 / 486.3 / 486.3 | 178.6 / 212.5 / 212.5 |
+| Undo after no-body-wait W | 308.9 / 339.5 / 339.5 | 158.3 / 197.3 / 197.3 |
+
+All 20 action/Undo cycles restored the original reader and inbox row; final persistence survived reload. First opens made one body GET each, cached opens zero. The first planned cold E happened to be body-ready before input without a body wait; it is explicitly recorded and was not replaced. The other nine no-body-wait inputs had no body ready.
+
+The remaining failure is cold E4: **197.8ms**, including 187.5ms to acceptance, against the unchanged 150ms target. Its mutation request took 173ms; a concurrent sync-status request took 118ms and an inbox page 230ms. The hypothesis that counts/folder listing explained every outlier was incomplete. Periodic SDK/background work remains a suspect, not a proven cause of this final miss. After three implementation attempts, further code changes stopped rather than selectively rerunning or waiving the failure.
+
+Frames remain separate from acceptance: latest action frame-estimate medians/p95/max were E warm 20.6/23.1/23.1ms, W warm 22.9/26.4/26.4ms, E no-body-wait 14.1/22.4/22.4ms and W no-body-wait 14.7/19.8/19.8ms. Observed rAF intervals were 16.7/33.3/35.3ms; the same 254ms/128ms thread animations remained. These are not paint/INP measurements.
+
+[Matched before still](release-50003-after.png) · [Inspected latest after still](latency-50003-after.png). No visible layout or mail-content change is expected beyond the existing duplicate behavior. New interaction recordings, the latest-code 6.5k rerun and latest-code live-arrival acceptance remain incomplete; old media is not relabeled as that evidence.
+
+Intermediate failures were also retained: count yielding alone left cold E up to 161.6ms and W up to 319ms in diagnostics; monolithic metadata projection plus count yielding left cold E at 161.5/231.6ms in its fresh full-size trial. Profiling-on runs and those intermediate results are not used as a final pass. The final paged-folder run retained every planned sample.
+
+Existing API regressions now verify count scheduling with real Done/Undo receipts, no preliminary inventory count, exact/empty/cached totals, stale-count rejection, and folder snapshot consistency while 1,100 fictional messages undergo concurrent changes. Targeted tests and host/mock typechecks passed. With the final source frozen and browser timings complete, the full suites passed: **94 web tests and 354 API tests** (111,053 API assertions). Owned QA services and the browser session were stopped; the user's normal app remained untouched.
+
+**PR remains draft and unmerged: the latest result is a verified improvement, not completion of all release gates.**

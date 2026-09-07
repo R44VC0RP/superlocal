@@ -2656,9 +2656,10 @@ describe('bounded host inbox window', () => {
     for (const domain of domains) await h.inbox.createMailbox('alice', { sourceId: account.id, name: domain, selector: { kind: 'domain', value: domain } })
     await h.sync('alice', account.id)
     const providerCalls = structuredClone(box.calls), database = new Database(':memory:')
-    let bodyReads = 0, inference = 0, captureRequested = false, unscopedReads = 0, conversationReads = 0
-    let correspondenceFailure: InboxError | undefined
+    let bodyReads = 0, inference = 0, captureRequested = false, unscopedReads = 0, conversationReads = 0, inventoryCounts = 0
+    let correspondenceFailure: InboxError | undefined, countPageHook: (() => void) | undefined
     const guarded: Inbox = { ...h.inbox,
+      mailboxCounts: async () => { inventoryCounts++; throw new Error('Host counts must not scan the whole mailbox inventory') },
       mailboxCorrespondence: (...args) => correspondenceFailure ? Promise.reject(correspondenceFailure) : h.inbox.mailboxCorrespondence(...args),
       message: async () => { bodyReads++; throw new Error('Window reads must not load message bodies') },
       mailboxMessage: async () => { bodyReads++; throw new Error('Window reads must not load mailbox bodies') },
@@ -2667,7 +2668,7 @@ describe('bounded host inbox window', () => {
         if (!input.threadId) { unscopedReads++; expect(captureRequested).toBe(true) }
         return h.inbox.mailboxMessagePage(owner, input)
       },
-      mailboxConversations: async (...args) => { conversationReads++; return h.inbox.mailboxConversations(...args) },
+      mailboxConversations: async (...args) => { conversationReads++; countPageHook?.(); return h.inbox.mailboxConversations(...args) },
     }
     const fetcher: typeof fetch = Object.assign(async () => { inference++; throw new Error('Window reads must not run inference') }, {
       preconnect: () => { inference++; throw new Error('Window reads must not preconnect inference') },
@@ -2706,11 +2707,57 @@ describe('bounded host inbox window', () => {
     expect(ready.totals.conversations).toBeNull()
     // Exact totals are explicit work, not an opening-triggered copy. All Mail
     // excludes Trash, but requested folder totals still cover the off-window thread.
+    // A real action scheduled during the first count page must run before the
+    // second page, rather than waiting behind an uninterrupted inventory traversal.
+    const selectedBoxes = (await h.inbox.mailboxes('alice')).map(mailbox => mailbox.id)
+    const target = ready.rows[0]!, targetScope = { mailboxIds: selectedBoxes, keys: [{ sourceId: target.sourceId, threadId: target.threadId }] }
+    const scheduledDone = deferred<Awaited<ReturnType<Inbox['setMailboxStates']>>>()
+    let countPages = 0, doneCompleted = false, doneBeforeSecondPage = false, doneBeforeCountSettled = false
+    countPageHook = () => {
+      countPages++
+      if (countPages === 2) doneBeforeSecondPage = doneCompleted
+      if (countPages !== 1) return
+      setImmediate(() => {
+        void (async () => {
+          const receipt = await h.inbox.setMailboxStates('alice', { id: randomUUID(), targets: target.targets, done: true })
+          expect(receipt.retracted).toBe(false); expect(receipt.states.every(state => state.done)).toBe(true)
+          const changed = (await h.inbox.mailboxConversations('alice', targetScope)).items[0]!
+          expect(changed.doneMembershipCount).toBe(4); expect(changed.awakeInboxMessageCount).toBe(0)
+          doneCompleted = true
+          return receipt
+        })().then(scheduledDone.resolve, scheduledDone.reject)
+      })
+    }
+    const [invalidatedCounts, doneReceipt] = await bounded(Promise.all([
+      call('counts', { queryId: first.state.queryId }).then(value => { doneBeforeCountSettled = doneCompleted; return value }),
+      scheduledDone.promise,
+    ]), 'scheduled Done and independent read between count pages')
+    countPageHook = undefined
+    expect(countPages).toBeGreaterThanOrEqual(2); expect(countPages).toBeLessThanOrEqual(5)
+    expect(doneBeforeSecondPage).toBe(true); expect(doneBeforeCountSettled).toBe(true)
+    expect(invalidatedCounts.totals.conversations).toBeNull(); expect(invalidatedCounts.totals.folders.Done).toBeUndefined()
+    const changedCounts = await bounded((async () => {
+      for (;;) { const value = await call('counts', { queryId: first.state.queryId }); if (value.totals.conversations !== null) return value; await Bun.sleep(10) }
+    })(), 'counts restart after concurrent Done')
+    expect(changedCounts.totals).toMatchObject({ conversations: 349, messages: 698, folders: { Inbox: 348, Done: 1, 'All Mail': 349, Trash: 1 } })
+    const undoReceipt = await h.inbox.undoMailboxStates('alice', doneReceipt.id)
+    expect(undoReceipt.retracted).toBe(true); expect(undoReceipt.states.every(state => !state.done)).toBe(true)
+    expect(await h.inbox.mailboxStateReceipt('alice', doneReceipt.id)).toEqual(undoReceipt)
+    const restored = (await h.inbox.mailboxConversations('alice', targetScope)).items[0]!
+    expect(restored.doneMembershipCount).toBe(0); expect(restored.awakeInboxMessageCount).toBe(2)
+    // The client's ordinary delta observes Undo and invalidates completed counts.
+    const beforeUndoDelta = conversationReads
+    const undoDelta = await call('changes', { queryId: first.state.queryId, sinceRevision: changedCounts.state.indexRevision,
+      sinceCursor: changedCounts.state.readCursor!, residentKeys: [...new Set([...first.rows, ...ready.rows].map(row => row.key))], pinnedKeys: [], limit: 100 })
+    expect(undoDelta.resetReason).toBeNull(); expect(undoDelta.totals.conversations).toBeNull()
+    expect(conversationReads - beforeUndoDelta).toBeLessThanOrEqual(5)
     const counted = await bounded((async () => {
       for (;;) { const value = await call('counts', { queryId: first.state.queryId }); if (value.totals.conversations !== null) return value; await Bun.sleep(10) }
     })(), 'explicit cached counts')
-    expect(counted.totals).toMatchObject({ conversations: 349, messages: 698, folders: { 'All Mail': 349, Trash: 1 } })
+    expect(counted.totals).toMatchObject({ conversations: 349, messages: 698, folders: { Inbox: 349, Done: 0, 'All Mail': 349, Trash: 1 } })
+    const beforeCachedCounts = conversationReads
     expect((await call('counts', { queryId: first.state.queryId })).totals).toEqual(counted.totals)
+    expect(conversationReads).toBe(beforeCachedCounts); expect(inventoryCounts).toBe(0)
     const cached = await call('lookup', { account: 'unified', ids: ready.rows.slice(0, 3).map(row => row.key) })
     expect(cached.entries.every(entry => entry.status === 'found')).toBe(true)
     expect(cached.entries.map(entry => entry.status === 'found' && entry.row.key)).toEqual(ready.rows.slice(0, 3).map(row => row.key))
@@ -2727,7 +2774,7 @@ describe('bounded host inbox window', () => {
       return last
     }
     let through = ready.state.indexRevision
-    const retainedCursor = ready.nextCursor!, selectedBoxes = (await h.inbox.mailboxes('alice')).map(mailbox => mailbox.id)
+    const retainedCursor = ready.nextCursor!
     for (let sample = 0; sample < 9; sample++) {
       const current = (await h.inbox.mailboxConversations('alice', { mailboxIds: selectedBoxes, keys: [{ sourceId: ready.rows[0]!.sourceId, threadId: ready.rows[0]!.threadId }] })).items[0]!
       const receipt = await h.inbox.setMailboxStates('alice', { id: randomUUID(), targets: current.targets, done: true })
@@ -2859,10 +2906,18 @@ describe('bounded host inbox window', () => {
     expect(resumedCounts.totals.conversations).toBe(351)
     expect(resumed.rows.some(row => row.mail.subject === 'Subject after-capture-invalidation')).toBe(true)
     expect((await call('zeroResume', { sessionId: interrupted.id, account: 'unified' })).status).toBe('found')
-    expect(bodyReads).toBe(0); expect(inference).toBe(0)
+    expect(bodyReads).toBe(0); expect(inference).toBe(0); expect(inventoryCounts).toBe(0)
     const current = await preferences.read()
     await preferences.write({ ...current, unifiedMode: 'selected', includedMailboxIds: [(await h.inbox.mailboxes('alice'))[0]!.id] })
     await expect(call('page', { queryId: nextView.state.queryId })).rejects.toMatchObject({ code: 'HOST_INBOX_SCOPE_CHANGED' })
+    await preferences.write({ ...await preferences.read(), unifiedMode: 'selected', includedMailboxIds: [] })
+    const beforeEmpty = conversationReads, empty = await call('query', view)
+    expect(empty.rows).toHaveLength(0); expect(empty.exhausted).toBe(true)
+    const emptyCounts = await call('counts', { queryId: empty.state.queryId })
+    expect(emptyCounts.totals).toMatchObject({ conversations: 0, messages: 0, inbox: 0, holding: false })
+    expect(Object.values(emptyCounts.totals.folders).every(value => value === 0)).toBe(true)
+    expect(Object.values(emptyCounts.totals.splits).every(value => value === 0)).toBe(true)
+    expect(conversationReads).toBe(beforeEmpty); expect(inventoryCounts).toBe(0)
   }, 30000)
 
   test('identical public query openings reconcile independently when changes are interleaved', async () => {
@@ -7567,8 +7622,28 @@ describe('source-scoped sending identities', () => {
       const definition = createMockProviderDefinition(store)
       const h = await fixture({ providers: [definition] })
       const account = await h.inbox.connect('alice', { providerId: definition.id, credentials: { databaseId: store.identity, storeId: mailbox.id } })
-      store.linkSource({ owner: 'alice', storeId: mailbox.id, accountId: account.id }, account.connectionId!)
-      const inventory = spyOn(store, 'snapshot').mockImplementation(() => { throw new Error('Identity discovery must not scan mail') })
+      const scope = { owner: 'alice', storeId: mailbox.id, accountId: account.id }
+      store.linkSource(scope, account.connectionId!)
+      const firstLabel = store.createFolder(scope, 'Fictional first label', 'label')
+      const secondLabel = store.createFolder(scope, 'Fictional second label', 'label')
+      const emptyFolders = await store.listFolders(scope)
+      expect(emptyFolders.map(folder => [folder.id, folder.totalCount, folder.unreadCount])).toEqual([
+        ['inbox', 0, 0], ['sent', 0, 0], ['archive', 0, 0], ['spam', 0, 0], ['trash', 0, 0],
+        [firstLabel.id, 0, 0], [secondLabel.id, 0, 0],
+      ])
+      const unread = store.receive(scope, { from: participant('sender@example.test'), subject: 'Fictional unread metadata',
+        text: 'Fictional body is not needed for folder counts.', labels: [firstLabel.id, firstLabel.id, secondLabel.id] })
+      const read = store.receive(scope, { from: participant('sender@example.test'), subject: 'Fictional read metadata',
+        text: 'Fictional read message.', isRead: true, labels: [firstLabel.id] })
+      const otherMailbox = store.createMailbox({ owner: 'bob', seedKey: 'identities', name: 'Fictional other owner',
+        email: 'other@example.test', aliases: [], color: '#123456' })
+      const otherScope = { owner: 'bob', storeId: otherMailbox.id, accountId: 'other-source' }
+      store.receive(otherScope, { from: participant('sender@example.test'), subject: 'Fictional owner isolation', text: 'Other owner.' })
+      const siblingMailbox = store.createMailbox({ owner: 'alice', seedKey: 'sibling', name: 'Fictional sibling store',
+        email: 'sibling@example.test', aliases: [], color: '#123456' })
+      const siblingScope = { owner: 'alice', storeId: siblingMailbox.id, accountId: 'sibling-source' }
+      store.receive(siblingScope, { from: participant('sender@example.test'), subject: 'Fictional store isolation', text: 'Other store.' })
+      const inventory = spyOn(store, 'snapshot').mockImplementation(() => { throw new Error('Identity and folder metadata must not hydrate mail') })
       try {
         expect((await h.inbox.sendingIdentities('alice', account.id)).identities).toEqual([
           { email: mailbox.email, isPrimary: true, isDefault: true }, { email: mailbox.aliases[0]!, isPrimary: false, isDefault: false },
@@ -7580,8 +7655,64 @@ describe('source-scoped sending identities', () => {
         ])
         await expect(h.inbox.sendingIdentities('bob', account.id)).rejects.toMatchObject({ code: 'NOT_FOUND' })
         await expect(h.inbox.mailboxCandidates('bob', account.connectionId!)).rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(await store.listFolders(scope)).toEqual(emptyFolders.map(folder => ({ ...folder,
+          totalCount: folder.id === 'inbox' || folder.id === firstLabel.id ? 2 : folder.id === secondLabel.id ? 1 : 0,
+          unreadCount: ['inbox', firstLabel.id, secondLabel.id].includes(folder.id) ? 1 : 0,
+        })))
+        store.mutate(scope, unread.id, { isRead: true, folder: 'archive', removeLabels: [firstLabel.id] })
+        expect(await store.listFolders(scope)).toEqual(emptyFolders.map(folder => ({ ...folder,
+          totalCount: ['inbox', 'archive', firstLabel.id, secondLabel.id].includes(folder.id) ? 1 : 0, unreadCount: 0,
+        })))
+        store.mutate(scope, read.id, { isRead: false, addLabels: [secondLabel.id, secondLabel.id] })
+        expect(await store.listFolders(scope)).toEqual(emptyFolders.map(folder => ({ ...folder,
+          totalCount: folder.id === secondLabel.id ? 2 : ['inbox', 'archive', firstLabel.id].includes(folder.id) ? 1 : 0,
+          unreadCount: ['inbox', firstLabel.id, secondLabel.id].includes(folder.id) ? 1 : 0,
+        })))
+        store.mutate(scope, unread.id, { deletePermanently: true })
+        expect(await store.listFolders(scope)).toEqual(emptyFolders.map(folder => ({ ...folder,
+          totalCount: ['inbox', firstLabel.id, secondLabel.id].includes(folder.id) ? 1 : 0,
+          unreadCount: ['inbox', firstLabel.id, secondLabel.id].includes(folder.id) ? 1 : 0,
+        })))
+        for (const isolatedScope of [otherScope, siblingScope]) {
+          expect((await store.listFolders(isolatedScope)).map(folder => [folder.id, folder.totalCount, folder.unreadCount])).toEqual([
+            ['inbox', 1, 1], ['sent', 0, 0], ['archive', 0, 0], ['spam', 0, 0], ['trash', 0, 0],
+          ])
+        }
+        await expect(store.listFolders({ ...scope, owner: 'bob' })).rejects.toThrow()
+        await expect(store.listFolders({ ...scope, accountId: 'wrong-source' })).rejects.toThrow()
         expect(inventory).not.toHaveBeenCalled()
       } finally { inventory.mockRestore() }
+      const arrivals = Array.from({ length: 1100 }, (_, index) => store.receive(scope, {
+        from: participant('sender@example.test'), subject: `Fictional paged metadata ${index}`, text: 'Fictional page.',
+      })).sort((a, b) => a.id.localeCompare(b.id))
+      const beforeConcurrent = await store.listFolders(scope)
+      let completed = false, actedBeforeCompletion = false
+      const listing = store.listFolders(scope).then(result => { completed = true; return result })
+      // Registered after the first page yield: these changes land between metadata pages.
+      const concurrent = new Promise<void>((resolve, reject) => setTimeout(() => {
+        try {
+          actedBeforeCompletion = !completed
+          store.mutate(scope, arrivals[1097]!.id, { isRead: true })
+          store.mutate(scope, arrivals[1098]!.id, { folder: 'archive' })
+          store.mutate(scope, arrivals[1099]!.id, { deletePermanently: true })
+          store.receive(scope, { from: participant('sender@example.test'), subject: 'Fictional concurrent arrival',
+            text: 'Arrived during paging.', labels: [firstLabel.id] })
+          store.createFolder(scope, 'Fictional concurrent label', 'label')
+          resolve()
+        } catch (error) { reject(error) }
+      }, 0))
+      const [asOf] = await Promise.all([listing, concurrent])
+      expect(actedBeforeCompletion).toBe(true)
+      expect(asOf).toEqual(beforeConcurrent)
+      const afterConcurrent = await store.listFolders(scope)
+      expect(afterConcurrent.slice(0, -1)).toEqual(beforeConcurrent.map(folder => ({ ...folder,
+        totalCount: folder.totalCount! + (folder.id === 'inbox' ? -1 : folder.id === 'archive' || folder.id === firstLabel.id ? 1 : 0),
+        unreadCount: folder.unreadCount! + (folder.id === 'inbox' ? -2 : folder.id === 'archive' || folder.id === firstLabel.id ? 1 : 0),
+      })))
+      expect(afterConcurrent.at(-1)).toMatchObject({ name: 'Fictional concurrent label', totalCount: 0, unreadCount: 0 })
+      const closing = store.listFolders(scope)
+      store.close()
+      await expect(closing).rejects.toThrow('The mock store is closed.')
     } finally { store.close() }
   })
 

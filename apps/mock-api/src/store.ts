@@ -271,12 +271,30 @@ export class MockMailStore {
     return this.db.query<JsonRow, [string, string]>('SELECT data FROM mock_folders WHERE owner=? AND store_id=? ORDER BY rowid').all(scope.owner, scope.storeId).map(row => JSON.parse(row.data))
   }
 
-  listFolders(scope: StoreScope): ProviderFolder[] {
-    const messages = this.snapshot(scope)
-    return this.folderRows(scope).map(folder => {
-      const matches = messages.filter(message => message.folderIds?.includes(folder.id))
-      return { ...folder, totalCount: matches.length, unreadCount: matches.filter(message => !message.isRead).length }
-    })
+  async listFolders(scope: StoreScope): Promise<ProviderFolder[]> {
+    const folders = this.folderRows(scope), at = this.highWater(scope)
+    const counts = new Map(folders.map(folder => [folder.id, { ...folder, totalCount: 0, unreadCount: 0 }]))
+    let after = ''
+    while (true) {
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
+      this.assertScope(scope)
+      const rows = this.db.query<{ id: string; folderIds: string | null; isRead: number | null }, [string, string, string, number]>(`
+        SELECT v.id,json_extract(v.data,'$.folderIds') folderIds,json_extract(v.data,'$.isRead') isRead
+        FROM mock_versions v INDEXED BY mock_version_snapshot WHERE v.owner=? AND v.store_id=? AND v.id>? AND v.seq=(
+          SELECT MAX(seq) FROM mock_versions INDEXED BY mock_version_snapshot WHERE owner=v.owner AND store_id=v.store_id AND id=v.id AND seq<=?
+        ) AND v.data IS NOT NULL ORDER BY v.id LIMIT 512
+      `).all(scope.owner, scope.storeId, after, at)
+      for (const row of rows) {
+        for (const id of new Set(row.folderIds ? JSON.parse(row.folderIds) as string[] : [])) {
+          const count = counts.get(id)
+          if (count) { count.totalCount++; if (!row.isRead) count.unreadCount++ }
+        }
+      }
+      if (rows.length < 512) break
+      after = rows[rows.length - 1]!.id
+    }
+    this.assertScope(scope)
+    return [...counts.values()]
   }
 
   folder(scope: StoreScope, value: unknown, writable = false): string {

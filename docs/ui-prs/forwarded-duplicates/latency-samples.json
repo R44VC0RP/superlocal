@@ -1,0 +1,47 @@
+{
+  "units": "milliseconds",
+  "beforeRevision": "a7caebc4cbf92019961430a871ecd0d83ec0c737",
+  "afterSourceSha256": {
+    "apps/local-host/src/inbox-window.ts": "79a310a33bb478097539a088487f4a164bd424e47e600b8d91c5c2022e465ef3",
+    "apps/mock-api/src/store.ts": "be665e8b0486265831237351d062af3a25c1693838daf1c0b5bd5550e710ff4c"
+  },
+  "canonicalMessages": 50003,
+  "nativeConversations": 25083,
+  "startup": [173.8,351.7,162.7,155.1,145.8],
+  "firstVisibleBody": [144.2,163.3,120.2,104.9,152.6],
+  "cachedVisibleBody": [65.1,63.1,68.5,60.9,62.7],
+  "firstBodyGETs": [1,1,1,1,1],
+  "cachedBodyGETs": [0,0,0,0,0],
+  "warmE": {
+    "action": [68.8,48,52.2,48.9,52.1],
+    "accepted": [61.7,27.4,32.3,28.3,29],
+    "undo": [230.6,45.3,47,162.9,47.5],
+    "bodyReadyBeforeInput": [true,true,true,true,true]
+  },
+  "warmW": {
+    "action": [50.2,53.7,40.6,44.6,53.1],
+    "accepted": [27.3,28.8,20.7,21.7,26.7],
+    "undo": [47.4,45.6,44.8,45,47.7],
+    "bodyReadyBeforeInput": [true,true,true,true,true]
+  },
+  "coldE": {
+    "action": [79.9,78,110.9,197.8,94.3],
+    "accepted": [59.5,63.9,88.5,187.5,82.4],
+    "undo": [143.5,179.1,178.6,94.5,212.5],
+    "bodyReadyBeforeInput": [true,false,false,false,false]
+  },
+  "coldW": {
+    "action": [78.6,78.1,47.7,79,39.9],
+    "accepted": [58.8,63.4,30.9,71.5,28],
+    "undo": [197.3,158.3,111.1,197.3,136.7],
+    "bodyReadyBeforeInput": [false,false,false,false,false]
+  },
+  "normalUndoRestorations": { "passed": 20, "planned": 20 },
+  "acceptancePassed": false,
+  "notes": [
+    "Same five-sample protocol and initial fixture digests as the pre-fix head50003 series in release-samples.json. CPU profiler off; timing logs on; no concurrent builds/tests.",
+    "Cold denotes the planned no-body-wait flow. Cold E1 was already body-ready when input occurred; it is retained in its planned series, not replaced.",
+    "Action timing is handler-to-two-rAF telemetry, not paint or INP. Undo has no separately assigned formal budget.",
+    "Cold E4 exceeds the unchanged 150ms target. No selective retries; the 6500 browser rerun and latest-code concurrent-arrival/recording checks remain incomplete."
+  ]
+}

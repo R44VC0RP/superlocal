@@ -1433,19 +1433,29 @@ export function createInboxWindowService(deps: Dependencies) {
     if (count?.complete && totals(scope, query).conversations !== null) return { state: state(scope, query), totals: count.totals }
     const empty = (): DTO.InboxTotals => ({ conversations: 0, messages: 0, inbox: 0, splits: Object.fromEntries(scope.preferences.splits.map(name => [name, 0])),
       folders: Object.fromEntries(['Inbox', 'Starred', 'Sent', 'Done', 'Auto Archived', 'Reminders', 'Spam', 'Trash', 'All Mail'].map(name => [name, 0])), holding: false })
-    if (!count) {
-      // SDK counts are exact for the cached receiving scope. App folder/category
-      // conjunctions are not message predicates; do not mislabel matching-message
-      // counts as whole-conversation message totals.
-      const cached = scope.boxes.length ? await inbox.mailboxCounts(owner, { mailboxIds: scope.boxes.map(box => box.id) }) : null
-      const read = observe(scope, cached?.asOfState ?? null, cached?.scopeState ?? scope.row.id, query)
-      count = { baseline: read, totals: empty(), complete: !cached || cached.conversations === 0 }
-    }
     const budget = readBudget(), view = json<DTO.InboxViewQuery>(query.data)
-    while (!count.complete && budget.pages > 0) {
+    let firstPage: Awaited<ReturnType<Inbox['mailboxConversations']>> | undefined
+    if (!count) {
+      // The first bounded page supplies both the snapshot fence and emptiness.
+      // A preliminary mailbox-wide count adds no information to this traversal.
+      if (scope.boxes.length) {
+        await wait()
+        budget.pages--
+        firstPage = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 100 })
+      }
+      const read = observe(scope, firstPage?.state ?? null, firstPage?.scopeState ?? scope.row.id, query)
+      count = { baseline: read, totals: empty(), complete: !firstPage || firstPage.items.length === 0 }
+    }
+    while (!count.complete && (firstPage || budget.pages > 0)) {
       const position = count.position ?? {}
-      budget.pages--
-      const page = await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 100, ...(position.cursor ? { cursor: position.cursor } : {}) })
+      if (!firstPage) {
+        // Counting is background work. Resolved SDK promises alone do not let
+        // queued body/action HTTP requests run between synchronous SQLite pages.
+        await wait()
+        budget.pages--
+      }
+      const page = firstPage ?? await inbox.mailboxConversations(owner, { mailboxIds: scope.boxes.map(box => box.id), limit: 100, ...(position.cursor ? { cursor: position.cursor } : {}) })
+      firstPage = undefined
       if (page.state !== count.baseline.sdkState || page.scopeState !== count.baseline.scopeState) {
         saved = readMetadata(query); delete saved.counts; saveReadMetadata(query, saved)
         return { state: state(scope, query), totals: unknownTotals(scope) }
