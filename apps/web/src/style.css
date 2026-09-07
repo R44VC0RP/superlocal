@@ -1504,6 +1504,16 @@ kbd {
   font-size: 14px;
   padding: 24px 36px;
 }
+.teach-hint {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+  padding: 16px 36px 20px;
+}
+.teach-hint[role="alert"] {
+  color: var(--text);
+}
 .simple-modal-header {
   padding: 24px 28px;
   display: flex;

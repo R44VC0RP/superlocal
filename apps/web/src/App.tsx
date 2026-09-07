@@ -72,6 +72,7 @@ type Route = {
 type Overlay =
   | "command"
   | "remind"
+  | "teach"
   | "label"
   | "shortcuts"
   | "accounts"
@@ -160,9 +161,12 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const issueCapturePending = useRef(false);
   const [overlayIds, setOverlayIds] = useState<string[] | null>(null);
   const [commandDraftId, setCommandDraftId] = useState<string | null>(null);
+  const [teachBusy, setTeachBusy] = useState(false);
+  const [teachError, setTeachError] = useState("");
   const commandMode =
     overlay === "command" ||
     overlay === "remind" ||
+    overlay === "teach" ||
     overlay === "label" ||
     overlay === "accounts"
       ? overlay
@@ -1261,6 +1265,19 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setOverlay(null);
     timing.finish();
   }
+  /** One conversation, one note: the host generalizes it into a durable classifier rule and re-sorts recent inbox mail. */
+  async function teach(note: string) {
+    const target = targets[0] ?? currentMail;
+    if (!target?.sourceId || !target.sdkThreadId) { setTeachError("Open a conversation first."); return; }
+    setTeachBusy(true); setTeachError("");
+    try {
+      const result = await store.ai.teach({ sourceId: target.sourceId, threadId: target.sdkThreadId, id: `teach-${crypto.randomUUID()}`, note });
+      setOverlay(null);
+      setNotice({ text: `Rule saved: ${result.rule.text}` });
+    } catch (error) {
+      setTeachError(error instanceof Error && error.message ? error.message : "The rule could not be saved. Try rephrasing.");
+    } finally { setTeachBusy(false); }
+  }
   async function remind(when: string) {
     let before: Mail[];
     try { before = await capturedTargets(targetIds); } catch (error) { actionError(error); return; }
@@ -1445,6 +1462,13 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       icon: "Clock",
       run: () => openOverlay("remind"),
     },
+    ...(inbox.ai?.configured ? [{
+      label: "Teach AI",
+      detail: "Tell the classifier how to treat mail like this",
+      key: "",
+      icon: "Bolt",
+      run: () => { setTeachError(""); openOverlay("teach"); },
+    }] : []),
     {
       label: "Star",
       detail: "Keep this conversation close",
@@ -2577,6 +2601,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         onLabel={changeLabel}
         onCreateLabel={(label) => { void store.createLabel(route.account, label).then(() => changeLabel(label)).catch(actionError); }}
         onRemind={remind}
+        onTeach={teach}
+        teachBusy={teachBusy}
+        teachError={teachError}
         accounts={inbox.accounts}
         pinnedMailboxIds={accountOptions}
         unifiedMailboxCount={unifiedMailboxIds.length}

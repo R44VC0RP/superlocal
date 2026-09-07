@@ -301,3 +301,28 @@
 .ai-score-reasons {
   padding-left: 18px;
 }
+
+.ai-rule-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.ai-rule-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.ai-rule-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.ai-rule-category {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}

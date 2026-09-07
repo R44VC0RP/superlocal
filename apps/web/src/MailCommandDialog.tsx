@@ -12,7 +12,7 @@ export type CommandItem = {
 };
 
 type MailCommandDialogProps = {
-  mode: "command" | "remind" | "label" | "accounts";
+  mode: "command" | "remind" | "label" | "accounts" | "teach";
   open?: boolean;
   initialQuery?: string;
   onClose: () => void;
@@ -23,6 +23,10 @@ type MailCommandDialogProps = {
   onLabel: (label: string) => void;
   onCreateLabel: (label: string) => void;
   onRemind: (when: string) => void;
+  /** Free-text feedback about the targeted conversation; resolves when the rule is saved. */
+  onTeach?: (note: string) => Promise<void>;
+  teachBusy?: boolean;
+  teachError?: string;
   accounts: MailboxOption[];
   pinnedMailboxIds?: string[];
   unifiedMailboxCount?: number;
@@ -44,6 +48,9 @@ export default function MailCommandDialog({
   onLabel,
   onCreateLabel,
   onRemind,
+  onTeach,
+  teachBusy = false,
+  teachError = "",
   accounts,
   pinnedMailboxIds = [],
   unifiedMailboxCount = accounts.length,
@@ -116,7 +123,7 @@ export default function MailCommandDialog({
       })),
   ];
   const filteredAccounts = accountChoices.filter(account => `${account.name} ${account.detail}`.toLowerCase().includes(query.toLowerCase()));
-  const optionCount = (mode === "command" ? commandItems : mode === "label" ? labelOptions : mode === "remind" ? reminderOptions : filteredAccounts).length;
+  const optionCount = mode === "teach" ? 0 : (mode === "command" ? commandItems : mode === "label" ? labelOptions : mode === "remind" ? reminderOptions : filteredAccounts).length;
   const activeIndex = optionCount ? Math.min(Math.max(menuIndex, 0), optionCount - 1) : -1;
 
   useEffect(() => {
@@ -147,7 +154,9 @@ export default function MailCommandDialog({
             ? "Remind Me"
             : mode === "label"
               ? "Labels"
-               : "Mailboxes"
+              : mode === "teach"
+                ? "Teach AI"
+                : "Mailboxes"
       }
       onClose={dismiss}
       className={`app-modal command-modal ${mode === "accounts" ? `accounts-modal ${query ? "has-query" : ""}` : ""}`}
@@ -161,7 +170,9 @@ export default function MailCommandDialog({
                 ? "Clock"
                 : mode === "label"
                   ? "Label"
-                  : "User"
+                  : mode === "teach"
+                    ? "Bolt"
+                    : "User"
           }
         />
         <span>
@@ -175,7 +186,9 @@ export default function MailCommandDialog({
                   : labelMode === "navigate"
                     ? "Go to label"
                     : "Add or remove label"
-                 : "Mailboxes"}
+                : mode === "teach"
+                  ? "Teach AI about this conversation"
+                  : "Mailboxes"}
         </span>
         <IconButton name="Close" title="Close" onClick={dismiss} />
       </div>
@@ -198,10 +211,13 @@ export default function MailCommandDialog({
                     : labelMode === "navigate"
                       ? "Find a label"
                       : canCreateLabel ? "Find or create a label" : "Find a label"
-                  : "Find a mailbox"
+                  : mode === "teach"
+                    ? "What should the classifier learn?"
+                    : "Find a mailbox"
           }
           value={query}
-          placeholder={mode === "remind" ? "Try: 8 am, 3 days, aug 7" : mode === "accounts" ? "Search mailboxes…" : ""}
+          placeholder={mode === "remind" ? "Try: 8 am, 3 days, aug 7" : mode === "accounts" ? "Search mailboxes…" : mode === "teach" ? "e.g. Don't mark these as important" : ""}
+          disabled={mode === "teach" && teachBusy}
           onChange={(e) => {
             setQuery(e.target.value);
             setMenuIndex(0);
@@ -218,6 +234,7 @@ export default function MailCommandDialog({
             if (e.key === "Enter") {
               e.preventDefault();
               if (mode === "command") commandItems[activeIndex]?.run();
+              else if (mode === "teach") { if (query.trim() && onTeach && !teachBusy) void onTeach(query.trim()); }
               else if (mode === "remind")
                 onRemind(query || reminderOptions[activeIndex] || "tomorrow");
               else if (mode === "accounts" && filteredAccounts[activeIndex])
@@ -273,6 +290,11 @@ export default function MailCommandDialog({
         )}
         {mode === "command" && !commandItems.length && (
           <p className="no-options">No commands found.</p>
+        )}
+        {mode === "teach" && (
+          <p className="teach-hint" role={teachError ? "alert" : "status"}>
+            {teachError || (teachBusy ? "Writing the rule…" : "Say it in your own words. Superlocal turns it into a rule for this kind of mail, applies it to this conversation now, and re-sorts recent inbox mail.")}
+          </p>
         )}
         {mode === "remind" && (
           <>

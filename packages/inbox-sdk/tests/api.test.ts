@@ -12419,7 +12419,7 @@ describe('AI triage inference and local scoring', () => {
       { endpoint: 'http://inference.example.test/responses' }, { endpoint: 'https://user:pass@inference.example.test/responses' },
       { endpoint: 'https://inference.example.test/responses?key=dummy' }, { endpoint: 'https://inference.example.test/responses#fragment' },
       { defaultModel: 'unlisted-model' }, { models: [...configuration.models, ...configuration.models] },
-      { browserSecret: 'dummy' }, { maxOutputTokens: 8193 }, { timeoutMs: 999 }, { concurrency: 9 },
+      { browserSecret: 'dummy' }, { maxOutputTokens: 8193 }, { timeoutMs: 999 }, { concurrency: 17 },
       { models: [{ ...configuration.models[0], pricing: { ...configuration.models[0]!.pricing, inputPerMillion: -1 } }] },
       { models: [{ ...configuration.models[0], pricing: { ...configuration.models[0]!.pricing, outputPerMillion: 1_000_001 } }] },
       { models: [{ ...configuration.models[0], pricing: { ...configuration.models[0]!.pricing, cachedInputPerMillion: 'free' } }] },
@@ -13754,6 +13754,58 @@ describe('AI triage service', () => {
     const request = decisions.find(item => item.assessment?.reason === 'personal')!
     const manual = await service.feedback('alice', { sourceId: request.sourceId, threadId: request.threadId, revision: request.revision, id: 'ai-long-manual-other', category: 'Other' })
     expect(manual).toMatchObject({ override: { category: 'Other' }, score: { category: 'Other' }, assessment: { response: 'needed', certainty: 'insufficient' } })
+  })
+
+  test('teaching generalizes a note into a rule that overrides the thread, enters the prompt with highest precedence, invalidates saved assessments, and re-sorts newest inbox mail', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const seeds = [native('taught-alert'), native('taught-other')]
+    const { account } = await h.seed('alice', 'ai-taught-rules', seeds)
+    const requests: Array<{ instructions: string; schema: string; content: Record<string, unknown> }> = []
+    const ruleResponse = { ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify({ text: 'Fixture vendor account alerts are not important.', category: 'Other' }) }] }] }
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async (_url, init) => {
+        const body = JSON.parse(String(init?.body))
+        requests.push({ instructions: body.instructions, schema: body.text.format.name, content: JSON.parse(body.input[0].content) })
+        return Response.json(body.text.format.name === 'triage_rule_v1' ? ruleResponse : response)
+      }) as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start(); await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    await service.process('alice', { id: 'ai-taught-seed', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 2) await Bun.sleep(10) })(), 'taught seed receipts')
+    expect(requests.every(request => request.schema === 'triage_result_v2' && !request.instructions.includes('USER RULES'))).toBe(true)
+    const alert = (await h.page('alice')).items.find(item => item.subject === seeds[0]!.subject)!
+    const before = (await service.lookup('alice', [{ sourceId: account.id, threadId: alert.threadId }])).decisions[0]!
+    expect(before).toMatchObject({ state: 'ready', override: null })
+    await expect(service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-1', note: '   ' })).rejects.toMatchObject({ code: 'AI_INVALID_FEEDBACK' })
+    const taught = await service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-1', note: 'Do not mark these as important anymore' })
+    // The rule request carries the note plus content-light context only: no message text, addresses, or names.
+    const ruleRequest = requests.find(request => request.schema === 'triage_rule_v1')!
+    expect(ruleRequest.content).toEqual({ note: 'Do not mark these as important anymore', conversation: expect.objectContaining({ subjects: [seeds[0]!.subject], type: 'other', currentCategory: expect.any(String) }) })
+    expect(JSON.stringify(ruleRequest.content)).not.toContain('@')
+    expect(taught.rule).toMatchObject({ id: 'ai-taught-rule-1', text: 'Fixture vendor account alerts are not important.', category: 'Other' })
+    expect(taught.decision).toMatchObject({ threadId: alert.threadId, override: { category: 'Other' }, score: { category: 'Other' } })
+    expect(taught.state.settings.rules).toEqual([taught.rule])
+    expect(taught.state.settings.revision).toBe(before.settingsRevision + 1)
+    // Saved assessments are invalidated by the rule and re-sorted newest-first under the new instructions.
+    await bounded((async () => { while ((await service.state('alice')).jobs.find(job => job.id === 'ai-taught-rule-1:resort')?.status !== 'completed') await Bun.sleep(10) })(), 'taught re-sort')
+    const triageAfterRule = requests.filter(request => request.schema === 'triage_result_v2').slice(2)
+    expect(triageAfterRule.length).toBeGreaterThan(0)
+    for (const request of triageAfterRule) {
+      expect(request.instructions.startsWith('USER RULES')).toBe(true)
+      expect(request.instructions).toContain('- Fixture vendor account alerts are not important.')
+      expect(request.content).not.toHaveProperty('rules')
+    }
+    const after = (await service.lookup('alice', [{ sourceId: account.id, threadId: alert.threadId }])).decisions[0]!
+    expect(after).toMatchObject({ state: 'ready', settingsRevision: taught.state.settings.revision })
+    expect(after.inputHash).not.toBe(before.inputHash)
+    // Teaching with the same id is idempotent and never bills another rule request.
+    const ruleRequests = requests.filter(request => request.schema === 'triage_rule_v1').length
+    expect((await service.teach('alice', { sourceId: account.id, threadId: alert.threadId, id: 'ai-taught-rule-1', note: 'Do not mark these as important anymore' })).rule).toEqual(taught.rule)
+    expect(requests.filter(request => request.schema === 'triage_rule_v1')).toHaveLength(ruleRequests)
+    // Removing the rule through settings drops it from the prompt again.
+    const cleared = await service.configure('alice', { ...(await service.state('alice')).settings, rules: [] })
+    expect(cleared.settings.rules).toEqual([])
+    await expect(service.configure('alice', { ...cleared.settings, rules: [{ id: 'bad id', text: 'x', category: null, createdAt: 'now' }] })).rejects.toMatchObject({ code: 'AI_INVALID_SETTINGS' })
   })
 
   test('feedback is revision-conditional and idempotent, manual clear removes its own vote, and a new reply changes the captured input', async () => {
