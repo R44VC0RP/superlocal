@@ -229,6 +229,8 @@ export interface MailboxMembership {
   revision: number
   done: boolean
   snoozedUntil: string | null
+  /** Due instant of the reminder that most recently woke this membership; internal to the SDK store, cleared by the next explicit state change. */
+  wokeAt?: string | null
 }
 
 export interface MailboxMessageSummary extends Omit<MessageSummary, 'snoozedUntil'> {
@@ -292,6 +294,8 @@ export interface MailboxConversation extends MailboxThreadKey {
   latestAwakeInboxAt?: string | null
   /** Minimum future snooze among all selected memberships, including Done memberships; otherwise null. */
   earliestSnoozedUntil: string | null
+  /** Latest reminder due instant among awake (not done, not snoozed) primary-inbox memberships; null when none returned from a reminder. */
+  latestWokeAt?: string | null
   lastMessageAt: string
   isRead: boolean
   isStarred: boolean

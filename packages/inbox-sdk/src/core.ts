@@ -1867,7 +1867,8 @@ export function createInbox(options: InboxOptions): Inbox {
       const memberships = db.query<MembershipRow, [string]>("SELECT * FROM sdk_memberships WHERE json_extract(data,'$.snoozedUntil') IS NOT NULL AND json_extract(data,'$.snoozedUntil')<=?").all(new Date(now()).toISOString())
       for (const row of memberships) {
         const state = JSON.parse(row.data) as MailboxMembership
-        state.snoozedUntil = null; state.revision += 1
+        // Keep the due instant so a returned reminder can resurface at its wake time instead of its original receipt.
+        state.wokeAt = state.snoozedUntil; state.snoozedUntil = null; state.revision += 1
         db.query('UPDATE sdk_memberships SET data=? WHERE mailbox=? AND message=?').run(JSON.stringify(state), row.mailbox, row.message)
         event(row.owner, 'membership.updated', row.source, row.message, 'updated', 'mutation', row.mailbox)
       }
@@ -2452,8 +2453,9 @@ export function createInbox(options: InboxOptions): Inbox {
         const primaryColumns = roles.map(role => `SUM(m.folder='${role}') primary_${role}`)
         const awakeInboxCondition = `m.folder='inbox' AND EXISTS(SELECT 1 FROM sdk_memberships v INDEXED BY sdk_membership_read WHERE v.owner=m.owner AND v.source=m.account AND v.message=m.id AND v.mailbox IN (SELECT value FROM json_each(?)) AND json_extract(v.data,'$.done')=0 AND (json_extract(v.data,'$.snoozedUntil') IS NULL OR json_extract(v.data,'$.snoozedUntil')<=?))`
         const aggregate = db.query<{ count: number; read: number; starred: number; attachments: number; awakeInboxMessageCount: number; latestAwakeInboxAt: string | null } & Record<typeof roles[number] | `primary_${typeof roles[number]}`, number>, (string | number)[]>(`SELECT COUNT(*) count,MIN(m.is_read) read,MAX(m.is_starred) starred,MAX(json_extract(m.visible,'$.hasAttachments')) attachments,SUM(CASE WHEN ${awakeInboxCondition} THEN 1 ELSE 0 END) awakeInboxMessageCount,MAX(CASE WHEN ${awakeInboxCondition} THEN m.received_at ELSE NULL END) latestAwakeInboxAt,${nativeColumns.join(',')},${primaryColumns.join(',')} FROM sdk_messages m INDEXED BY sdk_message_thread WHERE ${selected.sql}`).get(scope.json, readAt, scope.json, readAt, ...selected.params)!
-        const memberGroups = db.query<{ mailboxId: string; messageCount: number; doneCount: number; snoozedCount: number; earliestSnoozedUntil: string | null }, (string | number)[]>(`SELECT v.mailbox mailboxId,COUNT(*) messageCount,SUM(json_extract(v.data,'$.done')=1) doneCount,SUM(json_extract(v.data,'$.snoozedUntil') IS NOT NULL) snoozedCount,MIN(CASE WHEN json_extract(v.data,'$.snoozedUntil')>? THEN json_extract(v.data,'$.snoozedUntil') END) earliestSnoozedUntil FROM sdk_messages m INDEXED BY sdk_message_thread CROSS JOIN sdk_memberships v INDEXED BY sdk_membership_read ON v.owner=m.owner AND v.source=m.account AND v.message=m.id WHERE ${selected.sql} AND v.mailbox IN (SELECT value FROM json_each(?)) GROUP BY v.mailbox ORDER BY v.mailbox`).all(readAt, ...selected.params, scope.json)
-        const mailboxStates = memberGroups.map(({ earliestSnoozedUntil: _earliest, ...state }) => state)
+        const memberGroups = db.query<{ mailboxId: string; messageCount: number; doneCount: number; snoozedCount: number; earliestSnoozedUntil: string | null; latestWokeAt: string | null }, (string | number)[]>(`SELECT v.mailbox mailboxId,COUNT(*) messageCount,SUM(json_extract(v.data,'$.done')=1) doneCount,SUM(json_extract(v.data,'$.snoozedUntil') IS NOT NULL) snoozedCount,MIN(CASE WHEN json_extract(v.data,'$.snoozedUntil')>? THEN json_extract(v.data,'$.snoozedUntil') END) earliestSnoozedUntil,MAX(CASE WHEN m.folder='inbox' AND json_extract(v.data,'$.done')=0 AND json_extract(v.data,'$.snoozedUntil') IS NULL THEN json_extract(v.data,'$.wokeAt') END) latestWokeAt FROM sdk_messages m INDEXED BY sdk_message_thread CROSS JOIN sdk_memberships v INDEXED BY sdk_membership_read ON v.owner=m.owner AND v.source=m.account AND v.message=m.id WHERE ${selected.sql} AND v.mailbox IN (SELECT value FROM json_each(?)) GROUP BY v.mailbox ORDER BY v.mailbox`).all(readAt, ...selected.params, scope.json)
+        const mailboxStates = memberGroups.map(({ earliestSnoozedUntil: _earliest, latestWokeAt: _woke, ...state }) => state)
+        const latestWokeAt = memberGroups.reduce<string | null>((latest, state) => state.latestWokeAt && (!latest || state.latestWokeAt > latest) ? state.latestWokeAt : latest, null)
         const membershipCount = memberGroups.reduce((sum, state) => sum + state.messageCount, 0)
         const doneMembershipCount = memberGroups.reduce((sum, state) => sum + state.doneCount, 0)
         const earliestSnoozedUntil = memberGroups.reduce<string | null>((earliest, state) => state.earliestSnoozedUntil && (!earliest || state.earliestSnoozedUntil < earliest) ? state.earliestSnoozedUntil : earliest, null)
@@ -2468,7 +2470,7 @@ export function createInbox(options: InboxOptions): Inbox {
         const targetLimit = Math.min(500, membershipBudget - used)
         const targets = db.query<{ mailboxId: string; messageId: string; revision: number; messageRevision: number }, (string | number)[]>(`SELECT v.mailbox mailboxId,m.id messageId,json_extract(v.data,'$.revision') revision,m.revision messageRevision FROM sdk_messages m INDEXED BY sdk_message_thread CROSS JOIN sdk_memberships v INDEXED BY sdk_membership_read ON v.owner=m.owner AND v.source=m.account AND v.message=m.id WHERE ${selected.sql} AND v.mailbox IN (SELECT value FROM json_each(?)) ORDER BY m.received_at DESC,m.id DESC,v.mailbox LIMIT ?`).all(...selected.params, scope.json, targetLimit)
         const row: MailboxConversation = { sourceId: leader.account, threadId: leader.thread_id, cursor: page.next(leader.received_at, leader.id), subject: first.subject, firstMessageId: first.id, messageCount: aggregate.count, membershipCount, doneMembershipCount,
-          awakeInboxMessageCount: aggregate.awakeInboxMessageCount, latestAwakeInboxAt: aggregate.latestAwakeInboxAt, earliestSnoozedUntil, lastMessageAt: leader.received_at, isRead: !!aggregate.read, isStarred: !!aggregate.starred, hasAttachments: !!aggregate.attachments,
+          awakeInboxMessageCount: aggregate.awakeInboxMessageCount, latestAwakeInboxAt: aggregate.latestAwakeInboxAt, earliestSnoozedUntil, latestWokeAt, lastMessageAt: leader.received_at, isRead: !!aggregate.read, isStarred: !!aggregate.starred, hasAttachments: !!aggregate.attachments,
           primaryFolderCounts: { inbox: aggregate.primary_inbox, archive: aggregate.primary_archive, sent: aggregate.primary_sent, drafts: aggregate.primary_drafts, spam: aggregate.primary_spam, trash: aggregate.primary_trash },
           nativeFolders: { inbox: !!aggregate.inbox, archive: !!aggregate.archive, sent: !!aggregate.sent, drafts: !!aggregate.drafts, spam: !!aggregate.spam, trash: !!aggregate.trash }, mailboxStates, messages, messagesComplete: messages.length === aggregate.count, targets, targetsComplete: targets.length === membershipCount }
         let size = Buffer.byteLength(JSON.stringify(row))
@@ -2734,7 +2736,7 @@ export function createInbox(options: InboxOptions): Inbox {
       if (!input || !Object.keys(input).length || Object.keys(input).some(key => !['done', 'snoozedUntil'].includes(key))) throw new InboxError('VALIDATION', 'Invalid mailbox state.')
       if (input.done !== undefined && typeof input.done !== 'boolean') throw new InboxError('VALIDATION', 'Done must be boolean.')
       if (input.snoozedUntil !== undefined && input.snoozedUntil !== null && (!Number.isFinite(Date.parse(input.snoozedUntil)) || Date.parse(input.snoozedUntil) <= now())) throw new InboxError('VALIDATION', 'Snooze requires a future instant.')
-      Object.assign(state, input)
+      Object.assign(state, input); delete state.wokeAt
       if (input.snoozedUntil) state.snoozedUntil = new Date(input.snoozedUntil).toISOString()
       state.revision += 1
       db.query('UPDATE sdk_memberships SET data=? WHERE owner=? AND mailbox=? AND message=?').run(JSON.stringify(state), owner, mailboxId, messageId)
@@ -2770,7 +2772,7 @@ export function createInbox(options: InboxOptions): Inbox {
         if (target.messageRevision !== undefined && summary(messageRow(owner, target.messageId)).revision !== target.messageRevision) throw new InboxError('PRECONDITION_FAILED', 'Message changed.', 412)
         return state
       })
-      const states = before.map(state => ({ ...state, ...(input.done === undefined ? {} : { done: input.done }),
+      const states = before.map(({ wokeAt: _woke, ...state }) => ({ ...state, ...(input.done === undefined ? {} : { done: input.done }),
         snoozedUntil: input.snoozedUntil ? new Date(input.snoozedUntil).toISOString() : null, revision: state.revision + 1 }))
       for (const state of states) {
         db.query('UPDATE sdk_memberships SET data=? WHERE owner=? AND mailbox=? AND message=?').run(JSON.stringify(state), owner, state.mailboxId, state.messageId)

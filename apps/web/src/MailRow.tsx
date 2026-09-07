@@ -62,6 +62,9 @@ function MailRow({
         {recipients ? `To: ${recipients}` : "No To recipients"}
       </span>
       <span className="row-metadata">
+        {m.remindedAt !== undefined && (
+          <Icon name="Bell" size={13} className="reminded-icon" />
+        )}
         {m.starred && <Icon name="Star" size={13} className="starred-icon" />}
         {(m.window ? m.hasAttachments : m.messages.some((msg) => msg.hasAttachments || msg.attachments?.length)) && (
           <Icon name="Paperclip" size={14} />

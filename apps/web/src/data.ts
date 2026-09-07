@@ -82,6 +82,8 @@ export type Mail = {
   reminder?: string;
   scheduled?: string;
   reminderAt?: number;
+  /** Due instant of a reminder that has returned this conversation to Inbox; it sorts and dates by this until newer mail or an explicit action. */
+  remindedAt?: number;
   receivedAt?: number;
   /** Latest awake incoming inbox message across the full selected conversation. */
   importantReceivedAt?: number | null;

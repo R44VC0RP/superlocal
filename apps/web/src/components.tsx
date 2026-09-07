@@ -32,6 +32,12 @@ const paths: Record<string, ReactNode> = {
     </>
   ),
   Send: <path d="m2 3 16 7-16 7 3-7Zm3 7h13" />,
+  Bell: (
+    <>
+      <path d="M10 3a4.5 4.5 0 0 1 4.5 4.5V11l1.5 2.5H4L5.5 11V7.5A4.5 4.5 0 0 1 10 3Z" />
+      <path d="M8.3 16a1.8 1.8 0 0 0 3.4 0" />
+    </>
+  ),
   Trash: (
     <>
       <path d="M3 5h14M7 5V3h6v2M5 5l1 12h8l1-12M8 8v6m4-6v6" />

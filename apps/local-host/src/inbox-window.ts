@@ -350,8 +350,11 @@ export function createInboxWindowService(deps: Dependencies) {
       const full = sdk.messagesComplete && values.length === sdk.messageCount
       const mail = project(scope, values).mail.find(mail => mail.account === scope.row.account)
       if (!mail) fail('HOST_INBOX_SCOPE_CHANGED', 409)
-      if (sdk.latestAwakeInboxAt !== undefined) mail!.importantReceivedAt = sdk.latestAwakeInboxAt === null ? null : Date.parse(sdk.latestAwakeInboxAt)
-      mail!.subject = sdk.subject; mail!.receivedAt = Date.parse(sdk.lastMessageAt); Object.assign(mail!, displayTime(sdk.lastMessageAt))
+      // A reminder that came due after the last message resurfaces at its wake time; newer mail or an explicit action supersedes it.
+      const woke = sdk.latestWokeAt && sdk.latestWokeAt > sdk.lastMessageAt && sdk.awakeInboxMessageCount > 0 && Date.parse(sdk.latestWokeAt) <= budget.now ? sdk.latestWokeAt : undefined
+      if (sdk.latestAwakeInboxAt !== undefined) mail!.importantReceivedAt = sdk.latestAwakeInboxAt === null ? null : Date.parse(woke && woke > sdk.latestAwakeInboxAt ? woke : sdk.latestAwakeInboxAt)
+      mail!.subject = sdk.subject; mail!.receivedAt = Date.parse(woke ?? sdk.lastMessageAt); Object.assign(mail!, displayTime(woke ?? sdk.lastMessageAt))
+      mail!.remindedAt = woke ? Date.parse(woke) : undefined
       mail!.hasAttachments = sdk.hasAttachments; mail!.unread = !sdk.isRead; mail!.starred = sdk.isStarred
       if (!full) {
         const primary = sdk.primaryFolderCounts, roles = sdk.nativeFolders

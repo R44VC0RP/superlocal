@@ -567,6 +567,9 @@ kbd {
 .starred-icon {
   color: #e4c377;
 }
+.reminded-icon {
+  color: #d1b1cf;
+}
 .row-actions {
   display: none;
   flex: 0 0 auto;

@@ -128,7 +128,7 @@ const mailboxConversationQuery = mailboxQuery.omit({ mailboxIds: true, limit: tr
 })
 const mailboxConversation = mailboxThreadKey.extend({
   cursor: opaque.optional(), subject: z.string(), firstMessageId: id, messageCount: revision, membershipCount: revision, doneMembershipCount: revision,
-  awakeInboxMessageCount: revision, latestAwakeInboxAt: date.nullable().optional(), earliestSnoozedUntil: date.nullable(), lastMessageAt: date, isRead: z.boolean(), isStarred: z.boolean(), hasAttachments: z.boolean(),
+  awakeInboxMessageCount: revision, latestAwakeInboxAt: date.nullable().optional(), earliestSnoozedUntil: date.nullable(), latestWokeAt: date.nullable().optional(), lastMessageAt: date, isRead: z.boolean(), isStarred: z.boolean(), hasAttachments: z.boolean(),
   primaryFolderCounts: z.strictObject({ inbox: revision, archive: revision, sent: revision, drafts: revision, spam: revision, trash: revision }).optional(),
   nativeFolders: z.object({ inbox: z.boolean(), archive: z.boolean(), sent: z.boolean(), drafts: z.boolean(), spam: z.boolean(), trash: z.boolean() }),
   mailboxStates: z.array(z.object({ mailboxId: id, messageCount: revision, doneCount: revision, snoozedCount: revision })).max(1000),
