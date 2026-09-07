@@ -872,7 +872,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     assert.equal(result.code, 0, result.output);
     return;
   }
-  const [{ createMockHost }, { MockInboxProvider }, { ProviderError }, { InboxStore, InboxActionError }, fs, { tmpdir }, { join }, { Database }, { createAttentionFeedbackStore }] = await Promise.all([
+  const [{ createMockHost }, { MockInboxProvider }, { ProviderError }, { InboxStore, InboxActionError, dayGroup }, fs, { tmpdir }, { join }, { Database }, { createAttentionFeedbackStore }] = await Promise.all([
     import("../../mock-api/src/host.ts"), import("../../mock-api/src/provider.ts"), import("../../../packages/inbox-sdk/server/sdk/types.ts"),
     import("../src/inbox.ts"), import("node:fs/promises"), import("node:os"), import("node:path"), import("bun:sqlite"), import("../../local-host/src/attention-feedback.ts"),
   ]);
@@ -1419,7 +1419,8 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     assert.equal(calendarView("today").date, calendarToday.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
     assert.equal(calendarView("today").group, "Today");
     assert.equal(calendarView("yesterday").group, "Yesterday");
-    assert.equal(calendarView("year").group, calendarPreviousYear.toLocaleDateString([], { month: "long", year: "numeric" }));
+    assert.equal(calendarView("year").group, dayGroup(calendarPreviousYear, calendarToday));
+    assert.match(calendarView("year").group, /^[A-Z][a-z]+ \d{1,2}(st|nd|rd|th), \d{4}$/);
     await store.loadThread(calendarView("today").id);
     const RealDate = Date, tomorrow = new Date(calendarToday); tomorrow.setDate(tomorrow.getDate() + 1);
     try {

@@ -248,12 +248,13 @@ export function selectMailView(
   const entries: MailListEntry[] = [];
   let totalHeight = 0;
   for (const [index, message] of visibleMail.entries()) {
+    // Today sits at the top unlabeled; every later day gets its own heading.
     if (
-      folder !== "Inbox" &&
       !search &&
-      index > 0 &&
       message.group &&
-      message.group !== visibleMail[index - 1].group
+      (index > 0
+        ? message.group !== visibleMail[index - 1].group
+        : message.group !== "Today")
     ) {
       entries.push({
         key: `group-${message.id}`,
@@ -261,7 +262,7 @@ export function selectMailView(
         height: 60,
         mail: message,
         index,
-        group: message.group === "August" ? "Earlier in August" : message.group,
+        group: message.group,
       });
       totalHeight += 60;
     }
