@@ -20,6 +20,8 @@ export type Message = {
   from: string;
   email: string;
   to: string;
+  /** SDK-derived display excerpt; shown in collapsed thread rows until the body is loaded. */
+  preview?: string;
   cc?: string;
   bcc?: string;
   date: string;

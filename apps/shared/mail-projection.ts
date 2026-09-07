@@ -73,7 +73,7 @@ export function projectMailboxMail(input: MailProjectionInput): { accounts: Mail
       const messages = rows.map(row => {
         const message: Message = { id: row.id, revision: row.revision, bodyRevision: row.bodyRevision, from: row.from.name || row.from.email,
           email: row.from.email, to: addresses(row.to), cc: addresses(row.cc), date: input.displayTime(row.receivedAt).date,
-          receivedAt: row.receivedAt, body: "", loaded: false, outgoing: row.folder === "sent", hasAttachments: row.hasAttachments,
+          receivedAt: row.receivedAt, preview: row.preview, body: "", loaded: false, outgoing: row.folder === "sent", hasAttachments: row.hasAttachments,
           attention: classifyAttention(row), nativeFolder: row.folder, isRead: row.isRead, isStarred: row.isStarred,
           memberships: row.memberships.filter(state => state.mailboxId === box.id) };
         return input.decorateMessage?.(message, row) ?? message;

@@ -770,7 +770,7 @@ export default function ThreadView({
                     }}
                   >
                     <strong>{sent ? "Me" : message.from}</strong>
-                    <span>{message.bodyFormat === "text" ? message.bodyText : plainText(message.body)}</span>
+                    <span>{message.loaded === false ? message.preview : message.bodyFormat === "text" ? message.bodyText : plainText(message.body)}</span>
                     <time dateTime={message.receivedAt} title={message.receivedAt ? new Date(message.receivedAt).toLocaleString() : message.date}>{message.date}</time>
                     <Icon name="ChevronDown" size={12} />
                   </button>
