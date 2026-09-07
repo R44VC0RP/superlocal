@@ -220,6 +220,7 @@ export function AiTriageSettings({ actions, mailboxes, onEditStateChange }: AiTr
       {level === "apply" && <>New mail is placed in <strong>Important</strong> or <strong>Other</strong> by {modelLabel}. Important means a reply or action is needed or it matches your interests. Your manual moves and taught rules always win.</>}
       {level !== "off" && <> Email text goes to {provider}; your reading history and preferences stay on this server.</>}
     </p>
+    {level !== "off" && <label className="settings-checkbox-row ai-auto-labels"><span>Label by type<span className="settings-checkbox-note">Adds Newsletters, Promotions, Receipts, Notifications, Invitations or Cold outreach as local labels. Personal mail stays unlabeled; nothing is written to your provider.</span></span><input type="checkbox" checked={!!saved.autoLabels} disabled={locked} onChange={event => saveNow({ autoLabels: event.target.checked }, event.target.checked ? "Labeling by type. Already assessed mail is being labeled now." : "Type labels are no longer added.")} /></label>}
     {level !== "off" && (working > 0 || state.queue.failed > 0) && <p className="settings-note" role="status">
       {working > 0 && `Assessing ${number(working)} conversation${working === 1 ? "" : "s"}…`}
       {working > 0 && state.queue.failed > 0 && " "}

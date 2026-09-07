@@ -13538,6 +13538,53 @@ describe('AI triage service', () => {
     expect(manual).toMatchObject({ override: { category: 'Other' }, score: { category: 'Other' }, assessment: { response: 'needed', certainty: 'insufficient' } })
   })
 
+  test('type labels are SDK-local, idempotent per assessment, replace a previous type label, and label the existing backlog when turned on', async () => {
+    const h = await fixture(), database = new Database(':memory:')
+    const seeds = [native('labeled-newsletter'), native('labeled-conversation')]
+    const { account, box } = await h.seed('alice', 'ai-auto-labels', seeds)
+    let type: AiAssessment['type'] = 'newsletter'
+    const service = createAiTriageService({ database, inbox: h.inbox, configuration, sessionKey: Buffer.from(KEY, 'base64'), now: () => h.clock.value,
+      fetcher: (async (_url, init) => {
+        const message = JSON.parse(JSON.parse(String(init?.body)).input[0].content).messages[0] as { ref: string; subject: string }
+        const kind = message.subject === seeds[1]!.subject ? 'conversation' : type
+        return Response.json({ ...response, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify({ ...assessment, type: kind, evidence: [{ messageRef: message.ref, quote: message.subject, field: 'type' }] }) }] }] })
+      }) as typeof fetch })
+    cleanup.push(async () => { await service.close(); database.close() })
+    await service.start(); await service.configure('alice', { ...(await service.state('alice')).settings, enabled: true })
+    await service.process('alice', { id: 'ai-labels-seed', scope: 'inbox', limit: 100 })
+    await bounded((async () => { while ((await service.state('alice')).usage.completed !== 2) await Bun.sleep(10) })(), 'label seed receipts')
+    await h.inbox.runDue()
+    expect(await h.inbox.labels('alice', account.id)).toEqual([])
+    const labelsOf = async (subject: string) => { const item = (await h.page('alice')).items.find(item => item.subject === subject)!; return (await h.inbox.labels('alice', account.id)).filter(label => item.labelIds.includes(label.id)).map(label => label.name).sort() }
+    // Turning labels on labels the existing backlog without inference; personal conversations stay unlabeled.
+    const calls = (await service.state('alice')).usage.attempts
+    await service.configure('alice', { ...(await service.state('alice')).settings, autoLabels: true })
+    await bounded((async () => { while ((await labelsOf(seeds[0]!.subject)).length !== 1) { await h.inbox.runDue(); await Bun.sleep(10) } })(), 'backlog type label')
+    expect(await labelsOf(seeds[0]!.subject)).toEqual(['Newsletters'])
+    expect(await labelsOf(seeds[1]!.subject)).toEqual([])
+    expect((await h.inbox.labels('alice', account.id)).map(label => ({ name: label.name, scope: label.scope }))).toEqual([{ name: 'Newsletters', scope: 'local' }])
+    expect((await service.state('alice')).usage.attempts).toBe(calls)
+    const providerCalls = structuredClone(box.calls)
+    // A new assessment of the same thread with a different type replaces the old type label in one local mutation.
+    type = 'promotion'
+    box.put({ ...seeds[0]!, bodyText: 'Now a sale announcement with a discount code.' })
+    await h.sync('alice', account.id)
+    await bounded((async () => { while ((await labelsOf(seeds[0]!.subject)).join() !== 'Promotions') { await h.inbox.runDue(); await Bun.sleep(10) } })(), 'replaced type label')
+    expect(await labelsOf(seeds[0]!.subject)).toEqual(['Promotions'])
+    expect((await h.inbox.labels('alice', account.id)).map(label => label.name).sort()).toEqual(['Newsletters', 'Promotions'])
+    // Local labels never reach the provider: only the sync read happened upstream since the labels were applied.
+    expect(box.calls.mutate).toEqual(providerCalls.mutate)
+    expect(box.calls.createFolder).toEqual(providerCalls.createFolder)
+    // Off again: nothing is removed retroactively and no new labels are added.
+    await service.configure('alice', { ...(await service.state('alice')).settings, autoLabels: false })
+    type = 'receipt'
+    box.put({ ...seeds[0]!, bodyText: 'Your order receipt is attached.' })
+    await h.sync('alice', account.id)
+    await bounded((async () => { while ((await service.state('alice')).usage.completed < 4) await Bun.sleep(10) })(), 'receipt assessment')
+    await h.inbox.runDue()
+    expect(await labelsOf(seeds[0]!.subject)).toEqual(['Promotions'])
+  })
+
   test('teaching generalizes a note into a rule that overrides the thread, enters the prompt with highest precedence, invalidates saved assessments, and re-sorts newest inbox mail', async () => {
     const h = await fixture(), database = new Database(':memory:')
     const seeds = [native('taught-alert'), native('taught-other')]
