@@ -774,18 +774,22 @@ export function createInbox(options: InboxOptions): Inbox {
     }
     const byId = (id: string) => {
       const row = db.query<Candidate, [string, string, string, string]>(`SELECT ${columns} FROM sdk_messages m WHERE m.owner=? AND m.id=? AND m.deleted=0`).get(scope.sourceJson, scope.json, owner, id)
-      // Ordinary mail never crosses the cached-body boundary for this read.
-      return row && forwardingRfcId(row.parent_rfc) ? load(row) : null
+      // Reject ordinary same-source replies from indexed metadata before loading
+      // either body; large inbox counts must not hydrate their reply histories.
+      const rfc = row && forwardingRfcId(row.parent_rfc)
+      if (!row || !row.eligible || !rfc) return null
+      const found = parent(rfc)
+      return !found.ambiguous && found.value && found.value.account !== row.account ? load(row) : null
     }
-    const parents = new Map<string, { value: Cached | null; ambiguous: boolean }>()
+    const parents = new Map<string, { value: Candidate | null; ambiguous: boolean }>()
     const edges = new Map<string, boolean>()
-    const parent = (rfc: string): { value: Cached | null; ambiguous: boolean } => {
+    const parent = (rfc: string): { value: Candidate | null; ambiguous: boolean } => {
       if (parents.has(rfc)) return parents.get(rfc)!
       // Even an adversarial RFC collision set cannot trigger a mailbox scan. More
       // than two owner candidates fails open before any body crosses the boundary.
       const rows = db.query<Candidate, [string, string, string, string]>(`SELECT ${columns} FROM sdk_messages m INDEXED BY sdk_message_forwarding_rfc WHERE m.owner=? AND (CASE WHEN json_valid(m.body) THEN json_extract(m.body,'$.rfcMessageId') END)=? AND m.deleted=0 LIMIT 3`).all(scope.sourceJson, scope.json, owner, rfc)
       const selected = rows.filter(row => row.eligible)
-      const result = rows.length > 2 || selected.length > 1 ? { value: null, ambiguous: true } : { value: load(selected[0] ?? null), ambiguous: false }
+      const result = rows.length > 2 || selected.length > 1 ? { value: null, ambiguous: true } : { value: selected[0] ?? null, ambiguous: false }
       parents.set(rfc, result)
       return result
     }
@@ -798,9 +802,10 @@ export function createInbox(options: InboxOptions): Inbox {
       const found = parent(rfc)
       if (found.ambiguous) return null
       if (!found.value) return current
-      const original = found.value
-      if (visited.has(original.row.id)) return null
-      if (current.row.account === original.row.account) return current
+      if (visited.has(found.value.id)) return null
+      if (current.row.account === found.value.account) return current
+      const original = load(found.value)
+      if (!original) return current
       if (!edges.has(current.row.id)) {
         const sender = current.message.from.email.trim().toLowerCase()
         const delivered = !!db.query('SELECT 1 FROM sdk_delivery_evidence WHERE owner=? AND source=? AND message=? AND kind=\'address\' AND value=?').get(owner, original.row.account, original.row.id, sender)

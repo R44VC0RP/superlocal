@@ -4270,7 +4270,10 @@ describe('live bounded mailbox reads', () => {
       rfcMessageId: `<large-copy-${index}@example.test>`, inReplyTo: mail.rfcMessageId }))
     await h.seed('alice', 'batch-originals', originals)
     const forwarded = await h.seed('alice', 'batch-copies', copies)
-    await h.seed('alice', 'batch-ordinary', Array.from({ length: 20 }, (_, index) => native(`ordinary-${index}`, { bodyText: 'ordinary '.repeat(20000) })))
+    await h.seed('alice', 'batch-ordinary', Array.from({ length: 20 }, (_, index) => native(`ordinary-${index}`, {
+      bodyText: 'ordinary '.repeat(20000), rfcMessageId: `<ordinary-${index}@example.test>`,
+      ...(index ? { inReplyTo: '<ordinary-0@example.test>' } : {}),
+    })))
     const mailboxIds = (await h.inbox.mailboxes('alice')).map(box => box.id)
     const page = await h.inbox.mailboxMessagePage('alice', { mailboxIds })
     const requested = page.items.filter(mail => mail.sourceId === forwarded.account.id).map(mail => mail.id)
