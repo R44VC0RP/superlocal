@@ -1,7 +1,7 @@
 import type { Database } from 'bun:sqlite'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { InboxError, type Inbox, type Mailbox, type Message, type MessageSummary } from 'inbox-sdk'
-import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, AI_PREFERENCE_VERSION, aiKinds, aiResponses, aiActions, aiUrgencies, aiRisks, aiActivityReasons, type AiActivityReason, type AiAssessment, type AiDecision, type AiDecisionPage, type AiRule, type AiTeachInput, type AiTeachResult, type AiDiagnosticActivity, type AiDiagnosticAttempt, type AiDiagnostics, type AiFeedbackInput, type AiHistoryJob, type AiInferenceResult, type AiReadingInput, type AiSettings, type AiThreadKey, type AiTriageInput, type AiTriageState, type AiUsageSummary } from '../../shared/ai-triage'
+import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, AI_PREFERENCE_VERSION, aiAutoLabels, aiKinds, aiResponses, aiActions, aiUrgencies, aiRisks, aiActivityReasons, type AiActivityReason, type AiAssessment, type AiDecision, type AiDecisionPage, type AiRule, type AiTeachInput, type AiTeachResult, type AiDiagnosticActivity, type AiDiagnosticAttempt, type AiDiagnostics, type AiFeedbackInput, type AiHistoryJob, type AiInferenceResult, type AiReadingInput, type AiSettings, type AiThreadKey, type AiTriageInput, type AiTriageState, type AiUsageSummary } from '../../shared/ai-triage'
 import { AI_RULES_PROMPT_VERSION, inferAiRule, inferAiTriage, prepareAiText, publicAiProvider, type AiInferenceConfig } from './ai-inference'
 import { countAiTopicMatches, normalizeAiTopics, scoreAiTriage } from './ai-preferences'
 
@@ -155,7 +155,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
   }
   const settingsStatement = db.prepare<SettingsRow, [string]>('SELECT * FROM local_ai_settings WHERE owner=?')
   const settingsRow = (owner: string) => settingsStatement.get(owner)
-  const defaultSettings = (): AiSettings => ({ revision: 0, enabled: false, mode: 'preview', model: configuration?.defaultModel ?? '', mailboxIds: null, personalization: true, readingSignals: false, interests: [], rules: [] })
+  const defaultSettings = (): AiSettings => ({ revision: 0, enabled: false, mode: 'preview', model: configuration?.defaultModel ?? '', mailboxIds: null, personalization: true, readingSignals: false, interests: [], rules: [], autoLabels: false })
   const settings = (owner: string): AiSettings => { const row = settingsRow(owner); return row ? JSON.parse(row.data) : defaultSettings() }
   const ruleTexts = (value: AiSettings) => (value.rules ?? []).map(rule => rule.text)
   const rulesDigest = (value: AiSettings) => digest(ruleTexts(value))
@@ -763,6 +763,36 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
     publish(queue.owner, decision, queue.fingerprint, context?.sender ?? row.sender, context?.messages, reason)
     db.query('DELETE FROM local_ai_queue WHERE owner=? AND source=? AND thread=?').run(queue.owner, queue.source, queue.thread)
     settleItems(queue.owner, queue.source, queue.thread, !!assessment)
+    if (assessment && context && value.autoLabels) scheduleAutoLabel(queue.owner, decision)
+  }
+  /** SDK-local type labels, applied after the decision transaction commits. Idempotent per assessed input; never a provider write. */
+  const autoLabelQueue: Array<{ owner: string; decision: AiDecision }> = []
+  let autoLabelPump: Promise<void> | undefined
+  const autoLabelNames = new Set(Object.values(aiAutoLabels))
+  function scheduleAutoLabel(owner: string, decision: AiDecision) {
+    if (autoLabelQueue.length >= 20000) return
+    autoLabelQueue.push({ owner, decision: structuredClone(decision) })
+    autoLabelPump ??= (async () => {
+      try { while (autoLabelQueue.length && !closed) { const next = autoLabelQueue.shift()!; await applyAutoLabel(next.owner, next.decision).catch(code => console.warn(JSON.stringify({ event: 'local.ai', code: code instanceof InboxError ? code.code : 'AI_LABEL_FAILED' }))) } }
+      finally { autoLabelPump = undefined }
+    })()
+  }
+  async function applyAutoLabel(owner: string, decision: AiDecision) {
+    if (!decision.assessment || !decision.inputHash || !decision.messageIds.length || !settings(owner).autoLabels) return
+    const wanted = aiAutoLabels[decision.assessment.type]
+    const existing = await inbox.labels(owner, decision.sourceId)
+    let target = wanted ? existing.find(label => label.name === wanted) : undefined
+    if (wanted && !target) target = await inbox.createLabel(owner, decision.sourceId, wanted)
+    const remove = existing.filter(label => autoLabelNames.has(label.name) && label.id !== target?.id).map(label => label.id)
+    if (!target && !remove.length) return
+    const messageIds = decision.messageIds.slice(0, 50), changes = { ...(target ? { addLabelIds: [target.id] } : {}), ...(remove.length ? { removeLabelIds: remove } : {}) }
+    // Keyed by assessed input and exact change so a repeat is a no-op, while a later label set for the same assessment is a new receipt.
+    await inbox.mutate(owner, { messageIds, changes, idempotencyKey: `ai-label:${decision.inputHash.slice(0, 24)}:${digest({ messageIds, changes }).slice(0, 24)}` })
+  }
+  /** Turning labels on labels what is already assessed, newest first and bounded, without any inference. */
+  function labelBacklog(owner: string) {
+    const rows = db.query<{ data: string }, [string]>("SELECT data FROM local_ai_decisions WHERE owner=? AND json_extract(data,'$.state')='ready' ORDER BY seq DESC LIMIT 5000").all(owner)
+    for (const row of rows) scheduleAutoLabel(owner, JSON.parse(row.data))
   }
   async function executeQueue(queue: QueueRow, controller: AbortController) {
     if (queue.attempts >= 3) { transaction(() => finishDecision(queue, null, null, 'AI_RETRY_LIMIT')); return }
@@ -1005,7 +1035,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       return { configured: !!configuration, provider: configuration ? publicAiProvider(configuration) : null, problemCode: configuration ? configuration.models.some(model => model.id === value.model) ? recoveryRow(owner)?.problem ?? rescoreRow(owner)?.problem ?? db.query<CoverageRow, [string]>('SELECT counts,last_drain,problem FROM local_ai_coverage WHERE owner=?').get(owner)?.problem ?? null : 'AI_MODEL_UNAVAILABLE' : configurationProblem && /^[A-Z][A-Z0-9_]{0,79}$/.test(configurationProblem) ? configurationProblem : 'AI_NOT_CONFIGURED', settings: value, queue: { pending: counts.find(item => item.status === 'queued')?.count ?? 0, processing: counts.find(item => item.status === 'processing')?.count ?? 0, failed }, usage: usage(owner), jobs: db.query<{ data: string }, [string]>('SELECT data FROM local_ai_jobs WHERE owner=? ORDER BY rowid DESC LIMIT 20').all(owner).map(row => JSON.parse(row.data)), cursor: cursor(owner).head }
     },
     configure(owner: string, input: AiSettings): Promise<AiTriageState> { return serial(owner, async () => {
-      if (!object(input) || Object.keys(input).some(key => !['revision', 'enabled', 'mode', 'model', 'mailboxIds', 'personalization', 'readingSignals', 'interests', 'rules'].includes(key)) || !Number.isSafeInteger(input.revision) || input.revision < 0 || typeof input.enabled !== 'boolean' || !['preview', 'apply'].includes(input.mode) || typeof input.model !== 'string' || input.model.length > 200 || typeof input.personalization !== 'boolean' || typeof input.readingSignals !== 'boolean' || !Array.isArray(input.interests) || input.interests.length > 64 || input.interests.some(topic => typeof topic !== 'string' || topic.length > 256) || input.rules !== undefined && (!Array.isArray(input.rules) || input.rules.length > 64 || !input.rules.every(ruleOK) || new Set(input.rules.map(rule => rule.id)).size !== input.rules.length) || input.mailboxIds !== null && (!Array.isArray(input.mailboxIds) || input.mailboxIds.length > 1000 || input.mailboxIds.some(id => !idOK(id)))) fail('AI_INVALID_SETTINGS')
+      if (!object(input) || Object.keys(input).some(key => !['revision', 'enabled', 'mode', 'model', 'mailboxIds', 'personalization', 'readingSignals', 'interests', 'rules', 'autoLabels'].includes(key)) || !Number.isSafeInteger(input.revision) || input.revision < 0 || typeof input.enabled !== 'boolean' || !['preview', 'apply'].includes(input.mode) || typeof input.model !== 'string' || input.model.length > 200 || typeof input.personalization !== 'boolean' || typeof input.readingSignals !== 'boolean' || !Array.isArray(input.interests) || input.interests.length > 64 || input.interests.some(topic => typeof topic !== 'string' || topic.length > 256) || input.autoLabels !== undefined && typeof input.autoLabels !== 'boolean' || input.rules !== undefined && (!Array.isArray(input.rules) || input.rules.length > 64 || !input.rules.every(ruleOK) || new Set(input.rules.map(rule => rule.id)).size !== input.rules.length) || input.mailboxIds !== null && (!Array.isArray(input.mailboxIds) || input.mailboxIds.length > 1000 || input.mailboxIds.some(id => !idOK(id)))) fail('AI_INVALID_SETTINGS')
       const previous = settings(owner), priorRow = settingsRow(owner)
       if (!priorRow && (db.query<{ count: number }, []>('SELECT COUNT(*) count FROM local_ai_settings').get()?.count ?? 0) >= 256) fail('AI_OWNER_LIMIT', 429)
       if (previous.revision !== input.revision) fail('AI_SETTINGS_CONFLICT', 412)
@@ -1013,7 +1043,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
       if (configuration && !configuration.models.some(model => model.id === input.model)) fail('AI_MODEL_UNAVAILABLE')
       const boxes = await inbox.mailboxes(owner)
       if (input.mailboxIds?.some(id => !boxes.some(box => box.id === id && box.status === 'active'))) fail('AI_SCOPE_NOT_FOUND', 404)
-      const value: AiSettings = { ...input, revision: previous.revision + 1, mailboxIds: input.mailboxIds === null ? null : [...new Set(input.mailboxIds)].sort(), interests: normalizeAiTopics(input.interests), rules: (input.rules ?? previous.rules ?? []).map(rule => ({ id: rule.id, text: rule.text.replace(/\s+/g, ' ').trim(), category: rule.category, createdAt: rule.createdAt })) }
+      const value: AiSettings = { ...input, revision: previous.revision + 1, mailboxIds: input.mailboxIds === null ? null : [...new Set(input.mailboxIds)].sort(), interests: normalizeAiTopics(input.interests), rules: (input.rules ?? previous.rules ?? []).map(rule => ({ id: rule.id, text: rule.text.replace(/\s+/g, ' ').trim(), category: rule.category, createdAt: rule.createdAt })), autoLabels: input.autoLabels ?? previous.autoLabels ?? false }
       // Rules change the model's instructions, so like a model change they invalidate every saved assessment.
       const invalidated = previous.model !== value.model || JSON.stringify(previous.mailboxIds) !== JSON.stringify(value.mailboxIds) || rulesDigest(previous) !== rulesDigest(value)
       const fenced = previous.enabled !== value.enabled || invalidated
@@ -1036,6 +1066,7 @@ export function createAiTriageService({ database: db, inbox, configuration, conf
         else queueRescore(owner, value, invalidated)
       })
       if (pauseOnly && value.enabled) queuePolicyRescore(owner)
+      if (value.autoLabels && !previous.autoLabels && value.enabled) labelBacklog(owner)
       startRescore(owner)
       if (value.enabled) { watch(owner); schedule(owner) } else { subscriptions.get(owner)?.(); subscriptions.delete(owner) }
       return service.state(owner)

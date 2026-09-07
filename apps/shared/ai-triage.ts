@@ -91,6 +91,12 @@ export type AiSettings = {
   interests: string[];
   /** User-taught classification rules. Unlike interests, these ARE appended to the model's instructions; absent on older saved settings. */
   rules?: AiRule[];
+  /** Apply an SDK-local label named after the assessed type (Newsletters, Promotions, Receipts, ...); never a provider label. Absent on older saved settings. */
+  autoLabels?: boolean;
+};
+/** Local label per assessed type. Personal correspondence and requests stay unlabeled; unknown/other apply none. */
+export const aiAutoLabels: Partial<Record<AiAssessment["type"], string>> = {
+  newsletter: "Newsletters", promotion: "Promotions", receipt: "Receipts", invoice: "Receipts", notification: "Notifications", invitation: "Invitations", cold_outreach: "Cold outreach",
 };
 /** One durable rule generalized from the user's own feedback. Text is the user's data, never provider output executed as instructions. */
 export type AiRule = { id: string; text: string; category: AiCategory | null; createdAt: string };
