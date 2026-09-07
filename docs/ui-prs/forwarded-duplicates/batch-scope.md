@@ -18,7 +18,7 @@ A consequence of view-local matching: if the original leaves Inbox after Done, i
 
 ## Baseline and visible evidence
 
-The branch includes current `main` through `2ef1614`, including the latest AI settings and sidebar progress work. Matched captures use the same fictional fixture, 1440×960 viewport, 100% zoom, Carbon/dark appearance and Comfortable density. AI is unconfigured in the mock; its idle progress indicator is hidden.
+The branch includes current `main` through `a56173a`, including the latest AI settings, sidebar progress and optional type-label work. Matched captures use the same fictional fixture, 1440×960 viewport, 100% zoom, Carbon/dark appearance and Comfortable density. AI is unconfigured in the mock; its idle progress indicator is hidden.
 
 The fixture has 406 canonical messages, 326 native conversations and 325 Inbox conversations. It includes a pair in the first batch, a pair with an archived original, and a pair whose original falls after the initial 200 raw rows.
 
@@ -30,7 +30,7 @@ The fixture has 406 canonical messages, 326 native conversations and 325 Inbox c
 
 [Before recording](batch-before.mp4) · [After recording](batch-after.mp4)
 
-Verified assets: baseline `index-CzzxcNng.js`; final candidate `index-le0_olMp.js`; shared CSS `index-BM6XF745.css`. Captures were inspected. Earlier full workflow checks ran on the same batch backend with `index-DqnWbfjM.js`, before unrelated upstream AI UI updates; final captures/build identity were refreshed afterward.
+Final stills use verified assets: baseline `index-BgrRbzWJ.js`; candidate `index-jirXAW5I.js`; shared CSS `index-BM6XF745.css`. Recordings use the preceding `2ef1614` integration (`index-CzzxcNng.js` / `index-le0_olMp.js`); the later change adds an AI label toggle outside these visible scenarios. Earlier full workflow checks used the same batch backend with `index-DqnWbfjM.js`. Builds and affected stills were refreshed after the upstream changes; captures were inspected.
 
 Browser results:
 
@@ -44,7 +44,7 @@ Browser results:
 
 Instrumented in-process host-service requests compared baseline and candidate against matching immutable fictional snapshot clones. These are **host-request work timings, not browser navigation, body paint, animation or E/W latency**.
 
-The smaller dataset contains 6,500 messages / 3,331 native conversations; the larger retains 50,003 messages / 25,083 conversations, including the earlier three-message arrival exercise. The original fixtures and running UI fixture were not modified. Runtime: Bun 1.4.0, Apple M5 Max, macOS 27. Source fingerprints remained stable during measurement. The host/SDK baseline was `fb7a21d`; later upstream merges changed only frontend files, not measured host/SDK code.
+The smaller dataset contains 6,500 messages / 3,331 native conversations; the larger retains 50,003 messages / 25,083 conversations, including the earlier three-message arrival exercise. The original fixtures and running UI fixture were not modified. Runtime: Bun 1.4.0, Apple M5 Max, macOS 27. Source fingerprints remained stable during measurement. The host/SDK baseline was `fb7a21d`. Later upstream work changes AI UI and optional type labeling; it does not change the measured window/SDK implementation, and automatic labeling is off in these fixtures.
 
 Each sample is one query requesting 100 raw rows plus its next-page request for 100. Five samples per revision/size; values below are milliseconds, median / p95 / max (nearest-rank p95 equals max).
 
@@ -70,7 +70,7 @@ Raw query-plus-page samples:
 
 ## Regression verification and limits
 
-- Full API suite: 353 passed. Full web suite: 94 passed. SDK build/typecheck, host typecheck and final optimized web build passed; the existing bundle-size warning remains.
+- Full API suite: 353 passed. Full web suite: 94 passed. After the final upstream type-label merge, its new lifecycle test, teaching test, five batch-proof tests and host batch regression passed. SDK build/typecheck, host typecheck and final optimized web build passed; the existing bundle-size warning remains.
 - After head/Undo refinements, both host-service-backed web cases and all 12 existing bounded-host API cases passed. New assertions cover withheld AI originals, resident-copy removal, pinned-original restoration, real Done/Undo receipts, exact page membership, no refill and reversible per-row bookmarks.
 - SDK tests cover batch-only parent lookup, privacy/generation fences, malformed data, collisions/cycles, same-source proof, proof-cache eviction/invalidation and no global forwarding maintenance. Existing unrelated tests were preserved; no new test files or dependencies were introduced.
 - No global uniqueness across separately requested batches is promised. Stored totals and bulk capture semantics remain native, not globally compacted totals.
