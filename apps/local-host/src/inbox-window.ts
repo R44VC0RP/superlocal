@@ -398,10 +398,12 @@ export function createInboxWindowService(deps: Dependencies) {
         counts: { messages: sdk.messageCount, memberships: sdk.membershipCount, unread: full ? values.filter(value => !value.isRead).length : sdk.isRead ? 0 : null, done: sdk.doneMembershipCount,
           snoozed: full ? values.reduce((sum, value) => sum + value.memberships.filter(state => !!state.snoozedUntil && Date.parse(state.snoozedUntil) > budget.now).length, 0) : sdk.earliestSnoozedUntil ? null : 0 },
         targets: sdk.targets, targetsComplete, actionContextComplete: full && targetsComplete && preview.length === sdk.messageCount, contextVersion: context.hash }
-      while (bytes(row) > 512 * 1024 && row.summaries.length > 1) {
+      let rowSize = bytes(row)
+      while (rowSize > 512 * 1024 && row.summaries.length > 1) {
         const removed = row.summaries.pop()!; row.mail.messages = row.mail.messages.filter(message => message.id !== removed.id); row.messagesComplete = false; row.actionContextComplete = false
+        rowSize = bytes(row)
       }
-      if (bytes(row) > DTO.INBOX_RESPONSE_BYTE_LIMIT - 65536) fail('HOST_INBOX_TOO_LARGE', 413)
+      if (rowSize > DTO.INBOX_RESPONSE_BYTE_LIMIT - 65536) fail('HOST_INBOX_TOO_LARGE', 413)
       budget.summaries.set(row.key, values); budget.contexts.set(row.key, context.evidence)
       if (full) budget.legacy.set(row.key, legacyContextFingerprint(scope, values))
       rows.push(row)

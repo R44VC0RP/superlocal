@@ -826,6 +826,11 @@ export class InboxStore {
       this.windowCheck(epoch, generation);
       if (request !== this.windowSenderEpoch) throw new DOMException("Sender changed", "AbortError");
     }
+    // Optional statistics yield to actions already queued when the reader settles.
+    const actionReady = this.actionQueue;
+    await actionReady;
+    this.windowCheck(epoch, generation);
+    if (request !== this.windowSenderEpoch) throw new DOMException("Sender changed", "AbortError");
     const result = await this.windowTransport.sender(input);
     this.windowCheck(epoch, generation);
     if (request !== this.windowSenderEpoch) throw new DOMException("Sender changed", "AbortError");

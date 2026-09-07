@@ -235,7 +235,7 @@ export function mockCredentialScope(store: MockMailStore, credentials: ProviderC
 export function createMockProviderDefinition(store: MockMailStore): ProviderDefinition {
   return {
     id: PROVIDER_ID, name: 'Superlocal Mock (offline)', connection: 'credentials', scopes: [],
-    credentialReconnect: false, mailboxSelection: 'automatic',
+    credentialReconnect: false, mailboxSelection: 'automatic', syncHints: false,
     create(credentials) { return new MockInboxProvider(store, mockCredentialScope(store, credentials)) },
   }
 }

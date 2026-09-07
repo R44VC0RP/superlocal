@@ -3318,6 +3318,21 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           const senderRequests: SenderInput[] = [], requestOrder: string[] = [];
           const senderBodyBaseline = bodyReads.length, senderQueryBaseline = queries, senderPageBaseline = pages.length;
           const senderInput: SenderInput = { account: box.id, id: giantKey, domain: null };
+          const senderFetch = globalThis.fetch, doneRow = store.getSnapshot().mail.find(mail => mail.id === row(1601).key)!;
+          assert.ok(doneRow, "the Done target is separate from the pending reader and its companion");
+          const doneMail = { ...doneRow, sourceGeneration: source.generation };
+          let releaseDone: (() => void) | undefined, rejectDone = false, doneRequests = 0;
+          globalThis.fetch = (async (input, init) => {
+            const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+            if (url.pathname !== "/v1/mailbox-actions" || init?.method !== "POST") return senderFetch(input, init);
+            const command = JSON.parse(String(init.body)) as Parameters<import("inbox-sdk/types").Inbox["setMailboxStates"]>[1];
+            assert.equal(command.done, true); assert.deepEqual(command.targets, doneMail.window!.targets.map(({ mailboxId, messageId, revision }) => ({ mailboxId, messageId, revision })));
+            doneRequests++; requestOrder.push("done");
+            await new Promise<void>(resolve => { releaseDone = resolve; });
+            requestOrder.push(rejectDone ? "done:failed" : "done:ack");
+            return rejectDone ? Response.json({ code: "CONFLICT", error: "Fictional Done conflict." }, { status: 412 })
+              : Response.json({ id: command.id, retracted: false, states: command.targets.map(target => ({ ...target, revision: target.revision + 1, done: true, snoozedUntil: null })) } satisfies import("inbox-sdk/types").MailboxStateReceipt);
+          }) as typeof fetch;
           let readerError: Error | undefined, cachedAtDispatch: readonly Mail[] | undefined;
           bodyRead = async id => {
             assert.ok(["giant-700", "giant-699", "giant-698", "giant-697"].includes(id));
@@ -3341,8 +3356,15 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           await until(() => !!releaseReader, "the actual current-reader body request is held");
           assert.deepEqual(bodyReads.slice(senderBodyBaseline), ["giant-700"]); assert.equal(senderRequests.length, 0, "secondary statistics cannot dispatch while the reader body is pending");
           assert.strictEqual(store.loadThread(giantKey), readerReady, "the parent reader effect shares the already-started body request");
-          releaseReader!(); releaseReader = undefined; await opening;
-          assert.deepEqual(requestOrder, ["body:giant-700", "ready:giant-700", "sender"]);
+          const done = store.action([doneMail], "done"); void done.catch(() => {});
+          await until(() => !!releaseDone, "the actual Done POST is held after the reader and sender requests began");
+          releaseReader!(); releaseReader = undefined; await readerReady; await sleep(30);
+          assert.equal(senderRequests.length, 0, "settled reader statistics cannot compete with an already-queued durable Done write");
+          assert.equal(store.getSnapshot().pending, 1);
+          releaseDone!(); releaseDone = undefined;
+          const doneReceipt = await done; await opening;
+          assert.ok(doneReceipt.receipts?.some(receipt => receipt.kind === "mailbox-state"), "the durable Done receipt releases optional statistics");
+          assert.deepEqual(requestOrder, ["body:giant-700", "done", "ready:giant-700", "done:ack", "sender"]);
           assert.deepEqual(senderRequests, [senderInput]);
           assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.find(message => message.id === "giant-700")!.body, "<p>Priority body giant-700.</p>");
           const cachedReader = store.getSnapshot().mail.find(mail => mail.id === giantKey);
@@ -3375,6 +3397,27 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           await store.senderWindow({ ...senderInput, selectedMessageId: "giant-698" });
           assert.equal(senderRequests.length, 4); assert.equal(bodyReads.length, senderBodyBaseline + 3, "ungated sender reads remain body-free even for an unloaded reader message");
 
+          rejectDone = true;
+          for (const clearWhileWaiting of [false, true]) {
+            const before = senderRequests.length;
+            const failedDone = assert.rejects(store.action([doneMail], "done"), /Fictional Done conflict/);
+            await until(() => !!releaseDone, "the conflicting Done POST is held before its acknowledgement");
+            const waitingSender = store.senderWindow(senderInput, store.loadThread(giantKey));
+            const settledSender = clearWhileWaiting
+              ? assert.rejects(waitingSender, error => error instanceof DOMException && error.name === "AbortError") : waitingSender;
+            void settledSender.catch(() => {});
+            await sleep(30);
+            assert.equal(senderRequests.length, before, "even a cached reader waits for an already-queued action");
+            if (clearWhileWaiting) store.clearSenderWindow();
+            releaseDone!(); releaseDone = undefined; await Promise.all([failedDone, settledSender]);
+            assert.equal(store.getSnapshot().pending, 0);
+            assert.equal(senderRequests.length, before + (clearWhileWaiting ? 0 : 1), clearWhileWaiting
+              ? "clearing the sender while it waits on Done prevents dispatch after queue release"
+              : "a failed durable action releases optional sender statistics without hiding its error");
+          }
+          assert.equal(doneRequests, 3, "the controlled conflicts do not retry their Done POSTs");
+          globalThis.fetch = senderFetch;
+
           store.clearSenderWindow();
           const oldReader = store.loadThread(giantKey, "giant-697");
           const oldSender = store.senderWindow({ ...senderInput, selectedMessageId: "giant-697" }, oldReader);
@@ -3384,7 +3427,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Sent" });
           await until(() => !store.getSnapshot().window!.paging, "the replacement view finishes its single buffer");
           releaseReader!(); releaseReader = undefined; await switched;
-          assert.equal(senderRequests.length, 4, "a changed window epoch rejects queued old-view statistics before dispatch");
+          assert.equal(senderRequests.length, 5, "a changed window epoch rejects queued old-view statistics before dispatch");
           await store.retry(); assert.deepEqual(changes.at(-1)!.pinnedKeys, []);
           assert.equal(changes.at(-1)!.queryId, store.getSnapshot().window!.state.queryId); assert.equal(store.getSnapshot().error, null);
           assert.ok(!store.getSnapshot().mail.some(mail => mail.id === giantKey));

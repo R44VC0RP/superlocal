@@ -8532,6 +8532,93 @@ describe('worker leases, sync checkpoints, and delayed actions', () => {
     expect((await h.page()).total).toBe(600)
   })
 
+  test('built-in Gmail and mock skip sync hints while other definitions retain the default', () => {
+    expect(builtInProviders.find(provider => provider.id === 'gmail')!.syncHints).toBe(false)
+    for (const id of ['imap', 'inbound', 'outlook']) expect(builtInProviders.find(provider => provider.id === id)!.syncHints).not.toBe(false)
+    const store = new MockMailStore(':memory:')
+    try { expect(createMockProviderDefinition(store).syncHints).toBe(false) }
+    finally { store.close() }
+  })
+
+  test.each([undefined, true, false])('sync hints %s preserve eager snapshots or skip inventory without losing deltas', async (syncHints) => {
+    const seed = [native('same'), native('deleted'), ...Array.from({ length: 598 }, (_, index) => native(`known-${index}`))]
+    const box = referenceMailbox('sync-hints', 'sync-hints@example.test', seed)
+    const contexts: SyncContext[] = []
+    let waitForSync: (() => Promise<void>) | undefined
+    const definition: ProviderDefinition = { id: DYNAMIC, name: 'Hint contract',
+      ...(syncHints === undefined ? {} : { syncHints }),
+      create(credentials) {
+        const provider = box.adapter(credentials, DYNAMIC, fullCapabilities)
+        const sync = provider.sync.bind(provider)
+        provider.sync = async (cursor, options, context) => {
+          const wait = waitForSync; waitForSync = undefined
+          // The reference adapter clones its arguments; do not let that read the hints before the wait.
+          const result = await sync(cursor, options)
+          if (wait) await wait()
+          // Read the actual context only after the async boundary, not the adapter's cloned call log.
+          contexts.push(structuredClone(context!))
+          return result
+        }
+        return provider
+      } }
+    const h = await fixture({ providers: [definition] })
+    const account = await h.inbox.connect('alice', { providerId: DYNAMIC, credentials: { mailbox: 'sync-hints' } })
+    await h.sync('alice', account.id)
+    expect(contexts[0]).toEqual({ lane: 'latest', snapshotComplete: false,
+      ...(syncHints === false ? {} : { knownMessageIds: [], knownMessageStates: [] }) })
+    const database = new Database(h.database)
+    await h.restart(database)
+    const query = database.query.bind(database)
+    let inventories = 0
+    const guard = spyOn(database, 'query').mockImplementation(((sql: string) => {
+      if (/^SELECT\s+native_id\b.*\bconfirmed\b.*\bFROM\s+sdk_messages\b/i.test(sql)) inventories++
+      return query(sql)
+    }) as typeof database.query)
+    try {
+      const held = h.gate<void>(undefined)
+      waitForSync = held.wait
+      box.nextSync(receipt([], 'held'))
+      const syncing = h.pending(h.sync('alice', account.id))
+      await bounded(held.entered, 'sync hints before concurrent persistence')
+      box.nextSync(receipt([native('same', { isRead: true, isStarred: true }), native('backfill-new')], 'backfill'))
+      await h.sync('alice', account.id, { lane: 'backfill' })
+      held.release()
+      await syncing
+      const heldContext = contexts.at(-1)!
+      expect(heldContext).toMatchObject({ lane: 'latest', snapshotComplete: true })
+      expect(contexts.at(-2)!.lane).toBe('backfill')
+      if (syncHints !== false) {
+        expect(heldContext.knownMessageIds!.slice().sort()).toEqual(seed.map(message => message.id).sort())
+        expect(heldContext.knownMessageStates!.slice().sort((a, b) => a.id.localeCompare(b.id))).toEqual(
+          seed.map(({ id, isRead, isStarred, folder }) => ({ id, isRead, isStarred, folder })).sort((a, b) => a.id.localeCompare(b.id)))
+      }
+      const beforeArrival = await h.inbox.changes('alice')
+      box.nextSync(receipt([native('same', { isRead: true, isStarred: true }), native('arrival')], 'delta', { deletedMessageIds: ['deleted'] }))
+      await h.sync('alice', account.id)
+      expect((await h.page()).total).toBe(601)
+      expect((await h.page('alice', { starredOnly: true })).items).toEqual([expect.objectContaining({ subject: 'Subject same', isRead: true, isStarred: true })])
+      expect((await h.page('alice', { search: 'Subject deleted' })).total).toBe(0)
+      const arrival = (await h.page('alice', { search: 'Subject arrival' })).items[0]!
+      expect((await h.inbox.changes('alice', { since: beforeArrival.state })).events).toContainEqual(expect.objectContaining({ type: 'mail.changed', entityId: arrival.id, reason: 'arrival' }))
+      for (let poll = 0; poll < 5; poll++) {
+        box.nextSync(receipt([], `idle-${poll}`))
+        await h.sync('alice', account.id)
+      }
+      expect(inventories).toBe(syncHints === false ? 0 : 8)
+      if (syncHints === false) {
+        for (const context of contexts) {
+          expect(Object.hasOwn(context, 'knownMessageIds')).toBe(false)
+          expect(Object.hasOwn(context, 'knownMessageStates')).toBe(false)
+        }
+      } else {
+        expect(contexts.at(-1)!.knownMessageIds).toHaveLength(601)
+        expect(contexts.at(-1)!.knownMessageIds).not.toContain('deleted')
+        expect(contexts.at(-1)!.knownMessageStates).toContainEqual({ id: 'same', isRead: true, isStarred: true, folder: 'inbox' })
+      }
+      expect(box.calls.mutate).toEqual([])
+    } finally { guard.mockRestore() }
+  })
+
   test('a held page-only head cannot overwrite concurrently completed or explicitly restarted backfill coverage', async () => {
     const h = await fixture()
     const { box } = await h.connect('alice', 'page-only-coverage-race')

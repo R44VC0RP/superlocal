@@ -127,6 +127,8 @@ export interface ProviderDefinition {
   name: string
   /** Translate retained native folder roles into upstream category facts, without opening a provider connection. */
   nativeCategoryRoles?: Readonly<Record<string, string>>
+  /** Defaults to true. False omits knownMessageIds/knownMessageStates only; use it only if sync never consumes them. */
+  syncHints?: boolean
   connection?: 'oauth' | 'credentials'
   scopes?: string[]
   /** Runtime cancellation is separate from provider-validated credential fields. */

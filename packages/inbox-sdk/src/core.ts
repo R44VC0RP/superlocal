@@ -2195,7 +2195,8 @@ export function createInbox(options: InboxOptions): Inbox {
         const backfill = db.query<{ data: string }, [string, number, string]>('SELECT data FROM sdk_checkpoints WHERE account=? AND generation=? AND scope=? AND lane=\'backfill\'').get(id, row.generation, checkpointScope)
         const backfillCheckpoint: SyncCheckpoint | undefined = backfill ? JSON.parse(backfill.data) : undefined
         let fence: number
-        const known = db.query<{ native_id: string; is_read: number; is_starred: number; folder: string }, [string, number]>(
+        const definition = definitions.get((JSON.parse(row.data) as Account).providerId)
+        const known = definition?.syncHints === false ? undefined : db.query<{ native_id: string; is_read: number; is_starred: number; folder: string }, [string, number]>(
           "SELECT native_id,json_extract(confirmed,'$.isRead') is_read,json_extract(confirmed,'$.isStarred') is_starred,json_extract(confirmed,'$.folder') folder FROM sdk_messages WHERE account=? AND generation=? AND deleted=0").all(id, row.generation)
         const syncOptions = { folder: scope, limit: request.limit ?? 100, ...(selection?.scopes ? { mailboxScopes: selection.scopes } : {}) }
         // Runtime hints are separate from providers' validated operation input.
@@ -2204,8 +2205,9 @@ export function createInbox(options: InboxOptions): Inbox {
           snapshotComplete: !request.reset && (backfillCheckpoint
             ? backfillCheckpoint.initialized && backfillCheckpoint.cursor === null
             : checkpoint.snapshotComplete ?? (Boolean(saved) && checkpoint.initialized && (JSON.parse(row.data) as Account).sync.coverage === 'complete')),
-          knownMessageIds: known.map(message => message.native_id),
-          knownMessageStates: known.map(message => ({ id: message.native_id, isRead: Boolean(message.is_read), isStarred: Boolean(message.is_starred), folder: message.folder })) }
+          ...(known ? {
+            knownMessageIds: known.map(message => message.native_id),
+            knownMessageStates: known.map(message => ({ id: message.native_id, isRead: Boolean(message.is_read), isStarred: Boolean(message.is_starred), folder: message.folder })) } : {}) }
         let page: SyncResult
         let synchronized = 0
         let inputCursor = checkpoint.cursor
