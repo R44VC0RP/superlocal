@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, type CSSProperties } from "react";
 import { Icon, IconButton } from "./components";
 import { displayDate, type Mail } from "./data";
 
@@ -10,6 +10,17 @@ type MailRowProps = {
   sent: boolean;
   showSnippets: boolean;
 };
+
+const labelHues: Record<string, number> = { social: 250, marketing: 25, pitch: 300, news: 85, updates: 200, forums: 150, promotions: 55, finance: 130 };
+
+/** Stable hue per label so the same label reads the same color everywhere. */
+export function labelHue(label: string) {
+  const key = label.trim().toLowerCase();
+  if (key in labelHues) return labelHues[key];
+  let hash = 0;
+  for (const char of key) hash = (hash * 31 + char.codePointAt(0)!) >>> 0;
+  return hash % 360;
+}
 
 function MailRow({
   mail: m,
@@ -54,7 +65,12 @@ function MailRow({
         {showSnippets && <span className="row-snippet">{m.snippet}</span>}
       </span>
       {m.labels.length > 0 && (
-        <span className="row-label" role="cell" title={m.labels.join(", ")}>
+        <span
+          className="row-label"
+          role="cell"
+          title={m.labels.join(", ")}
+          style={{ "--label-hue": labelHue(m.labels[0]) } as CSSProperties}
+        >
           {m.labels[0]}
         </span>
       )}

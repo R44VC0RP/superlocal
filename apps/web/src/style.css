@@ -558,11 +558,16 @@ kbd {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--muted);
+  --label-hue: 250;
+  color: oklch(0.88 0.08 var(--label-hue));
+  background: oklch(0.38 0.1 var(--label-hue));
   font-size: 10px;
-  border: 1px solid var(--border);
   border-radius: 3px;
-  padding: 1px 5px;
+  padding: 2px 5px;
+}
+[data-theme="light"] .row-label {
+  color: oklch(0.42 0.14 var(--label-hue));
+  background: oklch(0.92 0.06 var(--label-hue));
 }
 .starred-icon {
   color: #e4c377;

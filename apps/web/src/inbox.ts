@@ -215,6 +215,14 @@ function draftHtml(value: string): string {
   return template.innerHTML;
 }
 
+/** Day-level group heading: "September 4th", plus the year once it differs from today's. */
+export function dayGroup(time: Date, today = new Date()) {
+  const day = time.getDate(), rest = day % 100;
+  const suffix = rest >= 11 && rest <= 13 ? "th" : day % 10 === 1 ? "st" : day % 10 === 2 ? "nd" : day % 10 === 3 ? "rd" : "th";
+  const month = time.toLocaleDateString([], { month: "long" });
+  return `${month} ${day}${suffix}${time.getFullYear() === today.getFullYear() ? "" : `, ${time.getFullYear()}`}`;
+}
+
 function displayTimes() {
   // One pass gets consistent calendar boundaries/default locale/timezone.
   // Recreate on the next pass, so midnight or a timezone change cannot leave
@@ -224,15 +232,13 @@ function displayTimes() {
   const yesterdayLabel = yesterday.toDateString();
   const clock = new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" });
   const date = new Intl.DateTimeFormat([], { month: "short", day: "numeric" });
-  const month = new Intl.DateTimeFormat([], { month: "long" });
-  const year = new Intl.DateTimeFormat([], { month: "long", year: "numeric" });
   const values = new Map<string, { date: string; group: string }>();
   const locale = clock.resolvedOptions();
   return { key: `${locale.locale}\0${locale.timeZone}\0${todayLabel}`, format: (value: string) => {
     const cached = values.get(value); if (cached) return cached;
     const time = new Date(value), day = time.toDateString(), sameDay = day === todayLabel;
     const formatted = { date: sameDay ? clock.format(time) : date.format(time),
-      group: sameDay ? "Today" : day === yesterdayLabel ? "Yesterday" : (time.getFullYear() !== today.getFullYear() ? year : month).format(time) };
+      group: sameDay ? "Today" : day === yesterdayLabel ? "Yesterday" : dayGroup(time, today) };
     values.set(value, formatted); return formatted;
   } };
 }
