@@ -322,13 +322,6 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const matchingWindow = inbox.host?.inboxWindow && inbox.window && JSON.stringify(inbox.window.query) === JSON.stringify(windowQuery) ? inbox.window : null;
   const activeWindow = inbox.host?.inboxWindow ? matchingWindow ?? { keys: [], totals: unknownTotals } : undefined;
   useEffect(() => { void store.setWindowQuery(windowQuery).catch(actionError); }, [store, windowQuery]);
-  // Fast opens and retained views show nothing; only a genuinely slow load announces itself.
-  const [slowLoading, setSlowLoading] = useState(false);
-  useEffect(() => {
-    if (!inbox.loading) { setSlowLoading(false); return; }
-    const timer = setTimeout(() => setSlowLoading(true), 150);
-    return () => clearTimeout(timer);
-  }, [inbox.loading]);
   // Static folders follow the receiving sources' capabilities; a unified view offers what any selected source supports.
   const hiddenFolders = useMemo(() => folders.filter(([, , , capability]) => capability && !store.sourceCapability(capability, route.account)).map(([name]) => name),
     [store, inbox.sources, inbox.mailboxes, inbox.viewPreferences, route.account]);
@@ -2364,7 +2357,6 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
                 />
               )}
               {inbox.host?.inboxWindow && !currentMail && <div className="mail-window-status" role="status">
-                {inbox.loading && slowLoading ? "Loading conversations…" : null}
                 {!inbox.loading && matchingWindow?.keys.length === 0 && (!matchingWindow.exhausted || matchingWindow.hasNewer) && (matchingWindow.nextCursor || matchingWindow.hasNewer
                   ? <span>No matches in the conversations checked.</span>
                   : <><span>Could not finish loading this view.</span><button type="button" className="text-button" disabled={inbox.refreshing} onClick={() => { void store.refresh().catch(actionError); }}>Retry</button></>)}
