@@ -17,6 +17,8 @@ export type AiInferenceConfig = {
   maxOutputTokens?: number;
   timeoutMs?: number;
   concurrency?: number;
+  /** Responses API reasoning effort for classification and rule drafting; default low. */
+  reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high';
 }
 
 class AiSafeError extends Error {
@@ -59,7 +61,7 @@ function validateRate(value: unknown): AiRateCard | null {
 }
 
 function validateConfig(value: unknown): AiInferenceConfig {
-  if (!object(value) || !keys(value, ['version', 'protocol', 'name', 'endpoint', 'apiKey', 'defaultModel', 'models', 'maxOutputTokens', 'timeoutMs', 'concurrency']) ||
+  if (!object(value) || !keys(value, ['version', 'protocol', 'name', 'endpoint', 'apiKey', 'defaultModel', 'models', 'maxOutputTokens', 'timeoutMs', 'concurrency', 'reasoningEffort']) ||
     value.version !== 1 || value.protocol !== 'openai-responses' || !label(value.name, 80) || !httpsUrl(value.endpoint) ||
     typeof value.apiKey !== 'string' || !/^[\x21-\x7e]{1,4096}$/.test(value.apiKey) || !modelId(value.defaultModel) ||
     !Array.isArray(value.models) || value.models.length < 1 || value.models.length > 64) fail('AI_CONFIG_INVALID')
@@ -70,11 +72,13 @@ function validateConfig(value: unknown): AiInferenceConfig {
   if (new Set(models.map(item => item.id)).size !== models.length || !models.some(item => item.id === value.defaultModel) ||
     value.maxOutputTokens !== undefined && !integer(value.maxOutputTokens, 128, 8192) ||
     value.timeoutMs !== undefined && !integer(value.timeoutMs, 1000, 120_000) ||
-    value.concurrency !== undefined && !integer(value.concurrency, 1, 16)) fail('AI_CONFIG_INVALID')
+    value.concurrency !== undefined && !integer(value.concurrency, 1, 16) ||
+    value.reasoningEffort !== undefined && !['minimal', 'low', 'medium', 'high'].includes(value.reasoningEffort as string)) fail('AI_CONFIG_INVALID')
   return {
     version: 1, protocol: 'openai-responses', name: value.name, endpoint: value.endpoint, apiKey: value.apiKey,
     defaultModel: value.defaultModel, models, maxOutputTokens: value.maxOutputTokens as number | undefined ?? 2500,
     timeoutMs: value.timeoutMs as number | undefined ?? 45_000, concurrency: value.concurrency as number | undefined ?? 2,
+    reasoningEffort: (value.reasoningEffort as AiInferenceConfig['reasoningEffort']) ?? 'low',
   }
 }
 
@@ -373,7 +377,7 @@ export async function inferAiTriage(
     timer = setTimeout(() => { timedOut = true; controller.abort() }, effective.timeoutMs)
     const work = async () => {
       const body = JSON.stringify({
-        model: selected.id, store: false, stream: false, tools: [], tool_choice: 'none', truncation: 'disabled',
+        model: selected.id, store: false, stream: false, tools: [], tool_choice: 'none', truncation: 'disabled', reasoning: { effort: effective.reasoningEffort },
         max_output_tokens: effective.maxOutputTokens, instructions: renderAiRules(options.rules ?? []) + instructions + (options.retrying ? '\nRecheck evidence carefully: copy short literal source phrases for every required field. Do not paraphrase or invent quotes. Use unknown if the source does not establish a claim.' : ''),
         input: [{ role: 'user', content: JSON.stringify(input) }],
         text: { format: { type: 'json_schema', name: 'triage_result_v2', strict: true, schema: assessmentSchema } },
@@ -487,7 +491,7 @@ export async function inferAiRule(input: AiRuleDraftInput, config: AiInferenceCo
       type: input.conversation.type, reason: input.conversation.reason?.slice(0, 400) ?? null, topics: input.conversation.topics.slice(0, 8).map(value => value.slice(0, 80)), currentCategory: input.conversation.currentCategory },
       ...(input.existingRules?.length ? { existingRules: input.existingRules.slice(0, 64).map(rule => ({ id: rule.id, text: rule.text.slice(0, 240) })) } : {}) }
     const body = JSON.stringify({
-      model: options.model, store: false, stream: false, tools: [], tool_choice: 'none', truncation: 'disabled', max_output_tokens: 600, instructions: ruleInstructions,
+      model: options.model, store: false, stream: false, tools: [], tool_choice: 'none', truncation: 'disabled', reasoning: { effort: effective.reasoningEffort }, max_output_tokens: 600, instructions: ruleInstructions,
       input: [{ role: 'user', content: JSON.stringify(bounded) }], text: { format: { type: 'json_schema', name: 'triage_rule_v1', strict: true, schema: ruleSchema } },
     })
     const response = await (options.fetcher ?? fetch)(effective.endpoint, { method: 'POST', redirect: 'error', signal: controller.signal,
