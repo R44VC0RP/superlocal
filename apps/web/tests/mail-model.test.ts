@@ -8,6 +8,7 @@ import { classifyAttention, conversationAttention } from "../../shared/mail-atte
 import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, aiSortingStatus, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
+import { matchingRecipientAlias } from "../src/recipient-alias.ts";
 import {
   advanceMail,
   appendOutgoing,
@@ -28,6 +29,42 @@ const inbox = seedMail().find(
     mail.messages.every((message) => message.email !== mail.account),
 )!;
 const deadline = "2026-10-01T12:00:00.000Z";
+
+test("recipient alias display requires one verified incoming recipient match", () => {
+  const aliases = ["notes@example.test", "billing@example.test"];
+  const row = (to: string[], cc: string[] = [], folder = "inbox", deliveredTo?: string[]) => ({ folder, deliveredTo,
+    to: to.map(email => ({ email })), cc: cc.map(email => ({ email })) });
+  const match = (rows: ReturnType<typeof row>[], known = aliases) => matchingRecipientAlias(rows, known.map(email => ({ email, isPrimary: false })), "primary@example.test");
+  assert.equal(match([row(["NOTES@example.test", "external@example.test"])]), aliases[0]);
+  assert.equal(match([row(["external@example.test"], [aliases[0]])]), aliases[0]);
+  assert.equal(match([row([aliases[0]]), row([aliases[0]])]), aliases[0]);
+  assert.equal(match([row([aliases[0]]), row(["external@example.test"], [], "sent")]), aliases[0]);
+  assert.equal(match([row([aliases[0]]), row([aliases[1]], [], "sent")]), aliases[0]);
+  assert.equal(match([row([aliases[0]], [aliases[1]])]), undefined);
+  assert.equal(match([row([aliases[0]]), row([aliases[1]])]), undefined);
+  assert.equal(match([row(["primary@example.test"])], [...aliases, "PRIMARY@example.test"]), undefined);
+  assert.equal(match([row(["external@example.test"])]), undefined);
+  assert.equal(match([row([aliases[0]])], []), undefined);
+  assert.equal(match([row([aliases[0]], [], "sent")]), undefined);
+  assert.equal(match([row([aliases[0]], [], "drafts")]), undefined);
+  assert.equal(match([row(["notes+other@example.test"])]), undefined);
+  assert.equal(match([row([])]), undefined);
+  assert.equal(match([row([], [], "inbox", ["NOTES@example.test", aliases[0]])]), aliases[0]);
+  assert.equal(match([row(["list@example.test"], [], "inbox", [aliases[1]])]), aliases[1]);
+  assert.equal(match([row([aliases[0]], [], "inbox", ["primary@example.test"])]), aliases[0]);
+  assert.equal(match([row(aliases, [], "inbox", [aliases[1]])]), aliases[1]);
+  assert.equal(match([row([], [], "inbox", aliases)]), undefined);
+  assert.equal(match([row([], [], "inbox", ["unknown@example.test"])]), undefined);
+  assert.equal(match([row([], [], "inbox", ["primary@example.test"])], [...aliases, "primary@example.test"]), undefined);
+  assert.equal(match([row([], [], "inbox", [aliases[0]]), row([], [], "inbox", [aliases[1]])]), undefined);
+  assert.equal(matchingRecipientAlias([row([], [], "inbox", ["provider-primary@example.test"])], [{ email: "provider-primary@example.test", isPrimary: true }], "different-owner@example.test"), undefined);
+  assert.equal(matchingRecipientAlias([row(["provider-primary@example.test"])], [{ email: "provider-primary@example.test", isPrimary: true }], "different-owner@example.test"), undefined);
+  for (const folder of ["scheduled", "outbox", "unsent", "queued", "SENT", "draft"]) {
+    assert.equal(match([row([aliases[0]], [], folder)]), undefined, folder);
+    assert.equal(match([row([], [], folder, [aliases[0]])]), undefined, folder);
+    assert.equal(match([row([aliases[0]]), row([aliases[1]], [], folder)]), aliases[0], folder);
+  }
+});
 
 test("guided zero snapshots all active Important work without unread, custom-split or receiving-view leaks", () => {
   const now = Date.parse(deadline);
@@ -583,7 +620,7 @@ for (const scenario of ["scope and sparse reload", "lost acknowledgements and la
   }
 });
 
-test("SDK-backed sending identities stay composer-scoped and preserve explicit draft senders", async () => {
+test("SDK-backed sending identities support bounded row aliases and preserve explicit draft senders", async () => {
   // Isolate the irreversible owner lock from the other existing SDK cases.
   if (process.env.INBOX_SENDER_TEST_CHILD !== "1") {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
@@ -652,14 +689,15 @@ test("SDK-backed sending identities stay composer-scoped and preserve explicit d
     }) as typeof fetch;
     const store = new InboxStore(); stop = store.start();
     await until(() => store.getSnapshot().loaded);
-    assert.equal(identityReads.length, 0, "inbox bootstrap never discovers sending identities");
+    await until(() => store.getSnapshot().mail.some(mail => mail.subject === "Explicit alias reply" && mail.recipientAlias === alias));
+    assert.ok(identityReads.length <= store.getSnapshot().accounts.length, "legacy rows share bounded per-source identity discovery");
     const primary = store.getSnapshot().accounts.find(box => box.sourceId === sourceId)!;
     const secondary = store.getSnapshot().accounts.find(box => box.sourceId === host!.store.link(host!.owner, secondBox.id)!.accountId)!;
     assert.equal(primary.sourceGeneration, (await host.inbox.account(host.owner, sourceId)).generation);
     const values = await store.sendingIdentities(primary.id);
     assert.equal(values.sourceId, sourceId);
     assert.ok(values.identities.some(identity => identity.email === alias));
-    assert.ok(identityReads.every(url => url.pathname === `/v1/accounts/${sourceId}/sending-identities`), "only the active composer's source is read");
+    assert.equal(identityReads.at(-1)!.pathname, `/v1/accounts/${sourceId}/sending-identities`, "composer reads its own source");
     const beforeFailure = identityReads.length;
     failIdentity = true;
     await assert.rejects(store.sendingIdentities(primary.id, { refresh: true }), error => error instanceof ApiError && error.code === "PROVIDER_UNAVAILABLE");
@@ -819,10 +857,10 @@ test("SDK-backed sending identities stay composer-scoped and preserve explicit d
   }
 });
 
-test("MailRow renders actual To recipients without mailbox or Bcc substitution", async () => {
+test("MailRow renders only the bare verified recipient alias", async () => {
   if (!process.versions.bun) {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
-      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "MailRow renders actual To"], {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "MailRow renders only"], {
         env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
       });
       let output = "";
@@ -834,27 +872,18 @@ test("MailRow renders actual To recipients without mailbox or Bcc substitution",
   const [{ createElement }, { renderToStaticMarkup }, { default: MailRow }] = await Promise.all([
     import("react"), import("react-dom/server"), import("../src/MailRow.tsx"),
   ]);
-  const render = (to: string, sent = false, unified = false, toAddresses?: string[]) => renderToStaticMarkup(createElement(MailRow, {
-    mail: { ...inbox, to, toAddresses, account: unified ? UNIFIED_ACCOUNT : inbox.account, accountEmail: "owner@example.test",
-      mailboxNames: unified ? ["Receiving mailbox"] : undefined,
-      messages: [{ ...inbox.messages[0], to, cc: "cc-only@example.test", bcc: "private-bcc@example.test" }] },
-    index: 0, highlighted: false, selected: false, sent, showSnippets: false,
+  const render = (recipientAlias?: string) => renderToStaticMarkup(createElement(MailRow, {
+    mail: { ...inbox, to: "actual-to@example.test", toAddresses: ["actual-to@example.test"], recipientAlias,
+      account: UNIFIED_ACCOUNT, accountEmail: "owner@example.test", mailboxNames: ["Receiving mailbox"],
+      messages: [{ ...inbox.messages[0], to: "actual-to@example.test", cc: "cc-only@example.test", bcc: "private-bcc@example.test" }] },
+    index: 0, highlighted: false, selected: false, sent: false, showSnippets: false,
   }));
-  const alias = render("Project <project@example.test>");
-  assert.match(alias, /To: Project &lt;project@example.test&gt;/);
-  assert.match(alias, /title="To: Project &lt;project@example.test&gt;"/);
-  const projectedAlias = render("Project <project@example.test>", false, false, ["project@example.test"]);
-  assert.match(projectedAlias, />To: project@example.test<\/span>/);
-  assert.match(projectedAlias, /title="To: Project &lt;project@example.test&gt;"/);
-  const multiple = render("first@example.test, second@example.test", false, true);
-  assert.match(multiple, /To: first@example.test, second@example.test/);
-  assert.match(render("recipient@example.test", true), /To: recipient@example.test/, "sent rows use the real To too");
-  const absent = render("");
-  assert.match(absent, /No To recipients/);
-  assert.match(render("owner@example.test", false, true, []), /No To recipients/, "an authoritative empty To never falls back to an ownership address");
-  for (const html of [alias, projectedAlias, multiple, absent, render("", true, true), render("owner@example.test", false, true, [])]) {
-    assert.doesNotMatch(html, /private-bcc@example.test|cc-only@example.test|owner@example.test/);
-  }
+  const alias = render("notes@example.test");
+  assert.match(alias, /class="row-recipients" role="cell" title="notes@example.test">notes@example.test<\/span>/);
+  assert.doesNotMatch(alias, />To:|No To recipients/);
+  const blank = render();
+  assert.match(blank, /class="row-recipients" role="cell"><\/span>/);
+  for (const html of [alias, blank]) assert.doesNotMatch(html, /actual-to@example.test|private-bcc@example.test|cc-only@example.test|owner@example.test/);
 });
 test("SDK-backed optimistic flags retain conditional intent through latency, failures and overlapping views", async () => {
   // The ordinary web runner is Node; the actual SDK intentionally uses
@@ -2818,6 +2847,9 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       const pages: PageInput[] = [], changes: ChangesInput[] = [], querySignals: AbortSignal[] = [], published: number[] = [], mismatchedCheckpoints: number[] = [];
       const captures: Array<{ path: string; id: string; account: string; queryId?: string }> = [];
       let queries = 0, revision = 1, holdQuery = false, heldQuery = false, stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+      let identityReads = 0;
+      let identityGate: Promise<void> | undefined;
+      const identitySignals: AbortSignal[] = [];
       // The host count pager is resumable: unknown until its bounded passes finish, then exact.
       const countRequests: string[] = [], countsKnownAfter = name === "sparse" ? 8 : Infinity;
       const knownTotals: Page["totals"] = { conversations: 6, messages: 6, inbox: 7, splits: { Important: 7, Other: 0 }, folders: { Inbox: 7 }, holding: false };
@@ -2839,10 +2871,20 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       };
       const row = (index: number): Row => {
         const id = `${box.id}:thread-${index}`, messageId = `message-${index}`;
+        const summary: import("inbox-sdk/types").MailboxMessageSummary = {
+          id: messageId, accountId: source.id, sourceId: source.id, threadId: `thread-${index}`, revision: 1,
+          from: { name: "Fictional sender", email: "sender@example.test" },
+          to: index === 0 ? [] : [{ name: "Notes", email: "notes@example.test" }], cc: [], deliveredTo: index === 0 ? ["notes@example.test"] : undefined,
+          subject: `Fictional page row ${index}`, preview: "Bounded alias row.",
+          receivedAt: new Date(Date.parse(deadline) - index * 1000).toISOString(), isRead: false, isStarred: false, folder: "inbox",
+          folderIds: [], labelIds: [], hasAttachments: false,
+          memberships: [{ mailboxId: box.id, messageId, revision: 1, done: false, snoozedUntil: null }],
+        };
         return { key: id, sourceId: source.id, threadId: `thread-${index}`, sourceGeneration: 1, revision: 1, pageCursor: `row-${index}`,
           mail: { ...inbox, id, account: box.id, mailboxId: box.id, sourceId: source.id, sourceGeneration: source.generation, sdkThreadId: `thread-${index}`, subject: `Fictional page row ${index}`,
             receivedAt: Date.parse(deadline) - index * 1000, folder: "Inbox", locations: ["Inbox"], messages: [{ ...inbox.messages[0], id: messageId, body: "", loaded: false }] },
-          summaries: [], messagesComplete: false, counts: { messages: 1, memberships: 1, unread: 1, done: 0, snoozed: 0 },
+          summaries: name === "full" && index <= 1 ? [summary] : [], messagesComplete: name === "full" && index === 0,
+          counts: { messages: 1, memberships: 1, unread: 1, done: 0, snoozed: 0 },
           targets: [{ mailboxId: box.id, messageId, revision: 1 }], targetsComplete: true, actionContextComplete: false, contextVersion: `context-${index}` };
       };
       const page = (index: number): Page => ({ state: state(), totals, rows: Array.from({ length: sizes[index] ?? 0 }, (_, i) => row(index * 100 + i)),
@@ -2850,6 +2892,15 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       globalThis.fetch = (async (input, init) => {
         const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
         if (url.pathname === "/v1/accounts") return Response.json([source]);
+        if (url.pathname === `/v1/accounts/${source.id}/sending-identities`) {
+          identityReads++;
+          identitySignals.push(init!.signal!);
+          if (identityGate) await identityGate; // Intentionally ignores abort: stale finalizers must not own new demand.
+          return Response.json({ sourceId: source.id, checkedAt: new Date().toISOString(), identities: [
+            { email: source.email, isPrimary: true, isDefault: true },
+            { email: "notes@example.test", isPrimary: false, isDefault: false },
+          ] });
+        }
         if (url.pathname === "/v1/mailboxes") return Response.json([box]);
         if (url.pathname === "/v1/changes") return Response.json({ state: "fictional-state", events: [], hasMore: false, resetRequired: false });
         if (["/v1/labels", "/v1/drafts", `/v1/accounts/${source.id}/folders`].includes(url.pathname)) return Response.json([]);
@@ -2912,6 +2963,37 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       await sleep(650);
       assert.equal(queries, 1); assert.equal(pages.length, sizes.length > 1 ? 1 : 0, `${name}: initial response plus at most one automatic buffer`);
       assert.equal(changes.length, 0, `${name}: incomplete context does not start an index-completion poller`);
+      if (name === "full") {
+        await until(() => store.getSnapshot().mail.find(mail => mail.id === row(0).key)?.recipientAlias === "notes@example.test", "the Delivered-To-only source alias appears without a body read");
+        assert.equal(store.getSnapshot().mail.find(mail => mail.id === row(1).key)?.recipientAlias, undefined,
+          "an incomplete conversation stays blank because an omitted message could contain another alias");
+        assert.equal(identityReads, 1, "one loaded source produces one identity request, not one request per row");
+        const control = store as unknown as {
+          recipientAliases: Map<string, { checkedAt: number }>;
+          recipientAliasWorkers: Set<Promise<void>>;
+          recipientAliasRefreshTimer?: ReturnType<typeof setTimeout>;
+          rebuildWindow(): void;
+          scheduleRecipientAliases(rows: []): void;
+          scheduleRecipientAliasRefresh(): void;
+        };
+        await until(() => control.recipientAliasWorkers.size === 0, "initial identity read settles");
+        const cachedMail = store.getSnapshot().mail.find(mail => mail.id === row(0).key)!;
+        let release!: () => void;
+        identityGate = new Promise<void>(resolve => { release = resolve; });
+        control.recipientAliases.get(source.id)!.checkedAt -= 300_001;
+        control.rebuildWindow();
+        assert.equal(identityReads, 2);
+        assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === row(0).key), cachedMail, "TTL refresh retains the alias and immutable mail identity while pending");
+        identityGate = undefined; release();
+        await until(() => control.recipientAliasWorkers.size === 0, "unchanged identity refresh settles");
+        assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === row(0).key), cachedMail, "unchanged TTL response never blanks or replaces the mail row");
+        control.recipientAliases.get(source.id)!.checkedAt -= 300_001;
+        control.scheduleRecipientAliases([]); control.scheduleRecipientAliasRefresh();
+        assert.equal(control.recipientAliasRefreshTimer, undefined, "expired sources without eligible rows have no timer, not a 1ms rebuild loop");
+        await sleep(10); assert.equal(identityReads, 2);
+        control.rebuildWindow();
+        await until(() => control.recipientAliasWorkers.size === 0, "eligible demand resumes refresh");
+      } else assert.equal(identityReads, 0, "rows without recipient summaries do not trigger identity requests");
       // Progressing passes finish beyond the old five-request cap; stalled passes stop.
       await until(() => countRequests.length === (name === "empty" ? 1 : Number.isFinite(countsKnownAfter) ? countsKnownAfter : 5), `${name}: the count fill settles`);
       await sleep(120); assert.equal(countRequests.length, (name === "empty" ? 1 : Number.isFinite(countsKnownAfter) ? countsKnownAfter : 5), `${name}: a fill stops at completion or lack of progress`);
@@ -3831,6 +3913,28 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         await assert.rejects(store.doneOptimistically([captured]), /only available in the Inbox/);
         assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
         await store.setWindowQuery(activeQuery);
+        const aliasControl = store as unknown as {
+          recipientAliases: Map<string, { checkedAt: number }>;
+          recipientAliasWorkers: Set<Promise<void>>;
+          recipientAliasLoads: Map<string, unknown>;
+        };
+        await until(() => aliasControl.recipientAliasWorkers.size === 0, "identity metadata settles before navigation");
+        aliasControl.recipientAliases.get(source.id)!.checkedAt -= 300_001;
+        const releases: Array<() => void> = [];
+        const beforeNavigationReads = identityReads;
+        for (const folder of ["Sent", "Inbox", "Sent", "Inbox", "Sent", "Inbox"]) {
+          identityGate = new Promise<void>(resolve => { releases.push(resolve); });
+          await store.setWindowQuery({ ...activeQuery, folder });
+        }
+        assert.equal(identityReads, beforeNavigationReads + 6, "more cancelled windows than the worker limit cannot starve the new window's identity read");
+        assert.ok(identitySignals.slice(-6, -1).every(signal => signal.aborted), "each retired window aborts its identity demand");
+        for (const release of releases.slice(0, -1)) release();
+        await sleep(0);
+        assert.equal(aliasControl.recipientAliasLoads.size, 1, "late old finalizers cannot erase the current request owner");
+        assert.equal(aliasControl.recipientAliasWorkers.size, 1);
+        identityGate = undefined; releases.at(-1)!();
+        await until(() => aliasControl.recipientAliasWorkers.size === 0, "newest window identity response settles");
+        assert.ok(Date.now() - aliasControl.recipientAliases.get(source.id)!.checkedAt < 1000, "the current response, not an obsolete window, owns the refreshed metadata");
         const closing = store.doneOptimistically([selected(0)]);
         const closed = assert.rejects(closing, error => error instanceof DOMException && error.name === "AbortError");
         assert.equal(store.getSnapshot().pendingDone.length, 1);

@@ -1407,6 +1407,15 @@ export function createInbox(options: InboxOptions): Inbox {
       from: mail.from, to: mail.to, cc: mail.cc, subject: mail.subject, preview: mailPreview(mail), receivedAt: mail.receivedAt,
       isRead: mail.isRead, isStarred: mail.isStarred, folder: mail.folder, folderIds,
       labelIds: [], hasAttachments: attachments.length > 0, snoozedUntil: null, facts: mailFacts(mail) }
+    // Partial provider observations may omit headers. Preserve only this message's
+    // retained hints, never infer them from authenticated mailbox membership proof.
+    const deliveredTo: unknown = mail.deliveredTo ?? (old ? (JSON.parse(old.confirmed) as MessageSummary).deliveredTo : undefined)
+    if (deliveredTo !== undefined) {
+      if (!Array.isArray(deliveredTo) || deliveredTo.some(email => typeof email !== 'string' || email.length > 320 || !/^[^\s<>@]+@[^\s<>@]+$/.test(email))) {
+        throw new InboxError('INVALID_PROVIDER', 'Provider supplied invalid Delivered-To hints.', 502)
+      }
+      summary.deliveredTo = [...new Set(deliveredTo.map(email => email.toLowerCase()))]
+    }
     const body = JSON.stringify({ bcc: mail.bcc, bodyText: mail.bodyText, bodyHtml: mail.bodyHtml, attachments,
       replyTo: normalized.replyTo, rfcMessageId: normalized.rfcMessageId, references: normalized.references, inReplyTo: normalized.inReplyTo })
     summary.bodyRevision = createHmac('sha256', options.encryptionKey)
@@ -3070,7 +3079,11 @@ export function createInbox(options: InboxOptions): Inbox {
             return identities.find(value => value.toLowerCase() === email.toLowerCase())
           }
           const matches = [...new Set([...base.to, ...base.cc].flatMap(recipient => eligible(recipient.email) ?? []))]
-          const from = (base.folder === 'sent' ? eligible(base.from.email) : undefined) ?? (matches.length === 1 ? matches[0] : undefined) ?? eligible(box?.defaultSender) ?? eligible(native.email)
+          const delivered = [...new Set((base.deliveredTo ?? []).flatMap(email => eligible(email) ?? []))]
+          // Keep an unambiguous To/Cc choice. Delivered-To fills missing recipients
+          // and disambiguates aliases, but never expands the authorized sender set.
+          const from = (base.folder === 'sent' ? eligible(base.from.email) : undefined) ?? (matches.length === 1 ? matches[0] : undefined)
+            ?? (delivered.length === 1 ? delivered[0] : undefined) ?? eligible(box?.defaultSender) ?? eligible(native.email)
             ?? (identities.length === 1 ? eligible(identities[0]) : undefined)
           if (!from) throw new InboxError('FORBIDDEN_SENDER', 'No authorized sender is available for this reply.', 403)
           prepared.from = from

@@ -137,6 +137,26 @@ function header(part: GmailPart | undefined, name: string): string {
   return part?.headers?.find((item) => item.name.toLowerCase() === name.toLowerCase())?.value ?? ''
 }
 
+function validAddress(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 254) return false
+  const parts = value.split('@')
+  const local = parts[0]!
+  const domain = parts[1]
+  return parts.length === 2 && local.length <= 64 &&
+    /^[a-z\d!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z\d!#$%&'*+/=?^_`{|}~-]+)*$/i.test(local) &&
+    Boolean(domain && domain.split('.').every(label =>
+      /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/i.test(label)))
+}
+
+/** Preserve repeated headers without promoting forwarding hints to delivery provenance. */
+function deliveredTo(part: GmailPart | undefined): string[] {
+  return [...new Set((part?.headers ?? []).flatMap(item => {
+    if (item.name.toLowerCase() !== 'delivered-to' || typeof item.value !== 'string') return []
+    const email = item.value.trim().toLowerCase()
+    return validAddress(email) ? [email] : []
+  }))]
+}
+
 function normalizeContentId(value: string | undefined): string {
   if (!value) return ''
 
@@ -544,6 +564,7 @@ export class GmailProvider implements InboxProvider {
       to: parseParticipants(header(message.payload, 'To')),
       cc: parseParticipants(header(message.payload, 'Cc')),
       bcc: parseParticipants(header(message.payload, 'Bcc')),
+      deliveredTo: deliveredTo(message.payload),
       replyTo: parseParticipants(header(message.payload, 'Reply-To')),
       ...(header(message.payload, 'Message-ID') ? { rfcMessageId: header(message.payload, 'Message-ID') } : {}),
       ...(header(message.payload, 'In-Reply-To') ? { inReplyTo: header(message.payload, 'In-Reply-To') } : {}),
@@ -658,16 +679,6 @@ export class GmailProvider implements InboxProvider {
   }
 
   async identities(): Promise<{ sending: readonly SendingIdentity[] }> {
-    const validAddress = (value: unknown): value is string => {
-      if (typeof value !== 'string' || value.length > 254) return false
-      const parts = value.split('@')
-      const local = parts[0]!
-      const domain = parts[1]
-      return parts.length === 2 && local.length <= 64 &&
-        /^[a-z\d!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z\d!#$%&'*+/=?^_`{|}~-]+)*$/i.test(local) &&
-        Boolean(domain && domain.split('.').every(label =>
-          /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/i.test(label)))
-    }
     // OAuth grants can be token-only; Google's authenticated response supplies the primary identity.
     const primary = this.credentials.email
     if (primary !== undefined && !validAddress(primary)) throw new ProviderError('gmail', 'VALIDATION', 'Invalid expected primary email address')

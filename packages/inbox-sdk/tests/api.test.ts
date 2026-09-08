@@ -4669,7 +4669,7 @@ describe('bounded mailbox snapshot and changes', () => {
     const h = await fixture()
     h.discoveries.set('summary-scoped', { sources: ['alpha.example.test', 'beta.example.test'].map(value => ({ kind: 'domain' as const, value, canReceive: true, canSend: false, canFilter: true })), identities: [] })
     const html = `<html><head><style>td { color: navy }</style></head><body><script>fictionalUnsafe()</script><table>${'<tr><td onclick="fictionalUnsafe()">Fictional digest <a href="https://example.test/read">Read</a></td></tr>'.repeat(200)}</table></body></html>`
-    const { account, box } = await h.connect('alice', 'summary-scoped', [native('summary-alpha', { sourceDomains: ['alpha.example.test'], bodyHtml: html }), native('summary-beta', { sourceDomains: ['beta.example.test'] })], SCOPED)
+    const { account, box } = await h.connect('alice', 'summary-scoped', [native('summary-alpha', { sourceDomains: ['alpha.example.test'], deliveredTo: ['help@alpha.example.test'], bodyHtml: html }), native('summary-beta', { sourceDomains: ['beta.example.test'] })], SCOPED)
     const alpha = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Alpha', selector: { kind: 'domain', value: 'alpha.example.test' } })
     const beta = await h.inbox.createMailbox('alice', { sourceId: account.id, name: 'Beta', selector: { kind: 'domain', value: 'beta.example.test' } })
     await h.sync('alice', account.id)
@@ -4714,6 +4714,7 @@ describe('bounded mailbox snapshot and changes', () => {
       expect(result).toMatchObject({ id: own.id, sourceId: account.id, threadId: own.threadId, bodyRevision: own.bodyRevision,
         memberships: [{ mailboxId: alpha.id, revision: 2, done: true, snoozedUntil: new Date(EPOCH + 86400000).toISOString() }] })
       expect(result.facts).toBeUndefined()
+      expect(result.deliveredTo).toEqual(['help@alpha.example.test'])
       for (const field of ['bodyHtml', 'bodyText', 'bodyDocument', 'attachments', 'bcc']) expect(result).not.toHaveProperty(field)
       expect(await client.mailboxMessageSummary(alpha.id, own.id)).toEqual(result)
       expect(wire.requests.at(-1)!.status).toBe(304)
@@ -4728,8 +4729,10 @@ describe('bounded mailbox snapshot and changes', () => {
       expect(bodyReads).toBe(0)
       const live = await client.mailboxMessagePage({ mailboxIds: [alpha.id] })
       expect(live.items[0]!.facts).toBeUndefined()
+      expect(live.items[0]!.deliveredTo).toEqual(result.deliveredTo)
       const conversations = await client.mailboxConversations({ mailboxIds: [alpha.id] })
       expect(conversations.items[0]!.messages[0]!.facts).toBeUndefined()
+      expect(conversations.items[0]!.messages[0]!.deliveredTo).toEqual(result.deliveredTo)
       expect(conversations.items[0]!.mailboxStates[0]).toMatchObject({ messageCount: 1, doneCount: 1, snoozedCount: 1 })
       expect(await client.mailboxCounts({ mailboxIds: [alpha.id], query: { done: true, snoozed: true } })).toMatchObject({ messages: 1, conversations: 1 })
       expect(bodyReads).toBe(0); expect(box.calls).toEqual(before)
@@ -7838,11 +7841,16 @@ describe('source-scoped sending identities', () => {
     const alias = { email: 'alias@example.test', isPrimary: false, isDefault: true }
     const second = { email: 'second@example.test', isPrimary: false, isDefault: false }
     const box = referenceMailbox('senders-reply', primary.email, [
-      native('alias', { to: [participant('ALIAS@example.test')], cc: [participant('colleague@example.test')], replyTo: [participant('desk@example.test')] }),
+      native('alias', { to: [participant('ALIAS@example.test')], cc: [participant('colleague@example.test')], replyTo: [participant('desk@example.test')], deliveredTo: [primary.email] }),
       native('ambiguous', { to: [participant(alias.email), participant(second.email)] }),
-      native('own-sent', { from: participant(second.email), to: [participant('recipient@example.test')], folder: 'sent' }),
+      native('own-sent', { from: participant(second.email), to: [participant('recipient@example.test')], folder: 'sent', deliveredTo: [alias.email] }),
       native('owned-incoming', { from: participant(second.email), to: [participant(alias.email)], folder: 'inbox' }),
       native('invented', { to: [participant('alias+invented@example.test')] }),
+      native('delivered-bcc', { to: [], deliveredTo: ['ALIAS@example.test', alias.email] }),
+      native('delivered-list', { to: [participant('list@example.test')], deliveredTo: [second.email] }),
+      native('delivered-disambiguated', { to: [participant(alias.email), participant(second.email)], deliveredTo: [second.email] }),
+      native('delivered-ambiguous', { to: [], deliveredTo: [alias.email, second.email] }),
+      native('delivered-unknown', { to: [], deliveredTo: ['alias+invented@example.test'] }),
     ])
     const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
       ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() { return { sending: [primary, alias, second] } },
@@ -7853,7 +7861,8 @@ describe('source-scoped sending identities', () => {
     const source = rows.find(row => row.subject === 'Subject alias')!
     const reply = await h.inbox.createDraft('alice', { accountId: account.id, mailboxId: account.id, mode: 'replyAll', sourceMessageId: source.id })
     expect(reply.from).toBe(alias.email); expect(reply.to).toEqual([participant('desk@example.test')]); expect(reply.cc).toEqual([participant('colleague@example.test')])
-    for (const [subject, from] of [['ambiguous', primary.email], ['own-sent', second.email], ['owned-incoming', alias.email], ['invented', primary.email]]) {
+    for (const [subject, from] of [['ambiguous', primary.email], ['own-sent', second.email], ['owned-incoming', alias.email], ['invented', primary.email],
+      ['delivered-bcc', alias.email], ['delivered-list', second.email], ['delivered-disambiguated', second.email], ['delivered-ambiguous', primary.email], ['delivered-unknown', primary.email]]) {
       const draft = await h.inbox.createDraft('alice', { accountId: account.id, mode: 'reply', sourceMessageId: rows.find(row => row.subject === `Subject ${subject}`)!.id })
       expect(draft.from).toBe(from)
     }
@@ -7862,6 +7871,8 @@ describe('source-scoped sending identities', () => {
     const edited = await h.inbox.updateDraft('alice', explicit.id, { bodyText: 'Keep my chosen sender' }, explicit.revision)
     await h.restart()
     expect(await h.inbox.draft('alice', explicit.id)).toMatchObject({ from: second.email, bodyText: edited.bodyText })
+    const bccSource = rows.find(row => row.subject === 'Subject delivered-bcc')!
+    expect((await h.inbox.createDraft('alice', { accountId: account.id, mode: 'reply', sourceMessageId: bccSource.id })).from).toBe(alias.email)
     expect(box.calls.getMessage).toEqual([]); expect(box.calls.send).toEqual([])
     await h.inbox.setPolicy('alice', { undoSendSeconds: 0 })
     const operation = await h.submit('alice', edited, 'explicit-alias-after-restart')
@@ -9674,7 +9685,7 @@ describe('pilot contract: server OAuth, configured mailboxes, and canonical mess
     })
     const { account } = await h.connect('alice', 'scope-proof', [
       shared, { ...shared, id: 'delivery-two' },
-      native('header-only', { to: [participant('help@alpha.example.test')], sourceDomains: ['beta.example.test'] }),
+      native('header-only', { to: [participant('help@alpha.example.test')], deliveredTo: ['help@alpha.example.test'], sourceDomains: ['beta.example.test'] }),
     ], SCOPED)
     const candidates = await h.json<MailboxCandidate[]>('alice', `/connections/${account.connectionId}/mailbox-candidates`)
     expect(candidates.map(item => item.selector)).toEqual(expect.arrayContaining([
@@ -9706,7 +9717,7 @@ describe('pilot contract: server OAuth, configured mailboxes, and canonical mess
   test('delivery evidence accumulates before unchanged-body and backfill shortcuts, then survives omissions and restart', async () => {
     const h = await fixture()
     h.discoveries.set('evidence-union', discovery)
-    const original = native('one-upstream-record', { bodyText: 'Authoritative body', sourceDomains: ['alpha.example.test'] })
+    const original = native('one-upstream-record', { bodyText: 'Authoritative body', sourceDomains: ['alpha.example.test'], deliveredTo: ['help@alpha.example.test'] })
     const { account, box } = await h.connect('alice', 'evidence-union', [original], SCOPED)
     const a = await h.json<Mailbox>('alice', '/mailboxes', {
       sourceId: account.id, name: 'Evidence A', selector: { kind: 'domain', value: 'alpha.example.test' },
@@ -9716,6 +9727,7 @@ describe('pilot contract: server OAuth, configured mailboxes, and canonical mess
     }, 'POST', 201)
     await h.json('alice', `/mailboxes/${a.id}/sync`, {}, 'POST')
     const first = (await h.inbox.mailboxMessages('alice', { mailboxIds: [a.id] })).items[0]!
+    expect(first.deliveredTo).toEqual(original.deliveredTo)
     expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [b.id] })).total).toBe(0)
     const baseline = await h.inbox.changes('alice')
     box.nextSync(receipt([{ ...original, sourceDomains: ['beta.example.test'] }], 'same-body-new-scope'))
@@ -9728,16 +9740,26 @@ describe('pilot contract: server OAuth, configured mailboxes, and canonical mess
       sourceId: account.id, name: 'Historical address proof', selector: { kind: 'address', value: 'help@alpha.example.test' },
     }, 'POST', 201)
     expect((await h.inbox.mailboxMessages('alice', { mailboxIds: [historicalAddress.id] })).total).toBe(0)
-    box.nextSync(receipt([native(original.id, { bodyText: 'Obsolete backfill body', deliveryRecipients: ['help@alpha.example.test'] })], 'historical-detail'))
+    expect((await h.inbox.mailboxMessageSummary('alice', a.id, first.id)).deliveredTo).toEqual(original.deliveredTo)
+    box.nextSync(receipt([native(original.id, { bodyText: 'Obsolete backfill body', deliveryRecipients: ['help@alpha.example.test'], deliveredTo: ['desk@beta.example.test'] })], 'historical-detail'))
     await h.json('alice', `/mailboxes/${b.id}/sync`, { lane: 'backfill' }, 'POST')
     const union = await h.inbox.mailboxMessages('alice', { mailboxIds: [a.id, b.id] })
     expect(union.total).toBe(1)
     expect(union.items[0]!.id).toBe(first.id)
+    expect(union.items[0]!.deliveredTo).toEqual(original.deliveredTo)
     expect(union.items[0]!.memberships.map(item => item.mailboxId).sort()).toEqual([a.id, b.id].sort())
     expect((await h.inbox.mailboxMessage('alice', a.id, first.id)).bodyText).toBe(original.bodyText)
     expect((await h.inbox.mailboxMessage('alice', b.id, first.id)).bodyText).toBe(original.bodyText)
     expect((await h.inbox.mailboxMessage('alice', historicalAddress.id, first.id)).bodyText).toBe(original.bodyText)
     expect((await h.inbox.changes('alice', { since: baseline.state })).events.filter(event => event.type === 'mail.changed' && event.reason === 'arrival')).toEqual([])
+    const beforeClear = await h.inbox.mailboxMessagePage('alice', { mailboxIds: [a.id] })
+    box.nextSync(receipt([{ ...original, deliveredTo: [] }], 'explicitly-cleared-header-hints'))
+    await h.sync('alice', account.id)
+    const delta = await h.inbox.mailboxChanges('alice', { mailboxIds: [a.id], since: beforeClear.state, scopeState: beforeClear.scopeState })
+    expect(delta.upserts[0]!.deliveredTo).toEqual([])
+    expect(delta.upserts[0]!.bodyRevision).toBe(first.bodyRevision)
+    expect(delta.upserts[0]!.revision).toBeGreaterThan(first.revision)
+    expect(box.calls.getMessage).toEqual([])
   })
 
   test('unified counts and tied-timestamp pagination count canonical records rather than mailbox memberships', async () => {

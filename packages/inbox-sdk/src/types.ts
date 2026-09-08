@@ -73,6 +73,8 @@ export interface MailMessage {
   /** Authenticated delivery provenance, supplied by the SDK rather than recipient headers. */
   sourceDomains?: string[]
   deliveryRecipients?: string[]
+  /** Untrusted Delivered-To header hints. Never use these as mailbox or sending authority. */
+  deliveredTo?: string[]
   from: Participant
   to: Participant[]
   cc: Participant[]

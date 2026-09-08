@@ -93,6 +93,7 @@ export type Mail = {
   mailboxId?: string;
   sdkThreadId?: string;
   accountEmail?: string;
+  recipientAlias?: string;
   locations?: string[];
   operationId?: string;
   mailboxIds?: string[];

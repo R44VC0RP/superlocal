@@ -16,6 +16,7 @@ import { getApplicationStorage } from "./storage";
 import { createScopedFetch } from "./application-auth";
 import { getApplicationScope } from "./application-scope";
 import { matchesSearch } from "./mail-search";
+import { hasIncomingRecipientHeaders, matchingRecipientAlias } from "./recipient-alias";
 import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, createAiTriageClient, type HostConfiguration, type InboxViewPreferences, createCategoryTransport, CategoryRequestError } from "./host";
 import { readSplitPreferences, writeSplitPreferences, readAttentionFeedback, recordAttentionFeedback, retractAttentionFeedback, InboxViewPreferencesError,
   type SavedSplitPreferences, type AttentionFeedback, type AttentionFeedbackTarget } from "./host";
@@ -48,6 +49,8 @@ const viewKey = (query: InboxViewQuery) => JSON.stringify(query);
 const expiredQuery = (error: unknown) => error instanceof InboxViewPreferencesError && error.code === "HOST_INBOX_QUERY_EXPIRED";
 type ThreadHistory = { contextVersion: string; summaries: MailboxMessageSummary[]; cursor: string | null; exhausted: boolean; truncated?: boolean; error?: string };
 type ThreadValidation = { row: InboxWindowRow; controller: AbortController; promise: Promise<{ summaries: MailboxMessageSummary[]; error?: string }> };
+type RecipientAliasIdentity = { email: string; isPrimary: boolean };
+type RecipientAliasRequest = { key: string; sourceId: string; generation: number; storeGeneration: number; demandEpoch: number; mode: "window" | "legacy" };
 class DraftRecipientError extends Error {}
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
 type Sending = { ref: SendReference; operation: Operation; draft: SdkDraft };
@@ -159,6 +162,8 @@ const MAX_ISSUES = 4;
 const RESOLVE_HOLD_MS = 10_000;
 /** A dismissed problem that recurs within this window starts hidden instead of reopening. */
 const DISMISSAL_MEMORY_MS = 5 * 60_000;
+const RECIPIENT_ALIAS_TTL_MS = 5 * 60_000;
+const RECIPIENT_ALIAS_CONCURRENCY = 4;
 /** Change-history polling cadence while the event stream is unavailable. */
 const POLL_MS = 30_000;
 const MAX_BACKOFF_MS = 60_000;
@@ -295,6 +300,15 @@ export class InboxStore {
   private bodyEpoch = 0;
   private blobInfo = new Map<string, BlobInfo>();
   private folders = new Map<string, Folder[]>();
+  private recipientAliases = new Map<string, { generation: number; checkedAt: number; identities: RecipientAliasIdentity[] }>();
+  private recipientAliasQueue = new Map<string, RecipientAliasRequest>();
+  private recipientAliasLoads = new Map<string, RecipientAliasRequest>();
+  private recipientAliasWorkers = new Set<Promise<void>>();
+  private recipientAliasActive = new Set<string>();
+  private legacyRecipientDemand = new Map<string, { sourceId: string; sourceGeneration: number }>();
+  private recipientAliasDemandEpoch = 0;
+  private recipientAliasController = new AbortController();
+  private recipientAliasRefreshTimer?: ReturnType<typeof setTimeout>;
   private folderDiscovery?: Promise<void>;
   private discoveredFolders = new Set<string>();
   private labels: Label[] = [];
@@ -433,6 +447,7 @@ export class InboxStore {
   private restoreWindow(view: RetainedView): Promise<void> {
     const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
     this.windowController.abort(); this.windowController = new AbortController();
+    this.resetRecipientAliasDemand();
     this.clearThreadMessagePins();
     // An aborted open or drain of the previous view must not gate this view's reconciliation.
     this.windowLoading = undefined; this.windowPaging = undefined; this.windowChanges = undefined;
@@ -700,6 +715,7 @@ export class InboxStore {
   private openWindow = (): Promise<void> => {
     const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
     this.windowController.abort(); this.windowController = new AbortController();
+    this.resetRecipientAliasDemand();
     this.clearThreadMessagePins();
     this.windowPaging = undefined; this.windowChanges = undefined; this.windowReplayCheckpoint = undefined; this.windowBoundaryCursors.clear(); this.windowNewerCursor = null; this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
     const signal = AbortSignal.any([this.windowController.signal, this.controller.signal]);
@@ -1258,6 +1274,100 @@ export class InboxStore {
     if (!box || !source) throw new Error("Select a connected mailbox first.");
     return { box, source };
   }
+  private pruneRecipientAliases(accounts: readonly Account[]) {
+    for (const [sourceId, cached] of this.recipientAliases) {
+      const source = accounts.find(account => account.id === sourceId);
+      if (source?.status !== "connected" || source.generation !== cached.generation) this.recipientAliases.delete(sourceId);
+    }
+  }
+  private resetRecipientAliasDemand() {
+    this.recipientAliasDemandEpoch++;
+    this.recipientAliasController.abort(); this.recipientAliasController = new AbortController();
+    this.recipientAliasQueue.clear(); this.recipientAliasLoads.clear(); this.recipientAliasWorkers.clear(); this.recipientAliasActive.clear();
+    clearTimeout(this.recipientAliasRefreshTimer); this.recipientAliasRefreshTimer = undefined;
+  }
+  private recipientSourceIsCurrent(sourceId: string, sourceGeneration: number, storeGeneration: number): boolean {
+    if (storeGeneration !== this.generation || this.controller.signal.aborted || this.applicationScope.signal.aborted) return false;
+    const source = this.sourceAccounts.find(account => account.id === sourceId);
+    if (!this.state.host?.inboxWindow) return source?.generation === sourceGeneration && source.status === "connected"
+      && this.recipientAliasActive.has(`${sourceId}\0${sourceGeneration}`);
+    const window = this.state.window;
+    return source?.generation === sourceGeneration && source.status === "connected" && !!window
+      && window.state.sources.some(value => value.sourceId === sourceId && value.generation === sourceGeneration)
+      && window.keys.some(key => {
+        const row = this.windowRows.get(key);
+        return row?.sourceId === sourceId && row.sourceGeneration === sourceGeneration;
+      });
+  }
+  private scheduleRecipientAliases(rows: readonly { sourceId: string; sourceGeneration: number }[]) {
+    const now = Date.now();
+    this.recipientAliasActive = new Set(rows.map(row => `${row.sourceId}\0${row.sourceGeneration}`));
+    for (const row of rows) {
+      const source = this.sourceAccounts.find(account => account.id === row.sourceId);
+      if (!source || source.status !== "connected" || source.generation !== row.sourceGeneration) continue;
+      const current = this.recipientAliases.get(source.id);
+      const key = `${source.id}\0${source.generation}`;
+      if (current?.generation === source.generation && now - current.checkedAt < RECIPIENT_ALIAS_TTL_MS
+        || this.recipientAliasLoads.has(key)) continue;
+      const request: RecipientAliasRequest = { key, sourceId: source.id, generation: source.generation, storeGeneration: this.generation,
+        demandEpoch: this.recipientAliasDemandEpoch, mode: this.state.host?.inboxWindow ? "window" : "legacy" };
+      this.recipientAliasLoads.set(key, request);
+      this.recipientAliasQueue.set(key, request);
+    }
+    this.drainRecipientAliases();
+  }
+  private scheduleRecipientAliasRefresh() {
+    clearTimeout(this.recipientAliasRefreshTimer);
+    this.recipientAliasRefreshTimer = undefined;
+    const active = this.recipientAliasActive;
+    const next = Math.min(...[...this.recipientAliases.entries()].flatMap(([sourceId, cached]) => {
+      const key = `${sourceId}\0${cached.generation}`;
+      return active.has(key) && !this.recipientAliasLoads.has(key) ? [cached.checkedAt + RECIPIENT_ALIAS_TTL_MS] : [];
+    }));
+    if (!Number.isFinite(next)) return;
+    this.recipientAliasRefreshTimer = setTimeout(() => {
+      this.recipientAliasRefreshTimer = undefined;
+      if (this.state.host?.inboxWindow) this.rebuildWindow();
+      else {
+        this.scheduleRecipientAliases([...this.legacyRecipientDemand.values()]);
+        this.scheduleRecipientAliasRefresh();
+      }
+    }, Math.max(1, next - Date.now()));
+  }
+  private drainRecipientAliases() {
+    while (this.recipientAliasWorkers.size < RECIPIENT_ALIAS_CONCURRENCY && this.recipientAliasQueue.size) {
+      const [key, request] = this.recipientAliasQueue.entries().next().value!;
+      this.recipientAliasQueue.delete(key);
+      const storeGeneration = request.storeGeneration;
+      const signal = AbortSignal.any([this.recipientAliasController.signal, this.controller.signal, this.applicationScope.signal]);
+      let worker!: Promise<void>;
+      worker = (async () => {
+        let identities: RecipientAliasIdentity[] = [];
+        try {
+          const result = await this.client.sendingIdentities(request.sourceId, {}, { signal });
+          if (result.sourceId !== request.sourceId) throw new Error("Recipient identity source changed");
+          identities = result.identities.map(identity => ({ email: identity.email, isPrimary: identity.isPrimary }));
+        } catch {
+          // Recipient metadata is optional. A failed discovery leaves the column blank until the bounded cache expires.
+        }
+        if (signal.aborted || request.demandEpoch !== this.recipientAliasDemandEpoch
+          || !this.recipientSourceIsCurrent(request.sourceId, request.generation, storeGeneration)) return;
+        const previous = this.recipientAliases.get(request.sourceId);
+        this.recipientAliases.set(request.sourceId, { generation: request.generation, checkedAt: Date.now(), identities });
+        if (previous?.generation !== request.generation || JSON.stringify(previous.identities) !== JSON.stringify(identities)) {
+          if (request.mode === "window") this.rebuildWindow();
+          else this.rebuild(new Set([...this.legacyRecipientDemand.entries()]
+            .filter(([, value]) => value.sourceId === request.sourceId).map(([thread]) => thread)));
+        }
+      })().finally(() => {
+        if (!this.recipientAliasWorkers.delete(worker)) return;
+        if (this.recipientAliasLoads.get(key) === request) this.recipientAliasLoads.delete(key);
+        this.scheduleRecipientAliasRefresh();
+        this.drainRecipientAliases();
+      });
+      this.recipientAliasWorkers.add(worker);
+    }
+  }
   sendingIdentities: LoadSendingIdentities = async (mailboxId, input = {}) => {
     const { source } = this.account(mailboxId);
     const generation = this.generation, signal = this.controller.signal;
@@ -1434,6 +1544,9 @@ export class InboxStore {
       this.clearPendingDone();
       this.retainedViews.clear(); this.windowCounts = undefined;
       this.client.clearCache();
+      this.resetRecipientAliasDemand(); this.recipientAliases.clear();
+      this.legacyRecipientDemand.clear();
+      clearTimeout(this.recipientAliasRefreshTimer); this.recipientAliasRefreshTimer = undefined;
       clearTimeout(this.refreshTimer); clearTimeout(this.importantTimer); this.importantDeadline = Infinity;
       clearTimeout(this.aiPollTimer); clearTimeout(this.aiHoldTimer); this.aiPollPromise = undefined; this.aiHolds.clear();
       clearTimeout(this.aiRebuildTimer); this.aiRebuildTimer = undefined; this.aiRebuildThreads.clear();
@@ -1658,6 +1771,7 @@ export class InboxStore {
       for (const account of accounts) if (!same(presentation(account), presentation(previousAccounts.find(previous => previous.id === account.id)))) affectedSources.add(account.id);
       for (const box of selected) if (!same(box, this.boxes.find(previous => previous.id === box.id))) affectedSources.add(box.sourceId);
       this.sourceAccounts = accounts; this.boxes = selected;
+      this.pruneRecipientAliases(accounts);
       if (!same(accounts, this.state.sources) || !same(selected, this.state.mailboxes)) this.publish({ sources: accounts, mailboxes: selected });
       const folderSources = new Set(events.filter(event => event.type === "account.updated" && event.accountId).map(event => event.accountId!));
       for (const id of folderSources) if (accounts.some(account => account.id === id && account.status === "connected")) {
@@ -1892,6 +2006,7 @@ export class InboxStore {
       }
       this.operations = operations;
       this.sourceAccounts = accounts; this.boxes = selected; this.labels = labels; this.summaries = summaries; this.sending = sending;
+      this.pruneRecipientAliases(accounts);
       if (!host.inboxWindow) {
       this.messageRows = new Map([...summaries.values()].flat().map(row => [nativeKey(row.sourceId, row.id), row]));
       this.summaryFences = new Map([...this.messageRows].map(([key, row]) => [key, { epoch: flagEpoch, revision: row.revision }]));
@@ -1988,6 +2103,10 @@ export class InboxStore {
   private rebuildWindow() {
     const calendar = displayTimes(); this.calendarKey = calendar.key;
     const rows = [...this.windowRows.values()], retained = new Map(rows.map(row => [row.key, this.threadSummaries(row).summaries]));
+    const activeKeys = new Set(this.state.window?.keys ?? []);
+    this.scheduleRecipientAliases(rows.filter(row => activeKeys.has(row.key)
+      && hasIncomingRecipientHeaders(retained.get(row.key)!)));
+    this.scheduleRecipientAliasRefresh();
     const summaries = new Map<string, MailboxMessageSummary>();
     for (const row of rows) for (const summary of retained.get(row.key)!) {
       const key = nativeKey(summary.sourceId, summary.id), previous = summaries.get(key);
@@ -2015,9 +2134,14 @@ export class InboxStore {
       const local = byId.get(row.key), detail = this.windowDetails.get(row.key), provenance = this.rowProvenance(row);
       const ids = new Set(retained.get(row.key)!.map(summary => summary.id));
       if (detail?.exhausted && row.counts.messages === ids.size) { provenance.messagesComplete = true; provenance.actionContextComplete = row.targetsComplete; }
+      const source = this.sourceAccounts.find(source => source.id === row.sourceId && source.generation === row.sourceGeneration);
+      const aliases = source && this.recipientAliases.get(source.id);
+      const recipientAlias = source && aliases?.generation === source.generation
+        && provenance.messagesComplete
+        ? matchingRecipientAlias(retained.get(row.key)!, aliases.identities, source.email) : undefined;
       // Whole-conversation aggregate/provenance always wins over partial projected metadata.
       const time = Number.isFinite(row.mail.receivedAt) ? calendar.format(new Date(row.mail.receivedAt!).toISOString()) : { date: row.mail.date, group: row.mail.group };
-      let next: Mail = { ...row.mail, ...time, messages: local?.messages.filter(message => ids.has(message.id)) ?? row.mail.messages, window: provenance,
+      let next: Mail = { ...row.mail, ...time, recipientAlias, messages: local?.messages.filter(message => ids.has(message.id)) ?? row.mail.messages, window: provenance,
         hasAttachments: row.mail.hasAttachments ?? (row.messagesComplete ? row.mail.messages.some(message => message.hasAttachments) : undefined), historyExhausted: detail?.exhausted ?? row.messagesComplete,
         historyTruncated: detail?.truncated || undefined, historyError: detail?.error };
       const overlay = row.summaries.some(summary => this.projectFlags(summary) !== summary);
@@ -2086,6 +2210,11 @@ export class InboxStore {
         canSend: this.state.host?.allowProviderWrites === true && source.status === "connected" && box.status === "active" && source.capabilities.send && !!box.defaultSender };
     });
     const mail: Mail[] = [], labelNames: Record<string, string[]> = {};
+    if (!onlyThreads) this.legacyRecipientDemand.clear();
+    else for (const key of onlyThreads) this.legacyRecipientDemand.delete(key);
+    const aliasRows = new Map<string, MailboxMessageSummary[]>();
+    const unifiedAliasRows = new Map<string, Map<string, MailboxMessageSummary>>();
+    const includedAliases = new Set(this.unifiedMailboxIds());
     const senderHistory = new Map<string, SenderHistoryMessage>();
     const sentMessages = new Map<string, Operation>();
     for (const operation of this.operations.values()) if (operation.type === "send") {
@@ -2115,6 +2244,14 @@ export class InboxStore {
         const group = groups.get(row.threadId) ?? []; group.push(row); groups.set(row.threadId, group);
       }
       for (const [thread, rows] of groups) {
+        const key = nativeKey(source.id, thread);
+        aliasRows.set(viewThreadId(box.id, thread), rows);
+        if (hasIncomingRecipientHeaders(rows)) this.legacyRecipientDemand.set(key, { sourceId: source.id, sourceGeneration: source.generation });
+        if (includedAliases.has(box.id)) {
+          const combined = unifiedAliasRows.get(key) ?? new Map<string, MailboxMessageSummary>();
+          for (const row of rows) if ((combined.get(row.id)?.revision ?? -1) <= row.revision) combined.set(row.id, row);
+          unifiedAliasRows.set(key, combined);
+        }
         rows.sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.id.localeCompare(b.id));
         const latest = rows.at(-1)!;
         const states = rows.map(row => row.memberships.find(state => state.mailboxId === box.id)!);
@@ -2179,6 +2316,18 @@ export class InboxStore {
     const included = this.unifiedMailboxIds();
     labelNames[UNIFIED_ACCOUNT] = [...new Set(included.flatMap(id => labelNames[id] ?? []))];
     mail.push(...unifiedMail(mail, included, accounts));
+    this.scheduleRecipientAliases([...this.legacyRecipientDemand.values()]);
+    this.scheduleRecipientAliasRefresh();
+    for (const conversation of mail) {
+      if (conversation.operationId || !conversation.sourceId || !conversation.sdkThreadId) continue;
+      const source = this.sourceAccounts.find(source => source.id === conversation.sourceId);
+      const cached = this.recipientAliases.get(conversation.sourceId);
+      const rows = conversation.account === UNIFIED_ACCOUNT
+        ? [...(unifiedAliasRows.get(nativeKey(conversation.sourceId, conversation.sdkThreadId))?.values() ?? [])]
+        : aliasRows.get(conversation.id) ?? [];
+      conversation.recipientAlias = source && cached?.generation === source.generation
+        ? matchingRecipientAlias(rows, cached.identities, source.email) : undefined;
+    }
     if (!onlyThreads) this.knownThreads.clear();
     const ai = this.state.ai;
     const connectedSources = new Set(this.sourceAccounts.filter(source => source.status === "connected").map(source => source.id));
