@@ -1810,7 +1810,8 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   }
 
   const onKey = useEffectEvent((e: KeyboardEvent, sequencesOnly = false) => {
-    actionNavigationVersion.current++;
+    // One version bump per keystroke: the capture pass only bumps when it owns the key, otherwise the bubble pass does.
+    if (!sequencesOnly) actionNavigationVersion.current++;
     const target = e.target && (e.target as Node).nodeType === 1 ? e.target as HTMLElement : null;
     const editing = target?.closest(
       "input,textarea,[contenteditable=true],select",
@@ -1850,6 +1851,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       if (!e.repeat) sequence.current.key = "";
       return;
     }
+    if (sequencesOnly) actionNavigationVersion.current++;
     if (!intent) return;
     if (intent.clearSequence) sequence.current.key = "";
     if (intent.type === "account" || intent.type === "unified") {
