@@ -2581,13 +2581,26 @@ export class InboxStore {
     const { box, source } = this.account(boxId);
     if (!this.state.accounts.find(account => account.id === boxId)?.canSend) throw new Error("This mailbox cannot send messages.");
     if (input.mode && input.mode !== "new" && input.mode !== "forward" && !source.capabilities.reply) throw new Error("This source cannot send replies.");
-    if (input.mail) await this.loadThread(input.mail.id);
+    const composing = !input.mode || input.mode === "new";
+    if (input.mail && !composing) await this.loadThread(input.mail.id);
     if (input.sourceMessageId && !input.mail?.messages.some(message => message.id === input.sourceMessageId)) throw new Error("The selected message no longer belongs to this conversation.");
     const parent = input.sourceMessageId ?? input.mail?.messages.filter(message => !message.pending).at(-1)?.id;
     if (input.mail?.messages.find(message => message.id === parent)?.pending) throw new Error("Wait for the queued message to finish sending before replying to it.");
     const implicitReply = !!parent && (input.mode === "reply" || input.mode === "replyAll");
-    const raw = await this.client.createDraft({ accountId: source.id, mailboxId: box.id, ...(!implicitReply ? { from: box.defaultSender! } : {}),
-      mode: input.mode === "new" || !input.mode ? "compose" : input.mode, ...(parent ? { sourceMessageId: parent } : {}),
+    let from = box.defaultSender!;
+    if (composing && parent) {
+      const catalog = await this.sendingIdentities(box.id);
+      if (this.account(box.id).box.revision !== box.revision) throw new Error("The sending mailbox changed. Retry to compose with its current senders.");
+      const context = this.messageRows.get(nativeKey(source.id, parent));
+      if (!context || context.threadId !== input.mail?.sdkThreadId || !context.memberships.some(state => state.mailboxId === box.id)) throw new Error("The selected message no longer belongs to this mailbox.");
+      const selector = box.selector;
+      const eligible = catalog.identities.filter(identity => selector.kind === "address" ? identity.email.toLowerCase() === selector.value.toLowerCase()
+        : selector.kind === "domain" ? identity.email.split("@").at(-1)?.toLowerCase() === selector.value.toLowerCase() : true);
+      from = matchingRecipientAlias([context], eligible, source.email) ?? from;
+    }
+    // Contact composition borrows only the sender identity, not reply threading or content.
+    const raw = await this.client.createDraft({ accountId: source.id, mailboxId: box.id, ...(!implicitReply ? { from } : {}),
+      mode: input.mode === "new" || !input.mode ? "compose" : input.mode, ...(parent && !composing ? { sourceMessageId: parent } : {}),
       ...(input.subject !== undefined ? { subject: input.subject } : {}), ...(input.body !== undefined ? { bodyHtml: draftHtml(input.body), bodyText: plainText(input.body) } : {}),
       ...(input.to !== undefined ? { to: recipients(input.to) } : {}),
     }, this.requestOptions());

@@ -788,6 +788,23 @@ test("SDK-backed sending identities support bounded row aliases and preserve exp
     assert.equal(mail.to, alias, "row To is the actual header recipient, not the source owner");
     assert.deepEqual(mail.toAddresses, [alias]);
     assert.deepEqual(store.getSnapshot().mail.find(value => value.account === UNIFIED_ACCOUNT && value.subject === mail.subject)!.toAddresses, [alias]);
+    const contactDraft = await store.newDraft(primary.id, { to: "sender@example.test", mail, sourceMessageId });
+    assert.equal(contactDraft.from, alias, "contact compose inherits the selected message's authorized alias");
+    assert.equal(contactDraft.to, "sender@example.test");
+    assert.equal(contactDraft.mode, "new");
+    assert.equal(contactDraft.subject, ""); assert.equal(contactDraft.body, "<div></div>");
+    assert.equal(contactDraft.sourceMessageId, undefined); assert.equal(contactDraft.threadId, undefined);
+    assert.equal(Object.hasOwn(created.at(-1)!, "sourceMessageId"), false, "a new conversation must not carry reply headers");
+    await store.reloadDraft(contactDraft.id);
+    assert.equal(store.getSnapshot().drafts.find(draft => draft.id === contactDraft.id)!.from, alias, "the inferred sender is durable");
+    await store.discardDraft(contactDraft.id);
+    const createdBeforeFailure = created.length;
+    failIdentity = true;
+    await assert.rejects(store.newDraft(primary.id, { to: "sender@example.test", mail, sourceMessageId }), error => error instanceof ApiError && error.code === "PROVIDER_UNAVAILABLE");
+    assert.equal(created.length, createdBeforeFailure, "identity lookup failure does not silently compose from the primary address");
+    failIdentity = false;
+    await assert.rejects(store.newDraft(secondary.id, { to: "sender@example.test", mail, sourceMessageId }), /no longer belongs to this mailbox/);
+    assert.equal(created.length, createdBeforeFailure, "context cannot cross source ownership");
     for (const mode of ["reply", "replyAll"] as const) {
       const reply = await store.newDraft(primary.id, { mode, mail, sourceMessageId });
       assert.equal(Object.hasOwn(created.at(-1)!, "from"), false, "implicit replies leave sender selection to the SDK");
