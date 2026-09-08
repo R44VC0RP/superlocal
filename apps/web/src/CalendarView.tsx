@@ -168,6 +168,7 @@ function Calendar({
   const [day, setDay] = useState("2026-09-01");
   const [miniMonth, setMiniMonth] = useState("2026-09-01");
   const [view, setView] = useState<View>(initialView);
+  useEffect(() => setView(initialView), [initialView]);
   const [actionsOpen, setActionsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [meet, setMeet] = useState("");
@@ -334,8 +335,9 @@ function Calendar({
       if (event.key.toLowerCase() === "b") createEvent();
       else if (!event.shiftKey && event.key === "0") setView("day");
       else if (!event.shiftKey && event.key === "2") setView("week");
-      else if (!event.shiftKey && event.key === "-") navigate(-1);
-      else if (!event.shiftKey && event.key === "=") navigate(1);
+      else if (!event.shiftKey && ["-", "p"].includes(event.key)) navigate(-1);
+      else if (!event.shiftKey && ["=", "n"].includes(event.key)) navigate(1);
+      else if (!event.shiftKey && event.key === "t") setDay(today);
       else if (!event.shiftKey && event.key === "Escape") {
         if (actionsOpen) setActionsOpen(false);
         else if (sidebarOpen) setSidebarOpen(false);

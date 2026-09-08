@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type RefObject,
 } from "react";
 import Composer from "./Composer";
 import MessageBody, { type MessageCanvasColor } from "./MessageBody";
@@ -68,6 +69,8 @@ function messageCanvasStyle(background: MessageCanvasColor): CSSProperties {
 }
 
 type ThreadViewProps = {
+  scrollRef?: RefObject<HTMLDivElement | null>;
+  onSequenceKey?: (event: KeyboardEvent) => void;
   mail: Mail;
   draft?: Draft;
   replyRequest?: number;
@@ -105,6 +108,8 @@ type ThreadViewProps = {
 };
 
 export default function ThreadView({
+  scrollRef,
+  onSequenceKey,
   mail,
   draft,
   replyRequest = 0,
@@ -157,7 +162,8 @@ export default function ThreadView({
   const [unsubscribed, setUnsubscribed] = useState(
     () => readText(`unsubscribed:${mail.email}`) === "true",
   );
-  const scroller = useRef<HTMLDivElement>(null);
+  const ownScroller = useRef<HTMLDivElement>(null);
+  const scroller = scrollRef ?? ownScroller;
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
   const historyRequest = useRef(0);
@@ -509,6 +515,8 @@ export default function ThreadView({
   function bodyKeyboard(event: KeyboardEvent, id: string) {
     const article = scroller.current?.querySelector<HTMLElement>(`[data-thread-message="${CSS.escape(id)}"]`);
     if (!article) return;
+    onSequenceKey?.(event);
+    if (event.defaultPrevented) return;
     shortcut(event, article);
     if (event.defaultPrevented || event.key === "Tab") return;
     const target = event.target as HTMLElement | null;
