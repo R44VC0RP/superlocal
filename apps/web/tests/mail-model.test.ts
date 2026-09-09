@@ -8,7 +8,7 @@ import { classifyAttention, conversationAttention } from "../../shared/mail-atte
 import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, aiSortingStatus, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
-import { matchingRecipientAlias } from "../src/recipient-alias.ts";
+import { matchingRecipientAddress, matchingRecipientAlias } from "../src/recipient-alias.ts";
 import {
   advanceMail,
   appendOutgoing,
@@ -63,6 +63,26 @@ test("recipient alias display requires one verified incoming recipient match", (
     assert.equal(match([row([aliases[0]], [], folder)]), undefined, folder);
     assert.equal(match([row([], [], folder, [aliases[0]])]), undefined, folder);
     assert.equal(match([row([aliases[0]]), row([aliases[1]], [], folder)]), aliases[0], folder);
+  }
+  const primary = "primary@example.test";
+  const identities = [{ email: primary, isPrimary: true }, ...aliases.map(email => ({ email, isPrimary: false }))];
+  const display = (rows: ReturnType<typeof row>[]) => matchingRecipientAddress(rows, identities, primary);
+  assert.equal(display([row(["PRIMARY@example.test"])]), primary);
+  assert.equal(display([row([], [primary])]), primary);
+  assert.equal(display([row([], [], "inbox", [primary])]), primary);
+  assert.equal(display([row([primary]), row([primary])]), primary);
+  assert.equal(display([row([aliases[0]], [], "inbox", [primary])]), aliases[0], "primary delivery must not overwrite a To alias");
+  assert.equal(display([row([primary, aliases[0]])]), aliases[0]);
+  assert.equal(display([row([primary]), row([aliases[0]])]), aliases[0]);
+  assert.equal(display([row([primary, ...aliases])]), undefined, "primary matches cannot hide alias ambiguity");
+  assert.equal(display([row([], [], "inbox", [primary, ...aliases])]), undefined);
+  assert.equal(display([row(["unknown@example.test"])]), undefined);
+  assert.equal(display([row([])]), undefined);
+  assert.equal(matchingRecipientAddress([row([primary])], [], primary), undefined, "failed identity discovery does not invent a recipient");
+  assert.equal(matchingRecipientAddress([row([primary])], [{ email: primary, isPrimary: false }], primary), primary);
+  assert.equal(matchingRecipientAddress([row(["provider-primary@example.test"])], [{ email: "provider-primary@example.test", isPrimary: true }], primary), "provider-primary@example.test");
+  for (const folder of ["sent", "drafts", "scheduled", "outbox", "unsent", "queued", "SENT", "draft"]) {
+    assert.equal(display([row([primary], [], folder, [primary])]), undefined, folder);
   }
 });
 
@@ -657,6 +677,9 @@ test("SDK-backed sending identities support bounded row aliases and preserve exp
     host.store.receive({ owner: host.owner, storeId: nativeBox.id, accountId: sourceId }, {
       from: "sender@example.test", to: alias, subject: "Explicit alias reply", text: "Fictional alias recipient.",
     });
+    host.store.receive({ owner: host.owner, storeId: nativeBox.id, accountId: sourceId }, {
+      from: "sender@example.test", to: nativeBox.email, subject: "Explicit primary recipient", text: "Fictional primary recipient.",
+    });
     await host.inbox.sync(host.owner, sourceId, { folder: "all", lane: "latest", limit: 100 });
     const storage = new Map<string, string>();
     Object.assign(globalThis, { location: new URL("http://localhost:41999"), window: new EventTarget(),
@@ -692,6 +715,10 @@ test("SDK-backed sending identities support bounded row aliases and preserve exp
     await until(() => store.getSnapshot().mail.some(mail => mail.subject === "Explicit alias reply" && mail.recipientAlias === alias));
     assert.ok(identityReads.length <= store.getSnapshot().accounts.length, "legacy rows share bounded per-source identity discovery");
     const primary = store.getSnapshot().accounts.find(box => box.sourceId === sourceId)!;
+    for (const account of [primary.id, UNIFIED_ACCOUNT]) {
+      assert.equal(store.getSnapshot().mail.find(mail => mail.account === account && mail.subject === "Explicit primary recipient")?.recipientAlias,
+        nativeBox.email, "legacy individual and unified rows display the matched primary address");
+    }
     const secondary = store.getSnapshot().accounts.find(box => box.sourceId === host!.store.link(host!.owner, secondBox.id)!.accountId)!;
     assert.equal(primary.sourceGeneration, (await host.inbox.account(host.owner, sourceId)).generation);
     const values = await store.sendingIdentities(primary.id);
@@ -2891,7 +2918,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         const summary: import("inbox-sdk/types").MailboxMessageSummary = {
           id: messageId, accountId: source.id, sourceId: source.id, threadId: `thread-${index}`, revision: 1,
           from: { name: "Fictional sender", email: "sender@example.test" },
-          to: index === 0 ? [] : [{ name: "Notes", email: "notes@example.test" }], cc: [], deliveredTo: index === 0 ? ["notes@example.test"] : undefined,
+          to: index === 0 ? [] : [{ name: "Recipient", email: index === 2 ? source.email : "notes@example.test" }], cc: [], deliveredTo: index === 0 ? ["notes@example.test"] : undefined,
           subject: `Fictional page row ${index}`, preview: "Bounded alias row.",
           receivedAt: new Date(Date.parse(deadline) - index * 1000).toISOString(), isRead: false, isStarred: false, folder: "inbox",
           folderIds: [], labelIds: [], hasAttachments: false,
@@ -2900,7 +2927,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         return { key: id, sourceId: source.id, threadId: `thread-${index}`, sourceGeneration: 1, revision: 1, pageCursor: `row-${index}`,
           mail: { ...inbox, id, account: box.id, mailboxId: box.id, sourceId: source.id, sourceGeneration: source.generation, sdkThreadId: `thread-${index}`, subject: `Fictional page row ${index}`,
             receivedAt: Date.parse(deadline) - index * 1000, folder: "Inbox", locations: ["Inbox"], messages: [{ ...inbox.messages[0], id: messageId, body: "", loaded: false }] },
-          summaries: name === "full" && index <= 1 ? [summary] : [], messagesComplete: name === "full" && index === 0,
+          summaries: name === "full" && index <= 2 ? [summary] : [], messagesComplete: name === "full" && (index === 0 || index === 2),
           counts: { messages: 1, memberships: 1, unread: 1, done: 0, snoozed: 0 },
           targets: [{ mailboxId: box.id, messageId, revision: 1 }], targetsComplete: true, actionContextComplete: false, contextVersion: `context-${index}` };
       };
@@ -2982,6 +3009,8 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       assert.equal(changes.length, 0, `${name}: incomplete context does not start an index-completion poller`);
       if (name === "full") {
         await until(() => store.getSnapshot().mail.find(mail => mail.id === row(0).key)?.recipientAlias === "notes@example.test", "the Delivered-To-only source alias appears without a body read");
+        assert.equal(store.getSnapshot().mail.find(mail => mail.id === row(2).key)?.recipientAlias, source.email,
+          "complete bounded-window rows display the matched primary address without a body read");
         assert.equal(store.getSnapshot().mail.find(mail => mail.id === row(1).key)?.recipientAlias, undefined,
           "an incomplete conversation stays blank because an omitted message could contain another alias");
         assert.equal(identityReads, 1, "one loaded source produces one identity request, not one request per row");

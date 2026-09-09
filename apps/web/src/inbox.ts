@@ -16,7 +16,7 @@ import { getApplicationStorage } from "./storage";
 import { createScopedFetch } from "./application-auth";
 import { getApplicationScope } from "./application-scope";
 import { matchesSearch } from "./mail-search";
-import { hasIncomingRecipientHeaders, matchingRecipientAlias } from "./recipient-alias";
+import { hasIncomingRecipientHeaders, matchingRecipientAddress, matchingRecipientAlias } from "./recipient-alias";
 import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, createAiTriageClient, type HostConfiguration, type InboxViewPreferences, createCategoryTransport, CategoryRequestError } from "./host";
 import { readSplitPreferences, writeSplitPreferences, readAttentionFeedback, recordAttentionFeedback, retractAttentionFeedback, InboxViewPreferencesError,
   type SavedSplitPreferences, type AttentionFeedback, type AttentionFeedbackTarget } from "./host";
@@ -2138,7 +2138,7 @@ export class InboxStore {
       const aliases = source && this.recipientAliases.get(source.id);
       const recipientAlias = source && aliases?.generation === source.generation
         && provenance.messagesComplete
-        ? matchingRecipientAlias(retained.get(row.key)!, aliases.identities, source.email) : undefined;
+        ? matchingRecipientAddress(retained.get(row.key)!, aliases.identities, source.email) : undefined;
       // Whole-conversation aggregate/provenance always wins over partial projected metadata.
       const time = Number.isFinite(row.mail.receivedAt) ? calendar.format(new Date(row.mail.receivedAt!).toISOString()) : { date: row.mail.date, group: row.mail.group };
       let next: Mail = { ...row.mail, ...time, recipientAlias, messages: local?.messages.filter(message => ids.has(message.id)) ?? row.mail.messages, window: provenance,
@@ -2326,7 +2326,7 @@ export class InboxStore {
         ? [...(unifiedAliasRows.get(nativeKey(conversation.sourceId, conversation.sdkThreadId))?.values() ?? [])]
         : aliasRows.get(conversation.id) ?? [];
       conversation.recipientAlias = source && cached?.generation === source.generation
-        ? matchingRecipientAlias(rows, cached.identities, source.email) : undefined;
+        ? matchingRecipientAddress(rows, cached.identities, source.email) : undefined;
     }
     if (!onlyThreads) this.knownThreads.clear();
     const ai = this.state.ai;
