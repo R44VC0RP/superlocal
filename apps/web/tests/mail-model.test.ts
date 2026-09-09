@@ -956,13 +956,16 @@ test("MailRow separates incoming recipient identities from sent To addresses", a
     index: 0, highlighted: false, selected: false, sent, showSnippets: false,
   }));
   const alias = render("notes@example.test");
-  assert.match(alias, /class="row-recipients" role="cell" title="notes@example.test">notes@example.test<\/span>/);
-  assert.doesNotMatch(alias, />To:|No To recipients/);
+  assert.match(alias, /class="row-recipients" role="cell" title="To: notes@example.test">To: notes@example.test<\/span>/);
+  assert.doesNotMatch(alias, /No To recipients/);
   const primary = render("primary@example.test");
-  assert.match(primary, /title="primary@example.test">primary@example.test<\/span>/);
-  const blank = render();
-  assert.match(blank, /class="row-recipients" role="cell"><\/span>/);
-  for (const html of [alias, primary, blank]) assert.doesNotMatch(html, /actual-to@example.test|private-bcc@example.test|cc-only@example.test|owner@example.test/);
+  assert.match(primary, /title="To: primary@example.test">To: primary@example.test<\/span>/);
+  const fallback = render(undefined, false, ["actual-to@example.test"]);
+  assert.match(fallback, /title="To: Actual Recipient &lt;actual-to@example.test&gt;">To: actual-to@example.test<\/span>/);
+  assert.match(render(undefined, false, []), /title="No To recipients">No To recipients<\/span>/);
+  assert.match(render("notes@example.test", false, []), />To: notes@example.test<\/span>/);
+  for (const html of [alias, primary]) assert.doesNotMatch(html, /actual-to@example.test|private-bcc@example.test|cc-only@example.test|owner@example.test/);
+  assert.doesNotMatch(fallback, /private-bcc@example.test|cc-only@example.test|owner@example.test/);
   const sent = render("notes@example.test", true, ["actual-to@example.test"]);
   assert.match(sent, /title="To: Actual Recipient &lt;actual-to@example.test&gt;">To: actual-to@example.test<\/span>/);
   assert.doesNotMatch(sent, /notes@example.test|private-bcc@example.test|cc-only@example.test/);
