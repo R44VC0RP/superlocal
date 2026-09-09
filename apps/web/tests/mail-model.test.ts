@@ -8,7 +8,7 @@ import { classifyAttention, conversationAttention } from "../../shared/mail-atte
 import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, aiSortingStatus, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
-import { matchingRecipientAddress, matchingRecipientAlias } from "../src/recipient-alias.ts";
+import { matchingRecipientAddress, matchingRecipientAlias } from "../src/recipient-address.ts";
 import {
   advanceMail,
   appendOutgoing,
@@ -712,11 +712,11 @@ test("SDK-backed sending identities support bounded row aliases and preserve exp
     }) as typeof fetch;
     const store = new InboxStore(); stop = store.start();
     await until(() => store.getSnapshot().loaded);
-    await until(() => store.getSnapshot().mail.some(mail => mail.subject === "Explicit alias reply" && mail.recipientAlias === alias));
+    await until(() => store.getSnapshot().mail.some(mail => mail.subject === "Explicit alias reply" && mail.recipientAddress === alias));
     assert.ok(identityReads.length <= store.getSnapshot().accounts.length, "legacy rows share bounded per-source identity discovery");
     const primary = store.getSnapshot().accounts.find(box => box.sourceId === sourceId)!;
     for (const account of [primary.id, UNIFIED_ACCOUNT]) {
-      assert.equal(store.getSnapshot().mail.find(mail => mail.account === account && mail.subject === "Explicit primary recipient")?.recipientAlias,
+      assert.equal(store.getSnapshot().mail.find(mail => mail.account === account && mail.subject === "Explicit primary recipient")?.recipientAddress,
         nativeBox.email, "legacy individual and unified rows display the matched primary address");
     }
     const secondary = store.getSnapshot().accounts.find(box => box.sourceId === host!.store.link(host!.owner, secondBox.id)!.accountId)!;
@@ -916,8 +916,8 @@ test("MailRow separates incoming recipient identities from sent To addresses", a
   const [{ createElement }, { renderToStaticMarkup }, { default: MailRow }] = await Promise.all([
     import("react"), import("react-dom/server"), import("../src/MailRow.tsx"),
   ]);
-  const render = (recipientAlias?: string, sent = false, toAddresses?: string[], to = "Actual Recipient <actual-to@example.test>") => renderToStaticMarkup(createElement(MailRow, {
-    mail: { ...inbox, to, toAddresses, recipientAlias,
+  const render = (recipientAddress?: string, sent = false, toAddresses?: string[], to = "Actual Recipient <actual-to@example.test>") => renderToStaticMarkup(createElement(MailRow, {
+    mail: { ...inbox, to, toAddresses, recipientAddress,
       account: UNIFIED_ACCOUNT, accountEmail: "owner@example.test", mailboxNames: ["Receiving mailbox"],
       messages: [{ ...inbox.messages[0], to: "actual-to@example.test", cc: "cc-only@example.test", bcc: "private-bcc@example.test" }] },
     index: 0, highlighted: false, selected: false, sent, showSnippets: false,
@@ -3016,37 +3016,37 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       assert.equal(queries, 1); assert.equal(pages.length, sizes.length > 1 ? 1 : 0, `${name}: initial response plus at most one automatic buffer`);
       assert.equal(changes.length, 0, `${name}: incomplete context does not start an index-completion poller`);
       if (name === "full") {
-        await until(() => store.getSnapshot().mail.find(mail => mail.id === row(0).key)?.recipientAlias === "notes@example.test", "the Delivered-To-only source alias appears without a body read");
-        assert.equal(store.getSnapshot().mail.find(mail => mail.id === row(2).key)?.recipientAlias, source.email,
+        await until(() => store.getSnapshot().mail.find(mail => mail.id === row(0).key)?.recipientAddress === "notes@example.test", "the Delivered-To-only source alias appears without a body read");
+        assert.equal(store.getSnapshot().mail.find(mail => mail.id === row(2).key)?.recipientAddress, source.email,
           "complete bounded-window rows display the matched primary address without a body read");
-        assert.equal(store.getSnapshot().mail.find(mail => mail.id === row(1).key)?.recipientAlias, undefined,
+        assert.equal(store.getSnapshot().mail.find(mail => mail.id === row(1).key)?.recipientAddress, undefined,
           "an incomplete conversation stays blank because an omitted message could contain another alias");
         assert.equal(identityReads, 1, "one loaded source produces one identity request, not one request per row");
         const control = store as unknown as {
-          recipientAliases: Map<string, { checkedAt: number }>;
-          recipientAliasWorkers: Set<Promise<void>>;
-          recipientAliasRefreshTimer?: ReturnType<typeof setTimeout>;
+          recipientIdentityCache: Map<string, { checkedAt: number }>;
+          recipientIdentityWorkers: Set<Promise<void>>;
+          recipientIdentityRefreshTimer?: ReturnType<typeof setTimeout>;
           rebuildWindow(): void;
-          scheduleRecipientAliases(rows: []): void;
-          scheduleRecipientAliasRefresh(): void;
+          scheduleRecipientIdentityReads(rows: []): void;
+          scheduleRecipientIdentityRefresh(): void;
         };
-        await until(() => control.recipientAliasWorkers.size === 0, "initial identity read settles");
+        await until(() => control.recipientIdentityWorkers.size === 0, "initial identity read settles");
         const cachedMail = store.getSnapshot().mail.find(mail => mail.id === row(0).key)!;
         let release!: () => void;
         identityGate = new Promise<void>(resolve => { release = resolve; });
-        control.recipientAliases.get(source.id)!.checkedAt -= 300_001;
+        control.recipientIdentityCache.get(source.id)!.checkedAt -= 300_001;
         control.rebuildWindow();
         assert.equal(identityReads, 2);
         assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === row(0).key), cachedMail, "TTL refresh retains the alias and immutable mail identity while pending");
         identityGate = undefined; release();
-        await until(() => control.recipientAliasWorkers.size === 0, "unchanged identity refresh settles");
+        await until(() => control.recipientIdentityWorkers.size === 0, "unchanged identity refresh settles");
         assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === row(0).key), cachedMail, "unchanged TTL response never blanks or replaces the mail row");
-        control.recipientAliases.get(source.id)!.checkedAt -= 300_001;
-        control.scheduleRecipientAliases([]); control.scheduleRecipientAliasRefresh();
-        assert.equal(control.recipientAliasRefreshTimer, undefined, "expired sources without eligible rows have no timer, not a 1ms rebuild loop");
+        control.recipientIdentityCache.get(source.id)!.checkedAt -= 300_001;
+        control.scheduleRecipientIdentityReads([]); control.scheduleRecipientIdentityRefresh();
+        assert.equal(control.recipientIdentityRefreshTimer, undefined, "expired sources without eligible rows have no timer, not a 1ms rebuild loop");
         await sleep(10); assert.equal(identityReads, 2);
         control.rebuildWindow();
-        await until(() => control.recipientAliasWorkers.size === 0, "eligible demand resumes refresh");
+        await until(() => control.recipientIdentityWorkers.size === 0, "eligible demand resumes refresh");
       } else assert.equal(identityReads, 0, "rows without recipient summaries do not trigger identity requests");
       // Progressing passes finish beyond the old five-request cap; stalled passes stop.
       await until(() => countRequests.length === (name === "empty" ? 1 : Number.isFinite(countsKnownAfter) ? countsKnownAfter : 5), `${name}: the count fill settles`);
@@ -3968,12 +3968,12 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
         await store.setWindowQuery(activeQuery);
         const aliasControl = store as unknown as {
-          recipientAliases: Map<string, { checkedAt: number }>;
-          recipientAliasWorkers: Set<Promise<void>>;
-          recipientAliasLoads: Map<string, unknown>;
+          recipientIdentityCache: Map<string, { checkedAt: number }>;
+          recipientIdentityWorkers: Set<Promise<void>>;
+          recipientIdentityLoads: Map<string, unknown>;
         };
-        await until(() => aliasControl.recipientAliasWorkers.size === 0, "identity metadata settles before navigation");
-        aliasControl.recipientAliases.get(source.id)!.checkedAt -= 300_001;
+        await until(() => aliasControl.recipientIdentityWorkers.size === 0, "identity metadata settles before navigation");
+        aliasControl.recipientIdentityCache.get(source.id)!.checkedAt -= 300_001;
         const releases: Array<() => void> = [];
         const beforeNavigationReads = identityReads;
         for (const folder of ["Sent", "Inbox", "Sent", "Inbox", "Sent", "Inbox"]) {
@@ -3984,11 +3984,11 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         assert.ok(identitySignals.slice(-6, -1).every(signal => signal.aborted), "each retired window aborts its identity demand");
         for (const release of releases.slice(0, -1)) release();
         await sleep(0);
-        assert.equal(aliasControl.recipientAliasLoads.size, 1, "late old finalizers cannot erase the current request owner");
-        assert.equal(aliasControl.recipientAliasWorkers.size, 1);
+        assert.equal(aliasControl.recipientIdentityLoads.size, 1, "late old finalizers cannot erase the current request owner");
+        assert.equal(aliasControl.recipientIdentityWorkers.size, 1);
         identityGate = undefined; releases.at(-1)!();
-        await until(() => aliasControl.recipientAliasWorkers.size === 0, "newest window identity response settles");
-        assert.ok(Date.now() - aliasControl.recipientAliases.get(source.id)!.checkedAt < 1000, "the current response, not an obsolete window, owns the refreshed metadata");
+        await until(() => aliasControl.recipientIdentityWorkers.size === 0, "newest window identity response settles");
+        assert.ok(Date.now() - aliasControl.recipientIdentityCache.get(source.id)!.checkedAt < 1000, "the current response, not an obsolete window, owns the refreshed metadata");
         const closing = store.doneOptimistically([selected(0)]);
         const closed = assert.rejects(closing, error => error instanceof DOMException && error.name === "AbortError");
         assert.equal(store.getSnapshot().pendingDone.length, 1);

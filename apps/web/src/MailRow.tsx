@@ -32,7 +32,7 @@ function MailRow({
 }: MailRowProps) {
   const messageCount = m.window ? m.window.counts.messages : m.messages.length;
   const to = sent ? m.toAddresses?.join(", ") ?? m.to : "";
-  const recipient = sent ? (to ? `To: ${to}` : "No To recipients") : m.recipientAlias;
+  const recipient = sent ? (to ? `To: ${to}` : "No To recipients") : m.recipientAddress;
   const recipientTitle = sent && to ? `To: ${m.to || to}` : recipient;
   return (
     <div
