@@ -3080,6 +3080,59 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         await sleep(10); assert.equal(identityReads, 2);
         control.rebuildWindow();
         await until(() => control.recipientIdentityWorkers.size === 0, "eligible demand resumes refresh");
+        // Exercise the real queue with more sources than worker slots, in both projection modes.
+        for (const inboxWindow of [false, true]) {
+          const queuedStore = new InboxStore();
+          const queued = queuedStore as unknown as {
+            sourceAccounts: typeof source[];
+            state: ReturnType<InboxStore["getSnapshot"]>;
+            windowRows: Map<string, Row>;
+            recipientIdentityWorkers: Set<Promise<void>>;
+            scheduleRecipientIdentityReads(rows: { sourceId: string; sourceGeneration: number }[]): void;
+            resetRecipientIdentityDemand(): void;
+          };
+          const sources = Array.from({ length: 6 }, (_, index) => ({ ...source, id: `queued-source-${index}` }));
+          const demand = sources.map(account => ({ sourceId: account.id, sourceGeneration: account.generation }));
+          queued.sourceAccounts = sources;
+          queued.state = { ...store.getSnapshot(), host: { ...store.getSnapshot().host!, inboxWindow },
+            window: { ...store.getSnapshot().window!, keys: sources.map(account => account.id),
+              state: { ...store.getSnapshot().window!.state, sources: sources.map(account => ({ sourceId: account.id, generation: account.generation })) } } };
+          queued.windowRows = new Map(sources.map(account => [account.id, { ...row(0), key: account.id, sourceId: account.id }]));
+          const reads: string[] = [], releases: Array<() => void> = [];
+          queuedStore.client.sendingIdentities = async sourceId => {
+            reads.push(sourceId);
+            await new Promise<void>(resolve => { releases.push(resolve); });
+            return { sourceId, checkedAt: new Date().toISOString(), identities: [] };
+          };
+          try {
+            queued.scheduleRecipientIdentityReads(demand);
+            assert.equal(reads.length, 4, "identity reads respect the worker bound");
+            queued.state.window = { ...queued.state.window!, keys: [] };
+            queued.scheduleRecipientIdentityReads([]);
+            for (const release of releases) release();
+            await sleep(0);
+            assert.equal(reads.length, 4, "withdrawn queued demand never starts a request when a worker finishes");
+            assert.equal(queued.recipientIdentityWorkers.size, 0);
+            queued.state.window = { ...queued.state.window!, keys: sources.map(account => account.id) };
+            queued.scheduleRecipientIdentityReads(demand.slice(4));
+            assert.deepEqual(reads.slice(4), sources.slice(4).map(account => account.id), "withdrawn sources can be requested again without stale load ownership");
+            queued.resetRecipientIdentityDemand();
+            for (const release of releases) release();
+            await sleep(0);
+            reads.length = 0; releases.length = 0;
+            queued.scheduleRecipientIdentityReads(demand);
+            assert.equal(reads.length, 4);
+            // Source validity may change while queued, without another demand scheduling pass.
+            queued.sourceAccounts = sources.map((account, index) => index === 4
+              ? { ...account, generation: account.generation + 1 } : { ...account, status: "disconnected" });
+            for (const release of releases) release();
+            await sleep(0);
+            assert.equal(reads.length, 4, "dispatch rechecks source generations and connection status before IO");
+          } finally {
+            queued.resetRecipientIdentityDemand();
+            for (const release of releases) release();
+          }
+        }
       } else assert.equal(identityReads, 0, "rows without recipient summaries do not trigger identity requests");
       // Progressing passes finish beyond the old five-request cap; stalled passes stop.
       await until(() => countRequests.length === (name === "empty" ? 1 : Number.isFinite(countsKnownAfter) ? countsKnownAfter : 5), `${name}: the count fill settles`);

@@ -1302,6 +1302,13 @@ export class InboxStore {
   private scheduleRecipientIdentityReads(rows: readonly { sourceId: string; sourceGeneration: number }[]) {
     const now = Date.now();
     this.recipientIdentityActive = new Set(rows.map(row => `${row.sourceId}\0${row.sourceGeneration}`));
+    // Paging can retire demand without opening a new window. Drop only queued work;
+    // in-flight requests retain their completion fences and worker ownership.
+    for (const [key, request] of this.recipientIdentityQueue) {
+      if (this.recipientIdentityActive.has(key)) continue;
+      this.recipientIdentityQueue.delete(key);
+      if (this.recipientIdentityLoads.get(key) === request) this.recipientIdentityLoads.delete(key);
+    }
     for (const row of rows) {
       const source = this.sourceAccounts.find(account => account.id === row.sourceId);
       if (!source || source.status !== "connected" || source.generation !== row.sourceGeneration) continue;
@@ -1339,6 +1346,11 @@ export class InboxStore {
       const [key, request] = this.recipientIdentityQueue.entries().next().value!;
       this.recipientIdentityQueue.delete(key);
       const storeGeneration = request.storeGeneration;
+      if (request.demandEpoch !== this.recipientIdentityDemandEpoch || !this.recipientIdentityActive.has(key)
+        || !this.recipientSourceIsCurrent(request.sourceId, request.generation, storeGeneration)) {
+        if (this.recipientIdentityLoads.get(key) === request) this.recipientIdentityLoads.delete(key);
+        continue;
+      }
       const signal = AbortSignal.any([this.recipientIdentityController.signal, this.controller.signal, this.applicationScope.signal]);
       let worker!: Promise<void>;
       worker = (async () => {
