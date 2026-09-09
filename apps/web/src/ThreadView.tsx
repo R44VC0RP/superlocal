@@ -686,7 +686,9 @@ export default function ThreadView({
               {unsubscribed ? "Unsubscribed" : "Unsubscribe"}
             </button>
           )}
-          {!!mail.mailboxNames?.length && <div className="thread-mailbox-origin" title={mail.mailboxNames.join(", ")}>{mail.mailboxNames[0]}{mail.mailboxNames.length > 1 ? ` +${mail.mailboxNames.length - 1} mailboxes` : ""}</div>}
+          {mail.recipientAlias ? (
+            <div className="thread-mailbox-origin" title={mail.recipientAlias}>{mail.recipientAlias}</div>
+          ) : !!mail.mailboxNames?.length && <div className="thread-mailbox-origin" title={mail.mailboxNames.join(", ")}>{mail.mailboxNames[0]}{mail.mailboxNames.length > 1 ? ` +${mail.mailboxNames.length - 1} mailboxes` : ""}</div>}
           {!!mail.labels.length && (
             <div className="thread-labels">
               {mail.labels.map((label) => (
