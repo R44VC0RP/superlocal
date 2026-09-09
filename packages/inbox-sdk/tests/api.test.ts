@@ -7836,7 +7836,7 @@ describe('source-scoped sending identities', () => {
     expect(box.calls.listMessages).toBe(0); expect(box.calls.getMessage).toEqual([])
   })
 
-  test('sending identities select only unambiguous authorized reply addresses, preserve explicit From and exclude current self aliases', async () => {
+  test('sending identities select the first authorized reply recipient, preserve explicit From and exclude current self aliases', async () => {
     const primary = { email: 'primary@example.test', isPrimary: true, isDefault: false }
     const alias = { email: 'alias@example.test', isPrimary: false, isDefault: true }
     const second = { email: 'second@example.test', isPrimary: false, isDefault: false }
@@ -7851,6 +7851,12 @@ describe('source-scoped sending identities', () => {
       native('delivered-disambiguated', { to: [participant(alias.email), participant(second.email)], deliveredTo: [second.email] }),
       native('delivered-ambiguous', { to: [], deliveredTo: [alias.email, second.email] }),
       native('delivered-unknown', { to: [], deliveredTo: ['alias+invented@example.test'] }),
+      native('alias-primary', { to: [participant(alias.email), participant(primary.email)], deliveredTo: [primary.email] }),
+      native('primary-alias', { to: [participant(primary.email), participant(alias.email)], deliveredTo: [alias.email] }),
+      native('to-before-cc', { to: [participant(primary.email)], cc: [participant(alias.email)] }),
+      native('cc-order', { to: [participant('external@example.test')], cc: [participant(second.email), participant(primary.email)] }),
+      native('skip-unknown', { to: [participant('unknown@example.test'), participant('ALIAS@example.test'), participant(alias.email), participant(primary.email)] }),
+      native('second-first', { to: [participant(second.email), participant(alias.email)] }),
     ])
     const h = await fixture({ providers: [{ id: DYNAMIC, name: DYNAMIC, create: credentials => ({
       ...box.adapter(credentials, DYNAMIC, fullCapabilities), async identities() { return { sending: [primary, alias, second] } },
@@ -7861,8 +7867,9 @@ describe('source-scoped sending identities', () => {
     const source = rows.find(row => row.subject === 'Subject alias')!
     const reply = await h.inbox.createDraft('alice', { accountId: account.id, mailboxId: account.id, mode: 'replyAll', sourceMessageId: source.id })
     expect(reply.from).toBe(alias.email); expect(reply.to).toEqual([participant('desk@example.test')]); expect(reply.cc).toEqual([participant('colleague@example.test')])
-    for (const [subject, from] of [['ambiguous', primary.email], ['own-sent', second.email], ['owned-incoming', alias.email], ['invented', primary.email],
-      ['delivered-bcc', alias.email], ['delivered-list', second.email], ['delivered-disambiguated', second.email], ['delivered-ambiguous', primary.email], ['delivered-unknown', primary.email]]) {
+    for (const [subject, from] of [['ambiguous', alias.email], ['own-sent', second.email], ['owned-incoming', alias.email], ['invented', primary.email],
+      ['delivered-bcc', alias.email], ['delivered-list', second.email], ['delivered-disambiguated', alias.email], ['delivered-ambiguous', primary.email], ['delivered-unknown', primary.email],
+      ['alias-primary', alias.email], ['primary-alias', primary.email], ['to-before-cc', primary.email], ['cc-order', second.email], ['skip-unknown', alias.email], ['second-first', second.email]]) {
       const draft = await h.inbox.createDraft('alice', { accountId: account.id, mode: 'reply', sourceMessageId: rows.find(row => row.subject === `Subject ${subject}`)!.id })
       expect(draft.from).toBe(from)
     }
@@ -10029,13 +10036,21 @@ describe('pilot contract: server OAuth, configured mailboxes, and canonical mess
   test('mailbox-bound drafts choose a verified scoped sender and detach cancels only their undispatched submissions', async () => {
     const h = await fixture()
     h.discoveries.set('scoped-drafts', discovery)
-    const { account, box } = await h.connect('alice', 'scoped-drafts', [], SCOPED)
+    const { account, box } = await h.connect('alice', 'scoped-drafts', [native('scoped-recipient-order', {
+      to: [participant('help@alpha.example.test'), participant('desk@beta.example.test')], sourceDomains: ['alpha.example.test', 'beta.example.test'],
+    })], SCOPED)
     const a = await h.json<Mailbox>('alice', '/mailboxes', {
       sourceId: account.id, name: 'Sender A', selector: { kind: 'domain', value: 'alpha.example.test' }, defaultSender: 'help@alpha.example.test',
     }, 'POST', 201)
     const b = await h.json<Mailbox>('alice', '/mailboxes', {
       sourceId: account.id, name: 'Sender B', selector: { kind: 'domain', value: 'beta.example.test' }, defaultSender: 'desk@beta.example.test',
     }, 'POST', 201)
+    await h.sync('alice', account.id)
+    const source = (await h.page()).items.find(message => message.subject === 'Subject scoped-recipient-order')!
+    for (const mailbox of [a, b]) {
+      const reply = await h.inbox.createDraft('alice', { accountId: account.id, mailboxId: mailbox.id, mode: 'reply', sourceMessageId: source.id })
+      expect(reply).toMatchObject({ from: mailbox.defaultSender })
+    }
     await invalid(await h.request('alice', `/mailboxes/${a.id}`, {
       method: 'PATCH', headers: { 'content-type': 'application/json', 'If-Match': await etag(h, 'alice', `/mailboxes/${a.id}`) },
       body: JSON.stringify({ defaultSender: b.defaultSender }),

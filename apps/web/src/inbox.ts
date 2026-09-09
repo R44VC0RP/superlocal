@@ -16,7 +16,8 @@ import { getApplicationStorage } from "./storage";
 import { createScopedFetch } from "./application-auth";
 import { getApplicationScope } from "./application-scope";
 import { matchesSearch } from "./mail-search";
-import { hasIncomingRecipientHeaders, matchingRecipientAddress, matchingRecipientAlias, type RecipientIdentity } from "./recipient-address";
+import { hasIncomingRecipientHeaders, matchingRecipientAddress, type RecipientIdentity } from "./recipient-address";
+import { senderFromRecipients } from "inbox-sdk/sender-selection";
 import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, createAiTriageClient, type HostConfiguration, type InboxViewPreferences, createCategoryTransport, CategoryRequestError } from "./host";
 import { readSplitPreferences, writeSplitPreferences, readAttentionFeedback, recordAttentionFeedback, retractAttentionFeedback, InboxViewPreferencesError,
   type SavedSplitPreferences, type AttentionFeedback, type AttentionFeedbackTarget } from "./host";
@@ -2595,7 +2596,7 @@ export class InboxStore {
       const selector = box.selector;
       const eligible = catalog.identities.filter(identity => selector.kind === "address" ? identity.email.toLowerCase() === selector.value.toLowerCase()
         : selector.kind === "domain" ? identity.email.split("@").at(-1)?.toLowerCase() === selector.value.toLowerCase() : true);
-      from = matchingRecipientAlias([context], eligible, source.email) ?? from;
+      from = senderFromRecipients(context, eligible) ?? from;
     }
     // Contact composition borrows only the sender identity, not reply threading or content.
     const raw = await this.client.createDraft({ accountId: source.id, mailboxId: box.id, ...(!implicitReply ? { from } : {}),

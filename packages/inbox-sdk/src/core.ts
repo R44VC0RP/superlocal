@@ -8,6 +8,7 @@ import { sanitizeEmailBody } from '../server/sanitize'
 import { createMediaStore } from './media'
 import { mailFacts } from './mail-facts'
 import { mailPreview } from './mail-preview'
+import { senderFromRecipients } from './sender-selection'
 import { FORWARDING_BODY_BYTES, FORWARDING_DEPTH, forwardingRfcId, isForwardedCopy, type ForwardingBody, type ForwardingMessage } from './forwarding'
 import { ProviderError, ProviderMutationError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
 import { CredentialError, InboxError, MAILBOX_SYNC_PROBLEM_CODES, type MailboxSyncStatus, type MailboxSyncProblemCode, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
@@ -3069,7 +3070,8 @@ export function createInbox(options: InboxOptions): Inbox {
         if (source.account !== account.id) throw new InboxError('NOT_FOUND', 'Source message not found.', 404)
         const base = summary(source); const body = JSON.parse(source.body)
         const native = JSON.parse(account.native)
-        const identities = (sending?.identities ?? nativeSendingIdentities(native)).map(identity => identity.email)
+        const catalog = sending?.identities ?? nativeSendingIdentities(native)
+        const identities = catalog.map(identity => identity.email)
         const own = new Set(identities.map(email => email.toLowerCase()))
         if (replying && input.from === undefined) {
           const box = input.mailboxId ? JSON.parse(mailboxRow(owner, input.mailboxId, true).data) as Mailbox : null
@@ -3078,12 +3080,9 @@ export function createInbox(options: InboxOptions): Inbox {
             if (box) { try { assertMailboxSender(box, email) } catch { return undefined } }
             return identities.find(value => value.toLowerCase() === email.toLowerCase())
           }
-          const matches = [...new Set([...base.to, ...base.cc].flatMap(recipient => eligible(recipient.email) ?? []))]
-          const delivered = [...new Set((base.deliveredTo ?? []).flatMap(email => eligible(email) ?? []))]
-          // Keep an unambiguous To/Cc choice. Delivered-To fills missing recipients
-          // and disambiguates aliases, but never expands the authorized sender set.
-          const from = (base.folder === 'sent' ? eligible(base.from.email) : undefined) ?? (matches.length === 1 ? matches[0] : undefined)
-            ?? (delivered.length === 1 ? delivered[0] : undefined) ?? eligible(box?.defaultSender) ?? eligible(native.email)
+          const eligibleIdentities = catalog.filter(identity => eligible(identity.email))
+          const from = (base.folder === 'sent' ? eligible(base.from.email) : undefined) ?? senderFromRecipients(base, eligibleIdentities)
+            ?? eligible(box?.defaultSender) ?? eligible(native.email)
             ?? (identities.length === 1 ? eligible(identities[0]) : undefined)
           if (!from) throw new InboxError('FORBIDDEN_SENDER', 'No authorized sender is available for this reply.', 403)
           prepared.from = from

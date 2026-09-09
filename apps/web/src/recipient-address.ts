@@ -20,37 +20,18 @@ export function hasIncomingRecipientHeaders(messages: readonly RecipientSummary[
     && (message.to.length > 0 || message.cc.length > 0 || (message.deliveredTo?.length ?? 0) > 0));
 }
 
-/** Sender inference stays alias-only. Displaying a primary recipient must not change From defaults. */
-export function matchingRecipientAlias(
-  messages: readonly RecipientSummary[],
-  identities: readonly RecipientIdentity[],
-  primary: string,
-): string | undefined {
-  return matchRecipient(messages, identities, primary, "alias");
-}
-
-/** Prefer a known alias, otherwise show a uniquely matched primary address, never an assumed account. */
+/** Prefer a unique alias, otherwise a matched primary, across the conversation. Never select From here. */
 export function matchingRecipientAddress(
   messages: readonly RecipientSummary[],
   identities: readonly RecipientIdentity[],
   primary: string,
 ): string | undefined {
-  return matchRecipient(messages, identities, primary, "address");
-}
-
-/** Header hints are not authenticated delivery evidence. */
-function matchRecipient(
-  messages: readonly RecipientSummary[],
-  identities: readonly RecipientIdentity[],
-  primary: string,
-  mode: "alias" | "address",
-): string | undefined {
   const own = new Set(identities.filter((identity) => !identity.isPrimary).map((identity) => identity.email.toLowerCase()));
   const primaryEmail = primary.toLowerCase();
   own.delete(primaryEmail);
-  const primaries = new Set(mode === "address" ? identities
+  const primaries = new Set(identities
     .filter((identity) => identity.isPrimary || identity.email.toLowerCase() === primaryEmail)
-    .map((identity) => identity.email.toLowerCase()) : []);
+    .map((identity) => identity.email.toLowerCase()));
   const primaryMatches = new Set<string>();
   let match: string | undefined;
   for (const message of messages) {

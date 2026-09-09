@@ -8,7 +8,7 @@ import { classifyAttention, conversationAttention } from "../../shared/mail-atte
 import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, aiSortingStatus, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
-import { matchingRecipientAddress, matchingRecipientAlias } from "../src/recipient-address.ts";
+import { matchingRecipientAddress } from "../src/recipient-address.ts";
 import {
   advanceMail,
   appendOutgoing,
@@ -34,7 +34,7 @@ test("recipient alias display requires one verified incoming recipient match", (
   const aliases = ["notes@example.test", "billing@example.test"];
   const row = (to: string[], cc: string[] = [], folder = "inbox", deliveredTo?: string[]) => ({ folder, deliveredTo,
     to: to.map(email => ({ email })), cc: cc.map(email => ({ email })) });
-  const match = (rows: ReturnType<typeof row>[], known = aliases) => matchingRecipientAlias(rows, known.map(email => ({ email, isPrimary: false })), "primary@example.test");
+  const match = (rows: ReturnType<typeof row>[], known = aliases) => matchingRecipientAddress(rows, known.map(email => ({ email, isPrimary: false })), "primary@example.test");
   assert.equal(match([row(["NOTES@example.test", "external@example.test"])]), aliases[0]);
   assert.equal(match([row(["external@example.test"], [aliases[0]])]), aliases[0]);
   assert.equal(match([row([aliases[0]]), row([aliases[0]])]), aliases[0]);
@@ -42,7 +42,7 @@ test("recipient alias display requires one verified incoming recipient match", (
   assert.equal(match([row([aliases[0]]), row([aliases[1]], [], "sent")]), aliases[0]);
   assert.equal(match([row([aliases[0]], [aliases[1]])]), undefined);
   assert.equal(match([row([aliases[0]]), row([aliases[1]])]), undefined);
-  assert.equal(match([row(["primary@example.test"])], [...aliases, "PRIMARY@example.test"]), undefined);
+  assert.equal(match([row(["primary@example.test"])], [...aliases, "PRIMARY@example.test"]), "primary@example.test");
   assert.equal(match([row(["external@example.test"])]), undefined);
   assert.equal(match([row([aliases[0]])], []), undefined);
   assert.equal(match([row([aliases[0]], [], "sent")]), undefined);
@@ -55,10 +55,9 @@ test("recipient alias display requires one verified incoming recipient match", (
   assert.equal(match([row(aliases, [], "inbox", [aliases[1]])]), aliases[1]);
   assert.equal(match([row([], [], "inbox", aliases)]), undefined);
   assert.equal(match([row([], [], "inbox", ["unknown@example.test"])]), undefined);
-  assert.equal(match([row([], [], "inbox", ["primary@example.test"])], [...aliases, "primary@example.test"]), undefined);
+  assert.equal(match([row([], [], "inbox", ["primary@example.test"])], [...aliases, "primary@example.test"]), "primary@example.test");
   assert.equal(match([row([], [], "inbox", [aliases[0]]), row([], [], "inbox", [aliases[1]])]), undefined);
-  assert.equal(matchingRecipientAlias([row([], [], "inbox", ["provider-primary@example.test"])], [{ email: "provider-primary@example.test", isPrimary: true }], "different-owner@example.test"), undefined);
-  assert.equal(matchingRecipientAlias([row(["provider-primary@example.test"])], [{ email: "provider-primary@example.test", isPrimary: true }], "different-owner@example.test"), undefined);
+  assert.equal(matchingRecipientAddress([row([], [], "inbox", ["provider-primary@example.test"])], [{ email: "provider-primary@example.test", isPrimary: true }], "different-owner@example.test"), "provider-primary@example.test");
   for (const folder of ["scheduled", "outbox", "unsent", "queued", "SENT", "draft"]) {
     assert.equal(match([row([aliases[0]], [], folder)]), undefined, folder);
     assert.equal(match([row([], [], folder, [aliases[0]])]), undefined, folder);
@@ -680,6 +679,16 @@ test("SDK-backed sending identities support bounded row aliases and preserve exp
     host.store.receive({ owner: host.owner, storeId: nativeBox.id, accountId: sourceId }, {
       from: "sender@example.test", to: nativeBox.email, subject: "Explicit primary recipient", text: "Fictional primary recipient.",
     });
+    const orderedRecipients = [
+      { name: "alias first", to: [alias, nativeBox.email], cc: [], from: alias },
+      { name: "primary first", to: [nativeBox.email, alias], cc: [], from: nativeBox.email },
+      { name: "To before Cc", to: [nativeBox.email], cc: [alias], from: nativeBox.email },
+      { name: "Cc fallback", to: ["external@example.test"], cc: [alias, nativeBox.email], from: alias },
+      { name: "skip unknown and retain order", to: ["unknown@example.test", alias.toUpperCase(), alias, nativeBox.email], cc: [], from: alias },
+    ];
+    for (const scenario of orderedRecipients) host.store.receive({ owner: host.owner, storeId: nativeBox.id, accountId: sourceId }, {
+      from: "sender@example.test", to: scenario.to, cc: scenario.cc, subject: `Ordered recipients: ${scenario.name}`, text: "Fictional ordered recipients.",
+    });
     await host.inbox.sync(host.owner, sourceId, { folder: "all", lane: "latest", limit: 100 });
     const storage = new Map<string, string>();
     Object.assign(globalThis, { location: new URL("http://localhost:41999"), window: new EventTarget(),
@@ -841,6 +850,30 @@ test("SDK-backed sending identities support bounded row aliases and preserve exp
     const forward = await store.newDraft(primary.id, { mode: "forward", mail, sourceMessageId });
     assert.equal(created.at(-1)!.from, primary.email, "forward default is unchanged");
     await store.discardDraft(forward.id);
+
+    for (const scenario of orderedRecipients) {
+      const context = store.getSnapshot().mail.find(value => value.account === primary.id && value.subject === `Ordered recipients: ${scenario.name}`)!;
+      const messageId = context.messages.at(-1)!.id;
+      for (const mode of ["new", "reply", "replyAll"] as const) {
+        const draft = await store.newDraft(primary.id, { mode, mail: context, sourceMessageId: messageId,
+          ...(mode === "new" ? { to: "sender@example.test" } : {}) });
+        assert.equal(draft.from, scenario.from, `${mode}: ${scenario.name}`);
+        if (mode === "new") {
+          assert.equal(draft.sourceMessageId, undefined); assert.equal(draft.threadId, undefined);
+          assert.equal(draft.subject, ""); assert.equal(draft.body, "<div></div>");
+        }
+        await store.discardDraft(draft.id);
+      }
+    }
+
+    const addressMailbox = await host.inbox.createMailbox(host.owner, { sourceId, name: "Alias-only sender", selector: { kind: "address", value: alias }, defaultSender: alias });
+    await host.inbox.syncMailbox(host.owner, addressMailbox.id, { folder: "inbox", lane: "latest", limit: 100 });
+    await store.refresh(true);
+    const scopedMail = store.getSnapshot().mail.find(value => value.account === addressMailbox.id && value.subject === "Ordered recipients: primary first")!;
+    assert.ok(scopedMail, "the incoming message belongs to the alias-only mailbox");
+    const scopedDraft = await store.newDraft(addressMailbox.id, { mail: scopedMail, sourceMessageId: scopedMail.messages.at(-1)!.id, to: "sender@example.test" });
+    assert.equal(scopedDraft.from, alias, "skip an earlier authorized source identity outside the selected mailbox");
+    await store.discardDraft(scopedDraft.id);
 
     store.editDraft({ ...saved, from: "removed@example.test" });
     await store.flushDraft(saved.id);
