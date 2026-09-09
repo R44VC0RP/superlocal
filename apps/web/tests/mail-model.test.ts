@@ -901,10 +901,10 @@ test("SDK-backed sending identities support bounded row aliases and preserve exp
   }
 });
 
-test("MailRow renders only the bare verified recipient alias", async () => {
+test("MailRow separates incoming recipient identities from sent To addresses", async () => {
   if (!process.versions.bun) {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
-      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "MailRow renders only"], {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "MailRow separates incoming"], {
         env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
       });
       let output = "";
@@ -916,18 +916,26 @@ test("MailRow renders only the bare verified recipient alias", async () => {
   const [{ createElement }, { renderToStaticMarkup }, { default: MailRow }] = await Promise.all([
     import("react"), import("react-dom/server"), import("../src/MailRow.tsx"),
   ]);
-  const render = (recipientAlias?: string) => renderToStaticMarkup(createElement(MailRow, {
-    mail: { ...inbox, to: "actual-to@example.test", toAddresses: ["actual-to@example.test"], recipientAlias,
+  const render = (recipientAlias?: string, sent = false, toAddresses?: string[], to = "Actual Recipient <actual-to@example.test>") => renderToStaticMarkup(createElement(MailRow, {
+    mail: { ...inbox, to, toAddresses, recipientAlias,
       account: UNIFIED_ACCOUNT, accountEmail: "owner@example.test", mailboxNames: ["Receiving mailbox"],
       messages: [{ ...inbox.messages[0], to: "actual-to@example.test", cc: "cc-only@example.test", bcc: "private-bcc@example.test" }] },
-    index: 0, highlighted: false, selected: false, sent: false, showSnippets: false,
+    index: 0, highlighted: false, selected: false, sent, showSnippets: false,
   }));
   const alias = render("notes@example.test");
   assert.match(alias, /class="row-recipients" role="cell" title="notes@example.test">notes@example.test<\/span>/);
   assert.doesNotMatch(alias, />To:|No To recipients/);
+  const primary = render("primary@example.test");
+  assert.match(primary, /title="primary@example.test">primary@example.test<\/span>/);
   const blank = render();
   assert.match(blank, /class="row-recipients" role="cell"><\/span>/);
-  for (const html of [alias, blank]) assert.doesNotMatch(html, /actual-to@example.test|private-bcc@example.test|cc-only@example.test|owner@example.test/);
+  for (const html of [alias, primary, blank]) assert.doesNotMatch(html, /actual-to@example.test|private-bcc@example.test|cc-only@example.test|owner@example.test/);
+  const sent = render("notes@example.test", true, ["actual-to@example.test"]);
+  assert.match(sent, /title="To: Actual Recipient &lt;actual-to@example.test&gt;">To: actual-to@example.test<\/span>/);
+  assert.doesNotMatch(sent, /notes@example.test|private-bcc@example.test|cc-only@example.test/);
+  assert.match(render(undefined, true, ["first@example.test", "second@example.test"]), />To: first@example.test, second@example.test<\/span>/);
+  assert.match(render(undefined, true, []), />No To recipients<\/span>/);
+  assert.match(render(undefined, true, undefined, "legacy@example.test"), /title="To: legacy@example.test">To: legacy@example.test<\/span>/);
 });
 test("SDK-backed optimistic flags retain conditional intent through latency, failures and overlapping views", async () => {
   // The ordinary web runner is Node; the actual SDK intentionally uses
