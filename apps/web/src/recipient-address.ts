@@ -1,3 +1,5 @@
+import { isIncomingRecipientFolder } from "inbox-sdk/sender-selection";
+
 type RecipientSummary = {
   folder: string;
   to: readonly { email: string }[];
@@ -9,10 +11,6 @@ export type RecipientIdentity = {
   email: string;
   isPrimary: boolean;
 };
-
-const nonIncomingFolders = new Set(["sent", "draft", "drafts", "scheduled", "outbox", "unsent", "queued"]);
-
-const isIncomingRecipientFolder = (folder: string): boolean => !nonIncomingFolders.has(folder.toLowerCase());
 
 /** Header recipients from drafts, sends and queued sends are not evidence of incoming delivery. */
 export function hasIncomingRecipientHeaders(messages: readonly RecipientSummary[]): boolean {

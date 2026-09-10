@@ -8,7 +8,8 @@ import { classifyAttention, conversationAttention } from "../../shared/mail-atte
 import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, aiSortingStatus, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
-import { matchingRecipientAddress } from "../src/recipient-address.ts";
+import { hasIncomingRecipientHeaders, matchingRecipientAddress } from "../src/recipient-address.ts";
+import { senderFromRecipients } from "inbox-sdk/sender-selection";
 import {
   advanceMail,
   appendOutgoing,
@@ -82,7 +83,13 @@ test("recipient alias display requires one verified incoming recipient match", (
   assert.equal(matchingRecipientAddress([row(["provider-primary@example.test"])], [{ email: "provider-primary@example.test", isPrimary: true }], primary), "provider-primary@example.test");
   for (const folder of ["sent", "drafts", "scheduled", "outbox", "unsent", "queued", "SENT", "draft"]) {
     assert.equal(display([row([primary], [], folder, [primary])]), undefined, folder);
+    const outgoing = row([aliases[0]], [], folder, [aliases[0]]);
+    assert.equal(hasIncomingRecipientHeaders([outgoing]), false, `${folder}: no discovery demand from outgoing mail`);
+    assert.equal(senderFromRecipients(outgoing, identities), undefined, `${folder}: no inferred recipient sender from outgoing mail`);
   }
+  const archived = row([aliases[0]], [], "Archive");
+  assert.equal(hasIncomingRecipientHeaders([archived]), true);
+  assert.equal(senderFromRecipients(archived, identities), aliases[0]);
 });
 
 test("guided zero snapshots all active Important work without unread, custom-split or receiving-view leaks", () => {
@@ -774,6 +781,13 @@ test("SDK-backed sending identities support bounded row aliases and preserve exp
       assert.ok(groups.find(group => group.account.id === secondary.id)!.identities.some(identity => identity.email === secondBox.aliases[0]), "all finite aliases from other sources are offered");
       const domainOnly = sendingAddressGroups([domainBox], { [domainBox.id]: sourceCatalog }, domainBox.id);
       assert.deepEqual(domainOnly[0].identities.map(identity => identity.email), [primary.email, alias], "domain views exclude source aliases outside their authorized receiving domain");
+      const mixedCase = [{ email: alias.toUpperCase() }, { email: `other@sub.${domainBox.selectorValue}` }];
+      assert.deepEqual(sendingAddressGroups([domainBox], { [domainBox.id]: mixedCase }, domainBox.id)[0].identities.map(identity => identity.email),
+        [alias.toUpperCase()], "domain matching ignores case, preserves the chosen address and excludes subdomains");
+      assert.deepEqual(sendingAddressGroups([{ ...addressBox, selectorValue: undefined }], { [addressBox.id]: mixedCase }, addressBox.id)[0].identities.map(identity => identity.email),
+        [alias.toUpperCase()], "an address view falls back to its mailbox email without changing identity casing");
+      assert.deepEqual(sendingAddressGroups([{ ...domainBox, selectorValue: undefined }], { [domainBox.id]: mixedCase }, domainBox.id), [],
+        "a missing domain selector cannot offer another source identity");
       const readOnly = { ...secondary, id: "read-only-mailbox", email: "read-only@example.test", canSend: false };
       const renderComposer = (draft: Draft) => {
         fromControl = undefined; renderedOptions.length = 0;
@@ -3059,30 +3073,32 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           "an incomplete conversation stays blank because an omitted message could contain another alias");
         assert.equal(identityReads, 1, "one loaded source produces one identity request, not one request per row");
         const control = store as unknown as {
-          recipientIdentityCache: Map<string, { checkedAt: number }>;
-          recipientIdentityWorkers: Set<Promise<void>>;
-          recipientIdentityRefreshTimer?: ReturnType<typeof setTimeout>;
+          recipientIdentities: {
+            cache: Map<string, { checkedAt: number }>;
+            workers: Set<Promise<void>>;
+            refreshTimer?: ReturnType<typeof setTimeout>;
+          };
           rebuildWindow(): void;
           scheduleRecipientIdentityReads(rows: []): void;
-          scheduleRecipientIdentityRefresh(): void;
         };
-        await until(() => control.recipientIdentityWorkers.size === 0, "initial identity read settles");
+        const identityLoader = control.recipientIdentities;
+        await until(() => identityLoader.workers.size === 0, "initial identity read settles");
         const cachedMail = store.getSnapshot().mail.find(mail => mail.id === row(0).key)!;
         let release!: () => void;
         identityGate = new Promise<void>(resolve => { release = resolve; });
-        control.recipientIdentityCache.get(source.id)!.checkedAt -= 300_001;
+        identityLoader.cache.get(source.id)!.checkedAt -= 300_001;
         control.rebuildWindow();
         assert.equal(identityReads, 2);
         assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === row(0).key), cachedMail, "TTL refresh retains the alias and immutable mail identity while pending");
         identityGate = undefined; release();
-        await until(() => control.recipientIdentityWorkers.size === 0, "unchanged identity refresh settles");
+        await until(() => identityLoader.workers.size === 0, "unchanged identity refresh settles");
         assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === row(0).key), cachedMail, "unchanged TTL response never blanks or replaces the mail row");
-        control.recipientIdentityCache.get(source.id)!.checkedAt -= 300_001;
-        control.scheduleRecipientIdentityReads([]); control.scheduleRecipientIdentityRefresh();
-        assert.equal(control.recipientIdentityRefreshTimer, undefined, "expired sources without eligible rows have no timer, not a 1ms rebuild loop");
+        identityLoader.cache.get(source.id)!.checkedAt -= 300_001;
+        control.scheduleRecipientIdentityReads([]);
+        assert.equal(identityLoader.refreshTimer, undefined, "expired sources without eligible rows have no timer, not a 1ms rebuild loop");
         await sleep(10); assert.equal(identityReads, 2);
         control.rebuildWindow();
-        await until(() => control.recipientIdentityWorkers.size === 0, "eligible demand resumes refresh");
+        await until(() => identityLoader.workers.size === 0, "eligible demand resumes refresh");
         // Exercise the real queue with more sources than worker slots, in both projection modes.
         for (const inboxWindow of [false, true]) {
           const queuedStore = new InboxStore();
@@ -3090,9 +3106,8 @@ test("demand-driven host windows bound automatic requests and render unknown tot
             sourceAccounts: typeof source[];
             state: ReturnType<InboxStore["getSnapshot"]>;
             windowRows: Map<string, Row>;
-            recipientIdentityWorkers: Set<Promise<void>>;
+            recipientIdentities: { workers: Set<Promise<void>>; reset(): void };
             scheduleRecipientIdentityReads(rows: { sourceId: string; sourceGeneration: number }[]): void;
-            resetRecipientIdentityDemand(): void;
           };
           const sources = Array.from({ length: 6 }, (_, index) => ({ ...source, id: `queued-source-${index}` }));
           const demand = sources.map(account => ({ sourceId: account.id, sourceGeneration: account.generation }));
@@ -3115,11 +3130,11 @@ test("demand-driven host windows bound automatic requests and render unknown tot
             for (const release of releases) release();
             await sleep(0);
             assert.equal(reads.length, 4, "withdrawn queued demand never starts a request when a worker finishes");
-            assert.equal(queued.recipientIdentityWorkers.size, 0);
+            assert.equal(queued.recipientIdentities.workers.size, 0);
             queued.state.window = { ...queued.state.window!, keys: sources.map(account => account.id) };
             queued.scheduleRecipientIdentityReads(demand.slice(4));
             assert.deepEqual(reads.slice(4), sources.slice(4).map(account => account.id), "withdrawn sources can be requested again without stale load ownership");
-            queued.resetRecipientIdentityDemand();
+            queued.recipientIdentities.reset();
             for (const release of releases) release();
             await sleep(0);
             reads.length = 0; releases.length = 0;
@@ -3132,7 +3147,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
             await sleep(0);
             assert.equal(reads.length, 4, "dispatch rechecks source generations and connection status before IO");
           } finally {
-            queued.resetRecipientIdentityDemand();
+            queued.recipientIdentities.reset();
             for (const release of releases) release();
           }
         }
@@ -4057,12 +4072,15 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
         await store.setWindowQuery(activeQuery);
         const aliasControl = store as unknown as {
-          recipientIdentityCache: Map<string, { checkedAt: number }>;
-          recipientIdentityWorkers: Set<Promise<void>>;
-          recipientIdentityLoads: Map<string, unknown>;
+          recipientIdentities: {
+            cache: Map<string, { checkedAt: number }>;
+            workers: Set<Promise<void>>;
+            loads: Map<string, unknown>;
+          };
         };
-        await until(() => aliasControl.recipientIdentityWorkers.size === 0, "identity metadata settles before navigation");
-        aliasControl.recipientIdentityCache.get(source.id)!.checkedAt -= 300_001;
+        const aliasLoader = aliasControl.recipientIdentities;
+        await until(() => aliasLoader.workers.size === 0, "identity metadata settles before navigation");
+        aliasLoader.cache.get(source.id)!.checkedAt -= 300_001;
         const releases: Array<() => void> = [];
         const beforeNavigationReads = identityReads;
         for (const folder of ["Sent", "Inbox", "Sent", "Inbox", "Sent", "Inbox"]) {
@@ -4073,11 +4091,11 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         assert.ok(identitySignals.slice(-6, -1).every(signal => signal.aborted), "each retired window aborts its identity demand");
         for (const release of releases.slice(0, -1)) release();
         await sleep(0);
-        assert.equal(aliasControl.recipientIdentityLoads.size, 1, "late old finalizers cannot erase the current request owner");
-        assert.equal(aliasControl.recipientIdentityWorkers.size, 1);
+        assert.equal(aliasLoader.loads.size, 1, "late old finalizers cannot erase the current request owner");
+        assert.equal(aliasLoader.workers.size, 1);
         identityGate = undefined; releases.at(-1)!();
-        await until(() => aliasControl.recipientIdentityWorkers.size === 0, "newest window identity response settles");
-        assert.ok(Date.now() - aliasControl.recipientIdentityCache.get(source.id)!.checkedAt < 1000, "the current response, not an obsolete window, owns the refreshed metadata");
+        await until(() => aliasLoader.workers.size === 0, "newest window identity response settles");
+        assert.ok(Date.now() - aliasLoader.cache.get(source.id)!.checkedAt < 1000, "the current response, not an obsolete window, owns the refreshed metadata");
         const closing = store.doneOptimistically([selected(0)]);
         const closed = assert.rejects(closing, error => error instanceof DOMException && error.name === "AbortError");
         assert.equal(store.getSnapshot().pendingDone.length, 1);

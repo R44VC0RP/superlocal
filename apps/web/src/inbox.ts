@@ -16,8 +16,9 @@ import { getApplicationStorage } from "./storage";
 import { createScopedFetch } from "./application-auth";
 import { getApplicationScope } from "./application-scope";
 import { matchesSearch } from "./mail-search";
-import { hasIncomingRecipientHeaders, matchingRecipientAddress, type RecipientIdentity } from "./recipient-address";
-import { senderFromRecipients } from "inbox-sdk/sender-selection";
+import { hasIncomingRecipientHeaders, matchingRecipientAddress } from "./recipient-address";
+import { RecipientIdentityLoader, type RecipientIdentitySource } from "./recipient-identities";
+import { senderFromRecipients, sendingIdentityMatchesMailbox } from "inbox-sdk/sender-selection";
 import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, createAiTriageClient, type HostConfiguration, type InboxViewPreferences, createCategoryTransport, CategoryRequestError } from "./host";
 import { readSplitPreferences, writeSplitPreferences, readAttentionFeedback, recordAttentionFeedback, retractAttentionFeedback, InboxViewPreferencesError,
   type SavedSplitPreferences, type AttentionFeedback, type AttentionFeedbackTarget } from "./host";
@@ -50,7 +51,6 @@ const viewKey = (query: InboxViewQuery) => JSON.stringify(query);
 const expiredQuery = (error: unknown) => error instanceof InboxViewPreferencesError && error.code === "HOST_INBOX_QUERY_EXPIRED";
 type ThreadHistory = { contextVersion: string; summaries: MailboxMessageSummary[]; cursor: string | null; exhausted: boolean; truncated?: boolean; error?: string };
 type ThreadValidation = { row: InboxWindowRow; controller: AbortController; promise: Promise<{ summaries: MailboxMessageSummary[]; error?: string }> };
-type RecipientIdentityRequest = { key: string; sourceId: string; generation: number; storeGeneration: number; demandEpoch: number; mode: "window" | "legacy" };
 class DraftRecipientError extends Error {}
 type SendReference = { id: string; draftId: string; accountId: string; mailboxId: string };
 type Sending = { ref: SendReference; operation: Operation; draft: SdkDraft };
@@ -162,8 +162,6 @@ const MAX_ISSUES = 4;
 const RESOLVE_HOLD_MS = 10_000;
 /** A dismissed problem that recurs within this window starts hidden instead of reopening. */
 const DISMISSAL_MEMORY_MS = 5 * 60_000;
-const RECIPIENT_IDENTITY_TTL_MS = 5 * 60_000;
-const RECIPIENT_IDENTITY_CONCURRENCY = 4;
 /** Change-history polling cadence while the event stream is unavailable. */
 const POLL_MS = 30_000;
 const MAX_BACKOFF_MS = 60_000;
@@ -300,15 +298,20 @@ export class InboxStore {
   private bodyEpoch = 0;
   private blobInfo = new Map<string, BlobInfo>();
   private folders = new Map<string, Folder[]>();
-  private recipientIdentityCache = new Map<string, { generation: number; checkedAt: number; identities: RecipientIdentity[] }>();
-  private recipientIdentityQueue = new Map<string, RecipientIdentityRequest>();
-  private recipientIdentityLoads = new Map<string, RecipientIdentityRequest>();
-  private recipientIdentityWorkers = new Set<Promise<void>>();
-  private recipientIdentityActive = new Set<string>();
-  private legacyRecipientDemand = new Map<string, { sourceId: string; sourceGeneration: number }>();
-  private recipientIdentityDemandEpoch = 0;
-  private recipientIdentityController = new AbortController();
-  private recipientIdentityRefreshTimer?: ReturnType<typeof setTimeout>;
+  private legacyRecipientDemand = new Map<string, RecipientIdentitySource>();
+  private readonly recipientIdentities = new RecipientIdentityLoader({
+    load: (sourceId, signal) => this.client.sendingIdentities(sourceId, {}, { signal }),
+    isCurrent: (sourceId, sourceGeneration, storeGeneration) => this.recipientSourceIsCurrent(sourceId, sourceGeneration, storeGeneration),
+    changed: (sourceId, mode) => {
+      if (mode === "window") this.rebuildWindow();
+      else this.rebuild(new Set([...this.legacyRecipientDemand.entries()]
+        .filter(([, value]) => value.sourceId === sourceId).map(([thread]) => thread)));
+    },
+    refresh: () => {
+      if (this.state.host?.inboxWindow) this.rebuildWindow();
+      else this.scheduleRecipientIdentityReads([...this.legacyRecipientDemand.values()]);
+    },
+  });
   private folderDiscovery?: Promise<void>;
   private discoveredFolders = new Set<string>();
   private labels: Label[] = [];
@@ -447,7 +450,7 @@ export class InboxStore {
   private restoreWindow(view: RetainedView): Promise<void> {
     const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
     this.windowController.abort(); this.windowController = new AbortController();
-    this.resetRecipientIdentityDemand();
+    this.recipientIdentities.reset();
     this.clearThreadMessagePins();
     // An aborted open or drain of the previous view must not gate this view's reconciliation.
     this.windowLoading = undefined; this.windowPaging = undefined; this.windowChanges = undefined;
@@ -715,7 +718,7 @@ export class InboxStore {
   private openWindow = (): Promise<void> => {
     const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
     this.windowController.abort(); this.windowController = new AbortController();
-    this.resetRecipientIdentityDemand();
+    this.recipientIdentities.reset();
     this.clearThreadMessagePins();
     this.windowPaging = undefined; this.windowChanges = undefined; this.windowReplayCheckpoint = undefined; this.windowBoundaryCursors.clear(); this.windowNewerCursor = null; this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
     const signal = AbortSignal.any([this.windowController.signal, this.controller.signal]);
@@ -1274,23 +1277,11 @@ export class InboxStore {
     if (!box || !source) throw new Error("Select a connected mailbox first.");
     return { box, source };
   }
-  private pruneRecipientIdentities(accounts: readonly Account[]) {
-    for (const [sourceId, cached] of this.recipientIdentityCache) {
-      const source = accounts.find(account => account.id === sourceId);
-      if (source?.status !== "connected" || source.generation !== cached.generation) this.recipientIdentityCache.delete(sourceId);
-    }
-  }
-  private resetRecipientIdentityDemand() {
-    this.recipientIdentityDemandEpoch++;
-    this.recipientIdentityController.abort(); this.recipientIdentityController = new AbortController();
-    this.recipientIdentityQueue.clear(); this.recipientIdentityLoads.clear(); this.recipientIdentityWorkers.clear(); this.recipientIdentityActive.clear();
-    clearTimeout(this.recipientIdentityRefreshTimer); this.recipientIdentityRefreshTimer = undefined;
-  }
   private recipientSourceIsCurrent(sourceId: string, sourceGeneration: number, storeGeneration: number): boolean {
     if (storeGeneration !== this.generation || this.controller.signal.aborted || this.applicationScope.signal.aborted) return false;
     const source = this.sourceAccounts.find(account => account.id === sourceId);
     if (!this.state.host?.inboxWindow) return source?.generation === sourceGeneration && source.status === "connected"
-      && this.recipientIdentityActive.has(`${sourceId}\0${sourceGeneration}`);
+      && this.recipientIdentities.hasDemand(sourceId, sourceGeneration);
     const window = this.state.window;
     return source?.generation === sourceGeneration && source.status === "connected" && !!window
       && window.state.sources.some(value => value.sourceId === sourceId && value.generation === sourceGeneration)
@@ -1299,86 +1290,9 @@ export class InboxStore {
         return row?.sourceId === sourceId && row.sourceGeneration === sourceGeneration;
       });
   }
-  private scheduleRecipientIdentityReads(rows: readonly { sourceId: string; sourceGeneration: number }[]) {
-    const now = Date.now();
-    this.recipientIdentityActive = new Set(rows.map(row => `${row.sourceId}\0${row.sourceGeneration}`));
-    // Paging can retire demand without opening a new window. Drop only queued work;
-    // in-flight requests retain their completion fences and worker ownership.
-    for (const [key, request] of this.recipientIdentityQueue) {
-      if (this.recipientIdentityActive.has(key)) continue;
-      this.recipientIdentityQueue.delete(key);
-      if (this.recipientIdentityLoads.get(key) === request) this.recipientIdentityLoads.delete(key);
-    }
-    for (const row of rows) {
-      const source = this.sourceAccounts.find(account => account.id === row.sourceId);
-      if (!source || source.status !== "connected" || source.generation !== row.sourceGeneration) continue;
-      const current = this.recipientIdentityCache.get(source.id);
-      const key = `${source.id}\0${source.generation}`;
-      if (current?.generation === source.generation && now - current.checkedAt < RECIPIENT_IDENTITY_TTL_MS
-        || this.recipientIdentityLoads.has(key)) continue;
-      const request: RecipientIdentityRequest = { key, sourceId: source.id, generation: source.generation, storeGeneration: this.generation,
-        demandEpoch: this.recipientIdentityDemandEpoch, mode: this.state.host?.inboxWindow ? "window" : "legacy" };
-      this.recipientIdentityLoads.set(key, request);
-      this.recipientIdentityQueue.set(key, request);
-    }
-    this.drainRecipientIdentityReads();
-  }
-  private scheduleRecipientIdentityRefresh() {
-    clearTimeout(this.recipientIdentityRefreshTimer);
-    this.recipientIdentityRefreshTimer = undefined;
-    const active = this.recipientIdentityActive;
-    const next = Math.min(...[...this.recipientIdentityCache.entries()].flatMap(([sourceId, cached]) => {
-      const key = `${sourceId}\0${cached.generation}`;
-      return active.has(key) && !this.recipientIdentityLoads.has(key) ? [cached.checkedAt + RECIPIENT_IDENTITY_TTL_MS] : [];
-    }));
-    if (!Number.isFinite(next)) return;
-    this.recipientIdentityRefreshTimer = setTimeout(() => {
-      this.recipientIdentityRefreshTimer = undefined;
-      if (this.state.host?.inboxWindow) this.rebuildWindow();
-      else {
-        this.scheduleRecipientIdentityReads([...this.legacyRecipientDemand.values()]);
-        this.scheduleRecipientIdentityRefresh();
-      }
-    }, Math.max(1, next - Date.now()));
-  }
-  private drainRecipientIdentityReads() {
-    while (this.recipientIdentityWorkers.size < RECIPIENT_IDENTITY_CONCURRENCY && this.recipientIdentityQueue.size) {
-      const [key, request] = this.recipientIdentityQueue.entries().next().value!;
-      this.recipientIdentityQueue.delete(key);
-      const storeGeneration = request.storeGeneration;
-      if (request.demandEpoch !== this.recipientIdentityDemandEpoch || !this.recipientIdentityActive.has(key)
-        || !this.recipientSourceIsCurrent(request.sourceId, request.generation, storeGeneration)) {
-        if (this.recipientIdentityLoads.get(key) === request) this.recipientIdentityLoads.delete(key);
-        continue;
-      }
-      const signal = AbortSignal.any([this.recipientIdentityController.signal, this.controller.signal, this.applicationScope.signal]);
-      let worker!: Promise<void>;
-      worker = (async () => {
-        let identities: RecipientIdentity[] = [];
-        try {
-          const result = await this.client.sendingIdentities(request.sourceId, {}, { signal });
-          if (result.sourceId !== request.sourceId) throw new Error("Recipient identity source changed");
-          identities = result.identities.map(identity => ({ email: identity.email, isPrimary: identity.isPrimary }));
-        } catch {
-          // Recipient metadata is optional. A failed discovery leaves the column blank until the bounded cache expires.
-        }
-        if (signal.aborted || request.demandEpoch !== this.recipientIdentityDemandEpoch
-          || !this.recipientSourceIsCurrent(request.sourceId, request.generation, storeGeneration)) return;
-        const previous = this.recipientIdentityCache.get(request.sourceId);
-        this.recipientIdentityCache.set(request.sourceId, { generation: request.generation, checkedAt: Date.now(), identities });
-        if (previous?.generation !== request.generation || JSON.stringify(previous.identities) !== JSON.stringify(identities)) {
-          if (request.mode === "window") this.rebuildWindow();
-          else this.rebuild(new Set([...this.legacyRecipientDemand.entries()]
-            .filter(([, value]) => value.sourceId === request.sourceId).map(([thread]) => thread)));
-        }
-      })().finally(() => {
-        if (!this.recipientIdentityWorkers.delete(worker)) return;
-        if (this.recipientIdentityLoads.get(key) === request) this.recipientIdentityLoads.delete(key);
-        this.scheduleRecipientIdentityRefresh();
-        this.drainRecipientIdentityReads();
-      });
-      this.recipientIdentityWorkers.add(worker);
-    }
+  private scheduleRecipientIdentityReads(rows: readonly RecipientIdentitySource[]) {
+    this.recipientIdentities.update(rows, { storeGeneration: this.generation, mode: this.state.host?.inboxWindow ? "window" : "legacy",
+      signal: AbortSignal.any([this.controller.signal, this.applicationScope.signal]) });
   }
   sendingIdentities: LoadSendingIdentities = async (mailboxId, input = {}) => {
     const { source } = this.account(mailboxId);
@@ -1556,9 +1470,8 @@ export class InboxStore {
       this.clearPendingDone();
       this.retainedViews.clear(); this.windowCounts = undefined;
       this.client.clearCache();
-      this.resetRecipientIdentityDemand(); this.recipientIdentityCache.clear();
+      this.recipientIdentities.clear();
       this.legacyRecipientDemand.clear();
-      clearTimeout(this.recipientIdentityRefreshTimer); this.recipientIdentityRefreshTimer = undefined;
       clearTimeout(this.refreshTimer); clearTimeout(this.importantTimer); this.importantDeadline = Infinity;
       clearTimeout(this.aiPollTimer); clearTimeout(this.aiHoldTimer); this.aiPollPromise = undefined; this.aiHolds.clear();
       clearTimeout(this.aiRebuildTimer); this.aiRebuildTimer = undefined; this.aiRebuildThreads.clear();
@@ -1783,7 +1696,7 @@ export class InboxStore {
       for (const account of accounts) if (!same(presentation(account), presentation(previousAccounts.find(previous => previous.id === account.id)))) affectedSources.add(account.id);
       for (const box of selected) if (!same(box, this.boxes.find(previous => previous.id === box.id))) affectedSources.add(box.sourceId);
       this.sourceAccounts = accounts; this.boxes = selected;
-      this.pruneRecipientIdentities(accounts);
+      this.recipientIdentities.prune(accounts);
       if (!same(accounts, this.state.sources) || !same(selected, this.state.mailboxes)) this.publish({ sources: accounts, mailboxes: selected });
       const folderSources = new Set(events.filter(event => event.type === "account.updated" && event.accountId).map(event => event.accountId!));
       for (const id of folderSources) if (accounts.some(account => account.id === id && account.status === "connected")) {
@@ -2018,7 +1931,7 @@ export class InboxStore {
       }
       this.operations = operations;
       this.sourceAccounts = accounts; this.boxes = selected; this.labels = labels; this.summaries = summaries; this.sending = sending;
-      this.pruneRecipientIdentities(accounts);
+      this.recipientIdentities.prune(accounts);
       if (!host.inboxWindow) {
       this.messageRows = new Map([...summaries.values()].flat().map(row => [nativeKey(row.sourceId, row.id), row]));
       this.summaryFences = new Map([...this.messageRows].map(([key, row]) => [key, { epoch: flagEpoch, revision: row.revision }]));
@@ -2118,7 +2031,6 @@ export class InboxStore {
     const activeKeys = new Set(this.state.window?.keys ?? []);
     this.scheduleRecipientIdentityReads(rows.filter(row => activeKeys.has(row.key)
       && hasIncomingRecipientHeaders(retained.get(row.key)!)));
-    this.scheduleRecipientIdentityRefresh();
     const summaries = new Map<string, MailboxMessageSummary>();
     for (const row of rows) for (const summary of retained.get(row.key)!) {
       const key = nativeKey(summary.sourceId, summary.id), previous = summaries.get(key);
@@ -2147,10 +2059,10 @@ export class InboxStore {
       const ids = new Set(retained.get(row.key)!.map(summary => summary.id));
       if (detail?.exhausted && row.counts.messages === ids.size) { provenance.messagesComplete = true; provenance.actionContextComplete = row.targetsComplete; }
       const source = this.sourceAccounts.find(source => source.id === row.sourceId && source.generation === row.sourceGeneration);
-      const cachedIdentities = source && this.recipientIdentityCache.get(source.id);
-      const recipientAddress = source && cachedIdentities?.generation === source.generation
+      const identities = source && this.recipientIdentities.get(source.id, source.generation);
+      const recipientAddress = source && identities
         && provenance.messagesComplete
-        ? matchingRecipientAddress(retained.get(row.key)!, cachedIdentities.identities, source.email) : undefined;
+        ? matchingRecipientAddress(retained.get(row.key)!, identities, source.email) : undefined;
       // Whole-conversation aggregate/provenance always wins over partial projected metadata.
       const time = Number.isFinite(row.mail.receivedAt) ? calendar.format(new Date(row.mail.receivedAt!).toISOString()) : { date: row.mail.date, group: row.mail.group };
       let next: Mail = { ...row.mail, ...time, recipientAddress, messages: local?.messages.filter(message => ids.has(message.id)) ?? row.mail.messages, window: provenance,
@@ -2329,16 +2241,15 @@ export class InboxStore {
     labelNames[UNIFIED_ACCOUNT] = [...new Set(included.flatMap(id => labelNames[id] ?? []))];
     mail.push(...unifiedMail(mail, included, accounts));
     this.scheduleRecipientIdentityReads([...this.legacyRecipientDemand.values()]);
-    this.scheduleRecipientIdentityRefresh();
     for (const conversation of mail) {
       if (conversation.operationId || !conversation.sourceId || !conversation.sdkThreadId) continue;
       const source = this.sourceAccounts.find(source => source.id === conversation.sourceId);
-      const cached = this.recipientIdentityCache.get(conversation.sourceId);
+      const identities = source && this.recipientIdentities.get(source.id, source.generation);
       const rows = conversation.account === UNIFIED_ACCOUNT
         ? [...(unifiedRecipientRows.get(nativeKey(conversation.sourceId, conversation.sdkThreadId))?.values() ?? [])]
         : recipientRows.get(conversation.id) ?? [];
-      conversation.recipientAddress = source && cached?.generation === source.generation
-        ? matchingRecipientAddress(rows, cached.identities, source.email) : undefined;
+      conversation.recipientAddress = source && identities
+        ? matchingRecipientAddress(rows, identities, source.email) : undefined;
     }
     if (!onlyThreads) this.knownThreads.clear();
     const ai = this.state.ai;
@@ -2605,9 +2516,7 @@ export class InboxStore {
       if (this.account(box.id).box.revision !== box.revision) throw new Error("The sending mailbox changed. Retry to compose with its current senders.");
       const context = this.messageRows.get(nativeKey(source.id, parent));
       if (!context || context.threadId !== input.mail?.sdkThreadId || !context.memberships.some(state => state.mailboxId === box.id)) throw new Error("The selected message no longer belongs to this mailbox.");
-      const selector = box.selector;
-      const eligible = catalog.identities.filter(identity => selector.kind === "address" ? identity.email.toLowerCase() === selector.value.toLowerCase()
-        : selector.kind === "domain" ? identity.email.split("@").at(-1)?.toLowerCase() === selector.value.toLowerCase() : true);
+      const eligible = catalog.identities.filter(identity => sendingIdentityMatchesMailbox(identity.email, box.selector));
       from = senderFromRecipients(context, eligible) ?? from;
     }
     // Contact composition borrows only the sender identity, not reply threading or content.
