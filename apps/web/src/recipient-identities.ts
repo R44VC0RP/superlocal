@@ -59,17 +59,21 @@ export class RecipientIdentityLoader {
 
   update(rows: readonly RecipientIdentitySource[], scope: DemandScope): void {
     const now = Date.now();
-    this.active = new Set(rows.map(row => sourceKey(row.sourceId, row.sourceGeneration)));
+    const demand = new Map<string, RecipientIdentitySource>();
+    for (const row of rows) {
+      const key = sourceKey(row.sourceId, row.sourceGeneration);
+      if (!demand.has(key)) demand.set(key, row);
+    }
+    this.active = new Set(demand.keys());
     // Paging may retire queued work without retiring the whole view.
     for (const [key, request] of this.queue) {
       if (this.active.has(key)) continue;
       this.queue.delete(key);
       if (this.loads.get(key) === request) this.loads.delete(key);
     }
-    for (const row of rows) {
+    for (const [key, row] of demand) {
       if (!this.options.isCurrent(row.sourceId, row.sourceGeneration, scope.storeGeneration)) continue;
       const cached = this.cache.get(row.sourceId);
-      const key = sourceKey(row.sourceId, row.sourceGeneration);
       if (cached?.generation === row.sourceGeneration && now - cached.checkedAt < IDENTITY_TTL_MS || this.loads.has(key)) continue;
       const request: IdentityRequest = { ...row, ...scope, demandEpoch: this.demandEpoch };
       this.loads.set(key, request);
@@ -82,10 +86,11 @@ export class RecipientIdentityLoader {
   private scheduleRefresh(): void {
     clearTimeout(this.refreshTimer);
     this.refreshTimer = undefined;
-    const next = Math.min(...[...this.cache.entries()].flatMap(([sourceId, cached]) => {
+    let next = Infinity;
+    for (const [sourceId, cached] of this.cache) {
       const key = sourceKey(sourceId, cached.generation);
-      return this.active.has(key) && !this.loads.has(key) ? [cached.checkedAt + IDENTITY_TTL_MS] : [];
-    }));
+      if (this.active.has(key) && !this.loads.has(key)) next = Math.min(next, cached.checkedAt + IDENTITY_TTL_MS);
+    }
     if (!Number.isFinite(next)) return;
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = undefined;
@@ -117,7 +122,8 @@ export class RecipientIdentityLoader {
           || !this.options.isCurrent(request.sourceId, request.sourceGeneration, request.storeGeneration)) return;
         const previous = this.cache.get(request.sourceId);
         this.cache.set(request.sourceId, { generation: request.sourceGeneration, checkedAt: Date.now(), identities });
-        if (previous?.generation !== request.sourceGeneration || JSON.stringify(previous.identities) !== JSON.stringify(identities)) {
+        if (previous?.generation !== request.sourceGeneration || previous.identities.length !== identities.length
+          || previous.identities.some((identity, index) => identity.email !== identities[index].email || identity.isPrimary !== identities[index].isPrimary)) {
           this.options.changed(request.sourceId, request.mode);
         }
       })().finally(() => {

@@ -3108,6 +3108,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
             windowRows: Map<string, Row>;
             recipientIdentities: { workers: Set<Promise<void>>; reset(): void };
             scheduleRecipientIdentityReads(rows: { sourceId: string; sourceGeneration: number }[]): void;
+            recipientSourceIsCurrent(sourceId: string, sourceGeneration: number, storeGeneration: number): boolean;
           };
           const sources = Array.from({ length: 6 }, (_, index) => ({ ...source, id: `queued-source-${index}` }));
           const demand = sources.map(account => ({ sourceId: account.id, sourceGeneration: account.generation }));
@@ -3117,13 +3118,17 @@ test("demand-driven host windows bound automatic requests and render unknown tot
               state: { ...store.getSnapshot().window!.state, sources: sources.map(account => ({ sourceId: account.id, generation: account.generation })) } } };
           queued.windowRows = new Map(sources.map(account => [account.id, { ...row(0), key: account.id, sourceId: account.id }]));
           const reads: string[] = [], releases: Array<() => void> = [];
+          let validations = 0;
+          const isCurrent = queued.recipientSourceIsCurrent.bind(queued);
+          queued.recipientSourceIsCurrent = (...args) => { validations++; return isCurrent(...args); };
           queuedStore.client.sendingIdentities = async sourceId => {
             reads.push(sourceId);
             await new Promise<void>(resolve => { releases.push(resolve); });
             return { sourceId, checkedAt: new Date().toISOString(), identities: [] };
           };
           try {
-            queued.scheduleRecipientIdentityReads(demand);
+            queued.scheduleRecipientIdentityReads(Array.from({ length: 1000 }, () => demand).flat());
+            assert.equal(validations, sources.length + 4, "duplicate rows validate once per source generation plus each dispatched worker, in both projection modes");
             assert.equal(reads.length, 4, "identity reads respect the worker bound");
             queued.state.window = { ...queued.state.window!, keys: [] };
             queued.scheduleRecipientIdentityReads([]);
