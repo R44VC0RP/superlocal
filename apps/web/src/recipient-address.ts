@@ -1,16 +1,9 @@
-import { isIncomingRecipientFolder } from "inbox-sdk/sender-selection";
+import { isIncomingRecipientFolder, type senderFromRecipients } from "inbox-sdk/sender-selection";
+import type { SendingIdentity } from "inbox-sdk/types";
 
-type RecipientSummary = {
-  folder: string;
-  to: readonly { email: string }[];
-  cc: readonly { email: string }[];
-  deliveredTo?: readonly string[];
-};
+type RecipientSummary = Parameters<typeof senderFromRecipients>[0];
 
-export type RecipientIdentity = {
-  email: string;
-  isPrimary: boolean;
-};
+export type RecipientIdentity = Pick<SendingIdentity, "email" | "isPrimary">;
 
 /** Header recipients from drafts, sends and queued sends are not evidence of incoming delivery. */
 export function hasIncomingRecipientHeaders(messages: readonly RecipientSummary[]): boolean {
