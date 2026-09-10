@@ -16,6 +16,9 @@ import { getApplicationStorage } from "./storage";
 import { createScopedFetch } from "./application-auth";
 import { getApplicationScope } from "./application-scope";
 import { matchesSearch } from "./mail-search";
+import { hasIncomingRecipientHeaders, matchingRecipientAddress } from "./recipient-address";
+import { RecipientIdentityLoader, type RecipientIdentitySource } from "./recipient-identities";
+import { senderFromRecipients, sendingIdentityMatchesMailbox } from "inbox-sdk/sender-selection";
 import { readHostConfiguration, readInboxViewPreferences, writeInboxViewPreferences, createAiTriageClient, type HostConfiguration, type InboxViewPreferences, createCategoryTransport, CategoryRequestError } from "./host";
 import { readSplitPreferences, writeSplitPreferences, readAttentionFeedback, recordAttentionFeedback, retractAttentionFeedback, InboxViewPreferencesError,
   type SavedSplitPreferences, type AttentionFeedback, type AttentionFeedbackTarget } from "./host";
@@ -295,6 +298,20 @@ export class InboxStore {
   private bodyEpoch = 0;
   private blobInfo = new Map<string, BlobInfo>();
   private folders = new Map<string, Folder[]>();
+  private legacyRecipientDemand = new Map<string, RecipientIdentitySource>();
+  private readonly recipientIdentities = new RecipientIdentityLoader({
+    load: (sourceId, signal) => this.client.sendingIdentities(sourceId, {}, { signal }),
+    isCurrent: (sourceId, sourceGeneration, storeGeneration) => this.recipientSourceIsCurrent(sourceId, sourceGeneration, storeGeneration),
+    changed: (sourceId, mode) => {
+      if (mode === "window") this.rebuildWindow();
+      else this.rebuild(new Set([...this.legacyRecipientDemand.entries()]
+        .filter(([, value]) => value.sourceId === sourceId).map(([thread]) => thread)));
+    },
+    refresh: () => {
+      if (this.state.host?.inboxWindow) this.rebuildWindow();
+      else this.scheduleRecipientIdentityReads([...this.legacyRecipientDemand.values()]);
+    },
+  });
   private folderDiscovery?: Promise<void>;
   private discoveredFolders = new Set<string>();
   private labels: Label[] = [];
@@ -433,6 +450,7 @@ export class InboxStore {
   private restoreWindow(view: RetainedView): Promise<void> {
     const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
     this.windowController.abort(); this.windowController = new AbortController();
+    this.recipientIdentities.reset();
     this.clearThreadMessagePins();
     // An aborted open or drain of the previous view must not gate this view's reconciliation.
     this.windowLoading = undefined; this.windowPaging = undefined; this.windowChanges = undefined;
@@ -700,6 +718,7 @@ export class InboxStore {
   private openWindow = (): Promise<void> => {
     const query = { ...this.windowQuery }, epoch = ++this.windowEpoch, generation = this.generation;
     this.windowController.abort(); this.windowController = new AbortController();
+    this.recipientIdentities.reset();
     this.clearThreadMessagePins();
     this.windowPaging = undefined; this.windowChanges = undefined; this.windowReplayCheckpoint = undefined; this.windowBoundaryCursors.clear(); this.windowNewerCursor = null; this.windowLocalRemoved.clear(); this.windowRemovalFences.clear(); this.windowAutoDone = false;
     const signal = AbortSignal.any([this.windowController.signal, this.controller.signal]);
@@ -1258,6 +1277,23 @@ export class InboxStore {
     if (!box || !source) throw new Error("Select a connected mailbox first.");
     return { box, source };
   }
+  private recipientSourceIsCurrent(sourceId: string, sourceGeneration: number, storeGeneration: number): boolean {
+    if (storeGeneration !== this.generation || this.controller.signal.aborted || this.applicationScope.signal.aborted) return false;
+    const source = this.sourceAccounts.find(account => account.id === sourceId);
+    if (!this.state.host?.inboxWindow) return source?.generation === sourceGeneration && source.status === "connected"
+      && this.recipientIdentities.hasDemand(sourceId, sourceGeneration);
+    const window = this.state.window;
+    return source?.generation === sourceGeneration && source.status === "connected" && !!window
+      && window.state.sources.some(value => value.sourceId === sourceId && value.generation === sourceGeneration)
+      && window.keys.some(key => {
+        const row = this.windowRows.get(key);
+        return row?.sourceId === sourceId && row.sourceGeneration === sourceGeneration;
+      });
+  }
+  private scheduleRecipientIdentityReads(rows: readonly RecipientIdentitySource[]) {
+    this.recipientIdentities.update(rows, { storeGeneration: this.generation, mode: this.state.host?.inboxWindow ? "window" : "legacy",
+      signal: AbortSignal.any([this.controller.signal, this.applicationScope.signal]) });
+  }
   sendingIdentities: LoadSendingIdentities = async (mailboxId, input = {}) => {
     const { source } = this.account(mailboxId);
     const generation = this.generation, signal = this.controller.signal;
@@ -1434,6 +1470,8 @@ export class InboxStore {
       this.clearPendingDone();
       this.retainedViews.clear(); this.windowCounts = undefined;
       this.client.clearCache();
+      this.recipientIdentities.clear();
+      this.legacyRecipientDemand.clear();
       clearTimeout(this.refreshTimer); clearTimeout(this.importantTimer); this.importantDeadline = Infinity;
       clearTimeout(this.aiPollTimer); clearTimeout(this.aiHoldTimer); this.aiPollPromise = undefined; this.aiHolds.clear();
       clearTimeout(this.aiRebuildTimer); this.aiRebuildTimer = undefined; this.aiRebuildThreads.clear();
@@ -1658,6 +1696,7 @@ export class InboxStore {
       for (const account of accounts) if (!same(presentation(account), presentation(previousAccounts.find(previous => previous.id === account.id)))) affectedSources.add(account.id);
       for (const box of selected) if (!same(box, this.boxes.find(previous => previous.id === box.id))) affectedSources.add(box.sourceId);
       this.sourceAccounts = accounts; this.boxes = selected;
+      this.recipientIdentities.prune(accounts);
       if (!same(accounts, this.state.sources) || !same(selected, this.state.mailboxes)) this.publish({ sources: accounts, mailboxes: selected });
       const folderSources = new Set(events.filter(event => event.type === "account.updated" && event.accountId).map(event => event.accountId!));
       for (const id of folderSources) if (accounts.some(account => account.id === id && account.status === "connected")) {
@@ -1892,6 +1931,7 @@ export class InboxStore {
       }
       this.operations = operations;
       this.sourceAccounts = accounts; this.boxes = selected; this.labels = labels; this.summaries = summaries; this.sending = sending;
+      this.recipientIdentities.prune(accounts);
       if (!host.inboxWindow) {
       this.messageRows = new Map([...summaries.values()].flat().map(row => [nativeKey(row.sourceId, row.id), row]));
       this.summaryFences = new Map([...this.messageRows].map(([key, row]) => [key, { epoch: flagEpoch, revision: row.revision }]));
@@ -1988,6 +2028,9 @@ export class InboxStore {
   private rebuildWindow() {
     const calendar = displayTimes(); this.calendarKey = calendar.key;
     const rows = [...this.windowRows.values()], retained = new Map(rows.map(row => [row.key, this.threadSummaries(row).summaries]));
+    const activeKeys = new Set(this.state.window?.keys ?? []);
+    this.scheduleRecipientIdentityReads(rows.filter(row => activeKeys.has(row.key)
+      && hasIncomingRecipientHeaders(retained.get(row.key)!)));
     const summaries = new Map<string, MailboxMessageSummary>();
     for (const row of rows) for (const summary of retained.get(row.key)!) {
       const key = nativeKey(summary.sourceId, summary.id), previous = summaries.get(key);
@@ -2015,9 +2058,14 @@ export class InboxStore {
       const local = byId.get(row.key), detail = this.windowDetails.get(row.key), provenance = this.rowProvenance(row);
       const ids = new Set(retained.get(row.key)!.map(summary => summary.id));
       if (detail?.exhausted && row.counts.messages === ids.size) { provenance.messagesComplete = true; provenance.actionContextComplete = row.targetsComplete; }
+      const source = this.sourceAccounts.find(source => source.id === row.sourceId && source.generation === row.sourceGeneration);
+      const identities = source && this.recipientIdentities.get(source.id, source.generation);
+      const recipientAddress = source && identities
+        && provenance.messagesComplete
+        ? matchingRecipientAddress(retained.get(row.key)!, identities, source.email) : undefined;
       // Whole-conversation aggregate/provenance always wins over partial projected metadata.
       const time = Number.isFinite(row.mail.receivedAt) ? calendar.format(new Date(row.mail.receivedAt!).toISOString()) : { date: row.mail.date, group: row.mail.group };
-      let next: Mail = { ...row.mail, ...time, messages: local?.messages.filter(message => ids.has(message.id)) ?? row.mail.messages, window: provenance,
+      let next: Mail = { ...row.mail, ...time, recipientAddress, messages: local?.messages.filter(message => ids.has(message.id)) ?? row.mail.messages, window: provenance,
         hasAttachments: row.mail.hasAttachments ?? (row.messagesComplete ? row.mail.messages.some(message => message.hasAttachments) : undefined), historyExhausted: detail?.exhausted ?? row.messagesComplete,
         historyTruncated: detail?.truncated || undefined, historyError: detail?.error };
       const overlay = row.summaries.some(summary => this.projectFlags(summary) !== summary);
@@ -2086,6 +2134,11 @@ export class InboxStore {
         canSend: this.state.host?.allowProviderWrites === true && source.status === "connected" && box.status === "active" && source.capabilities.send && !!box.defaultSender };
     });
     const mail: Mail[] = [], labelNames: Record<string, string[]> = {};
+    if (!onlyThreads) this.legacyRecipientDemand.clear();
+    else for (const key of onlyThreads) this.legacyRecipientDemand.delete(key);
+    const recipientRows = new Map<string, MailboxMessageSummary[]>();
+    const unifiedRecipientRows = new Map<string, Map<string, MailboxMessageSummary>>();
+    const includedRecipientMailboxes = new Set(this.unifiedMailboxIds());
     const senderHistory = new Map<string, SenderHistoryMessage>();
     const sentMessages = new Map<string, Operation>();
     for (const operation of this.operations.values()) if (operation.type === "send") {
@@ -2115,6 +2168,14 @@ export class InboxStore {
         const group = groups.get(row.threadId) ?? []; group.push(row); groups.set(row.threadId, group);
       }
       for (const [thread, rows] of groups) {
+        const key = nativeKey(source.id, thread);
+        recipientRows.set(viewThreadId(box.id, thread), rows);
+        if (hasIncomingRecipientHeaders(rows)) this.legacyRecipientDemand.set(key, { sourceId: source.id, sourceGeneration: source.generation });
+        if (includedRecipientMailboxes.has(box.id)) {
+          const combined = unifiedRecipientRows.get(key) ?? new Map<string, MailboxMessageSummary>();
+          for (const row of rows) if ((combined.get(row.id)?.revision ?? -1) <= row.revision) combined.set(row.id, row);
+          unifiedRecipientRows.set(key, combined);
+        }
         rows.sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.id.localeCompare(b.id));
         const latest = rows.at(-1)!;
         const states = rows.map(row => row.memberships.find(state => state.mailboxId === box.id)!);
@@ -2179,6 +2240,17 @@ export class InboxStore {
     const included = this.unifiedMailboxIds();
     labelNames[UNIFIED_ACCOUNT] = [...new Set(included.flatMap(id => labelNames[id] ?? []))];
     mail.push(...unifiedMail(mail, included, accounts));
+    this.scheduleRecipientIdentityReads([...this.legacyRecipientDemand.values()]);
+    for (const conversation of mail) {
+      if (conversation.operationId || !conversation.sourceId || !conversation.sdkThreadId) continue;
+      const source = this.sourceAccounts.find(source => source.id === conversation.sourceId);
+      const identities = source && this.recipientIdentities.get(source.id, source.generation);
+      const rows = conversation.account === UNIFIED_ACCOUNT
+        ? [...(unifiedRecipientRows.get(nativeKey(conversation.sourceId, conversation.sdkThreadId))?.values() ?? [])]
+        : recipientRows.get(conversation.id) ?? [];
+      conversation.recipientAddress = source && identities
+        ? matchingRecipientAddress(rows, identities, source.email) : undefined;
+    }
     if (!onlyThreads) this.knownThreads.clear();
     const ai = this.state.ai;
     const connectedSources = new Set(this.sourceAccounts.filter(source => source.status === "connected").map(source => source.id));
@@ -2432,13 +2504,24 @@ export class InboxStore {
     const { box, source } = this.account(boxId);
     if (!this.state.accounts.find(account => account.id === boxId)?.canSend) throw new Error("This mailbox cannot send messages.");
     if (input.mode && input.mode !== "new" && input.mode !== "forward" && !source.capabilities.reply) throw new Error("This source cannot send replies.");
-    if (input.mail) await this.loadThread(input.mail.id);
+    const composing = !input.mode || input.mode === "new";
+    if (input.mail && !composing) await this.loadThread(input.mail.id);
     if (input.sourceMessageId && !input.mail?.messages.some(message => message.id === input.sourceMessageId)) throw new Error("The selected message no longer belongs to this conversation.");
     const parent = input.sourceMessageId ?? input.mail?.messages.filter(message => !message.pending).at(-1)?.id;
     if (input.mail?.messages.find(message => message.id === parent)?.pending) throw new Error("Wait for the queued message to finish sending before replying to it.");
     const implicitReply = !!parent && (input.mode === "reply" || input.mode === "replyAll");
-    const raw = await this.client.createDraft({ accountId: source.id, mailboxId: box.id, ...(!implicitReply ? { from: box.defaultSender! } : {}),
-      mode: input.mode === "new" || !input.mode ? "compose" : input.mode, ...(parent ? { sourceMessageId: parent } : {}),
+    let from = box.defaultSender!;
+    if (composing && parent) {
+      const catalog = await this.sendingIdentities(box.id);
+      if (this.account(box.id).box.revision !== box.revision) throw new Error("The sending mailbox changed. Retry to compose with its current senders.");
+      const context = this.messageRows.get(nativeKey(source.id, parent));
+      if (!context || context.threadId !== input.mail?.sdkThreadId || !context.memberships.some(state => state.mailboxId === box.id)) throw new Error("The selected message no longer belongs to this mailbox.");
+      const eligible = catalog.identities.filter(identity => sendingIdentityMatchesMailbox(identity.email, box.selector));
+      from = senderFromRecipients(context, eligible) ?? from;
+    }
+    // Contact composition borrows only the sender identity, not reply threading or content.
+    const raw = await this.client.createDraft({ accountId: source.id, mailboxId: box.id, ...(!implicitReply ? { from } : {}),
+      mode: input.mode === "new" || !input.mode ? "compose" : input.mode, ...(parent && !composing ? { sourceMessageId: parent } : {}),
       ...(input.subject !== undefined ? { subject: input.subject } : {}), ...(input.body !== undefined ? { bodyHtml: draftHtml(input.body), bodyText: plainText(input.body) } : {}),
       ...(input.to !== undefined ? { to: recipients(input.to) } : {}),
     }, this.requestOptions());

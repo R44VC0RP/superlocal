@@ -103,6 +103,7 @@ const sourceFacts = z.object({
 })
 const messageSummary = z.object({
   id, accountId: id, threadId: id, revision, from: participant, to: z.array(participant), cc: z.array(participant),
+  deliveredTo: z.array(z.string().min(1).max(320)).optional(),
   subject: z.string(), preview: z.string(), receivedAt: z.string(), isRead: z.boolean(), isStarred: z.boolean(),
   folder: z.string(), folderIds: z.array(id), labelIds: z.array(id), hasAttachments: z.boolean(),
   snoozedUntil: z.string().nullable(), facts: sourceFacts.optional(), bodyRevision: opaque.optional(),

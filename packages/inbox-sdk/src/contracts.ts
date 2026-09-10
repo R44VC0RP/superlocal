@@ -422,6 +422,8 @@ export interface MessageSummary {
   from: Participant
   to: Participant[]
   cc: Participant[]
+  /** Untrusted Delivered-To hints, separate from authenticated delivery provenance. Absent in older caches. */
+  deliveredTo?: string[]
   subject: string
   preview: string
   receivedAt: string

@@ -162,6 +162,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   } | null>(null);
   const [capturingIssue, setCapturingIssue] = useState(false);
   const issueCapturePending = useRef(false);
+  const contactComposePending = useRef(false);
   const [overlayIds, setOverlayIds] = useState<string[] | null>(null);
   const [commandDraftId, setCommandDraftId] = useState<string | null>(null);
   const [teachBusy, setTeachBusy] = useState(false);
@@ -1161,13 +1162,15 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     catch (error) { actionError(error); }
   }
   async function composeContact() {
-    if (!contextContact || !contextSender?.canSend) return;
+    if (!currentMail || !contextContact || !contextSender?.canSend || contactComposePending.current) return;
+    contactComposePending.current = true;
     motion.prepare("switch");
     try {
-      const draft = await store.newDraft(contextSender.id, { to: contextContact.email });
+      const draft = await store.newDraft(contextSender.id, { to: contextContact.email, mail: currentMail, sourceMessageId: contextContact.messageId ?? undefined });
       navigate({ draft: draft.id, thread: undefined, view: undefined });
       setSearch(false);
     } catch (error) { actionError(error); }
+    finally { contactComposePending.current = false; }
   }
   function updateDraft(draft: Draft) {
     const current = drafts.find(value => value.id === draft.id);

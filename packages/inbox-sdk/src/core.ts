@@ -8,6 +8,7 @@ import { sanitizeEmailBody } from '../server/sanitize'
 import { createMediaStore } from './media'
 import { mailFacts } from './mail-facts'
 import { mailPreview } from './mail-preview'
+import { senderFromRecipients } from './sender-selection'
 import { FORWARDING_BODY_BYTES, FORWARDING_DEPTH, forwardingRfcId, isForwardedCopy, type ForwardingBody, type ForwardingMessage } from './forwarding'
 import { ProviderError, ProviderMutationError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
 import { CredentialError, InboxError, MAILBOX_SYNC_PROBLEM_CODES, type MailboxSyncStatus, type MailboxSyncProblemCode, type Account, type BlobInfo, type ChangeEvent, type Changes, type CredentialContext, type CredentialState, type Draft,
@@ -1407,6 +1408,15 @@ export function createInbox(options: InboxOptions): Inbox {
       from: mail.from, to: mail.to, cc: mail.cc, subject: mail.subject, preview: mailPreview(mail), receivedAt: mail.receivedAt,
       isRead: mail.isRead, isStarred: mail.isStarred, folder: mail.folder, folderIds,
       labelIds: [], hasAttachments: attachments.length > 0, snoozedUntil: null, facts: mailFacts(mail) }
+    // Partial provider observations may omit headers. Preserve only this message's
+    // retained hints, never infer them from authenticated mailbox membership proof.
+    const deliveredTo: unknown = mail.deliveredTo ?? (old ? (JSON.parse(old.confirmed) as MessageSummary).deliveredTo : undefined)
+    if (deliveredTo !== undefined) {
+      if (!Array.isArray(deliveredTo) || deliveredTo.some(email => typeof email !== 'string' || email.length > 320 || !/^[^\s<>@]+@[^\s<>@]+$/.test(email))) {
+        throw new InboxError('INVALID_PROVIDER', 'Provider supplied invalid Delivered-To hints.', 502)
+      }
+      summary.deliveredTo = [...new Set(deliveredTo.map(email => email.toLowerCase()))]
+    }
     const body = JSON.stringify({ bcc: mail.bcc, bodyText: mail.bodyText, bodyHtml: mail.bodyHtml, attachments,
       replyTo: normalized.replyTo, rfcMessageId: normalized.rfcMessageId, references: normalized.references, inReplyTo: normalized.inReplyTo })
     summary.bodyRevision = createHmac('sha256', options.encryptionKey)
@@ -3060,7 +3070,8 @@ export function createInbox(options: InboxOptions): Inbox {
         if (source.account !== account.id) throw new InboxError('NOT_FOUND', 'Source message not found.', 404)
         const base = summary(source); const body = JSON.parse(source.body)
         const native = JSON.parse(account.native)
-        const identities = (sending?.identities ?? nativeSendingIdentities(native)).map(identity => identity.email)
+        const catalog = sending?.identities ?? nativeSendingIdentities(native)
+        const identities = catalog.map(identity => identity.email)
         const own = new Set(identities.map(email => email.toLowerCase()))
         if (replying && input.from === undefined) {
           const box = input.mailboxId ? JSON.parse(mailboxRow(owner, input.mailboxId, true).data) as Mailbox : null
@@ -3069,8 +3080,9 @@ export function createInbox(options: InboxOptions): Inbox {
             if (box) { try { assertMailboxSender(box, email) } catch { return undefined } }
             return identities.find(value => value.toLowerCase() === email.toLowerCase())
           }
-          const matches = [...new Set([...base.to, ...base.cc].flatMap(recipient => eligible(recipient.email) ?? []))]
-          const from = (base.folder === 'sent' ? eligible(base.from.email) : undefined) ?? (matches.length === 1 ? matches[0] : undefined) ?? eligible(box?.defaultSender) ?? eligible(native.email)
+          const eligibleIdentities = catalog.filter(identity => eligible(identity.email))
+          const from = (base.folder === 'sent' ? eligible(base.from.email) : undefined) ?? senderFromRecipients(base, eligibleIdentities)
+            ?? eligible(box?.defaultSender) ?? eligible(native.email)
             ?? (identities.length === 1 ? eligible(identities[0]) : undefined)
           if (!from) throw new InboxError('FORBIDDEN_SENDER', 'No authorized sender is available for this reply.', 403)
           prepared.from = from

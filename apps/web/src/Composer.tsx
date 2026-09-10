@@ -1,4 +1,5 @@
 import { readText, removeSaved, writeText } from "./storage";
+import { sendingIdentityMatchesMailbox } from "inbox-sdk/sender-selection";
 import {
   useCallback,
   useEffect,
@@ -54,8 +55,8 @@ type ComposerProps = {
 /** Receiving views can overlap; expose each authorized source/address once. */
 export function sendingAddressGroups(accounts: MailboxOption[], catalog: Record<string, readonly { email: string }[] | undefined>, preferredMailbox: string) {
   const groups = accounts.map(account => ({ account, identities: (catalog[account.id] ?? (account.email ? [{ email: account.email }] : []))
-    .filter(identity => account.selectorKind === "address" ? identity.email.toLowerCase() === (account.selectorValue ?? account.email).toLowerCase()
-      : account.selectorKind === "domain" ? identity.email.split("@").at(-1)?.toLowerCase() === account.selectorValue?.toLowerCase() : true)
+    .filter(identity => sendingIdentityMatchesMailbox(identity.email, { kind: account.selectorKind,
+      value: account.selectorValue ?? (account.selectorKind === "address" ? account.email : undefined) }))
     .map(identity => ({ account: account.id, email: identity.email, value: JSON.stringify([account.id, identity.email]) })) }));
   const owners = new Map<string, string>();
   for (const group of groups) for (const identity of group.identities) {

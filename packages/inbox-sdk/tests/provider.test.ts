@@ -3762,6 +3762,38 @@ describe('Gmail sending identities', () => {
 })
 
 describe('Gmail read-only body and pagination regressions', () => {
+  test('Delivered-To keeps repeated top-level address hints without inventing authenticated delivery provenance', async () => {
+    const definition = builtInProviders.find(provider => provider.id === 'gmail')!
+    const native = { id: 'delivered-hints', threadId: 'delivered-thread', internalDate: '1767225600000', payload: {
+      mimeType: 'multipart/mixed', headers: [
+        { name: 'Delivered-To', value: ' NOTES@example.test ' },
+        { name: 'dELIVERED-tO', value: 'notes@example.test' },
+        { name: 'Delivered-To', value: 'billing@example.test' },
+        ...['', 'invalid', 'bad@@example.test', 'Name <forged@example.test>', 'a@example.test,b@example.test',
+          'a@example.test\r\nDelivered-To: forged@example.test', 'a@-bad.test', `${'x'.repeat(65)}@example.test`]
+          .map(value => ({ name: 'Delivered-To', value })),
+        { name: 'X-Delivered-To', value: 'forged@example.test' },
+        { name: 'To', value: 'list@example.test' },
+      ], parts: [{ partId: '0', mimeType: 'text/plain', headers: [{ name: 'Delivered-To', value: 'embedded@example.test' }],
+        body: { data: Buffer.from('Fictional list message.').toString('base64url') } }],
+    } }
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toBe('https://gmail.invalid/gmail/v1/users/me/messages/delivered-hints?format=full')
+      expect(init?.method ?? 'GET').toBe('GET')
+      return Response.json(native)
+    }) as typeof fetch
+    const provider = await definition.create({ accountId: 'gmail-delivered-hints', accessToken: 'offline-token',
+      scopes: ['https://www.googleapis.com/auth/gmail.readonly'], baseUrl: 'https://gmail.invalid/gmail/v1', fetch: fetcher })
+    try {
+      const message = await provider.getMessage(native.id)
+      expect(message.deliveredTo).toEqual(['notes@example.test', 'billing@example.test'])
+      expect(message.deliveryRecipients).toBeUndefined()
+      expect(message.to.map(recipient => recipient.email)).toEqual(['list@example.test'])
+      native.payload.headers = []
+      expect((await provider.getMessage(native.id)).deliveredTo).toEqual([])
+    } finally { await provider.disconnect() }
+  })
+
   test('explicit HTML UTF-8 declarations override legacy MIME only for valid original UTF-8 bytes', async () => {
     const definition = builtInProviders.find(provider => provider.id === 'gmail')!
     const plain = 'Plain caf\u00e9 body.'

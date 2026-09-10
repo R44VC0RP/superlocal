@@ -30,7 +30,8 @@ function MailRow({
   sent,
   showSnippets,
 }: MailRowProps) {
-  const recipients = m.toAddresses?.join(", ") ?? m.to;
+  const receivingAddress = sent ? undefined : m.recipientAddress;
+  const recipients = receivingAddress ?? m.toAddresses?.join(", ") ?? m.to;
   const messageCount = m.window ? m.window.counts.messages : m.messages.length;
   return (
     <div
@@ -74,7 +75,7 @@ function MailRow({
           {m.labels[0]}
         </span>
       )}
-      <span className="row-recipients" role="cell" title={recipients ? `To: ${m.to || recipients}` : "No To recipients"}>
+      <span className="row-recipients" role="cell" title={recipients ? `To: ${receivingAddress ?? (m.to || recipients)}` : "No To recipients"}>
         {recipients ? `To: ${recipients}` : "No To recipients"}
       </span>
       <span className="row-metadata">
